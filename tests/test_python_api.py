@@ -48,6 +48,7 @@ def test_round_trip_preserves_bits_and_query_order(tmp_path: Path) -> None:
     assert storage.dimension == source.shape[1]
     assert storage.count == source_ids.size
     assert storage.dtype == "float16"
+    assert storage.format_version == 1
 
     # Query order is unrelated to physical order and a query ID may be repeated.
     positions = np.array([3, 0, 4, 1, 3, 2], dtype=np.intp)

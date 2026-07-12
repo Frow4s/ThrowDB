@@ -37,10 +37,9 @@ _TUNING_ALIAS_KEYS: Final = frozenset(
 class CollectionSchema:
     """Immutable logical schema of one collection snapshot.
 
-    ``utf8`` IDs and ``float32`` embeddings are part of the public schema
-    contract, but the current format-v1 writer only implements the
-    ``uint64``/``float16`` combination. ``Collection.create`` reports that
-    limitation explicitly instead of silently changing the requested schema.
+    Numeric collections support both ``float16`` and ``float32`` embeddings.
+    ``utf8`` IDs remain reserved for the future string index and are rejected
+    explicitly by ``Collection.create``.
     """
 
     id_type: str = "uint64"
@@ -84,7 +83,11 @@ def _first_negative_position(ids: np.ndarray) -> int | None:
     return None
 
 
-def _normalize_numeric_ids(ids: object) -> np.ndarray:
+def _normalize_numeric_ids(
+    ids: object,
+    *,
+    position_offset: int = 0,
+) -> np.ndarray:
     """Validate numeric IDs and return native, aligned, contiguous uint64.
 
     A native aligned C-contiguous uint64 ndarray is returned by identity. All
@@ -113,8 +116,9 @@ def _normalize_numeric_ids(ids: object) -> np.ndarray:
         if ids.dtype.kind == "i":
             position = _first_negative_position(ids)
             if position is not None:
+                absolute_position = position_offset + position
                 raise ValueError(
-                    f"ids[{position}]={int(ids[position])} is negative; "
+                    f"ids[{absolute_position}]={int(ids[position])} is negative; "
                     "numeric IDs must be between 0 and 2**64-1"
                 )
 
@@ -144,21 +148,22 @@ def _normalize_numeric_ids(ids: object) -> np.ndarray:
     normalized = np.empty(expected_length, dtype=np.uint64)
     actual_length = 0
     for position, value in enumerate(ids):
+        absolute_position = position_offset + position
         if position >= expected_length:
             raise ValueError("ids sequence changed length during normalization")
         if isinstance(value, (bool, np.bool_)):
             raise TypeError(
-                f"ids[{position}]={value!r} is boolean, not an integer ID"
+                f"ids[{absolute_position}]={value!r} is boolean, not an integer ID"
             )
         try:
             integer = operator.index(value)
         except TypeError as error:
             raise TypeError(
-                f"ids[{position}]={value!r} is not an integer ID"
+                f"ids[{absolute_position}]={value!r} is not an integer ID"
             ) from error
         if not 0 <= integer <= _UINT64_MAX:
             raise ValueError(
-                f"ids[{position}]={integer} is outside the uint64 range "
+                f"ids[{absolute_position}]={integer} is outside the uint64 range "
                 "0..2**64-1"
             )
         normalized[position] = integer
@@ -256,7 +261,7 @@ def _resolve_tuning(
             raise ValueError("tuning must be 'auto' or a mapping of reader options")
         return {}, {
             "mode": "auto",
-            "reason": "conservative format-v1 default; no calibration was run",
+            "reason": "conservative local-reader default; no calibration was run",
             **_READER_DEFAULTS,
         }
     if not isinstance(tuning, Mapping):
@@ -326,9 +331,11 @@ class Collection:
         self._state = "building" if writer is not None else "readable"
         if writer is not None:
             self._count = writer.count
+            self._format_version = writer.format_version
         else:
             assert storage is not None
             self._count = storage.count
+            self._format_version = storage.format_version
         self._tuning = dict(tuning_profile) if tuning_profile is not None else None
 
     @classmethod
@@ -347,14 +354,11 @@ class Collection:
             raise NotImplementedError(
                 "utf8 IDs require the future format-v2 string index"
             )
-        if schema.dtype != "float16":
-            raise NotImplementedError(
-                "float32 embeddings require the future generic dtype writer"
-            )
         writer = Writer.create(
             path,
             dimension=schema.dimension,
             shard_size_bytes=shard_size_bytes,
+            dtype=schema.dtype,
         )
         return cls(schema=schema, writer=writer)
 
@@ -393,6 +397,10 @@ class Collection:
     @property
     def count(self) -> int:
         return self._count
+
+    @property
+    def format_version(self) -> int:
+        return self._format_version
 
     @property
     def mode(self) -> str:
@@ -468,9 +476,8 @@ class Collection:
         full = storage.get(normalized_ids)
         if prefix == self.dimension:
             return full
-        # Format v1 is row-major and currently reads complete records. Copying
-        # makes the public prefix result C-contiguous and independent of the
-        # temporary full-width matrix.
+        # Dense rows are currently read at full width. Copying makes the public
+        # prefix result C-contiguous and independent of the temporary matrix.
         return full[:, :prefix].copy(order="C")
 
     def get_into(

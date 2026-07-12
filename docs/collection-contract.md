@@ -1,9 +1,11 @@
 # Local collection product contract
 
-This document fixes the intended contract for the first user-facing ThrowDB
-product. It is a design target, not a description of the current format-v1
-implementation. Format-v1 remains readable while the contract is implemented
-through a versioned format-v2 writer and a new Python `Collection` API.
+This document fixes the contract for the first user-facing ThrowDB product.
+The numeric immutable-snapshot subset is implemented through the Python
+`Collection` API: safe uint64 normalization, float16/float32 rows, arbitrary
+fixed dimensions, and semantic prefix reads. Float16 remains byte-compatible
+format v1 and float32 uses numeric format v2. UTF-8 IDs and record CRUD remain
+design targets for the string-index and WAL/delta stages described below.
 
 ## Product boundary
 

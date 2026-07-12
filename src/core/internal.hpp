@@ -53,7 +53,11 @@ enum class HashAlgorithm : std::uint32_t {
     SipHash24 = 2,
 };
 
-inline constexpr FormatVersion kWriteFormatVersion = FormatVersion::V1;
+enum class ChecksumAlgorithm : std::uint32_t {
+    None = 0,
+    Crc32c = 1,
+};
+
 inline constexpr std::uint64_t kHeaderSize = 4096;
 inline constexpr std::uint64_t kIndexSlotSize = 16;
 inline constexpr std::uint64_t kStagingEntrySize = 16;
@@ -93,6 +97,14 @@ struct CommonHeader {
     std::uint32_t header_size{0};
 };
 
+struct SnapshotId {
+    std::uint64_t low{0};
+    std::uint64_t high{0};
+
+    [[nodiscard]] bool empty() const noexcept { return low == 0 && high == 0; }
+    bool operator==(const SnapshotId&) const = default;
+};
+
 struct CollectionSchema {
     IdType id_type{IdType::Invalid};
     DTypeCode dtype{DTypeCode::Invalid};
@@ -106,20 +118,31 @@ struct CollectionSchema {
 struct Manifest {
     FormatVersion format_version{FormatVersion::Invalid};
     CollectionSchema schema;
+    ChecksumAlgorithm header_checksum_algorithm{ChecksumAlgorithm::None};
     std::uint64_t record_size{0};
     std::uint64_t record_count{0};
     std::uint64_t shard_size_bytes{0};
     std::uint64_t records_per_shard{0};
     std::uint64_t shard_count{0};
     std::uint64_t index_capacity{0};
+    std::uint64_t expected_string_arena_size{0};
+    std::uint64_t required_feature_bits{0};
+    std::uint64_t optional_feature_bits{0};
+    SnapshotId snapshot_id;
     std::uint64_t hash_seed{kHashSeed};
+    std::uint64_t hash_seed_high{0};
     std::uint64_t index_control_offset{kHeaderSize};
     std::uint64_t index_slots_offset{kHeaderSize};
+    std::uint64_t index_slot_size{kIndexSlotSize};
     std::uint64_t index_file_size{kHeaderSize};
+    std::uint64_t string_arena_payload_offset{0};
+    std::uint64_t creation_time_unix_ns{0};
+    std::uint64_t header_checksum{0};
 };
 
 struct ShardHeader {
     FormatVersion format_version{FormatVersion::Invalid};
+    SnapshotId snapshot_id;
     std::uint64_t shard_id{0};
     std::uint64_t first_ordinal{0};
     std::uint64_t record_count{0};
@@ -127,6 +150,10 @@ struct ShardHeader {
     std::uint32_t dimension{0};
     DTypeCode dtype{DTypeCode::Invalid};
     RowLayout row_layout{RowLayout::Invalid};
+    ChecksumAlgorithm payload_checksum_algorithm{ChecksumAlgorithm::None};
+    std::uint64_t payload_size{0};
+    std::uint64_t payload_checksum{0};
+    std::uint64_t header_checksum{0};
 };
 
 struct IndexSlot {
@@ -163,6 +190,7 @@ void sync_directory(const std::filesystem::path& path);
     std::uint64_t left, std::uint64_t right, std::string_view description);
 [[nodiscard]] std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment);
 [[nodiscard]] std::uint32_t dtype_item_size(DTypeCode dtype) noexcept;
+[[nodiscard]] SnapshotId make_snapshot_id();
 
 void put_u32(std::span<std::byte> output, std::size_t offset, std::uint32_t value);
 void put_u64(std::span<std::byte> output, std::size_t offset, std::uint64_t value);

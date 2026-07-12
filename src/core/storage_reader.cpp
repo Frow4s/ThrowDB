@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -385,6 +386,9 @@ public:
         return static_cast<DType>(
             static_cast<std::uint32_t>(manifest_.schema.dtype));
     }
+    [[nodiscard]] std::uint32_t format_version() const noexcept {
+        return static_cast<std::uint32_t>(manifest_.format_version);
+    }
     [[nodiscard]] std::uint64_t record_size() const noexcept {
         return manifest_.record_size;
     }
@@ -474,17 +478,42 @@ private:
     }
 
     void validate_manifest() const {
-        if (manifest_.format_version != detail::FormatVersion::V1
-            || manifest_.schema.id_type != detail::IdType::UInt64
-            || manifest_.schema.dtype != detail::DTypeCode::Float16
-            || manifest_.schema.item_size != 2
-            || manifest_.schema.row_layout
-                   != detail::RowLayout::DenseRowMajor
+        if (manifest_.schema.id_type != detail::IdType::UInt64
+            || manifest_.schema.row_layout != detail::RowLayout::DenseRowMajor
             || manifest_.schema.index_kind != detail::IndexKind::UInt64Flat
             || manifest_.schema.hash_algorithm
                    != detail::HashAlgorithm::SplitMix64V1) {
             throw CorruptionError(
-                "manifest contains an unsupported format-v1 collection schema");
+                "manifest contains an unsupported numeric collection schema");
+        }
+
+        switch (manifest_.format_version) {
+            case detail::FormatVersion::V1:
+                if (manifest_.schema.dtype != detail::DTypeCode::Float16
+                    || manifest_.schema.item_size != 2) {
+                    throw CorruptionError(
+                        "manifest contains an unsupported format-v1 dtype");
+                }
+                break;
+            case detail::FormatVersion::V2: {
+                if (std::endian::native != std::endian::little) {
+                    throw StorageError(
+                        "format-v2 reading requires a little-endian host");
+                }
+                const bool dtype_supported =
+                    manifest_.schema.dtype == detail::DTypeCode::Float16
+                    || manifest_.schema.dtype == detail::DTypeCode::Float32;
+                if (!dtype_supported
+                    || manifest_.schema.item_size
+                           != detail::dtype_item_size(manifest_.schema.dtype)) {
+                    throw CorruptionError(
+                        "manifest contains an unsupported format-v2 dtype");
+                }
+                break;
+            }
+            case detail::FormatVersion::Invalid:
+                throw CorruptionError(
+                    "manifest contains an unsupported format version");
         }
         const std::uint64_t expected_record_size = detail::checked_multiply(
             manifest_.schema.dimension, manifest_.schema.item_size,
@@ -527,6 +556,8 @@ private:
             const std::uint64_t expected_count = std::min(
                 manifest_.records_per_shard,
                 manifest_.record_count - first_ordinal);
+            const std::uint64_t payload_size = detail::checked_multiply(
+                expected_count, manifest_.record_size, "shard payload");
             if (header.shard_id != shard_id
                 || header.first_ordinal != first_ordinal
                 || header.record_count != expected_count
@@ -538,8 +569,17 @@ private:
                 throw CorruptionError(
                     "shard header does not match manifest for '" + path.string() + "'");
             }
-            const std::uint64_t payload_size = detail::checked_multiply(
-                expected_count, manifest_.record_size, "shard payload");
+            if (manifest_.format_version == detail::FormatVersion::V2
+                && (header.snapshot_id != manifest_.snapshot_id
+                    || header.payload_size != payload_size
+                    || header.payload_checksum_algorithm
+                           != detail::ChecksumAlgorithm::None
+                    || header.payload_checksum != 0
+                    || header.header_checksum != 0)) {
+                throw CorruptionError(
+                    "format-v2 shard metadata does not match manifest for '"
+                    + path.string() + "'");
+            }
             if (detail::file_size(fd.get(), path) != detail::kHeaderSize + payload_size) {
                 throw CorruptionError(
                     "shard file size does not match header for '" + path.string() + "'");
@@ -634,6 +674,11 @@ void Storage::get_into(const std::uint64_t* ids, const std::size_t count,
 
 std::vector<std::uint16_t> Storage::get(
     const std::span<const std::uint64_t> ids) const {
+    if (dtype() != DType::Float16) {
+        throw InvalidArgumentError(
+            "Storage::get is only available for float16 collections; "
+            "use get_bytes or get_into for float32");
+    }
     const std::uint64_t element_count = detail::checked_multiply(
         ids.size(), dimension(), "read result");
     if (element_count > std::numeric_limits<std::size_t>::max()) {
@@ -644,9 +689,24 @@ std::vector<std::uint16_t> Storage::get(
     return result;
 }
 
+std::vector<std::byte> Storage::get_bytes(
+    const std::span<const std::uint64_t> ids) const {
+    const std::uint64_t byte_count = detail::checked_multiply(
+        ids.size(), record_size(), "read result");
+    if (byte_count > std::numeric_limits<std::size_t>::max()) {
+        throw InvalidArgumentError("read result does not fit in address space");
+    }
+    std::vector<std::byte> result(static_cast<std::size_t>(byte_count));
+    get_into(ids, result);
+    return result;
+}
+
 std::uint64_t Storage::count() const noexcept { return impl_->count(); }
 std::uint32_t Storage::dimension() const noexcept { return impl_->dimension(); }
 DType Storage::dtype() const noexcept { return impl_->dtype(); }
+std::uint32_t Storage::format_version() const noexcept {
+    return impl_->format_version();
+}
 std::uint64_t Storage::record_size() const noexcept { return impl_->record_size(); }
 
 }  // namespace throwdb

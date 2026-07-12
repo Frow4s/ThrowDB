@@ -198,6 +198,14 @@ def test_inconsistent_sequence_length_never_exposes_uninitialized_ids() -> None:
         _normalize_numeric_ids(ShortSequence())
 
 
+def test_id_normalization_can_report_an_absolute_batch_position() -> None:
+    with pytest.raises(ValueError, match=r"ids\[12\]=-1"):
+        _normalize_numeric_ids(
+            np.array([7, 8, -1], dtype=np.int32),
+            position_offset=10,
+        )
+
+
 def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     tmp_path: Path,
 ) -> None:
@@ -215,6 +223,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         assert builder.schema is schema
         assert builder.id_type == "uint64"
         assert builder.dtype == "float16"
+        assert builder.format_version == 1
         assert builder.dimension == schema.dimension
         assert builder.count == 0
         assert builder.tuning is None
@@ -228,6 +237,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert collection.schema == schema
     assert collection.id_type == "uint64"
     assert collection.dtype == "float16"
+    assert collection.format_version == 1
     assert collection.dimension == schema.dimension
     assert collection.count == ids.size
 
@@ -496,18 +506,13 @@ def test_collection_schema_rejects_invalid_values(
         throwdb.CollectionSchema(**kwargs)  # type: ignore[arg-type]
 
 
-def test_current_writer_reports_future_schema_features_explicitly(
+def test_current_writer_reports_future_id_schema_features_explicitly(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(NotImplementedError, match="utf8.*format-v2"):
         throwdb.Collection.create(
             tmp_path / "utf8",
             schema=throwdb.CollectionSchema(id_type="utf8", dimension=4),
-        )
-    with pytest.raises(NotImplementedError, match="float32.*generic dtype"):
-        throwdb.Collection.create(
-            tmp_path / "float32",
-            schema=throwdb.CollectionSchema(dimension=4, dtype="float32"),
         )
     with pytest.raises(TypeError, match="CollectionSchema"):
         throwdb.Collection.create(tmp_path / "invalid", schema=object())  # type: ignore[arg-type]

@@ -1,15 +1,16 @@
 # ThrowDB
 
 ThrowDB is a read-optimized, disk-backed store for fixed-width embeddings. The
-MVP targets arbitrary `uint64` IDs and `float16` NumPy matrices, with immutable
-shards on local NVMe and an in-memory immutable hash index.
+local snapshot engine supports arbitrary numeric IDs and bit-exact `float16`
+or `float32` NumPy matrices, with immutable shards on local NVMe and an
+in-memory immutable hash index.
 
 The implemented format-v1 contract is documented in
 [`docs/storage-format.md`](docs/storage-format.md). The target local collection
 semantics and staged product plan are documented in
 [`docs/collection-contract.md`](docs/collection-contract.md) and
 [`docs/product-roadmap.md`](docs/product-roadmap.md).
-The proposed version-2 binary representation is specified in
+The numeric version-2 binary representation is specified in
 [`docs/storage-format-v2.md`](docs/storage-format-v2.md).
 
 ## Install for development
@@ -41,7 +42,7 @@ vectors = np.load("embeddings.npy", mmap_mode="r")
 schema = throwdb.CollectionSchema(
     id_type="uint64",
     dimension=1024,
-    dtype="float16",
+    dtype="float32",       # float16 is also supported
 )
 with throwdb.Collection.create("/data/example", schema=schema) as collection:
     collection.add(ids, vectors)
@@ -50,25 +51,30 @@ collection = throwdb.Collection.open("/data/example", tuning="auto")
 result = collection.get([42, 100])
 prefix = collection.get([42, 100], prefix_dimensions=128)
 
-output = np.empty((2, 128), dtype=np.float16)
+output = np.empty((2, 128), dtype=np.float32)
 collection.get_into([42, 100], output, prefix_dimensions=128)
 ```
 
-The format-v1 backend currently implements numeric `uint64` IDs and
-`float16` embeddings. `CollectionSchema` recognizes the planned `utf8` and
-`float32` domains, but `Collection.create` reports them as unsupported until
-their format-v2 implementations exist. Prefix reads are API-correct today but
-format v1 reads each complete row into a temporary before returning its prefix.
+New `float16` snapshots intentionally retain the byte-compatible format-v1
+layout, while `float32` snapshots use numeric format v2 with a shared 128-bit
+snapshot identity across manifest, index, and shards. Both are opened through
+the same API; `collection.format_version` makes the selected representation
+observable. UTF-8 IDs remain reserved for the future string index. Prefix reads
+are API-correct today but the dense-row backend still reads each complete row
+into a temporary before returning its prefix.
 The initial `"auto"` tuning profile deliberately selects the conservative
 thread-pool baseline without running a calibration benchmark; the effective
 selection and reason are visible through `collection.tuning`.
 
 `Writer` and `Storage` are the lower-level zero-copy API. They require native,
-aligned, C-contiguous `uint64` and `float16` NumPy arrays and pass their buffers
-directly to synchronous C++ calls:
+aligned, C-contiguous `uint64` IDs and embedding arrays whose dtype exactly
+matches the writer (`float16` or `float32`). Buffers pass directly to
+synchronous C++ calls:
 
 ```python
-with throwdb.Writer.create("/data/example-low-level", dimension=1024) as writer:
+with throwdb.Writer.create(
+    "/data/example-low-level", dimension=1024, dtype="float32"
+) as writer:
     writer.add(ids.astype(np.uint64, copy=False), vectors)
 
 db = throwdb.Storage.open("/data/example-low-level")
@@ -129,7 +135,9 @@ To avoid allocating the result in C++, use a caller-owned array:
 
 ```python
 query_ids = np.array([42, 100], dtype=np.uint64)
-output = np.empty((len(query_ids), db.dimension), dtype=np.float16)
+output = np.empty(
+    (len(query_ids), db.dimension), dtype=np.dtype(db.dtype)
+)
 db.get_into(query_ids, output)
 ```
 
@@ -149,16 +157,17 @@ throwdb get \
 throwdb inspect --storage /data/example
 ```
 
-`ids.npy` must have dtype `uint64` and shape `(N,)`. `embeddings.npy` must have
-dtype `float16` and shape `(N, dimension)`. The CLI opens both with NumPy memory
-mapping and sends them to C++ in bounded batches.
+`ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
+dtype whose values are all non-negative. `embeddings.npy` must use `float16` or
+`float32` and have shape `(N, dimension)`. The CLI opens both with NumPy memory
+mapping, normalizes IDs safely, and sends them to C++ in bounded batches.
 
 ## Current MVP boundaries
 
 - immutable create/open lifecycle;
 - local filesystem/NVMe only;
-- one `float16` dtype and one fixed dimension per store;
-- buffered `pread` backend;
+- one `float16` or `float32` dtype and one fixed dimension per collection;
+- buffered `pread` and experimental Linux `io_uring` backends;
 - no update, delete, compaction, checksums or network service yet.
 
 See [the storage format](docs/storage-format.md) and
@@ -174,6 +183,6 @@ and compare executor task granularity; see the benchmark plan for the remote
 `1/4/8/16` sweep. On cgroup v2 systems the report also records the effective CPU
 quota and per-scenario `cpu.stat` deltas, including throttled periods and time.
 
-The on-disk format is versioned but still experimental. Do not treat storage
-created by the MVP as forward-compatible until format version 1 is declared
-stable.
+The on-disk format is versioned but still experimental. Format-v1 compatibility
+is covered by a byte-level golden test; format v2 may still evolve before its
+first stable declaration.

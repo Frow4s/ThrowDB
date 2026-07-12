@@ -52,6 +52,11 @@ if(THROWDB_BUILD_TESTS)
     target_link_libraries(throwdb_core_tests PRIVATE throwdb::core)
     target_compile_features(throwdb_core_tests PRIVATE cxx_std_20)
     add_test(NAME throwdb_core_tests COMMAND throwdb_core_tests)
+
+    add_executable(throwdb_format_v2_tests tests/format_v2_tests.cpp)
+    target_link_libraries(throwdb_format_v2_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_format_v2_tests PRIVATE cxx_std_20)
+    add_test(NAME throwdb_format_v2_tests COMMAND throwdb_format_v2_tests)
 endif()
 
 if(THROWDB_BUILD_BENCHMARKS)

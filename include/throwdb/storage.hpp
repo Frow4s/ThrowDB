@@ -11,6 +11,7 @@ namespace throwdb {
 
 enum class DType : std::uint32_t {
     Float16 = 1,
+    Float32 = 2,
 };
 
 enum class IoBackend : std::uint32_t {
@@ -80,6 +81,8 @@ public:
 
     [[nodiscard]] std::uint64_t count() const noexcept;
     [[nodiscard]] std::uint32_t dimension() const noexcept;
+    [[nodiscard]] DType dtype() const noexcept;
+    [[nodiscard]] std::uint32_t format_version() const noexcept;
     [[nodiscard]] std::uint64_t record_size() const noexcept;
     [[nodiscard]] bool finished() const noexcept;
 
@@ -114,13 +117,20 @@ public:
         void* output,
         std::size_t output_bytes) const;
 
-    // float16 values are returned as their raw IEEE-754 binary16 bit patterns.
+    // Returns the raw row-major payload for any supported dtype.
+    [[nodiscard]] std::vector<std::byte> get_bytes(
+        std::span<const std::uint64_t> ids) const;
+
+    // Compatibility convenience for float16 collections. Values are returned
+    // as their raw IEEE-754 binary16 bit patterns. Float32 collections must use
+    // get_bytes() or get_into().
     [[nodiscard]] std::vector<std::uint16_t> get(
         std::span<const std::uint64_t> ids) const;
 
     [[nodiscard]] std::uint64_t count() const noexcept;
     [[nodiscard]] std::uint32_t dimension() const noexcept;
     [[nodiscard]] DType dtype() const noexcept;
+    [[nodiscard]] std::uint32_t format_version() const noexcept;
     [[nodiscard]] std::uint64_t record_size() const noexcept;
 
 private:

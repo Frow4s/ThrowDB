@@ -247,8 +247,30 @@ features      = 0
 ```
 
 The v2 reader continues to validate v1 files with their original v1 rules. It
-must not apply v2 offsets to a v1 header. Writers create v2 snapshots by default
-only after numeric-v2 round-trip and compatibility tests pass.
+must not apply v2 offsets to a v1 header.
+
+## Current implementation status
+
+The numeric v2 codec, writer, and reader are implemented for `uint64` IDs and
+`float32` rows. Manifest, index, and every shard carry one nonzero snapshot ID;
+their schema, geometry, version, snapshot, offsets, sizes, and reserved bytes
+are checked when opening the snapshot. Numeric index ordinals must form a
+bijection onto the stored rows, and every occupied slot must be reachable by
+the declared linear-probing algorithm. Checksum algorithms, feature bits, and
+string-arena fields are currently fixed to zero and any unsupported value is
+rejected. Exact duplicate-ID verification for externally corrupted index files
+is deferred to the explicit checksum/integrity tooling; the supported writer
+rejects duplicates before publication.
+
+The `float16` writer deliberately continues to emit the byte-identical v1
+layout so existing production workflows do not receive a silent format change.
+The version-dispatching reader supports v1 float16 and numeric v2 float16/float32
+schema, while the current public writer selects v2 for float32. This rollout can
+later move float16 creation to v2 without changing the collection API.
+
+Physical prefix reads, checksums, UTF-8 IDs, and the mutation layer remain later
+steps. The current Python prefix API reads full dense rows before copying the
+requested columns.
 
 ## Incremental implementation order
 

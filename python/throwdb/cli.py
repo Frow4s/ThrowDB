@@ -10,6 +10,7 @@ from typing import Sequence
 import numpy as np
 
 from . import Storage, Writer
+from .collection import _normalize_numeric_ids
 
 
 DEFAULT_SHARD_SIZE_GIB = 16
@@ -25,20 +26,31 @@ MAX_IO_URING_QUEUE_DEPTH = 4096
 
 def _load_ids(path: Path) -> np.ndarray:
     ids = np.load(path, mmap_mode="r", allow_pickle=False)
-    if ids.dtype != np.dtype(np.uint64):
-        raise ValueError(f"ids must have native-endian dtype uint64, got {ids.dtype}")
     if ids.ndim != 1:
         raise ValueError(f"ids must have shape (N,), got {ids.shape}")
-    if not ids.flags.c_contiguous:
-        raise ValueError("ids must be C-contiguous")
+    if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
+        1,
+        2,
+        4,
+        8,
+    }:
+        raise ValueError(
+            "ids must have an 8-, 16-, 32-, or 64-bit integer dtype, "
+            f"got {ids.dtype}"
+        )
     return ids
 
 
 def _load_embeddings(path: Path) -> np.ndarray:
     embeddings = np.load(path, mmap_mode="r", allow_pickle=False)
-    if embeddings.dtype != np.dtype(np.float16):
+    if embeddings.dtype.name not in {"float16", "float32"}:
         raise ValueError(
-            "embeddings must have native-endian dtype float16, "
+            "embeddings must have dtype float16 or float32, "
+            f"got {embeddings.dtype}"
+        )
+    if not embeddings.dtype.isnative:
+        raise ValueError(
+            "embeddings must use native byte order, "
             f"got {embeddings.dtype}"
         )
     if embeddings.ndim != 2:
@@ -111,10 +123,16 @@ def _create(args: argparse.Namespace) -> None:
         args.storage,
         dimension=dimension,
         shard_size_bytes=shard_size_bytes,
+        dtype=embeddings.dtype.name,
     ) as writer:
         for begin in range(0, ids.shape[0], args.batch_rows):
             end = min(begin + args.batch_rows, ids.shape[0])
-            writer.add(ids[begin:end], embeddings[begin:end])
+            writer.add(
+                _normalize_numeric_ids(
+                    ids[begin:end], position_offset=begin
+                ),
+                embeddings[begin:end],
+            )
 
 
 def _get(args: argparse.Namespace) -> None:
@@ -131,12 +149,17 @@ def _get(args: argparse.Namespace) -> None:
     output = np.lib.format.open_memmap(
         args.output,
         mode="w+",
-        dtype=np.float16,
+        dtype=np.dtype(storage.dtype),
         shape=(ids.shape[0], storage.dimension),
     )
     for begin in range(0, ids.shape[0], args.batch_rows):
         end = min(begin + args.batch_rows, ids.shape[0])
-        storage.get_into(ids[begin:end], output[begin:end])
+        storage.get_into(
+            _normalize_numeric_ids(
+                ids[begin:end], position_offset=begin
+            ),
+            output[begin:end],
+        )
     output.flush()
 
 
@@ -156,7 +179,8 @@ def _inspect(args: argparse.Namespace) -> None:
                 "path": str(args.storage),
                 "count": storage.count,
                 "dimension": storage.dimension,
-                "dtype": "float16",
+                "dtype": storage.dtype,
+                "format_version": storage.format_version,
             },
             indent=2,
             sort_keys=True,
@@ -183,7 +207,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     create.set_defaults(handler=_create)
 
-    get = subparsers.add_parser("get", help="read IDs into a float16 NumPy file")
+    get = subparsers.add_parser(
+        "get", help="read IDs into a typed NumPy embedding file"
+    )
     get.add_argument("--storage", type=Path, required=True)
     get.add_argument("--ids", type=Path, required=True)
     get.add_argument("--output", type=Path, required=True)

@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from os import PathLike
 from types import TracebackType
+from typing import Literal, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
 
 __version__: str
+
+_DTypeName: TypeAlias = Literal["float16", "float32"]
+_EmbeddingArray: TypeAlias = (
+    npt.NDArray[np.float16] | npt.NDArray[np.float32]
+)
 
 
 class Writer:
@@ -15,6 +21,7 @@ class Writer:
         path: str | bytes | PathLike[str] | PathLike[bytes],
         dimension: int = 1024,
         shard_size_bytes: int = 17_179_869_184,
+        dtype: _DTypeName = "float16",
     ) -> Writer: ...
 
     @property
@@ -23,10 +30,16 @@ class Writer:
     @property
     def count(self) -> int: ...
 
+    @property
+    def dtype(self) -> _DTypeName: ...
+
+    @property
+    def format_version(self) -> int: ...
+
     def add(
         self,
         ids: npt.NDArray[np.uint64],
-        embeddings: npt.NDArray[np.float16],
+        embeddings: _EmbeddingArray,
     ) -> None: ...
 
     def finish(self) -> None: ...
@@ -62,14 +75,15 @@ class Storage:
     def count(self) -> int: ...
 
     @property
-    def dtype(self) -> str: ...
+    def dtype(self) -> _DTypeName: ...
 
-    def get(
-        self, ids: npt.NDArray[np.uint64]
-    ) -> npt.NDArray[np.float16]: ...
+    @property
+    def format_version(self) -> int: ...
+
+    def get(self, ids: npt.NDArray[np.uint64]) -> _EmbeddingArray: ...
 
     def get_into(
         self,
         ids: npt.NDArray[np.uint64],
-        output: npt.NDArray[np.float16],
+        output: _EmbeddingArray,
     ) -> None: ...
