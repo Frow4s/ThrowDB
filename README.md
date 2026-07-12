@@ -4,6 +4,14 @@ ThrowDB is a read-optimized, disk-backed store for fixed-width embeddings. The
 MVP targets arbitrary `uint64` IDs and `float16` NumPy matrices, with immutable
 shards on local NVMe and an in-memory immutable hash index.
 
+The implemented format-v1 contract is documented in
+[`docs/storage-format.md`](docs/storage-format.md). The target local collection
+semantics and staged product plan are documented in
+[`docs/collection-contract.md`](docs/collection-contract.md) and
+[`docs/product-roadmap.md`](docs/product-roadmap.md).
+The proposed version-2 binary representation is specified in
+[`docs/storage-format-v2.md`](docs/storage-format-v2.md).
+
 ## Install for development
 
 ThrowDB requires a C++20 compiler, CMake, Python 3.10+, NumPy and pybind11.
