@@ -1,0 +1,15 @@
+build*/
+dist/
+*.egg-info/
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+.idea/
+*.tmp
+*.building-*

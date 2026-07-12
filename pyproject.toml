@@ -1,0 +1,24 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.12",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "throwdb"
+version = "0.1.0"
+description = "Read-optimized disk-backed embedding storage"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.scripts]
+throwdb = "throwdb.cli:main"
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["python/throwdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
