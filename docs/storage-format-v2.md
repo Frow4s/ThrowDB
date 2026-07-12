@@ -212,21 +212,30 @@ separately versioned mutation layer:
 ```text
 collection root/
   CURRENT                 # atomically published collection-view descriptor
-  snapshots/<snapshot>/   # one immutable format-v2 base
-  deltas/                  # committed PUT/DELETE segments
-  wal/                     # active recovery log
+  manifest.bin             # existing v1/v2 base stays in place
+  index/, data/            # existing immutable base resources
+  catalogs/                # immutable view/resource catalogs
+  wal/                     # active and frozen recovery logs
+  segments/                # immutable mutation segments
+  mutation-index/          # partition roots and small immutable runs
+  sidecars/                # reverse metadata for legacy rows
 ```
 
 Each mutation batch has a monotonic commit sequence, checksummed framing, and an
-explicit commit marker. Readers capture one `CURRENT` view and consult committed
-deltas from newest to oldest before falling back to the base index. DELETE is a
-tombstone; PUT carries a complete fixed-schema embedding row.
+explicit commit marker. In transitional mode readers consult the mutation
+overlay/runs before falling back to the base index. In authoritative
+partitioned mode an index answer or absence is final and there is no base
+fallback. DELETE is a tombstone; PUT carries a complete fixed-schema embedding
+row.
 
-Compaction creates another complete format-v2 base from a stable committed
-sequence, validates it, and atomically replaces `CURRENT`. It never modifies the
-only readable snapshot. The exact WAL, delta-segment, and view-descriptor binary
-layouts receive their own specification before CRUD implementation; they are
-not encoded into unused manifest bytes implicitly.
+The mutation layer assigns legacy shards stable segment IDs and eventually
+publishes an authoritative partitioned `ID -> RowRef` index. Routine cleaning
+then rewrites only selected high-garbage segments and copy-on-write index
+resources before atomically replacing `CURRENT`; it never requires a complete
+base copy. A full rewrite is an explicit migration tool. The WAL framing,
+catalog invariants, recovery boundary, and selective-cleaner contract are
+specified in `mutable-storage.md`; they are not encoded into unused manifest
+bytes implicitly.
 
 ## Version-1 compatibility
 
@@ -268,9 +277,11 @@ The version-dispatching reader supports v1 float16 and numeric v2 float16/float3
 schema, while the current public writer selects v2 for float32. This rollout can
 later move float16 creation to v2 without changing the collection API.
 
-Physical prefix reads, checksums, UTF-8 IDs, and the mutation layer remain later
-steps. The current Python prefix API reads full dense rows before copying the
-requested columns.
+Prefix-optimized physical layout, base-payload scrub checksums, UTF-8 IDs,
+catalog publication, and public CRUD remain later steps. Checked RowRef and
+partition types plus CRC32C WAL framing/recovery are implemented as internal
+foundation. The current Python prefix API reads full dense rows before copying
+the requested columns.
 
 ## Incremental implementation order
 
@@ -282,8 +293,8 @@ requested columns.
    keeping the low-level uint64 zero-copy path.
 4. Generalize item-size arithmetic and add bit-exact float32 round trips.
 5. Add prefix reads to the row-major planner and Python output validation.
-6. Specify mutation WAL, delta segments, view publication, and compaction; then
-   implement numeric CRUD.
+6. Implement catalog publication, mutation segments, partitioned RowRef lookup,
+   selective cleaning, and numeric CRUD on the specified WAL foundation.
 7. Add string staging, arena construction, collision-verified indexing, UTF-8
    bindings, and string CRUD.
 8. Add explicit scrub/checksum tooling separately from the normal open path.

@@ -9,10 +9,12 @@ option(THROWDB_BUILD_TESTS "Build the C++ tests" ON)
 option(THROWDB_BUILD_BENCHMARKS "Build benchmark tools" ON)
 
 add_library(throwdb_core STATIC
+    src/core/crc32c.cpp
     src/core/format.cpp
     src/core/index.cpp
     src/core/io_uring_engine.cpp
     src/core/io_uring_pool.cpp
+    src/core/mutation_wal.cpp
     src/core/storage_reader.cpp
     src/core/storage_writer.cpp
 )
@@ -30,11 +32,15 @@ target_include_directories(throwdb_core
 )
 set_target_properties(throwdb_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if(MSVC)
-    target_compile_options(throwdb_core PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(throwdb_core PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+function(throwdb_enable_warnings target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
+
+throwdb_enable_warnings(throwdb_core)
 
 if(THROWDB_BUILD_PYTHON)
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
@@ -51,12 +57,26 @@ if(THROWDB_BUILD_TESTS)
     add_executable(throwdb_core_tests tests/core_tests.cpp)
     target_link_libraries(throwdb_core_tests PRIVATE throwdb::core)
     target_compile_features(throwdb_core_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_core_tests)
     add_test(NAME throwdb_core_tests COMMAND throwdb_core_tests)
 
     add_executable(throwdb_format_v2_tests tests/format_v2_tests.cpp)
     target_link_libraries(throwdb_format_v2_tests PRIVATE throwdb::core)
     target_compile_features(throwdb_format_v2_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_format_v2_tests)
     add_test(NAME throwdb_format_v2_tests COMMAND throwdb_format_v2_tests)
+
+    add_executable(throwdb_mutation_types_tests tests/mutation_types_tests.cpp)
+    target_link_libraries(throwdb_mutation_types_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_mutation_types_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_mutation_types_tests)
+    add_test(NAME throwdb_mutation_types_tests COMMAND throwdb_mutation_types_tests)
+
+    add_executable(throwdb_mutation_wal_tests tests/mutation_wal_tests.cpp)
+    target_link_libraries(throwdb_mutation_wal_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_mutation_wal_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_mutation_wal_tests)
+    add_test(NAME throwdb_mutation_wal_tests COMMAND throwdb_mutation_wal_tests)
 endif()
 
 if(THROWDB_BUILD_BENCHMARKS)

@@ -168,9 +168,12 @@ mapping, normalizes IDs safely, and sends them to C++ in bounded batches.
 - local filesystem/NVMe only;
 - one `float16` or `float32` dtype and one fixed dimension per collection;
 - buffered `pread` and experimental Linux `io_uring` backends;
-- no update, delete, compaction, checksums or network service yet.
+- no public update/delete, segment-cleaning, payload-scrubbing, or network
+  service yet; the checked mutation/WAL primitives are not wired into the
+  collection API yet.
 
-See [the storage format](docs/storage-format.md) and
+See [the storage format](docs/storage-format.md),
+[the mutable-storage design](docs/mutable-storage.md), and
 [the benchmark plan](docs/testing.md) for details. The legacy
 `benchmarks/random_read.py` and `throwdb_bench` runners are sequential-baseline
 benchmarks: they open `Storage` without enabling the internal executor. For a

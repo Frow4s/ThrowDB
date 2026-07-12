@@ -4,8 +4,9 @@ This document fixes the contract for the first user-facing ThrowDB product.
 The numeric immutable-snapshot subset is implemented through the Python
 `Collection` API: safe uint64 normalization, float16/float32 rows, arbitrary
 fixed dimensions, and semantic prefix reads. Float16 remains byte-compatible
-format v1 and float32 uses numeric format v2. UTF-8 IDs and record CRUD remain
-design targets for the string-index and WAL/delta stages described below.
+format v1 and float32 uses numeric format v2. UTF-8 IDs and public record CRUD
+remain design targets; checked RowRef/partition and WAL recovery primitives are
+now the internal foundation for the CRUD stages described below.
 
 ## Product boundary
 
@@ -15,7 +16,9 @@ A logical collection is a typed mapping:
 user ID -> fixed-schema embedding row
 ```
 
-The local product provides record-level create/read/update/delete operations.
+The target local product contract includes record-level
+create/read/update/delete operations; the currently shipped Python subset is
+immutable create/read.
 Approximate nearest-neighbour search, similarity scoring, replication, and a
 network protocol are separate product layers.
 
@@ -27,9 +30,10 @@ create -> append batches -> finish -> read-only snapshot
 
 `finish()` is the initial publication point. A failed build must not replace a
 readable snapshot. Record mutations are represented by committed delta records
-over the base, not by overwriting active shard bytes. Compaction builds a new
-immutable base and atomically switches the active view while existing readers
-retain their previous view.
+over the base, not by overwriting active shard bytes. Routine cleaning rewrites
+only selected immutable segments and atomically switches the resource catalog;
+it does not copy the complete base. Existing readers retain their previous
+view.
 
 ## Collection schema
 
@@ -154,9 +158,9 @@ Mutation rules:
   synced; a future explicit relaxed mode may acknowledge earlier.
 
 Each read captures one committed collection view at request start. Concurrent
-mutation or compaction cannot make a single result mix old and new rows.
+mutation or segment cleaning cannot make a single result mix old and new rows.
 
-## Mutation and compaction model
+## Mutation and segment-cleaning model
 
 ```text
 immutable base snapshot
@@ -171,10 +175,13 @@ otherwise lookup falls back to the base index. Mutation batches receive a
 monotonic commit sequence and are protected by checksummed WAL framing and a
 commit marker. Recovery ignores incomplete/uncommitted tails.
 
-Compaction merges the base and committed deltas into a new snapshot, validates
-it, and atomically publishes a new view. Old files are reclaimed only after no
-reader retains the old view. This keeps the optimized immutable read path while
-providing CRUD semantics.
+After a partitioned `ID -> RowRef` index becomes authoritative, the cleaner
+selects segments with enough garbage, copies only rows that are still live in a
+stable view, and atomically publishes the replacement segments and affected
+index partitions. Untouched base and mutation segments remain in place. Old
+files are reclaimed only after no reader retains the old view. A complete
+snapshot rewrite is reserved for explicit schema/layout migration rather than
+normal CRUD maintenance. The detailed contract is in `mutable-storage.md`.
 
 ## Compatibility policy
 

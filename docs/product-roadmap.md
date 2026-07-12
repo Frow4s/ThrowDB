@@ -1,9 +1,11 @@
 # ThrowDB product roadmap
 
 The current implementation is a performance and correctness proof for local,
-immutable `uint64 -> float16[1024]` storage. The next work turns that proof into
-an extensible collection engine. Device-specific settings such as two io_uring
-rings at total QD32 remain measured profiles, not product architecture.
+immutable numeric-ID collections with arbitrary fixed dimension and
+float16/float32 rows, plus internal mutation/WAL foundations. The next work
+turns that proof into an extensible mutable collection engine. Device-specific
+settings such as two io_uring rings at total QD32 remain measured profiles, not
+product architecture.
 
 ## Architectural layers
 
@@ -45,7 +47,8 @@ Deliver a stable Python wrapper over the C++ engine:
   `int8/16/32/64`, and Python integers;
 - immutable snapshot construction and atomic publication;
 - atomic insert, update, upsert, and tombstone delete batches;
-- checksummed WAL/delta recovery, one writer lease, and background compaction;
+- checksummed WAL/delta recovery, one writer lease, and selective segment
+  cleaning;
 - `get`, `get_into`, and prefix-dimension reads;
 - manual and automatic tuning configuration;
 - backward reading of format-v1 collections.
@@ -81,8 +84,8 @@ Add a catalog and control plane:
 - replication, recovery, and background lifecycle operations.
 
 The server and multi-collection catalog preserve the local commit-sequence,
-snapshot-view, durability, and compaction contracts rather than inventing a
-second mutation model.
+snapshot-view, durability, and selective-cleaning contracts rather than
+inventing a second mutation model.
 
 ## Stage 4: log-driven collection optimization
 
@@ -139,8 +142,9 @@ workloads and explainable baselines exist.
 3. Introduce `CollectionSchema`, canonical numeric-ID normalization, and the
    Python `Collection` wrapper over the existing numeric store.
 4. Implement generic numeric dtype/dimension support and prefix reads.
-5. Specify and implement checksummed mutation WAL/deltas, snapshot reads, and
-   compaction for numeric IDs.
+5. Specify and implement checksummed mutation WAL/deltas, snapshot reads, an
+   authoritative partitioned RowRef index, and selective cleaning for numeric
+   IDs.
 6. Add compact UTF-8 ID storage, collision-verified lookup, and string CRUD.
 7. Extract `ReadPlan`, fair scheduler, and storage-backend interfaces.
 8. Add an explicit calibration profile and request-policy explanation.
