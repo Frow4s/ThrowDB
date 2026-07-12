@@ -34,6 +34,8 @@ container policy must be changed before an io_uring backend can be tested.
 | Lifecycle | Explicit `finish` and successful context-manager exit | Store is published and reopenable |
 | Lifecycle | Exception inside writer context | No readable store is published |
 | Corruption | Truncated shard, index, or manifest | Open or first affected read fails loudly |
+| Format compatibility | New writer emits v1 manifest, index, and every shard at the documented offsets | Existing v1 wire representation stays unchanged |
+| Version dispatch | Manifest, shard, index, or staging advertises v2/unknown version before implementation | Reader rejects it before interpreting v1-specific fields |
 | Internal I/O | `io_workers` 0, 1, 2, 4, and 8 with a bounded queue | Results remain bit-exact across shards |
 | Chunked I/O | `io_ranges_per_task` 1, 4, 8, and 16, including batches smaller than a task | Results remain bit-exact at every partition boundary |
 | Shared reader | Simultaneous `get` calls on one `Storage` instance | Calls complete without cross-request corruption |

@@ -105,8 +105,14 @@ public:
         staging_reader.reset();
 
         detail::Manifest manifest;
-        manifest.dtype = static_cast<std::uint32_t>(options_.dtype);
-        manifest.dimension = options_.dimension;
+        manifest.format_version = detail::kWriteFormatVersion;
+        manifest.schema.id_type = detail::IdType::UInt64;
+        manifest.schema.dtype = static_cast<detail::DTypeCode>(options_.dtype);
+        manifest.schema.dimension = options_.dimension;
+        manifest.schema.item_size = 2;
+        manifest.schema.row_layout = detail::RowLayout::DenseRowMajor;
+        manifest.schema.index_kind = detail::IndexKind::UInt64Flat;
+        manifest.schema.hash_algorithm = detail::HashAlgorithm::SplitMix64V1;
         manifest.record_size = record_size_;
         manifest.record_count = count_;
         manifest.shard_size_bytes = options_.shard_size_bytes;
@@ -140,10 +146,14 @@ private:
         active_shard_fd_ = detail::create_exclusive(active_shard_path_);
         active_shard_first_ordinal_ = count_ + pending_batch_records_;
         active_shard_records_ = 0;
-        const detail::ShardHeader header{
-            active_shard_id_, active_shard_first_ordinal_, 0,
-            record_size_, options_.dimension,
-            static_cast<std::uint32_t>(options_.dtype)};
+        detail::ShardHeader header;
+        header.format_version = detail::kWriteFormatVersion;
+        header.shard_id = active_shard_id_;
+        header.first_ordinal = active_shard_first_ordinal_;
+        header.record_size = record_size_;
+        header.dimension = options_.dimension;
+        header.dtype = static_cast<detail::DTypeCode>(options_.dtype);
+        header.row_layout = detail::RowLayout::DenseRowMajor;
         const auto encoded = detail::encode_shard_header(header);
         detail::write_all(active_shard_fd_.get(), encoded.data(), encoded.size(),
                           active_shard_path_);
@@ -154,10 +164,15 @@ private:
         if (!active_shard_fd_) {
             return;
         }
-        const detail::ShardHeader header{
-            active_shard_id_, active_shard_first_ordinal_, active_shard_records_,
-            record_size_, options_.dimension,
-            static_cast<std::uint32_t>(options_.dtype)};
+        detail::ShardHeader header;
+        header.format_version = detail::kWriteFormatVersion;
+        header.shard_id = active_shard_id_;
+        header.first_ordinal = active_shard_first_ordinal_;
+        header.record_count = active_shard_records_;
+        header.record_size = record_size_;
+        header.dimension = options_.dimension;
+        header.dtype = static_cast<detail::DTypeCode>(options_.dtype);
+        header.row_layout = detail::RowLayout::DenseRowMajor;
         const auto encoded = detail::encode_shard_header(header);
         detail::pwrite_all(active_shard_fd_.get(), encoded.data(), encoded.size(),
                            0, active_shard_path_);

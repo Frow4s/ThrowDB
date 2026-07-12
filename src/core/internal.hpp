@@ -17,7 +17,43 @@
 
 namespace throwdb::detail {
 
-inline constexpr std::uint32_t kFormatVersion = 1;
+enum class FormatVersion : std::uint32_t {
+    Invalid = 0,
+    V1 = 1,
+    V2 = 2,
+};
+
+enum class DTypeCode : std::uint32_t {
+    Invalid = 0,
+    Float16 = 1,
+    Float32 = 2,
+    BFloat16 = 3,
+};
+
+enum class IdType : std::uint32_t {
+    Invalid = 0,
+    UInt64 = 1,
+    Utf8 = 2,
+};
+
+enum class RowLayout : std::uint32_t {
+    Invalid = 0,
+    DenseRowMajor = 1,
+};
+
+enum class IndexKind : std::uint32_t {
+    Invalid = 0,
+    UInt64Flat = 1,
+    Utf8FingerprintFlat = 2,
+};
+
+enum class HashAlgorithm : std::uint32_t {
+    Invalid = 0,
+    SplitMix64V1 = 1,
+    SipHash24 = 2,
+};
+
+inline constexpr FormatVersion kWriteFormatVersion = FormatVersion::V1;
 inline constexpr std::uint64_t kHeaderSize = 4096;
 inline constexpr std::uint64_t kIndexSlotSize = 16;
 inline constexpr std::uint64_t kStagingEntrySize = 16;
@@ -52,9 +88,24 @@ struct FileDescriptor {
     void reset(int fd = -1) noexcept;
 };
 
-struct Manifest {
-    std::uint32_t dtype{1};
+struct CommonHeader {
+    FormatVersion format_version{FormatVersion::Invalid};
+    std::uint32_t header_size{0};
+};
+
+struct CollectionSchema {
+    IdType id_type{IdType::Invalid};
+    DTypeCode dtype{DTypeCode::Invalid};
     std::uint32_t dimension{0};
+    std::uint32_t item_size{0};
+    RowLayout row_layout{RowLayout::Invalid};
+    IndexKind index_kind{IndexKind::Invalid};
+    HashAlgorithm hash_algorithm{HashAlgorithm::Invalid};
+};
+
+struct Manifest {
+    FormatVersion format_version{FormatVersion::Invalid};
+    CollectionSchema schema;
     std::uint64_t record_size{0};
     std::uint64_t record_count{0};
     std::uint64_t shard_size_bytes{0};
@@ -68,12 +119,14 @@ struct Manifest {
 };
 
 struct ShardHeader {
+    FormatVersion format_version{FormatVersion::Invalid};
     std::uint64_t shard_id{0};
     std::uint64_t first_ordinal{0};
     std::uint64_t record_count{0};
     std::uint64_t record_size{0};
     std::uint32_t dimension{0};
-    std::uint32_t dtype{1};
+    DTypeCode dtype{DTypeCode::Invalid};
+    RowLayout row_layout{RowLayout::Invalid};
 };
 
 struct IndexSlot {
@@ -109,6 +162,7 @@ void sync_directory(const std::filesystem::path& path);
 [[nodiscard]] std::uint64_t checked_multiply(
     std::uint64_t left, std::uint64_t right, std::string_view description);
 [[nodiscard]] std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment);
+[[nodiscard]] std::uint32_t dtype_item_size(DTypeCode dtype) noexcept;
 
 void put_u32(std::span<std::byte> output, std::size_t offset, std::uint32_t value);
 void put_u64(std::span<std::byte> output, std::size_t offset, std::uint64_t value);
@@ -117,12 +171,19 @@ void put_u64(std::span<std::byte> output, std::size_t offset, std::uint64_t valu
 [[nodiscard]] std::uint64_t get_u64(
     std::span<const std::byte> input, std::size_t offset);
 
+[[nodiscard]] CommonHeader decode_common_header(
+    std::span<const std::byte> bytes,
+    const std::array<char, 8>& expected_magic,
+    std::string_view description);
+
 [[nodiscard]] std::array<std::byte, kHeaderSize> encode_manifest(
     const Manifest& manifest);
 [[nodiscard]] Manifest decode_manifest(std::span<const std::byte> bytes);
 [[nodiscard]] std::array<std::byte, kHeaderSize> encode_shard_header(
     const ShardHeader& header);
-[[nodiscard]] ShardHeader decode_shard_header(std::span<const std::byte> bytes);
+[[nodiscard]] ShardHeader decode_shard_header(
+    std::span<const std::byte> bytes,
+    FormatVersion expected_format_version);
 [[nodiscard]] std::array<std::byte, kHeaderSize> encode_staging_header(
     std::uint64_t count);
 [[nodiscard]] std::uint64_t decode_staging_header(

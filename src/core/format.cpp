@@ -37,17 +37,10 @@ void put_magic(std::span<std::byte> bytes, const std::array<char, 8>& magic) {
     std::memcpy(bytes.data(), magic.data(), magic.size());
 }
 
-void validate_common_header(std::span<const std::byte> bytes,
-                            std::string_view description) {
-    if (bytes.size() < kHeaderSize) {
-        throw CorruptionError(std::string(description) + " header is truncated");
-    }
-    if (get_u32(bytes, 8) != kFormatVersion) {
-        throw CorruptionError(std::string(description) + " has unsupported format version");
-    }
-    if (get_u32(bytes, 12) != kHeaderSize) {
-        throw CorruptionError(std::string(description) + " has invalid header size");
-    }
+[[nodiscard]] std::string unsupported_version_message(
+    const std::string_view description, const std::uint32_t version) {
+    return std::string(description) + " has unsupported format version "
+           + std::to_string(version);
 }
 
 }  // namespace
@@ -211,6 +204,19 @@ std::uint64_t align_up(const std::uint64_t value, const std::uint64_t alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+std::uint32_t dtype_item_size(const DTypeCode dtype) noexcept {
+    switch (dtype) {
+        case DTypeCode::Invalid:
+            return 0;
+        case DTypeCode::Float16:
+        case DTypeCode::BFloat16:
+            return 2;
+        case DTypeCode::Float32:
+            return 4;
+    }
+    return 0;
+}
+
 void put_u32(const std::span<std::byte> output, const std::size_t offset,
              const std::uint32_t value) {
     if (offset > output.size() || output.size() - offset < 4) {
@@ -257,13 +263,51 @@ std::uint64_t get_u64(const std::span<const std::byte> input,
     return value;
 }
 
+CommonHeader decode_common_header(
+    const std::span<const std::byte> bytes,
+    const std::array<char, 8>& expected_magic,
+    const std::string_view description) {
+    require_magic(bytes, expected_magic, description);
+    if (bytes.size() < kHeaderSize) {
+        throw CorruptionError(std::string(description) + " header is truncated");
+    }
+    if (get_u32(bytes, 12) != kHeaderSize) {
+        throw CorruptionError(std::string(description) + " has invalid header size");
+    }
+    const std::uint32_t encoded_version = get_u32(bytes, 8);
+    FormatVersion format_version;
+    switch (encoded_version) {
+        case static_cast<std::uint32_t>(FormatVersion::V1):
+            format_version = FormatVersion::V1;
+            break;
+        case static_cast<std::uint32_t>(FormatVersion::V2):
+            format_version = FormatVersion::V2;
+            break;
+        default:
+            throw CorruptionError(
+                unsupported_version_message(description, encoded_version));
+    }
+    return CommonHeader{
+        format_version, static_cast<std::uint32_t>(kHeaderSize)};
+}
+
 std::array<std::byte, kHeaderSize> encode_manifest(const Manifest& manifest) {
+    if (manifest.format_version != FormatVersion::V1
+        || manifest.schema.id_type != IdType::UInt64
+        || manifest.schema.dtype != DTypeCode::Float16
+        || manifest.schema.item_size != 2
+        || manifest.schema.row_layout != RowLayout::DenseRowMajor
+        || manifest.schema.index_kind != IndexKind::UInt64Flat
+        || manifest.schema.hash_algorithm != HashAlgorithm::SplitMix64V1) {
+        throw InvalidArgumentError(
+            "format-v1 manifest contains an incompatible collection schema");
+    }
     std::array<std::byte, kHeaderSize> output{};
     put_magic(output, kManifestMagic);
-    put_u32(output, 8, kFormatVersion);
+    put_u32(output, 8, static_cast<std::uint32_t>(kWriteFormatVersion));
     put_u32(output, 12, kHeaderSize);
-    put_u32(output, 16, manifest.dtype);
-    put_u32(output, 20, manifest.dimension);
+    put_u32(output, 16, static_cast<std::uint32_t>(manifest.schema.dtype));
+    put_u32(output, 20, manifest.schema.dimension);
     put_u64(output, 24, manifest.record_size);
     put_u64(output, 32, manifest.record_count);
     put_u64(output, 40, manifest.shard_size_bytes);
@@ -278,11 +322,26 @@ std::array<std::byte, kHeaderSize> encode_manifest(const Manifest& manifest) {
 }
 
 Manifest decode_manifest(const std::span<const std::byte> bytes) {
-    require_magic(bytes, kManifestMagic, "manifest");
-    validate_common_header(bytes, "manifest");
+    const CommonHeader common = decode_common_header(
+        bytes, kManifestMagic, "manifest");
+    if (common.format_version != FormatVersion::V1) {
+        throw CorruptionError(unsupported_version_message(
+            "manifest", static_cast<std::uint32_t>(common.format_version)));
+    }
     Manifest result;
-    result.dtype = get_u32(bytes, 16);
-    result.dimension = get_u32(bytes, 20);
+    result.format_version = common.format_version;
+    result.schema.id_type = IdType::UInt64;
+    const std::uint32_t encoded_dtype = get_u32(bytes, 16);
+    if (encoded_dtype != static_cast<std::uint32_t>(DTypeCode::Float16)) {
+        throw CorruptionError("format-v1 manifest has unsupported dtype code "
+                              + std::to_string(encoded_dtype));
+    }
+    result.schema.dtype = DTypeCode::Float16;
+    result.schema.dimension = get_u32(bytes, 20);
+    result.schema.item_size = 2;
+    result.schema.row_layout = RowLayout::DenseRowMajor;
+    result.schema.index_kind = IndexKind::UInt64Flat;
+    result.schema.hash_algorithm = HashAlgorithm::SplitMix64V1;
     result.record_size = get_u64(bytes, 24);
     result.record_count = get_u64(bytes, 32);
     result.shard_size_bytes = get_u64(bytes, 40);
@@ -293,7 +352,7 @@ Manifest decode_manifest(const std::span<const std::byte> bytes) {
     result.index_control_offset = get_u64(bytes, 80);
     result.index_slots_offset = get_u64(bytes, 88);
     result.index_file_size = get_u64(bytes, 96);
-    if (result.dimension == 0 || result.record_size == 0
+    if (result.schema.dimension == 0 || result.record_size == 0
         || result.records_per_shard == 0 || result.index_capacity == 0) {
         throw CorruptionError("manifest contains zero-valued required fields");
     }
@@ -301,36 +360,57 @@ Manifest decode_manifest(const std::span<const std::byte> bytes) {
 }
 
 std::array<std::byte, kHeaderSize> encode_shard_header(const ShardHeader& header) {
+    if (header.format_version != FormatVersion::V1
+        || header.dtype != DTypeCode::Float16
+        || header.row_layout != RowLayout::DenseRowMajor) {
+        throw InvalidArgumentError(
+            "format-v1 shard contains an incompatible row schema");
+    }
     std::array<std::byte, kHeaderSize> output{};
     put_magic(output, kShardMagic);
-    put_u32(output, 8, kFormatVersion);
+    put_u32(output, 8, static_cast<std::uint32_t>(kWriteFormatVersion));
     put_u32(output, 12, kHeaderSize);
     put_u64(output, 16, header.shard_id);
     put_u64(output, 24, header.first_ordinal);
     put_u64(output, 32, header.record_count);
     put_u64(output, 40, header.record_size);
     put_u32(output, 48, header.dimension);
-    put_u32(output, 52, header.dtype);
+    put_u32(output, 52, static_cast<std::uint32_t>(header.dtype));
     return output;
 }
 
-ShardHeader decode_shard_header(const std::span<const std::byte> bytes) {
-    require_magic(bytes, kShardMagic, "shard");
-    validate_common_header(bytes, "shard");
+ShardHeader decode_shard_header(
+    const std::span<const std::byte> bytes,
+    const FormatVersion expected_format_version) {
+    const CommonHeader common = decode_common_header(bytes, kShardMagic, "shard");
+    if (common.format_version != expected_format_version) {
+        throw CorruptionError("shard format version does not match manifest");
+    }
+    if (expected_format_version != FormatVersion::V1) {
+        throw CorruptionError(unsupported_version_message(
+            "shard", static_cast<std::uint32_t>(expected_format_version)));
+    }
     ShardHeader result;
+    result.format_version = common.format_version;
     result.shard_id = get_u64(bytes, 16);
     result.first_ordinal = get_u64(bytes, 24);
     result.record_count = get_u64(bytes, 32);
     result.record_size = get_u64(bytes, 40);
     result.dimension = get_u32(bytes, 48);
-    result.dtype = get_u32(bytes, 52);
+    const std::uint32_t encoded_dtype = get_u32(bytes, 52);
+    if (encoded_dtype != static_cast<std::uint32_t>(DTypeCode::Float16)) {
+        throw CorruptionError("format-v1 shard has unsupported dtype code "
+                              + std::to_string(encoded_dtype));
+    }
+    result.dtype = DTypeCode::Float16;
+    result.row_layout = RowLayout::DenseRowMajor;
     return result;
 }
 
 std::array<std::byte, kHeaderSize> encode_staging_header(const std::uint64_t count) {
     std::array<std::byte, kHeaderSize> output{};
     put_magic(output, kStagingMagic);
-    put_u32(output, 8, kFormatVersion);
+    put_u32(output, 8, static_cast<std::uint32_t>(kWriteFormatVersion));
     put_u32(output, 12, kHeaderSize);
     put_u64(output, 16, count);
     put_u64(output, 24, kStagingEntrySize);
@@ -338,8 +418,12 @@ std::array<std::byte, kHeaderSize> encode_staging_header(const std::uint64_t cou
 }
 
 std::uint64_t decode_staging_header(const std::span<const std::byte> bytes) {
-    require_magic(bytes, kStagingMagic, "staging log");
-    validate_common_header(bytes, "staging log");
+    const CommonHeader common = decode_common_header(
+        bytes, kStagingMagic, "staging log");
+    if (common.format_version != FormatVersion::V1) {
+        throw CorruptionError(unsupported_version_message(
+            "staging log", static_cast<std::uint32_t>(common.format_version)));
+    }
     if (get_u64(bytes, 24) != kStagingEntrySize) {
         throw CorruptionError("staging log has invalid entry size");
     }

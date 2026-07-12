@@ -379,10 +379,11 @@ public:
         return manifest_.record_count;
     }
     [[nodiscard]] std::uint32_t dimension() const noexcept {
-        return manifest_.dimension;
+        return manifest_.schema.dimension;
     }
     [[nodiscard]] DType dtype() const noexcept {
-        return static_cast<DType>(manifest_.dtype);
+        return static_cast<DType>(
+            static_cast<std::uint32_t>(manifest_.schema.dtype));
     }
     [[nodiscard]] std::uint64_t record_size() const noexcept {
         return manifest_.record_size;
@@ -473,11 +474,21 @@ private:
     }
 
     void validate_manifest() const {
-        if (manifest_.dtype != static_cast<std::uint32_t>(DType::Float16)) {
-            throw CorruptionError("manifest contains an unsupported dtype");
+        if (manifest_.format_version != detail::FormatVersion::V1
+            || manifest_.schema.id_type != detail::IdType::UInt64
+            || manifest_.schema.dtype != detail::DTypeCode::Float16
+            || manifest_.schema.item_size != 2
+            || manifest_.schema.row_layout
+                   != detail::RowLayout::DenseRowMajor
+            || manifest_.schema.index_kind != detail::IndexKind::UInt64Flat
+            || manifest_.schema.hash_algorithm
+                   != detail::HashAlgorithm::SplitMix64V1) {
+            throw CorruptionError(
+                "manifest contains an unsupported format-v1 collection schema");
         }
         const std::uint64_t expected_record_size = detail::checked_multiply(
-            manifest_.dimension, 2, "manifest record size");
+            manifest_.schema.dimension, manifest_.schema.item_size,
+            "manifest record size");
         if (manifest_.record_size != expected_record_size) {
             throw CorruptionError("manifest record size does not match dimension");
         }
@@ -509,7 +520,8 @@ private:
             auto fd = detail::open_read_only(path);
             std::array<std::byte, detail::kHeaderSize> encoded{};
             detail::pread_exact(fd.get(), encoded.data(), encoded.size(), 0, path);
-            const detail::ShardHeader header = detail::decode_shard_header(encoded);
+            const detail::ShardHeader header = detail::decode_shard_header(
+                encoded, manifest_.format_version);
             const std::uint64_t first_ordinal =
                 shard_id * manifest_.records_per_shard;
             const std::uint64_t expected_count = std::min(
@@ -519,8 +531,10 @@ private:
                 || header.first_ordinal != first_ordinal
                 || header.record_count != expected_count
                 || header.record_size != manifest_.record_size
-                || header.dimension != manifest_.dimension
-                || header.dtype != manifest_.dtype) {
+                || header.format_version != manifest_.format_version
+                || header.dimension != manifest_.schema.dimension
+                || header.dtype != manifest_.schema.dtype
+                || header.row_layout != manifest_.schema.row_layout) {
                 throw CorruptionError(
                     "shard header does not match manifest for '" + path.string() + "'");
             }

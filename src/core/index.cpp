@@ -49,7 +49,7 @@ void insert(IndexData& index, const std::uint64_t id,
     const std::uint64_t slots_offset, const std::uint64_t total_size) {
     std::array<std::byte, kHeaderSize> output{};
     std::memcpy(output.data(), kIndexMagic.data(), kIndexMagic.size());
-    put_u32(output, 8, kFormatVersion);
+    put_u32(output, 8, static_cast<std::uint32_t>(kWriteFormatVersion));
     put_u32(output, 12, kHeaderSize);
     put_u64(output, 16, index.count);
     put_u64(output, 24, index.capacity);
@@ -63,12 +63,13 @@ void insert(IndexData& index, const std::uint64_t id,
 
 void validate_index_header(const std::span<const std::byte> bytes,
                            const Manifest& manifest) {
-    if (bytes.size() < kHeaderSize
-        || std::memcmp(bytes.data(), kIndexMagic.data(), kIndexMagic.size()) != 0) {
-        throw CorruptionError("index has invalid magic");
-    }
-    if (get_u32(bytes, 8) != kFormatVersion || get_u32(bytes, 12) != kHeaderSize) {
-        throw CorruptionError("index has invalid format header");
+    const CommonHeader common = decode_common_header(bytes, kIndexMagic, "index");
+    if (common.format_version != FormatVersion::V1
+        || manifest.format_version != FormatVersion::V1) {
+        throw CorruptionError(
+            "index has unsupported format version "
+            + std::to_string(static_cast<std::uint32_t>(
+                common.format_version)));
     }
     if (get_u64(bytes, 16) != manifest.record_count
         || get_u64(bytes, 24) != manifest.index_capacity
