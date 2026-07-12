@@ -64,15 +64,21 @@ io_uring kernel ABI and does not require `liburing`:
 db = throwdb.Storage.open(
     "/data/example",
     io_backend="io_uring",
+    io_uring_workers=2,
     io_uring_queue_depth=32,
 )
 ```
 
-For the first experiment, one ring is shared per `Storage` and complete
-multi-range calls are serialized. This isolates whether queue depth can replace
-16 synchronous `pread` worker threads; it is not yet the final concurrent
-scheduler. Requests planned as one range retain the direct `pread` fast path.
-`io_workers` and `io_queue_capacity` must both be zero in io_uring mode.
+`io_uring_workers=1` preserves the original caller-driven, mutex-serialized
+ring. Two or more workers create independent dedicated ring-owner threads and
+partition every multi-range call across them. `io_uring_queue_depth` is the
+total backend depth, so two workers at depth 32 receive 16 entries each. The
+default remains one worker until the multi-ring experiment is benchmarked.
+Multi-ring admission allows at most `2 * io_uring_workers` synchronous batches
+inside the worker queues; additional callers apply FIFO ticket-based
+backpressure before enqueue, so a fast caller cannot repeatedly bypass waiters.
+Requests planned as one range retain the direct `pread` fast path. `io_workers`
+and `io_queue_capacity` must both be zero in io_uring mode.
 
 Large inputs should be appended in batches; `finish()` writes the immutable
 hash index and publishes `manifest.bin` only after the shards and index are

@@ -23,6 +23,8 @@ constexpr std::int64_t kMaxIoWorkers = 1024;
 constexpr std::int64_t kMaxIoQueueCapacity = 1 << 20;
 constexpr std::int64_t kDefaultIoRangesPerTask = 8;
 constexpr std::int64_t kMaxIoRangesPerTask = 1 << 20;
+constexpr std::int64_t kDefaultIoUringWorkers = 1;
+constexpr std::int64_t kMaxIoUringWorkers = 64;
 constexpr std::int64_t kDefaultIoUringQueueDepth = 32;
 constexpr std::int64_t kMaxIoUringQueueDepth = 4096;
 
@@ -70,6 +72,16 @@ constexpr std::int64_t kMaxIoUringQueueDepth = 4096;
         throw py::value_error(
             "io_uring_queue_depth must be between 1 and "
             + std::to_string(kMaxIoUringQueueDepth));
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+[[nodiscard]] std::uint32_t checked_io_uring_workers(
+    const std::int64_t value) {
+    if (value < 1 || value > kMaxIoUringWorkers) {
+        throw py::value_error(
+            "io_uring_workers must be between 1 and "
+            + std::to_string(kMaxIoUringWorkers));
     }
     return static_cast<std::uint32_t>(value);
 }
@@ -303,7 +315,8 @@ public:
         const std::int64_t io_queue_capacity,
         const std::int64_t io_ranges_per_task,
         const std::string& io_backend,
-        const std::int64_t io_uring_queue_depth) {
+        const std::int64_t io_uring_queue_depth,
+        const std::int64_t io_uring_workers) {
         throwdb::ReaderOptions options;
         options.io_workers =
             checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
@@ -316,12 +329,19 @@ public:
         options.io_backend = checked_io_backend(io_backend);
         options.io_uring_queue_depth =
             checked_io_uring_queue_depth(io_uring_queue_depth);
+        options.io_uring_workers =
+            checked_io_uring_workers(io_uring_workers);
         if (options.io_backend == throwdb::IoBackend::IoUring
             && (options.io_workers != 0
                 || options.io_queue_capacity != 0)) {
             throw py::value_error(
                 "io_workers and io_queue_capacity must both be 0 when "
                 "io_backend is 'io_uring'");
+        }
+        if (options.io_backend == throwdb::IoBackend::IoUring
+            && options.io_uring_workers > options.io_uring_queue_depth) {
+            throw py::value_error(
+                "io_uring_queue_depth must be at least io_uring_workers");
         }
         if (options.io_workers == 0 && options.io_queue_capacity != 0) {
             throw py::value_error(
@@ -406,7 +426,8 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("io_queue_capacity") = 0,
             py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
             py::arg("io_backend") = "thread_pool",
-            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth)
+            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers)
         .def_property_readonly("dimension", &PyStorage::dimension)
         .def_property_readonly("count", &PyStorage::count)
         .def("get", &PyStorage::get, py::arg("ids"))

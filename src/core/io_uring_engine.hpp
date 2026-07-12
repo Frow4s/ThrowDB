@@ -43,6 +43,9 @@ public:
     }
 
     [[nodiscard]] std::uint32_t queue_depth() const noexcept;
+    // False means a fatal SQ/CQ or io_uring_enter failure poisoned this ring.
+    // Ordinary per-read errors and unexpected EOF do not poison it.
+    [[nodiscard]] bool usable() const noexcept;
     [[nodiscard]] static constexpr bool platform_supported() noexcept {
 #if defined(__linux__)
         return true;

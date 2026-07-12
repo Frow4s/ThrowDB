@@ -2,6 +2,7 @@
 
 #include "internal.hpp"
 #include "io_uring_engine.hpp"
+#include "io_uring_pool.hpp"
 #include "task_partition.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@ namespace {
 constexpr std::uint32_t kMaxIoWorkers = 1024;
 constexpr std::uint32_t kMaxIoQueueCapacity = 1U << 20;
 constexpr std::uint32_t kMaxIoRangesPerTask = 1U << 20;
+constexpr std::uint32_t kMaxIoUringWorkers = 64;
 constexpr std::uint32_t kMaxIoUringQueueDepth = 4096;
 
 [[nodiscard]] std::size_t effective_queue_capacity(
@@ -45,11 +47,20 @@ void validate_reader_options(const ReaderOptions& options) {
         throw InvalidArgumentError(
             "io_uring_queue_depth must be between 1 and 4096");
     }
+    if (options.io_uring_workers == 0
+        || options.io_uring_workers > kMaxIoUringWorkers) {
+        throw InvalidArgumentError(
+            "io_uring_workers must be between 1 and 64");
+    }
     if (options.io_backend == IoBackend::IoUring) {
         if (options.io_workers != 0 || options.io_queue_capacity != 0) {
             throw InvalidArgumentError(
                 "io_workers and io_queue_capacity must both be zero for "
                 "the io_uring backend");
+        }
+        if (options.io_uring_workers > options.io_uring_queue_depth) {
+            throw InvalidArgumentError(
+                "io_uring_queue_depth must be at least io_uring_workers");
         }
         return;
     }
@@ -216,8 +227,14 @@ public:
         open_and_validate_shards();
         index_ = detail::read_index(path_, manifest_);
         if (options_.io_backend == IoBackend::IoUring) {
-            io_uring_ = std::make_unique<detail::IoUringEngine>(
-                options_.io_uring_queue_depth);
+            if (options_.io_uring_workers == 1) {
+                io_uring_ = std::make_unique<detail::IoUringEngine>(
+                    options_.io_uring_queue_depth);
+            } else {
+                io_uring_pool_ = std::make_unique<detail::IoUringPool>(
+                    options_.io_uring_workers,
+                    options_.io_uring_queue_depth);
+            }
         } else if (options_.io_workers != 0) {
             executor_ = std::make_unique<BoundedExecutor>(
                 options_.io_workers, effective_queue_capacity(options_));
@@ -301,7 +318,7 @@ public:
             return;
         }
 
-        if (io_uring_ != nullptr) {
+        if (io_uring_ != nullptr || io_uring_pool_ != nullptr) {
             read_ranges_io_uring(requests, ranges, output);
             return;
         }
@@ -424,7 +441,11 @@ private:
                 range_index});
         }
 
-        io_uring_->read_exact(operations);
+        if (io_uring_pool_ != nullptr) {
+            io_uring_pool_->read_exact(operations);
+        } else {
+            io_uring_->read_exact(operations);
+        }
 
         for (std::size_t range_index = 0; range_index != ranges.size();
              ++range_index) {
@@ -563,6 +584,7 @@ private:
     std::vector<Shard> shards_;
     std::unique_ptr<BoundedExecutor> executor_;
     std::unique_ptr<detail::IoUringEngine> io_uring_;
+    std::unique_ptr<detail::IoUringPool> io_uring_pool_;
 };
 
 std::unique_ptr<Storage> Storage::open(const std::filesystem::path& path,

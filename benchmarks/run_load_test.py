@@ -67,6 +67,8 @@ IO_QUEUE_CAPACITY = 0
 IO_RANGES_PER_TASK = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
 IO_BACKEND = "thread_pool"
+IO_URING_WORKERS = 1
+MAX_IO_URING_WORKERS = 64
 IO_URING_QUEUE_DEPTH = 32
 MAX_IO_URING_QUEUE_DEPTH = 4096
 
@@ -137,6 +139,15 @@ def io_uring_queue_depth_int(value: str) -> int:
     return parsed
 
 
+def io_uring_workers_int(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= MAX_IO_URING_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"value must be in 1..{MAX_IO_URING_WORKERS}"
+        )
+    return parsed
+
+
 def run_command(command: Sequence[str]) -> dict[str, Any]:
     executable = shutil.which(command[0])
     if executable is None:
@@ -154,6 +165,16 @@ def run_command(command: Sequence[str]) -> dict[str, Any]:
         "returncode": completed.returncode,
         "output": completed.stdout.strip(),
     }
+
+
+def process_thread_count() -> int | None:
+    task_directory = Path("/proc/self/task")
+    if not task_directory.is_dir():
+        return None
+    try:
+        return sum(1 for entry in task_directory.iterdir() if entry.name.isdigit())
+    except OSError:
+        return None
 
 
 def find_cgroup_v2_directory(
@@ -833,6 +854,8 @@ def print_result(result: dict[str, Any]) -> None:
         f"clients={result['workers']:>2} "
         f"backend={result.get('io_backend', 'thread_pool'):<11} "
         f"io_workers={result.get('io_workers', 0):>2} "
+        f"uring_workers={result.get('io_uring_workers', 1):>2} "
+        f"uring_qd={result.get('io_uring_queue_depth', 0):>4} "
         f"ranges/task={result.get('io_ranges_per_task', 1):>2} "
         f"batch={result['batch_size']:>7,} "
         f"throughput={result['embeddings_per_second']:>12,.0f} emb/s "
@@ -877,6 +900,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="reader backend (default: thread_pool)",
     )
     parser.add_argument(
+        "--io-uring-workers",
+        type=io_uring_workers_int,
+        default=IO_URING_WORKERS,
+        help=(
+            "independent io_uring lanes "
+            f"(1..{MAX_IO_URING_WORKERS}; default: 1)"
+        ),
+    )
+    parser.add_argument(
         "--io-uring-queue-depth",
         type=io_uring_queue_depth_int,
         default=IO_URING_QUEUE_DEPTH,
@@ -917,6 +949,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--io-uring-queue-depth must be in "
             f"1..{MAX_IO_URING_QUEUE_DEPTH}"
         )
+    if not 1 <= args.io_uring_workers <= MAX_IO_URING_WORKERS:
+        raise ValueError(
+            f"--io-uring-workers must be in 1..{MAX_IO_URING_WORKERS}"
+        )
     if args.io_backend == "io_uring" and (
         args.io_workers != 0 or args.io_queue_capacity != 0
     ):
@@ -924,10 +960,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--io-workers and --io-queue-capacity must both be zero when "
             "--io-backend is io_uring"
         )
+    if (
+        args.io_backend == "io_uring"
+        and args.io_uring_workers > args.io_uring_queue_depth
+    ):
+        raise ValueError(
+            "--io-uring-queue-depth must be at least --io-uring-workers"
+        )
     if args.io_workers == 0 and args.io_queue_capacity != 0:
         raise ValueError(
             "--io-queue-capacity must be zero when --io-workers is zero"
         )
+    io_uring_admission_capacity = (
+        (1 if args.io_uring_workers == 1 else 2 * args.io_uring_workers)
+        if args.io_backend == "io_uring"
+        else None
+    )
+    io_uring_admission_policy = (
+        ("serialized_mutex" if args.io_uring_workers == 1 else "fifo_ticket")
+        if args.io_backend == "io_uring"
+        else None
+    )
     args.results.mkdir(parents=True, exist_ok=True)
     report_path = args.results / "report.json"
 
@@ -957,7 +1010,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "io_queue_capacity": args.io_queue_capacity,
             "io_ranges_per_task": args.io_ranges_per_task,
             "io_backend": args.io_backend,
+            "io_uring_workers": args.io_uring_workers,
             "io_uring_queue_depth": args.io_uring_queue_depth,
+            "io_uring_admission_capacity": io_uring_admission_capacity,
+            "io_uring_admission_policy": io_uring_admission_policy,
         },
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "system": collect_system_information(args.store),
@@ -978,6 +1034,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     log(f"opening storage: {args.store}")
+    thread_count_before_open = process_thread_count()
     open_started = time.perf_counter()
     storage = throwdb.Storage.open(
         args.store,
@@ -985,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         io_queue_capacity=args.io_queue_capacity,
         io_ranges_per_task=args.io_ranges_per_task,
         io_backend=args.io_backend,
+        io_uring_workers=args.io_uring_workers,
         io_uring_queue_depth=args.io_uring_queue_depth,
     )
     open_seconds = time.perf_counter() - open_started
@@ -998,7 +1056,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "io_queue_capacity": args.io_queue_capacity,
         "io_ranges_per_task": args.io_ranges_per_task,
         "io_backend": args.io_backend,
+        "io_uring_workers": args.io_uring_workers,
         "io_uring_queue_depth": args.io_uring_queue_depth,
+        "io_uring_admission_capacity": io_uring_admission_capacity,
+        "io_uring_admission_policy": io_uring_admission_policy,
+        "process_thread_count_before_open": thread_count_before_open,
+        "process_thread_count_after_open": process_thread_count(),
     }
     log(
         f"storage opened in {open_seconds:.3f}s: "
@@ -1056,7 +1119,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["io_queue_capacity"] = args.io_queue_capacity
                 result["io_ranges_per_task"] = args.io_ranges_per_task
                 result["io_backend"] = args.io_backend
+                result["io_uring_workers"] = args.io_uring_workers
                 result["io_uring_queue_depth"] = args.io_uring_queue_depth
+                result["io_uring_admission_capacity"] = (
+                    io_uring_admission_capacity
+                )
+                result["io_uring_admission_policy"] = (
+                    io_uring_admission_policy
+                )
                 if eviction is not None:
                     result["cache_eviction"] = eviction
                 report["sequential"].append(result)
@@ -1087,7 +1157,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["io_queue_capacity"] = args.io_queue_capacity
                 result["io_ranges_per_task"] = args.io_ranges_per_task
                 result["io_backend"] = args.io_backend
+                result["io_uring_workers"] = args.io_uring_workers
                 result["io_uring_queue_depth"] = args.io_uring_queue_depth
+                result["io_uring_admission_capacity"] = (
+                    io_uring_admission_capacity
+                )
+                result["io_uring_admission_policy"] = (
+                    io_uring_admission_policy
+                )
                 if eviction is not None:
                     result["cache_eviction"] = eviction
                 report["concurrent"].append(result)

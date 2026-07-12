@@ -3,6 +3,7 @@
 #include "throwdb/errors.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <deque>
@@ -124,7 +125,7 @@ public:
         }
 
         std::lock_guard lock(mutex_);
-        if (poisoned_) {
+        if (poisoned_.load(std::memory_order_acquire)) {
             throw StorageError(
                 "io_uring ring is unavailable after a previous protocol error");
         }
@@ -150,15 +151,24 @@ public:
                     pending.pop_front();
                 }
 
-                const std::uint32_t submission_head =
-                    publish(submission, states);
+                std::uint32_t submission_head = 0;
+                try {
+                    submission_head = publish(submission, states);
+                } catch (...) {
+                    // publish() validates capacity before writing any SQE. If
+                    // the shared SQ state is inconsistent, older reads can
+                    // still own caller buffers and must quiesce before return.
+                    poisoned_.store(true, std::memory_order_release);
+                    drain_completions_without_enter(outstanding);
+                    throw;
+                }
                 try {
                     submit_all(static_cast<std::uint32_t>(submission.size()));
                 } catch (...) {
                     // Discard SQEs the kernel did not consume and wait in
                     // userspace for every older or newly consumed request to
                     // post a CQE. Caller buffers remain alive during the drain.
-                    poisoned_ = true;
+                    poisoned_.store(true, std::memory_order_release);
                     discard_unsubmitted_and_drain(
                         submission_head, outstanding);
                     throw;
@@ -176,12 +186,12 @@ public:
 
         if (load_relaxed(sq_dropped_) != initial_sq_dropped
             || load_relaxed(cq_overflow_) != initial_cq_overflow) {
-            poisoned_ = true;
+            poisoned_.store(true, std::memory_order_release);
             throw StorageError(
                 "io_uring reported a dropped submission or completion");
         }
         if (protocol_failure) {
-            poisoned_ = true;
+            poisoned_.store(true, std::memory_order_release);
         }
         if (first_error.kind == ErrorKind::UnexpectedEof) {
             throw CorruptionError(
@@ -200,6 +210,10 @@ public:
         }
     }
 
+    [[nodiscard]] bool usable() const noexcept {
+        return !poisoned_.load(std::memory_order_acquire);
+    }
+
 private:
     template <typename OperationState>
     [[nodiscard]] std::uint32_t publish(
@@ -208,7 +222,9 @@ private:
         const std::uint32_t head = load_acquire(sq_head_);
         std::uint32_t tail = load_relaxed(sq_tail_);
         const std::uint32_t capacity = *sq_ring_entries_;
-        if (capacity - (tail - head) < window.size()) {
+        const std::uint32_t used = tail - head;
+        if (used > capacity || window.size() > capacity - used) {
+            poisoned_.store(true, std::memory_order_release);
             throw StorageError("io_uring submission queue unexpectedly became full");
         }
 
@@ -270,7 +286,7 @@ private:
                 IORING_ENTER_GETEVENTS, nullptr, 0);
             if (result < 0 && errno != EINTR && errno != EAGAIN) {
                 const int error_number = errno;
-                poisoned_ = true;
+                poisoned_.store(true, std::memory_order_release);
                 drain_completions_without_enter(outstanding);
                 throw StorageError(system_error(
                     "io_uring_enter wait failed", error_number));
@@ -476,7 +492,7 @@ private:
     std::uint32_t* cq_overflow_{nullptr};
     io_uring_cqe* cqes_{nullptr};
     std::mutex mutex_;
-    bool poisoned_{false};
+    std::atomic<bool> poisoned_{false};
 };
 
 #else
@@ -488,6 +504,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t queue_depth() const noexcept { return 0; }
+    [[nodiscard]] bool usable() const noexcept { return false; }
     void read_exact(std::span<const IoUringReadOperation>) {}
 };
 
@@ -505,6 +522,10 @@ void IoUringEngine::read_exact(
 
 std::uint32_t IoUringEngine::queue_depth() const noexcept {
     return impl_->queue_depth();
+}
+
+bool IoUringEngine::usable() const noexcept {
+    return impl_->usable();
 }
 
 }  // namespace throwdb::detail

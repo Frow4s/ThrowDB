@@ -19,6 +19,7 @@
 
 #include "throwdb/errors.hpp"
 #include "throwdb/storage.hpp"
+#include "../src/core/io_uring_pool.hpp"
 #include "../src/core/task_partition.hpp"
 
 namespace {
@@ -687,6 +688,38 @@ void test_invalid_io_executor_options_are_rejected() {
     require(rejected, "excessive io_uring queue depth was accepted");
 
     options = {};
+    options.io_uring_workers = 0;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "zero io_uring workers was accepted");
+
+    options = {};
+    options.io_uring_workers = 65;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "excessive io_uring workers was accepted");
+
+    options = {};
+    options.io_backend = throwdb::IoBackend::IoUring;
+    options.io_uring_workers = 2;
+    options.io_uring_queue_depth = 1;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "io_uring accepted fewer queue entries than workers");
+
+    options = {};
     options.io_backend = throwdb::IoBackend::IoUring;
     options.io_workers = 1;
     rejected = false;
@@ -722,11 +755,18 @@ void test_io_uring_backend_round_trip_when_runtime_allows_it() {
         expected.insert(expected.end(), begin, begin + dimension);
     }
     std::unique_ptr<throwdb::Storage> storage;
-    for (const std::uint32_t queue_depth : {1U, 2U, 4U}) {
+    struct RuntimeConfiguration {
+        std::uint32_t workers;
+        std::uint32_t queue_depth;
+    };
+    const std::array<RuntimeConfiguration, 6> configurations{{
+        {1, 1}, {1, 2}, {1, 4}, {2, 2}, {2, 3}, {2, 4}}};
+    for (const RuntimeConfiguration configuration : configurations) {
         throwdb::ReaderOptions options;
         options.max_read_range_bytes = record_size;
         options.io_backend = throwdb::IoBackend::IoUring;
-        options.io_uring_queue_depth = queue_depth;
+        options.io_uring_workers = configuration.workers;
+        options.io_uring_queue_depth = configuration.queue_depth;
         try {
             storage = throwdb::Storage::open(store_path, options);
         } catch (const throwdb::StorageError& error) {
@@ -748,13 +788,19 @@ void test_io_uring_backend_round_trip_when_runtime_allows_it() {
             "io_uring changed query order or embedding bits");
     }
 
-    constexpr std::size_t client_count = 4;
+    constexpr std::size_t client_count = 8;
     std::array<std::exception_ptr, client_count> errors{};
+    std::atomic<std::size_t> ready{0};
+    std::atomic<bool> start{false};
     std::vector<std::thread> clients;
     for (std::size_t client = 0; client != client_count; ++client) {
         clients.emplace_back([&, client] {
             try {
-                for (std::size_t call = 0; call != 10; ++call) {
+                ready.fetch_add(1, std::memory_order_release);
+                while (!start.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (std::size_t call = 0; call != 20; ++call) {
                     require_equal(
                         storage->get(query), expected,
                         "concurrent io_uring caller returned wrong data");
@@ -764,6 +810,10 @@ void test_io_uring_backend_round_trip_when_runtime_allows_it() {
             }
         });
     }
+    while (ready.load(std::memory_order_acquire) != client_count) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
     for (std::thread& client : clients) {
         client.join();
     }
@@ -796,6 +846,36 @@ void test_io_uring_backend_round_trip_when_runtime_allows_it() {
         "io_uring ring was unusable after a read error");
 }
 
+void test_io_uring_pool_planning_is_depth_aware() {
+    require_equal(
+        throwdb::detail::split_io_uring_queue_depth(2, 32),
+        std::vector<std::uint32_t>{16, 16},
+        "even io_uring queue depth split changed");
+    require_equal(
+        throwdb::detail::split_io_uring_queue_depth(2, 3),
+        std::vector<std::uint32_t>{2, 1},
+        "odd io_uring queue depth split changed");
+
+    std::array<std::byte, 1> placeholder{};
+    std::vector<throwdb::detail::IoUringReadOperation> operations(6);
+    for (auto& operation : operations) {
+        operation.buffer = placeholder.data();
+        operation.size = 2048;
+    }
+    const std::array<std::uint32_t, 2> even_depths{16, 16};
+    require_equal(
+        throwdb::detail::plan_io_uring_lanes(operations, even_depths),
+        std::vector<std::size_t>{0, 1, 0, 1, 0, 1},
+        "equal-depth io_uring lanes were not balanced");
+
+    operations.resize(3);
+    const std::array<std::uint32_t, 2> uneven_depths{2, 1};
+    require_equal(
+        throwdb::detail::plan_io_uring_lanes(operations, uneven_depths),
+        std::vector<std::size_t>{0, 1, 0},
+        "io_uring lane planner ignored unequal queue depths");
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -804,7 +884,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 16> tests{{
+    const std::array<TestCase, 17> tests{{
         {"round_trip_arbitrary_ids_and_order", test_round_trip_arbitrary_ids_and_order},
         {"multiple_append_batches_and_shards", test_multiple_append_batches_and_shards},
         {"duplicate_id_rejects_publication", test_duplicate_id_rejects_publication},
@@ -819,6 +899,7 @@ int main() {
         {"simultaneous_get_calls_share_internal_executor", test_simultaneous_get_calls_share_internal_executor},
         {"parallel_read_error_is_propagated_and_executor_survives", test_parallel_read_error_is_propagated_and_executor_survives},
         {"invalid_io_executor_options_are_rejected", test_invalid_io_executor_options_are_rejected},
+        {"io_uring_pool_planning_is_depth_aware", test_io_uring_pool_planning_is_depth_aware},
         {"io_uring_backend_round_trip_when_runtime_allows_it", test_io_uring_backend_round_trip_when_runtime_allows_it},
         {"empty_query_is_valid", [] {
              TempDirectory temporary;

@@ -39,6 +39,8 @@ container policy must be changed before an io_uring backend can be tested.
 | Shared reader | Simultaneous `get` calls on one `Storage` instance | Calls complete without cross-request corruption |
 | Worker error | A queued range hits a truncated shard | Exception reaches the caller; executor remains usable |
 | io_uring | Queue depths 1, 2, and 4 with more ranges than SQ entries | Ring wraps and every row remains bit-exact |
+| Multi-ring io_uring | One and two workers with total queue depths 2, 3, and 4 | A single request is split across rings without changing bits or row order |
+| Multi-ring concurrency | Simultaneous callers share two ring-owner workers | Calls complete without cross-request corruption or deadlock |
 | io_uring error | Truncate a shard after open, then issue a healthy request | EOF reaches the caller and the ring remains reusable |
 
 Floating-point comparisons are deliberately inappropriate here. The storage
@@ -179,16 +181,25 @@ derived throttled-period/time ratios. These are per-scenario deltas rather than
 container-lifetime totals, so CPU-quota stalls can be separated from ThrowDB
 queue latency.
 
-## Experimental io_uring sweep
+## Multi-ring io_uring experiment
 
-The first raw-ABI backend uses one mutex-protected ring per `Storage`. It is
-designed to answer whether a single caller with queue depth can saturate cold
-storage without 16 user-space worker threads. Concurrent multi-range calls are
-serialized in this version, so concurrency results measure the cost of that
-deliberately simple scheduler rather than a final design.
+The raw-ABI baseline uses one mutex-protected ring per `Storage`. The next
+experiment adds dedicated ring-owner workers. One large request is cost-balanced
+across all rings, concurrent batches enter every per-worker FIFO in the same
+order, and the caller waits for every lane before temporary buffers can expire.
+Queue depth is a total: two workers with depth 32 create two depth-16 rings.
+Admission is bounded to `2 * io_uring_workers` active/queued batches and is
+strictly FIFO between callers. It is recorded as
+`io_uring_admission_capacity` and `io_uring_admission_policy` in the benchmark
+report. The storage
+section also records `/proc/self/task` counts immediately before and after open,
+which isolates the dedicated user-space ring workers.
+
+Compare the known single-ring QD32 baseline with two rings at the same aggregate
+depth:
 
 ```bash
-for depth in 8 16 32 64; do
+for workers in 1 2; do
   python benchmarks/run_load_test.py \
     --store "$STORE" \
     --ids "$IDS" \
@@ -199,12 +210,15 @@ for depth in 8 16 32 64; do
     --io-backend io_uring \
     --io-workers 0 \
     --io-queue-capacity 0 \
-    --io-uring-queue-depth "$depth" \
-    --results "benchmark-results-io-uring-qd-$depth"
+    --io-uring-workers "$workers" \
+    --io-uring-queue-depth 32 \
+    --results "benchmark-results-io-uring-workers-$workers-qd-32"
 done
 ```
 
-The first success gate is bit-exact correctness and cold single-client
-throughput within 95% of the 16-worker thread-pool result. Compare CPU time,
-context switches, cgroup throttling, and warm latency before investing in a
-fair multi-caller ring scheduler.
+The two-ring success gate is bit-exact correctness, cold single-client
+throughput at least 95% of the single-ring QD32 result, higher warm concurrent
+throughput, and no return of cgroup throttling. Compare p50/p99, CPU time,
+context switches, diskstats, and `/proc/self/task` count. Whole-batch FIFO can
+still cause head-of-line blocking between very different batch sizes; a fair
+quantum scheduler is intentionally deferred until measurements justify it.

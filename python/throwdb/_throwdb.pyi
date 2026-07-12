@@ -50,6 +50,7 @@ class Storage:
         io_ranges_per_task: int = 8,
         io_backend: str = "thread_pool",
         io_uring_queue_depth: int = 32,
+        io_uring_workers: int = 1,
     ) -> Storage: ...
 
     @property

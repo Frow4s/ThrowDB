@@ -24,15 +24,25 @@ BENCHMARK = _load_benchmark_module()
 def test_reader_backend_arguments_are_parsed_and_bounded() -> None:
     parser = BENCHMARK.build_parser()
     args = parser.parse_args(
-        ["--io-backend", "io_uring", "--io-uring-queue-depth", "64"]
+        [
+            "--io-backend",
+            "io_uring",
+            "--io-uring-workers",
+            "2",
+            "--io-uring-queue-depth",
+            "64",
+        ]
     )
     assert args.io_backend == "io_uring"
+    assert args.io_uring_workers == 2
     assert args.io_uring_queue_depth == 64
 
     for argv in (
         ["--io-backend", "unknown"],
         ["--io-uring-queue-depth", "0"],
         ["--io-uring-queue-depth", "4097"],
+        ["--io-uring-workers", "0"],
+        ["--io-uring-workers", "65"],
     ):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)

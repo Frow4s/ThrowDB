@@ -42,8 +42,12 @@ struct ReaderOptions {
     // ThreadPool uses synchronous pread, optionally through io_workers.
     // IoUring is an experimental Linux-only buffered-read backend.
     IoBackend io_backend = IoBackend::ThreadPool;
-    // Maximum number of io_uring reads in flight. Used only by IoUring.
+    // Maximum total number of io_uring reads in flight across all workers.
+    // With multiple workers this depth is divided as evenly as possible.
     std::uint32_t io_uring_queue_depth = 32;
+    // Number of independent io_uring lanes. One preserves the caller-driven
+    // baseline; two or more create dedicated ring-owner worker threads.
+    std::uint32_t io_uring_workers = 1;
 };
 
 class Writer {

@@ -17,6 +17,8 @@ DEFAULT_BATCH_ROWS = 32_768
 DEFAULT_IO_RANGES_PER_TASK = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
 DEFAULT_IO_BACKEND = "thread_pool"
+DEFAULT_IO_URING_WORKERS = 1
+MAX_IO_URING_WORKERS = 64
 DEFAULT_IO_URING_QUEUE_DEPTH = 32
 MAX_IO_URING_QUEUE_DEPTH = 4096
 
@@ -80,6 +82,15 @@ def _io_uring_queue_depth(value: str) -> int:
     return parsed
 
 
+def _io_uring_workers(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > MAX_IO_URING_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 1 and {MAX_IO_URING_WORKERS}"
+        )
+    return parsed
+
+
 def _create(args: argparse.Namespace) -> None:
     ids = _load_ids(args.ids)
     embeddings = _load_embeddings(args.embeddings)
@@ -115,6 +126,7 @@ def _get(args: argparse.Namespace) -> None:
         io_ranges_per_task=args.io_ranges_per_task,
         io_backend=args.io_backend,
         io_uring_queue_depth=args.io_uring_queue_depth,
+        io_uring_workers=args.io_uring_workers,
     )
     output = np.lib.format.open_memmap(
         args.output,
@@ -136,6 +148,7 @@ def _inspect(args: argparse.Namespace) -> None:
         io_ranges_per_task=args.io_ranges_per_task,
         io_backend=args.io_backend,
         io_uring_queue_depth=args.io_uring_queue_depth,
+        io_uring_workers=args.io_uring_workers,
     )
     print(
         json.dumps(
@@ -188,6 +201,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_IO_BACKEND,
     )
     get.add_argument(
+        "--io-uring-workers",
+        type=_io_uring_workers,
+        default=DEFAULT_IO_URING_WORKERS,
+    )
+    get.add_argument(
         "--io-uring-queue-depth",
         type=_io_uring_queue_depth,
         default=DEFAULT_IO_URING_QUEUE_DEPTH,
@@ -207,6 +225,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--io-backend",
         choices=("thread_pool", "io_uring"),
         default=DEFAULT_IO_BACKEND,
+    )
+    inspect.add_argument(
+        "--io-uring-workers",
+        type=_io_uring_workers,
+        default=DEFAULT_IO_URING_WORKERS,
     )
     inspect.add_argument(
         "--io-uring-queue-depth",

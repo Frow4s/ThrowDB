@@ -12,6 +12,7 @@ add_library(throwdb_core STATIC
     src/core/format.cpp
     src/core/index.cpp
     src/core/io_uring_engine.cpp
+    src/core/io_uring_pool.cpp
     src/core/storage_reader.cpp
     src/core/storage_writer.cpp
 )

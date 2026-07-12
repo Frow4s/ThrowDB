@@ -276,6 +276,21 @@ def test_internal_io_worker_options_preserve_repeated_cross_shard_reads(
                 io_uring_queue_depth=queue_depth,
             )
 
+    for workers in (0, 65):
+        with pytest.raises(ValueError, match="io_uring_workers"):
+            throwdb.Storage.open(
+                str(store_path),
+                io_uring_workers=workers,
+            )
+
+    with pytest.raises(ValueError, match="queue_depth.*workers"):
+        throwdb.Storage.open(
+            str(store_path),
+            io_backend="io_uring",
+            io_uring_workers=2,
+            io_uring_queue_depth=1,
+        )
+
     with pytest.raises(ValueError, match="io_workers.*io_queue_capacity"):
         throwdb.Storage.open(
             str(store_path),
