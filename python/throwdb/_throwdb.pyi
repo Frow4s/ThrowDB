@@ -31,6 +31,8 @@ class Writer:
 
     def finish(self) -> None: ...
 
+    def abort(self) -> None: ...
+
     def __enter__(self) -> Writer: ...
 
     def __exit__(
@@ -58,6 +60,9 @@ class Storage:
 
     @property
     def count(self) -> int: ...
+
+    @property
+    def dtype(self) -> str: ...
 
     def get(
         self, ids: npt.NDArray[np.uint64]

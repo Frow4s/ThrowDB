@@ -25,21 +25,53 @@ pytest -q
 
 ## Python API
 
-The Python API accepts C-contiguous, native-endian NumPy arrays. Input buffers
-are passed directly to the synchronous C++ call and may be reused as soon as
-the call returns.
+`Collection` is the user-facing API. It accepts every NumPy unsigned integer
+width, non-negative signed integer arrays, and ordered Python integer
+sequences. Numeric IDs are checked exactly and normalized to the canonical
+`uint64` domain; an already native, aligned, C-contiguous `uint64` array stays
+zero-copy.
 
 ```python
 import numpy as np
 import throwdb
 
-ids = np.load("ids.npy", mmap_mode="r")
+ids = np.load("ids.npy", mmap_mode="r")          # uint32 is accepted
 vectors = np.load("embeddings.npy", mmap_mode="r")
 
-with throwdb.Writer.create("/data/example", dimension=1024) as writer:
-    writer.add(ids, vectors)
+schema = throwdb.CollectionSchema(
+    id_type="uint64",
+    dimension=1024,
+    dtype="float16",
+)
+with throwdb.Collection.create("/data/example", schema=schema) as collection:
+    collection.add(ids, vectors)
 
-db = throwdb.Storage.open("/data/example")
+collection = throwdb.Collection.open("/data/example", tuning="auto")
+result = collection.get([42, 100])
+prefix = collection.get([42, 100], prefix_dimensions=128)
+
+output = np.empty((2, 128), dtype=np.float16)
+collection.get_into([42, 100], output, prefix_dimensions=128)
+```
+
+The format-v1 backend currently implements numeric `uint64` IDs and
+`float16` embeddings. `CollectionSchema` recognizes the planned `utf8` and
+`float32` domains, but `Collection.create` reports them as unsupported until
+their format-v2 implementations exist. Prefix reads are API-correct today but
+format v1 reads each complete row into a temporary before returning its prefix.
+The initial `"auto"` tuning profile deliberately selects the conservative
+thread-pool baseline without running a calibration benchmark; the effective
+selection and reason are visible through `collection.tuning`.
+
+`Writer` and `Storage` are the lower-level zero-copy API. They require native,
+aligned, C-contiguous `uint64` and `float16` NumPy arrays and pass their buffers
+directly to synchronous C++ calls:
+
+```python
+with throwdb.Writer.create("/data/example-low-level", dimension=1024) as writer:
+    writer.add(ids.astype(np.uint64, copy=False), vectors)
+
+db = throwdb.Storage.open("/data/example-low-level")
 result = db.get(np.array([42, 100], dtype=np.uint64))
 ```
 

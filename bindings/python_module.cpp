@@ -364,6 +364,14 @@ public:
         return reader_->count();
     }
 
+    [[nodiscard]] std::string dtype() const {
+        switch (reader_->dtype()) {
+        case throwdb::DType::Float16:
+            return "float16";
+        }
+        throw std::runtime_error("storage has an unsupported dtype");
+    }
+
     py::array get(const py::array& ids) const {
         const auto id_span = validate_ids(ids);
         py::array output(
@@ -412,6 +420,7 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("shard_size_bytes") = kDefaultShardSizeBytes)
         .def("add", &PyWriter::add, py::arg("ids"), py::arg("embeddings"))
         .def("finish", &PyWriter::finish)
+        .def("abort", &PyWriter::abort)
         .def_property_readonly("dimension", &PyWriter::dimension)
         .def_property_readonly("count", &PyWriter::count)
         .def("__enter__", &PyWriter::enter, py::return_value_policy::reference_internal)
@@ -430,6 +439,7 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("io_uring_workers") = kDefaultIoUringWorkers)
         .def_property_readonly("dimension", &PyStorage::dimension)
         .def_property_readonly("count", &PyStorage::count)
+        .def_property_readonly("dtype", &PyStorage::dtype)
         .def("get", &PyStorage::get, py::arg("ids"))
         .def("get_into", &PyStorage::get_into, py::arg("ids"), py::arg("output"));
 }

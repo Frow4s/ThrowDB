@@ -47,6 +47,7 @@ def test_round_trip_preserves_bits_and_query_order(tmp_path: Path) -> None:
     storage = throwdb.Storage.open(str(store_path))
     assert storage.dimension == source.shape[1]
     assert storage.count == source_ids.size
+    assert storage.dtype == "float16"
 
     # Query order is unrelated to physical order and a query ID may be repeated.
     positions = np.array([3, 0, 4, 1, 3, 2], dtype=np.intp)
@@ -197,6 +198,25 @@ def test_exception_in_context_does_not_publish_store(tmp_path: Path) -> None:
             writer.add(ids, _vectors(ids.size, 3))
             raise RuntimeError("abort build")
 
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        throwdb.Storage.open(str(store_path))
+
+
+def test_explicit_abort_closes_writer_without_publishing_store(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "explicitly-aborted-store"
+    ids = np.array([1, 2], dtype=np.uint64)
+    writer = throwdb.Writer.create(
+        str(store_path), dimension=3, shard_size_bytes=1 << 20
+    )
+    writer.add(ids, _vectors(ids.size, 3))
+
+    writer.abort()
+    writer.abort()  # Aborting an already closed writer is harmless.
+
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.add(ids, _vectors(ids.size, 3))
     with pytest.raises((OSError, RuntimeError, ValueError)):
         throwdb.Storage.open(str(store_path))
 
