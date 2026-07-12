@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 
 def _load_benchmark_module() -> ModuleType:
     path = Path(__file__).parents[1] / "benchmarks" / "run_load_test.py"
@@ -17,6 +19,23 @@ def _load_benchmark_module() -> ModuleType:
 
 
 BENCHMARK = _load_benchmark_module()
+
+
+def test_reader_backend_arguments_are_parsed_and_bounded() -> None:
+    parser = BENCHMARK.build_parser()
+    args = parser.parse_args(
+        ["--io-backend", "io_uring", "--io-uring-queue-depth", "64"]
+    )
+    assert args.io_backend == "io_uring"
+    assert args.io_uring_queue_depth == 64
+
+    for argv in (
+        ["--io-backend", "unknown"],
+        ["--io-uring-queue-depth", "0"],
+        ["--io-uring-queue-depth", "4097"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
 
 
 def test_cgroup_v2_limit_and_counters_are_parsed(tmp_path: Path) -> None:

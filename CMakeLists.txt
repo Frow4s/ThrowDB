@@ -11,6 +11,7 @@ option(THROWDB_BUILD_BENCHMARKS "Build benchmark tools" ON)
 add_library(throwdb_core STATIC
     src/core/format.cpp
     src/core/index.cpp
+    src/core/io_uring_engine.cpp
     src/core/storage_reader.cpp
     src/core/storage_writer.cpp
 )
@@ -56,6 +57,11 @@ if(THROWDB_BUILD_BENCHMARKS)
     add_executable(throwdb_bench benchmarks/throwdb_bench.cpp)
     target_link_libraries(throwdb_bench PRIVATE throwdb::core)
     target_compile_features(throwdb_bench PRIVATE cxx_std_20)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(throwdb_io_uring_probe benchmarks/io_uring_probe.cpp)
+        target_compile_features(throwdb_io_uring_probe PRIVATE cxx_std_20)
+    endif()
 endif()
 
 include(GNUInstallDirs)

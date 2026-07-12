@@ -66,6 +66,9 @@ IO_WORKERS = 0
 IO_QUEUE_CAPACITY = 0
 IO_RANGES_PER_TASK = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
+IO_BACKEND = "thread_pool"
+IO_URING_QUEUE_DEPTH = 32
+MAX_IO_URING_QUEUE_DEPTH = 4096
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,15 @@ def ranges_per_task_int(value: str) -> int:
     if not 1 <= parsed <= MAX_IO_RANGES_PER_TASK:
         raise argparse.ArgumentTypeError(
             f"value must be in 1..{MAX_IO_RANGES_PER_TASK}"
+        )
+    return parsed
+
+
+def io_uring_queue_depth_int(value: str) -> int:
+    parsed = int(value)
+    if not 1 <= parsed <= MAX_IO_URING_QUEUE_DEPTH:
+        raise argparse.ArgumentTypeError(
+            f"value must be in 1..{MAX_IO_URING_QUEUE_DEPTH}"
         )
     return parsed
 
@@ -819,6 +831,7 @@ def print_result(result: dict[str, Any]) -> None:
     log(
         f"cache={result.get('cache_mode', 'n/a'):<4} "
         f"clients={result['workers']:>2} "
+        f"backend={result.get('io_backend', 'thread_pool'):<11} "
         f"io_workers={result.get('io_workers', 0):>2} "
         f"ranges/task={result.get('io_ranges_per_task', 1):>2} "
         f"batch={result['batch_size']:>7,} "
@@ -858,6 +871,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--io-backend",
+        choices=("thread_pool", "io_uring"),
+        default=IO_BACKEND,
+        help="reader backend (default: thread_pool)",
+    )
+    parser.add_argument(
+        "--io-uring-queue-depth",
+        type=io_uring_queue_depth_int,
+        default=IO_URING_QUEUE_DEPTH,
+        help=(
+            "maximum in-flight io_uring reads "
+            f"(1..{MAX_IO_URING_QUEUE_DEPTH}; default: 32)"
+        ),
+    )
+    parser.add_argument(
         "--cache-mode",
         choices=("cold", "warm", "both"),
         default=CACHE_MODE,
@@ -883,6 +911,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--io-ranges-per-task must be in "
             f"1..{MAX_IO_RANGES_PER_TASK}"
+        )
+    if not 1 <= args.io_uring_queue_depth <= MAX_IO_URING_QUEUE_DEPTH:
+        raise ValueError(
+            "--io-uring-queue-depth must be in "
+            f"1..{MAX_IO_URING_QUEUE_DEPTH}"
+        )
+    if args.io_backend == "io_uring" and (
+        args.io_workers != 0 or args.io_queue_capacity != 0
+    ):
+        raise ValueError(
+            "--io-workers and --io-queue-capacity must both be zero when "
+            "--io-backend is io_uring"
         )
     if args.io_workers == 0 and args.io_queue_capacity != 0:
         raise ValueError(
@@ -916,6 +956,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "io_workers": args.io_workers,
             "io_queue_capacity": args.io_queue_capacity,
             "io_ranges_per_task": args.io_ranges_per_task,
+            "io_backend": args.io_backend,
+            "io_uring_queue_depth": args.io_uring_queue_depth,
         },
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "system": collect_system_information(args.store),
@@ -942,6 +984,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         io_workers=args.io_workers,
         io_queue_capacity=args.io_queue_capacity,
         io_ranges_per_task=args.io_ranges_per_task,
+        io_backend=args.io_backend,
+        io_uring_queue_depth=args.io_uring_queue_depth,
     )
     open_seconds = time.perf_counter() - open_started
     report["storage"] = {
@@ -953,6 +997,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "io_workers": args.io_workers,
         "io_queue_capacity": args.io_queue_capacity,
         "io_ranges_per_task": args.io_ranges_per_task,
+        "io_backend": args.io_backend,
+        "io_uring_queue_depth": args.io_uring_queue_depth,
     }
     log(
         f"storage opened in {open_seconds:.3f}s: "
@@ -1009,6 +1055,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["io_workers"] = args.io_workers
                 result["io_queue_capacity"] = args.io_queue_capacity
                 result["io_ranges_per_task"] = args.io_ranges_per_task
+                result["io_backend"] = args.io_backend
+                result["io_uring_queue_depth"] = args.io_uring_queue_depth
                 if eviction is not None:
                     result["cache_eviction"] = eviction
                 report["sequential"].append(result)
@@ -1038,6 +1086,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["io_workers"] = args.io_workers
                 result["io_queue_capacity"] = args.io_queue_capacity
                 result["io_ranges_per_task"] = args.io_ranges_per_task
+                result["io_backend"] = args.io_backend
+                result["io_uring_queue_depth"] = args.io_uring_queue_depth
                 if eviction is not None:
                     result["cache_eviction"] = eviction
                 report["concurrent"].append(result)

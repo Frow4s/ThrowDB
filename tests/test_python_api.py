@@ -265,3 +265,20 @@ def test_internal_io_worker_options_preserve_repeated_cross_shard_reads(
             str(store_path),
             io_ranges_per_task=0,
         )
+
+    with pytest.raises(ValueError, match="io_backend"):
+        throwdb.Storage.open(str(store_path), io_backend="unknown")
+
+    for queue_depth in (0, 4097):
+        with pytest.raises(ValueError, match="io_uring_queue_depth"):
+            throwdb.Storage.open(
+                str(store_path),
+                io_uring_queue_depth=queue_depth,
+            )
+
+    with pytest.raises(ValueError, match="io_workers.*io_queue_capacity"):
+        throwdb.Storage.open(
+            str(store_path),
+            io_backend="io_uring",
+            io_workers=1,
+        )

@@ -16,6 +16,9 @@ DEFAULT_SHARD_SIZE_GIB = 16
 DEFAULT_BATCH_ROWS = 32_768
 DEFAULT_IO_RANGES_PER_TASK = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
+DEFAULT_IO_BACKEND = "thread_pool"
+DEFAULT_IO_URING_QUEUE_DEPTH = 32
+MAX_IO_URING_QUEUE_DEPTH = 4096
 
 
 def _load_ids(path: Path) -> np.ndarray:
@@ -68,6 +71,15 @@ def _io_ranges_per_task(value: str) -> int:
     return parsed
 
 
+def _io_uring_queue_depth(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > MAX_IO_URING_QUEUE_DEPTH:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 1 and {MAX_IO_URING_QUEUE_DEPTH}"
+        )
+    return parsed
+
+
 def _create(args: argparse.Namespace) -> None:
     ids = _load_ids(args.ids)
     embeddings = _load_embeddings(args.embeddings)
@@ -101,6 +113,8 @@ def _get(args: argparse.Namespace) -> None:
         io_workers=args.io_workers,
         io_queue_capacity=args.io_queue_capacity,
         io_ranges_per_task=args.io_ranges_per_task,
+        io_backend=args.io_backend,
+        io_uring_queue_depth=args.io_uring_queue_depth,
     )
     output = np.lib.format.open_memmap(
         args.output,
@@ -120,6 +134,8 @@ def _inspect(args: argparse.Namespace) -> None:
         io_workers=args.io_workers,
         io_queue_capacity=args.io_queue_capacity,
         io_ranges_per_task=args.io_ranges_per_task,
+        io_backend=args.io_backend,
+        io_uring_queue_depth=args.io_uring_queue_depth,
     )
     print(
         json.dumps(
@@ -166,6 +182,16 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_io_ranges_per_task,
         default=DEFAULT_IO_RANGES_PER_TASK,
     )
+    get.add_argument(
+        "--io-backend",
+        choices=("thread_pool", "io_uring"),
+        default=DEFAULT_IO_BACKEND,
+    )
+    get.add_argument(
+        "--io-uring-queue-depth",
+        type=_io_uring_queue_depth,
+        default=DEFAULT_IO_URING_QUEUE_DEPTH,
+    )
     get.set_defaults(handler=_get)
 
     inspect = subparsers.add_parser("inspect", help="print store metadata")
@@ -176,6 +202,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--io-ranges-per-task",
         type=_io_ranges_per_task,
         default=DEFAULT_IO_RANGES_PER_TASK,
+    )
+    inspect.add_argument(
+        "--io-backend",
+        choices=("thread_pool", "io_uring"),
+        default=DEFAULT_IO_BACKEND,
+    )
+    inspect.add_argument(
+        "--io-uring-queue-depth",
+        type=_io_uring_queue_depth,
+        default=DEFAULT_IO_URING_QUEUE_DEPTH,
     )
     inspect.set_defaults(handler=_inspect)
     return parser

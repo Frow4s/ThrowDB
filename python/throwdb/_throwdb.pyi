@@ -48,6 +48,8 @@ class Storage:
         io_workers: int = 0,
         io_queue_capacity: int = 0,
         io_ranges_per_task: int = 8,
+        io_backend: str = "thread_pool",
+        io_uring_queue_depth: int = 32,
     ) -> Storage: ...
 
     @property

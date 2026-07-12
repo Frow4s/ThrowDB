@@ -1,6 +1,7 @@
 #include "throwdb/storage.hpp"
 
 #include "internal.hpp"
+#include "io_uring_engine.hpp"
 #include "task_partition.hpp"
 
 #include <algorithm>
@@ -23,6 +24,7 @@ namespace {
 constexpr std::uint32_t kMaxIoWorkers = 1024;
 constexpr std::uint32_t kMaxIoQueueCapacity = 1U << 20;
 constexpr std::uint32_t kMaxIoRangesPerTask = 1U << 20;
+constexpr std::uint32_t kMaxIoUringQueueDepth = 4096;
 
 [[nodiscard]] std::size_t effective_queue_capacity(
     const ReaderOptions& options) {
@@ -32,11 +34,27 @@ constexpr std::uint32_t kMaxIoRangesPerTask = 1U << 20;
     return static_cast<std::size_t>(options.io_workers) * 2;
 }
 
-void validate_executor_options(const ReaderOptions& options) {
+void validate_reader_options(const ReaderOptions& options) {
     if (options.io_ranges_per_task == 0
         || options.io_ranges_per_task > kMaxIoRangesPerTask) {
         throw InvalidArgumentError(
             "io_ranges_per_task must be between 1 and 1048576");
+    }
+    if (options.io_uring_queue_depth == 0
+        || options.io_uring_queue_depth > kMaxIoUringQueueDepth) {
+        throw InvalidArgumentError(
+            "io_uring_queue_depth must be between 1 and 4096");
+    }
+    if (options.io_backend == IoBackend::IoUring) {
+        if (options.io_workers != 0 || options.io_queue_capacity != 0) {
+            throw InvalidArgumentError(
+                "io_workers and io_queue_capacity must both be zero for "
+                "the io_uring backend");
+        }
+        return;
+    }
+    if (options.io_backend != IoBackend::ThreadPool) {
+        throw InvalidArgumentError("reader contains an unknown I/O backend");
     }
     if (options.io_workers == 0) {
         if (options.io_queue_capacity != 0) {
@@ -197,7 +215,10 @@ public:
         validate_manifest();
         open_and_validate_shards();
         index_ = detail::read_index(path_, manifest_);
-        if (options_.io_workers != 0) {
+        if (options_.io_backend == IoBackend::IoUring) {
+            io_uring_ = std::make_unique<detail::IoUringEngine>(
+                options_.io_uring_queue_depth);
+        } else if (options_.io_workers != 0) {
             executor_ = std::make_unique<BoundedExecutor>(
                 options_.io_workers, effective_queue_capacity(options_));
         }
@@ -273,7 +294,19 @@ public:
             begin = end;
         }
 
-        if (executor_ == nullptr || ranges.size() == 1) {
+        if (ranges.size() == 1) {
+            const PlannedRange& range = ranges.front();
+            read_range(requests, range.request_begin, range.request_end,
+                       range.first_record, range.end_record, output);
+            return;
+        }
+
+        if (io_uring_ != nullptr) {
+            read_ranges_io_uring(requests, ranges, output);
+            return;
+        }
+
+        if (executor_ == nullptr) {
             for (const PlannedRange& range : ranges) {
                 read_range(requests, range.request_begin, range.request_end,
                            range.first_record, range.end_record, output);
@@ -339,6 +372,85 @@ public:
     }
 
 private:
+    void read_ranges_io_uring(
+        const std::vector<Request>& requests,
+        const std::vector<PlannedRange>& ranges,
+        const std::span<std::byte> output) const {
+        struct PreparedRange {
+            std::vector<std::byte> buffer;
+        };
+
+        std::vector<PreparedRange> prepared(ranges.size());
+        std::vector<detail::IoUringReadOperation> operations;
+        operations.reserve(ranges.size());
+        for (std::size_t range_index = 0; range_index != ranges.size();
+             ++range_index) {
+            const PlannedRange& range = ranges[range_index];
+            const std::uint64_t shard_id = requests[range.request_begin].shard;
+            if (shard_id >= shards_.size()
+                || range.end_record > shards_[shard_id].record_count) {
+                throw CorruptionError("index points outside a data shard");
+            }
+
+            void* destination = nullptr;
+            std::size_t size = 0;
+            std::uint64_t offset = 0;
+            if (range.request_end == range.request_begin + 1) {
+                const Request& request = requests[range.request_begin];
+                const std::uint64_t destination_offset =
+                    request.output_index * manifest_.record_size;
+                destination = output.data()
+                              + static_cast<std::size_t>(destination_offset);
+                size = static_cast<std::size_t>(manifest_.record_size);
+                offset = detail::kHeaderSize
+                         + request.local_record * manifest_.record_size;
+            } else {
+                const std::uint64_t range_bytes =
+                    (range.end_record - range.first_record)
+                    * manifest_.record_size;
+                if (range_bytes > std::numeric_limits<std::size_t>::max()) {
+                    throw InvalidArgumentError(
+                        "planned io_uring range does not fit in address space");
+                }
+                prepared[range_index].buffer.resize(
+                    static_cast<std::size_t>(range_bytes));
+                destination = prepared[range_index].buffer.data();
+                size = prepared[range_index].buffer.size();
+                offset = detail::kHeaderSize
+                         + range.first_record * manifest_.record_size;
+            }
+            operations.push_back(detail::IoUringReadOperation{
+                shards_[shard_id].fd.get(), destination, size, offset,
+                range_index});
+        }
+
+        io_uring_->read_exact(operations);
+
+        for (std::size_t range_index = 0; range_index != ranges.size();
+             ++range_index) {
+            const PlannedRange& range = ranges[range_index];
+            if (range.request_end == range.request_begin + 1) {
+                continue;
+            }
+            const std::vector<std::byte>& buffer =
+                prepared[range_index].buffer;
+            for (std::size_t request_index = range.request_begin;
+                 request_index != range.request_end; ++request_index) {
+                const Request& request = requests[request_index];
+                const std::uint64_t source_offset =
+                    (request.local_record - range.first_record)
+                    * manifest_.record_size;
+                const std::uint64_t destination_offset =
+                    request.output_index * manifest_.record_size;
+                std::memcpy(
+                    output.data()
+                        + static_cast<std::size_t>(destination_offset),
+                    buffer.data() + static_cast<std::size_t>(source_offset),
+                    static_cast<std::size_t>(manifest_.record_size));
+            }
+        }
+    }
+
     void validate_manifest() const {
         if (manifest_.dtype != static_cast<std::uint32_t>(DType::Float16)) {
             throw CorruptionError("manifest contains an unsupported dtype");
@@ -450,6 +562,7 @@ private:
     detail::IndexData index_;
     std::vector<Shard> shards_;
     std::unique_ptr<BoundedExecutor> executor_;
+    std::unique_ptr<detail::IoUringEngine> io_uring_;
 };
 
 std::unique_ptr<Storage> Storage::open(const std::filesystem::path& path,
@@ -457,7 +570,7 @@ std::unique_ptr<Storage> Storage::open(const std::filesystem::path& path,
     if (path.empty()) {
         throw InvalidArgumentError("storage path must not be empty");
     }
-    validate_executor_options(options);
+    validate_reader_options(options);
     return std::unique_ptr<Storage>(
         new Storage(std::make_unique<Impl>(path, options)));
 }

@@ -665,6 +665,135 @@ void test_invalid_io_executor_options_are_rejected() {
         rejected = true;
     }
     require(rejected, "excessive ranges per executor task was accepted");
+
+    options = {};
+    options.io_uring_queue_depth = 0;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "zero io_uring queue depth was accepted");
+
+    options = {};
+    options.io_uring_queue_depth = 4097;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "excessive io_uring queue depth was accepted");
+
+    options = {};
+    options.io_backend = throwdb::IoBackend::IoUring;
+    options.io_workers = 1;
+    rejected = false;
+    try {
+        static_cast<void>(throwdb::Storage::open(store_path, options));
+    } catch (const throwdb::InvalidArgumentError&) {
+        rejected = true;
+    }
+    require(rejected, "io_uring accepted thread-pool workers");
+}
+
+void test_io_uring_backend_round_trip_when_runtime_allows_it() {
+    TempDirectory temporary;
+    const auto store_path = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 9;
+    constexpr std::size_t row_count = 31;
+    const std::uint64_t record_size = dimension * sizeof(std::uint16_t);
+    std::vector<std::uint64_t> ids(row_count);
+    for (std::size_t row = 0; row != row_count; ++row) {
+        ids[row] = static_cast<std::uint64_t>(row * 1'000'003ULL + 71ULL);
+    }
+    const auto payload = make_payload(row_count, dimension);
+    build_store(store_path, ids, payload, dimension, 3 * record_size);
+
+    const std::array<std::size_t, 10> positions{
+        30, 0, 14, 3, 29, 14, 1, 20, 0, 27};
+    std::vector<std::uint64_t> query;
+    std::vector<std::uint16_t> expected;
+    for (const std::size_t position : positions) {
+        query.push_back(ids[position]);
+        const auto begin = payload.begin()
+                           + static_cast<std::ptrdiff_t>(position * dimension);
+        expected.insert(expected.end(), begin, begin + dimension);
+    }
+    std::unique_ptr<throwdb::Storage> storage;
+    for (const std::uint32_t queue_depth : {1U, 2U, 4U}) {
+        throwdb::ReaderOptions options;
+        options.max_read_range_bytes = record_size;
+        options.io_backend = throwdb::IoBackend::IoUring;
+        options.io_uring_queue_depth = queue_depth;
+        try {
+            storage = throwdb::Storage::open(store_path, options);
+        } catch (const throwdb::StorageError& error) {
+#if defined(__linux__)
+            const std::string message = error.what();
+            if (message.find("(errno=1)") == std::string::npos
+                && message.find("(errno=13)") == std::string::npos
+                && message.find("(errno=38)") == std::string::npos) {
+                throw;
+            }
+#endif
+            // Non-Linux builds and Linux CI restricted by EPERM, EACCES, or
+            // ENOSYS skip the runtime path. Other Linux setup/mmap failures
+            // are implementation failures and must not become false greens.
+            return;
+        }
+        require_equal(
+            storage->get(query), expected,
+            "io_uring changed query order or embedding bits");
+    }
+
+    constexpr std::size_t client_count = 4;
+    std::array<std::exception_ptr, client_count> errors{};
+    std::vector<std::thread> clients;
+    for (std::size_t client = 0; client != client_count; ++client) {
+        clients.emplace_back([&, client] {
+            try {
+                for (std::size_t call = 0; call != 10; ++call) {
+                    require_equal(
+                        storage->get(query), expected,
+                        "concurrent io_uring caller returned wrong data");
+                }
+            } catch (...) {
+                errors[client] = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+    for (const std::exception_ptr& error : errors) {
+        if (error != nullptr) {
+            std::rethrow_exception(error);
+        }
+    }
+
+    const auto last_shard = store_path / "data" / "shard-000010.dat";
+    std::filesystem::resize_file(last_shard, 4096);
+    bool rejected = false;
+    const std::array<std::uint64_t, 2> broken_query{ids[30], ids[0]};
+    try {
+        static_cast<void>(storage->get(broken_query));
+    } catch (const throwdb::StorageError&) {
+        rejected = true;
+    }
+    require(rejected, "io_uring silently accepted an unexpected shard EOF");
+
+    const std::array<std::uint64_t, 2> healthy_query{ids[0], ids[3]};
+    std::vector<std::uint16_t> healthy_expected;
+    healthy_expected.insert(
+        healthy_expected.end(), payload.begin(), payload.begin() + dimension);
+    healthy_expected.insert(
+        healthy_expected.end(), payload.begin() + 3 * dimension,
+        payload.begin() + 4 * dimension);
+    require_equal(
+        storage->get(healthy_query), healthy_expected,
+        "io_uring ring was unusable after a read error");
 }
 
 struct TestCase {
@@ -675,7 +804,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 15> tests{{
+    const std::array<TestCase, 16> tests{{
         {"round_trip_arbitrary_ids_and_order", test_round_trip_arbitrary_ids_and_order},
         {"multiple_append_batches_and_shards", test_multiple_append_batches_and_shards},
         {"duplicate_id_rejects_publication", test_duplicate_id_rejects_publication},
@@ -690,6 +819,7 @@ int main() {
         {"simultaneous_get_calls_share_internal_executor", test_simultaneous_get_calls_share_internal_executor},
         {"parallel_read_error_is_propagated_and_executor_survives", test_parallel_read_error_is_propagated_and_executor_survives},
         {"invalid_io_executor_options_are_rejected", test_invalid_io_executor_options_are_rejected},
+        {"io_uring_backend_round_trip_when_runtime_allows_it", test_io_uring_backend_round_trip_when_runtime_allows_it},
         {"empty_query_is_valid", [] {
              TempDirectory temporary;
              constexpr std::uint32_t dimension = 3;

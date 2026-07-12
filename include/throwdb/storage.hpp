@@ -13,6 +13,11 @@ enum class DType : std::uint32_t {
     Float16 = 1,
 };
 
+enum class IoBackend : std::uint32_t {
+    ThreadPool = 0,
+    IoUring = 1,
+};
+
 struct WriterOptions {
     std::uint32_t dimension = 1024;
     DType dtype = DType::Float16;
@@ -34,6 +39,11 @@ struct ReaderOptions {
     // Maximum number of planned read ranges grouped into one executor task.
     // The effective value may be smaller so a batch can use every I/O worker.
     std::uint32_t io_ranges_per_task = 8;
+    // ThreadPool uses synchronous pread, optionally through io_workers.
+    // IoUring is an experimental Linux-only buffered-read backend.
+    IoBackend io_backend = IoBackend::ThreadPool;
+    // Maximum number of io_uring reads in flight. Used only by IoUring.
+    std::uint32_t io_uring_queue_depth = 32;
 };
 
 class Writer {

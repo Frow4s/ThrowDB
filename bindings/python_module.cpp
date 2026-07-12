@@ -23,6 +23,8 @@ constexpr std::int64_t kMaxIoWorkers = 1024;
 constexpr std::int64_t kMaxIoQueueCapacity = 1 << 20;
 constexpr std::int64_t kDefaultIoRangesPerTask = 8;
 constexpr std::int64_t kMaxIoRangesPerTask = 1 << 20;
+constexpr std::int64_t kDefaultIoUringQueueDepth = 32;
+constexpr std::int64_t kMaxIoUringQueueDepth = 4096;
 
 [[nodiscard]] py::dtype float16_dtype() {
     return py::dtype::from_args(py::str("float16"));
@@ -60,6 +62,28 @@ constexpr std::int64_t kMaxIoRangesPerTask = 1 << 20;
             + std::to_string(kMaxIoRangesPerTask));
     }
     return static_cast<std::uint32_t>(value);
+}
+
+[[nodiscard]] std::uint32_t checked_io_uring_queue_depth(
+    const std::int64_t value) {
+    if (value < 1 || value > kMaxIoUringQueueDepth) {
+        throw py::value_error(
+            "io_uring_queue_depth must be between 1 and "
+            + std::to_string(kMaxIoUringQueueDepth));
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+[[nodiscard]] throwdb::IoBackend checked_io_backend(
+    const std::string& value) {
+    if (value == "thread_pool") {
+        return throwdb::IoBackend::ThreadPool;
+    }
+    if (value == "io_uring") {
+        return throwdb::IoBackend::IoUring;
+    }
+    throw py::value_error(
+        "io_backend must be 'thread_pool' or 'io_uring', got '" + value + "'");
 }
 
 void require_native_endian(const py::array& array, const char* name) {
@@ -277,7 +301,9 @@ public:
         const py::object& path,
         const std::int64_t io_workers,
         const std::int64_t io_queue_capacity,
-        const std::int64_t io_ranges_per_task) {
+        const std::int64_t io_ranges_per_task,
+        const std::string& io_backend,
+        const std::int64_t io_uring_queue_depth) {
         throwdb::ReaderOptions options;
         options.io_workers =
             checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
@@ -287,6 +313,16 @@ public:
             "io_queue_capacity");
         options.io_ranges_per_task =
             checked_io_ranges_per_task(io_ranges_per_task);
+        options.io_backend = checked_io_backend(io_backend);
+        options.io_uring_queue_depth =
+            checked_io_uring_queue_depth(io_uring_queue_depth);
+        if (options.io_backend == throwdb::IoBackend::IoUring
+            && (options.io_workers != 0
+                || options.io_queue_capacity != 0)) {
+            throw py::value_error(
+                "io_workers and io_queue_capacity must both be 0 when "
+                "io_backend is 'io_uring'");
+        }
         if (options.io_workers == 0 && options.io_queue_capacity != 0) {
             throw py::value_error(
                 "io_queue_capacity must be 0 when io_workers is 0");
@@ -368,7 +404,9 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("path"),
             py::arg("io_workers") = 0,
             py::arg("io_queue_capacity") = 0,
-            py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask)
+            py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
+            py::arg("io_backend") = "thread_pool",
+            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth)
         .def_property_readonly("dimension", &PyStorage::dimension)
         .def_property_readonly("count", &PyStorage::count)
         .def("get", &PyStorage::get, py::arg("ids"))

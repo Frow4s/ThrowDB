@@ -5,6 +5,21 @@ reopened, and queried without relying on writer process state. Tests use small
 dimensions and shard sizes, but exercise the same format and address arithmetic
 as a production `float16[1024]` store.
 
+## io_uring environment probe
+
+The optional Linux probe calls `io_uring_setup` directly through the kernel ABI;
+it does not require `liburing`. Run it before building an io_uring reader because
+container seccomp policy may reject the syscall even on a supported kernel:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target throwdb_io_uring_probe -j
+./build/throwdb_io_uring_probe
+```
+
+Exit code 0 means a ring was created successfully. `EPERM` or `EACCES` means the
+container policy must be changed before an io_uring backend can be tested.
+
 ## Correctness matrix
 
 | Area | Required case | Expected result |
@@ -23,6 +38,8 @@ as a production `float16[1024]` store.
 | Chunked I/O | `io_ranges_per_task` 1, 4, 8, and 16, including batches smaller than a task | Results remain bit-exact at every partition boundary |
 | Shared reader | Simultaneous `get` calls on one `Storage` instance | Calls complete without cross-request corruption |
 | Worker error | A queued range hits a truncated shard | Exception reaches the caller; executor remains usable |
+| io_uring | Queue depths 1, 2, and 4 with more ranges than SQ entries | Ring wraps and every row remains bit-exact |
+| io_uring error | Truncate a shard after open, then issue a healthy request | EOF reaches the caller and the ring remains reusable |
 
 Floating-point comparisons are deliberately inappropriate here. The storage
 engine does not calculate with embeddings: it preserves the original 16-bit
@@ -161,3 +178,33 @@ limit, and the initial `cpu.stat` counters. Every timed result additionally has
 derived throttled-period/time ratios. These are per-scenario deltas rather than
 container-lifetime totals, so CPU-quota stalls can be separated from ThrowDB
 queue latency.
+
+## Experimental io_uring sweep
+
+The first raw-ABI backend uses one mutex-protected ring per `Storage`. It is
+designed to answer whether a single caller with queue depth can saturate cold
+storage without 16 user-space worker threads. Concurrent multi-range calls are
+serialized in this version, so concurrency results measure the cost of that
+deliberately simple scheduler rather than a final design.
+
+```bash
+for depth in 8 16 32 64; do
+  python benchmarks/run_load_test.py \
+    --store "$STORE" \
+    --ids "$IDS" \
+    --source-embeddings "$EMBEDDINGS" \
+    --source-kind npy \
+    --profile full \
+    --cache-mode both \
+    --io-backend io_uring \
+    --io-workers 0 \
+    --io-queue-capacity 0 \
+    --io-uring-queue-depth "$depth" \
+    --results "benchmark-results-io-uring-qd-$depth"
+done
+```
+
+The first success gate is bit-exact correctness and cold single-client
+throughput within 95% of the 16-worker thread-pool result. Compare CPU time,
+context switches, cgroup throttling, and warm latency before investing in a
+fair multi-caller ring scheduler.
