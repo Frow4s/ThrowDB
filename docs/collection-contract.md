@@ -1,12 +1,11 @@
 # Local collection product contract
 
 This document fixes the contract for the first user-facing ThrowDB product.
-The numeric immutable-snapshot subset is implemented through the Python
-`Collection` API: safe uint64 normalization, float16/float32 rows, arbitrary
-fixed dimensions, and semantic prefix reads. Float16 remains byte-compatible
-format v1 and float32 uses numeric format v2. UTF-8 IDs and public record CRUD
-remain design targets; checked RowRef/partition and WAL recovery primitives are
-now the internal foundation for the CRUD stages described below.
+The fresh native numeric subset is implemented through the Python `Collection`
+API: safe uint64 normalization, float16/float32 rows, arbitrary fixed
+dimensions, semantic prefix reads, and durable batch CRUD. The public format
+version is 3. UTF-8 IDs, WAL rotation, and selective cleaning remain the next
+local-library slices.
 
 ## Product boundary
 
@@ -16,13 +15,13 @@ A logical collection is a typed mapping:
 user ID -> fixed-schema embedding row
 ```
 
-The target local product contract includes record-level
-create/read/update/delete operations; the currently shipped Python subset is
-immutable create/read.
+The local product contract includes record-level
+create/read/update/delete operations. The current implementation provides them
+for the numeric ID domain.
 Approximate nearest-neighbour search, similarity scoring, replication, and a
 network protocol are separate product layers.
 
-Physical base snapshots remain immutable and atomically published:
+Physical base segments remain immutable and atomically published:
 
 ```text
 create -> append batches -> finish -> read-only snapshot
@@ -107,8 +106,11 @@ Required behaviour:
 - output dtype is the collection dtype;
 - `get_into` validates dtype, shape, contiguity, and writability before I/O;
 - one opened collection is safe to share between simultaneous read callers;
-- destroying the collection concurrently with an active method is outside the
-  lifetime contract; the owner must keep it alive until callers return.
+- the C++ owner must keep a handle alive until active methods return; the
+  Python binding retains an internal shared owner so `close()` cannot destroy
+  an already-running native call.
+- opened handles and builders are bound to their creating process; after
+  `fork()`, the child must open a new handle rather than use the inherited one.
 
 `prefix_dimensions=N` returns the first `N` values of every row and requires
 `1 <= N <= collection.dimension`. The API guarantee does not promise that a
@@ -122,7 +124,7 @@ The initial Python surface is intended to be:
 
 ```python
 schema = throwdb.CollectionSchema(
-    id_type="utf8",
+    id_type="uint64",
     dimension=1024,
     dtype="float16",
 )
@@ -135,9 +137,10 @@ Writers accept bounded batches and may spill build metadata to disk. Successful
 context-manager exit calls `finish()`; exceptional exit must not publish the
 snapshot. Readers never depend on writer-process memory.
 
-After initial publication, the record API is:
+After initial publication, open a writer lease and use the record API:
 
 ```python
+collection = throwdb.Collection.open(path, mode="r+")
 collection.insert(ids, embeddings)   # every ID must be absent
 collection.update(ids, embeddings)   # every ID must exist
 collection.upsert(ids, embeddings)   # explicit insert-or-replace
@@ -157,8 +160,10 @@ Mutation rules:
 - the default durability mode acknowledges only after the commit record is
   synced; a future explicit relaxed mode may acknowledge earlier.
 
-Each read captures one committed collection view at request start. Concurrent
-mutation or segment cleaning cannot make a single result mix old and new rows.
+Each handle currently captures one committed collection view when it opens; a
+read-write handle also sees its own later commits. Reopen a different process's
+already-open handle to observe later commits. Within a handle, each read
+resolves all IDs against one state, so it cannot mix rows across a commit.
 
 ## Mutation and segment-cleaning model
 
@@ -188,15 +193,15 @@ normal CRUD maintenance. The detailed contract is in `mutable-storage.md`.
 Format version is a storage contract, not a package version.
 
 - readers must reject unknown versions explicitly;
-- the format-v2 reader must continue to read valid format-v1 numeric/float16
-  snapshots;
-- new schema features are written only in v2 or later;
-- migration creates a new snapshot and never rewrites the only readable copy;
+- the legacy low-level reader remains available for existing benchmarks, but
+  the new `Collection` path need not open format-v1/v2 collections during the
+  experimental MVP;
+- source NumPy arrays are the supported migration path into native format 3;
+- migration creates a new collection and never rewrites the source arrays;
 - reserved fields and feature flags must be validated rather than silently
   interpreted.
 
-The exact format-v2 binary layout is a separate design step. This document fixes
-the semantics that layout must represent.
+The native mutable layout is documented in `native-format-v3.md`.
 
 ## Tuning contract
 

@@ -1,11 +1,13 @@
 # ThrowDB
 
-ThrowDB is a read-optimized, disk-backed store for fixed-width embeddings. The
-local snapshot engine supports arbitrary numeric IDs and bit-exact `float16`
-or `float32` NumPy matrices, with immutable shards on local NVMe and an
-in-memory immutable hash index.
+ThrowDB is a local, disk-backed store for fixed-width embeddings. The native
+collection engine supports arbitrary numeric IDs, bit-exact `float16` or
+`float32` NumPy matrices, immutable base segments on local NVMe, a fast flat
+in-memory index, and durable WAL-backed record CRUD.
 
-The implemented format-v1 contract is documented in
+The fresh mutable format is documented in
+[`docs/native-format-v3.md`](docs/native-format-v3.md). The earlier immutable
+format-v1 contract is documented in
 [`docs/storage-format.md`](docs/storage-format.md). The target local collection
 semantics and staged product plan are documented in
 [`docs/collection-contract.md`](docs/collection-contract.md) and
@@ -53,23 +55,27 @@ prefix = collection.get([42, 100], prefix_dimensions=128)
 
 output = np.empty((2, 128), dtype=np.float32)
 collection.get_into([42, 100], output, prefix_dimensions=128)
+
+with throwdb.Collection.open("/data/example", mode="r+") as collection:
+    collection.insert([200], vectors[:1])
+    collection.update([42], vectors[1:2])
+    collection.upsert([100, 300], vectors[:2])
+    deleted = collection.delete([200, 999])  # [True, False]
 ```
 
-New `float16` snapshots intentionally retain the byte-compatible format-v1
-layout, while `float32` snapshots use numeric format v2 with a shared 128-bit
-snapshot identity across manifest, index, and shards. Both are opened through
-the same API; `collection.format_version` makes the selected representation
-observable. UTF-8 IDs remain reserved for the future string index. Prefix reads
-are API-correct today but the dense-row backend still reads each complete row
-into a temporary before returning its prefix.
+`Collection.create()` now builds the fresh native numeric format reported as
+`collection.format_version == 3`. UTF-8 IDs remain reserved for the next string
+index slice. Prefix reads are API-correct today but the dense-row backend still
+reads each complete row into a temporary before returning its prefix.
 The initial `"auto"` tuning profile deliberately selects the conservative
 thread-pool baseline without running a calibration benchmark; the effective
 selection and reason are visible through `collection.tuning`.
 
-`Writer` and `Storage` are the lower-level zero-copy API. They require native,
-aligned, C-contiguous `uint64` IDs and embedding arrays whose dtype exactly
-matches the writer (`float16` or `float32`). Buffers pass directly to
-synchronous C++ calls:
+`Writer` and `Storage` remain the legacy immutable low-level API used by the
+existing benchmark suite. They require native, aligned, C-contiguous `uint64`
+IDs and embedding arrays whose dtype exactly matches the writer (`float16` or
+`float32`). They do not open the fresh mutable format; new applications should
+use `Collection`.
 
 ```python
 with throwdb.Writer.create(
@@ -85,17 +91,19 @@ The sequential `pread` baseline remains the default. Enable the bounded,
 per-storage parallel backend explicitly:
 
 ```python
-db = throwdb.Storage.open(
+db = throwdb.Collection.open(
     "/data/example",
-    io_workers=16,
-    io_queue_capacity=32,
-    io_ranges_per_task=8,
+    tuning={
+        "io_workers": 16,
+        "io_queue_capacity": 32,
+        "io_ranges_per_task": 8,
+    },
 )
 ```
 
-Multi-range requests from all simultaneous callers of this `Storage` share the
-same executor and queue, so their aggregate I/O concurrency is bounded rather
-than multiplied per request. A zero queue capacity with positive workers selects
+Multi-range requests from all simultaneous callers of one collection handle
+share the same executor and queue, so their aggregate I/O concurrency is
+bounded rather than multiplied per request. A zero queue capacity with positive workers selects
 `2 * workers`. Each executor task processes up to `io_ranges_per_task` physical
 ranges; grouping ranges reduces queue and wake-up overhead for page-cache hits.
 A request whose planner produces exactly one physical range uses a synchronous
@@ -107,11 +115,13 @@ An experimental Linux-only backend drives buffered reads through the raw
 io_uring kernel ABI and does not require `liburing`:
 
 ```python
-db = throwdb.Storage.open(
+db = throwdb.Collection.open(
     "/data/example",
-    io_backend="io_uring",
-    io_uring_workers=2,
-    io_uring_queue_depth=32,
+    tuning={
+        "io_backend": "io_uring",
+        "io_uring_workers": 2,
+        "io_uring_queue_depth": 32,
+    },
 )
 ```
 
@@ -162,15 +172,38 @@ dtype whose values are all non-negative. `embeddings.npy` must use `float16` or
 `float32` and have shape `(N, dimension)`. The CLI opens both with NumPy memory
 mapping, normalizes IDs safely, and sends them to C++ in bounded batches.
 
+After building a rebuildable test collection, exercise durable CRUD, reopen
+recovery, prefix reads, and the writer lease with a small reversible sample:
+
+```bash
+python benchmarks/run_mutable_test.py \
+  --store /data/example \
+  --ids ids.npy \
+  --source-embeddings embeddings.npy \
+  --sample-rows 64 \
+  --results benchmark-results/mutable-smoke.json
+```
+
+The command restores the sampled logical rows and removes synthetic IDs when it
+finishes normally, but the test transactions remain in WAL history. Do not run
+it on the only copy of data that cannot be rebuilt; `SIGKILL` or machine failure
+can interrupt cleanup.
+
 ## Current MVP boundaries
 
-- immutable create/open lifecycle;
+- atomic bulk creation followed by WAL-backed `insert`, `update`, `upsert`,
+  and tombstone `delete`;
 - local filesystem/NVMe only;
 - one `float16` or `float32` dtype and one fixed dimension per collection;
+- canonical `uint64` storage IDs, with safe Python normalization from all
+  standard signed/unsigned integer widths;
+- one read-write process lease; read-only and read-write handles are snapshots
+  captured when opened and must be reopened to observe another process's later
+  commits;
 - buffered `pread` and experimental Linux `io_uring` backends;
-- no public update/delete, segment-cleaning, payload-scrubbing, or network
-  service yet; the checked mutation/WAL primitives are not wired into the
-  collection API yet.
+- no WAL rotation/selective cleaning, UTF-8 IDs, payload scrubbing, or network
+  service yet. Until rotation lands, mutation history grows in `wal/active.wal`
+  and is replayed when the collection opens.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and
@@ -179,7 +212,7 @@ See [the storage format](docs/storage-format.md),
 benchmarks: they open `Storage` without enabling the internal executor. For a
 complete machine, correctness, sequential-read, and concurrent-reader run, edit
 the configuration at the top of `benchmarks/run_load_test.py` and execute it
-once. Its
+once. The runner auto-detects fresh native and legacy immutable manifests. Its
 `--cache-mode cold|warm|both` option uses per-file `POSIX_FADV_DONTNEED` for
 rootless paired cache measurements on Linux. Use `--io-ranges-per-task` to record
 and compare executor task granularity; see the benchmark plan for the remote

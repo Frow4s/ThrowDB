@@ -1,0 +1,548 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <exception>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "throwdb/errors.hpp"
+#include "throwdb/native_collection.hpp"
+
+namespace {
+
+class TempDirectory {
+public:
+    TempDirectory() {
+        static std::atomic<std::uint64_t> sequence{0};
+        const auto timestamp = std::chrono::steady_clock::now()
+                                   .time_since_epoch()
+                                   .count();
+        path_ = std::filesystem::temp_directory_path()
+                / ("throwdb-native-collection-test-"
+                   + std::to_string(timestamp) + "-"
+                   + std::to_string(sequence.fetch_add(1)));
+        std::filesystem::create_directories(path_);
+    }
+
+    ~TempDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path_, ignored);
+    }
+
+    TempDirectory(const TempDirectory&) = delete;
+    TempDirectory& operator=(const TempDirectory&) = delete;
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+[[noreturn]] void fail(const std::string& message) {
+    throw std::runtime_error(message);
+}
+
+void require(const bool condition, const std::string& message) {
+    if (!condition) {
+        fail(message);
+    }
+}
+
+template <typename Exception, typename Callback>
+void require_throws(Callback&& callback, const std::string& message) {
+    try {
+        std::forward<Callback>(callback)();
+    } catch (const Exception&) {
+        return;
+    } catch (const std::exception& error) {
+        fail(message + " (wrong exception: " + error.what() + ")");
+    } catch (...) {
+        fail(message + " (wrong non-standard exception)");
+    }
+    fail(message + " (no exception)");
+}
+
+[[nodiscard]] std::vector<std::byte> rows(
+    const std::size_t row_count,
+    const std::size_t record_size,
+    const std::uint8_t salt) {
+    std::vector<std::byte> result(row_count * record_size);
+    for (std::size_t row = 0; row != row_count; ++row) {
+        for (std::size_t column = 0; column != record_size; ++column) {
+            result[row * record_size + column] = static_cast<std::byte>(
+                salt + static_cast<std::uint8_t>(row * 29 + column * 7));
+        }
+    }
+    return result;
+}
+
+void require_equal(
+    const std::span<const std::byte> actual,
+    const std::span<const std::byte> expected,
+    const std::string& message) {
+    require(
+        actual.size() == expected.size()
+            && std::equal(actual.begin(), actual.end(), expected.begin()),
+        message);
+}
+
+void test_multisegment_crud_snapshot_and_reopen() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::uint64_t record_size = dimension * 2;
+    const std::array<std::uint64_t, 5> base_ids{10, 20, 30, 40, 50};
+    const std::vector<std::byte> base = rows(base_ids.size(), record_size, 3);
+
+    throwdb::NativeBuilderOptions options;
+    options.dimension = dimension;
+    options.dtype = throwdb::DType::Float16;
+    options.segment_size_bytes = 2 * record_size;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->append(
+        std::span(base_ids).first(3),
+        std::span(base).first(3 * record_size));
+    builder->append(
+        std::span(base_ids).subspan(3),
+        std::span(base).subspan(3 * record_size));
+    require(builder->count() == base_ids.size(), "builder count is wrong");
+    require(builder->format_version() == 3, "native public version is wrong");
+    builder->finish();
+
+    auto old_snapshot = throwdb::NativeCollection::open(store);
+    const std::array<std::uint64_t, 4> base_query{50, 10, 30, 10};
+    const std::vector<std::byte> base_output = old_snapshot->get_bytes(base_query);
+    std::vector<std::byte> expected_base;
+    for (const std::size_t row : {4U, 0U, 2U, 0U}) {
+        const auto source = std::span(base).subspan(row * record_size, record_size);
+        expected_base.insert(expected_base.end(), source.begin(), source.end());
+    }
+    require_equal(base_output, expected_base, "base lookup is not bit exact");
+
+    std::array<std::byte, 2 * record_size> untouched{};
+    untouched.fill(std::byte{0x5a});
+    const auto before = untouched;
+    const std::array<std::uint64_t, 2> missing_query{10, 999};
+    require_throws<throwdb::MissingIdError>(
+        [&] { old_snapshot->get_into(missing_query, untouched); },
+        "missing base ID was accepted");
+    require(untouched == before, "missing lookup modified caller output");
+
+    auto writer = throwdb::NativeCollection::open(store, {}, true);
+    require(writer->writable(), "read-write handle is not writable");
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(
+                throwdb::NativeCollection::open(store, {}, true));
+        },
+        "a second writer lease was acquired");
+
+    const std::array<std::uint64_t, 2> insert_ids{60, 70};
+    const std::vector<std::byte> inserted = rows(2, record_size, 71);
+    writer->insert(insert_ids, inserted);
+    require(writer->count() == 7, "insert did not increase count");
+
+    require_throws<throwdb::MissingIdError>(
+        [&] { static_cast<void>(old_snapshot->get_bytes(insert_ids)); },
+        "old snapshot observed a later commit");
+
+    const std::array<std::uint64_t, 2> update_ids{20, 40};
+    const std::vector<std::byte> updated = rows(2, record_size, 111);
+    writer->update(update_ids, updated);
+    require(writer->count() == 7, "update changed count");
+
+    const std::array<std::uint64_t, 2> upsert_ids{10, 80};
+    const std::vector<std::byte> upserted = rows(2, record_size, 151);
+    writer->upsert(upsert_ids, upserted);
+    require(writer->count() == 8, "upsert count is wrong");
+
+    const std::array<std::uint64_t, 3> delete_ids{30, 999, 70};
+    const std::vector<std::uint8_t> deleted = writer->erase(delete_ids);
+    require(
+        deleted == std::vector<std::uint8_t>({1, 0, 1}),
+        "delete existence results are wrong");
+    require(writer->count() == 6, "delete count is wrong");
+    require(
+        writer->erase(delete_ids) == std::vector<std::uint8_t>({0, 0, 0}),
+        "delete is not idempotent");
+
+    const std::array<std::uint64_t, 2> duplicate_ids{90, 90};
+    const std::vector<std::byte> duplicate_rows = rows(2, record_size, 191);
+    require_throws<throwdb::DuplicateIdError>(
+        [&] { writer->upsert(duplicate_ids, duplicate_rows); },
+        "duplicate upsert batch was accepted");
+    require(writer->count() == 6, "failed duplicate batch changed count");
+
+    const std::array<std::uint64_t, 2> existing_insert{90, 20};
+    require_throws<throwdb::ExistingIdError>(
+        [&] { writer->insert(existing_insert, duplicate_rows); },
+        "insert accepted an existing ID");
+    require_throws<throwdb::MissingIdError>(
+        [&] { static_cast<void>(writer->get_bytes(std::array<std::uint64_t, 1>{90})); },
+        "failed insert partially committed");
+
+    const std::array<std::uint64_t, 2> missing_update{20, 999};
+    require_throws<throwdb::MissingIdError>(
+        [&] { writer->update(missing_update, duplicate_rows); },
+        "update accepted a missing ID");
+    writer.reset();
+    old_snapshot.reset();
+
+    auto reopened = throwdb::NativeCollection::open(store);
+    require(reopened->count() == 6, "recovered count is wrong");
+    const std::array<std::uint64_t, 6> final_ids{80, 10, 60, 40, 20, 50};
+    const std::vector<std::byte> actual = reopened->get_bytes(final_ids);
+    std::vector<std::byte> expected;
+    const auto append_row = [&expected](
+                                const std::vector<std::byte>& source,
+                                const std::size_t row) {
+        const auto bytes = std::span(source).subspan(
+            row * record_size, record_size);
+        expected.insert(expected.end(), bytes.begin(), bytes.end());
+    };
+    append_row(upserted, 1);
+    append_row(upserted, 0);
+    append_row(inserted, 0);
+    append_row(updated, 1);
+    append_row(updated, 0);
+    append_row(base, 4);
+    require_equal(actual, expected, "reopened CRUD state is wrong");
+}
+
+void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 3;
+    constexpr std::uint64_t record_size = dimension * 4;
+
+    throwdb::NativeBuilderOptions options;
+    options.dimension = dimension;
+    options.dtype = throwdb::DType::Float32;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    const std::array<std::uint64_t, 1> base_id{1};
+    const std::vector<std::byte> base = rows(1, record_size, 17);
+    builder->append(base_id, base);
+    builder->finish();
+
+    {
+        auto writer = throwdb::NativeCollection::open(store, {}, true);
+        const std::array<std::uint64_t, 1> inserted_id{2};
+        const std::vector<std::byte> inserted = rows(1, record_size, 99);
+        writer->insert(inserted_id, inserted);
+    }
+
+    const auto wal = store / "wal" / "active.wal";
+    const auto committed_size = std::filesystem::file_size(wal);
+    {
+        std::ofstream stream(wal, std::ios::binary | std::ios::app);
+        const std::array<char, 13> torn_tail{
+            't', 'o', 'r', 'n', '-', 'w', 'a', 'l', '-', 't', 'a', 'i', 'l'};
+        stream.write(torn_tail.data(), torn_tail.size());
+        if (!stream) {
+            fail("cannot append synthetic WAL tail");
+        }
+    }
+    require(
+        std::filesystem::file_size(wal) == committed_size + 13,
+        "synthetic WAL tail was not appended");
+
+    {
+        auto reader = throwdb::NativeCollection::open(store);
+        require(reader->count() == 2, "reader did not ignore active WAL tail");
+        require(
+            std::filesystem::file_size(wal) == committed_size + 13,
+            "read-only open unexpectedly repaired WAL");
+    }
+    {
+        auto writer = throwdb::NativeCollection::open(store, {}, true);
+        require(writer->count() == 2, "writer recovery lost committed state");
+        require(
+            std::filesystem::file_size(wal) == committed_size,
+            "writer did not truncate ignored active WAL tail");
+    }
+}
+
+void test_empty_collection_and_empty_batches() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->append({}, {});
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store, {}, true);
+    collection->insert({}, {});
+    collection->update({}, {});
+    collection->upsert({}, {});
+    require(collection->erase({}).empty(), "empty delete result is not empty");
+    require(collection->get_bytes({}).empty(), "empty get result is not empty");
+    require(collection->count() == 0, "empty batches changed count");
+}
+
+void test_read_only_open_does_not_require_writable_lock_metadata() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->finish();
+
+    const auto locks = store / "locks";
+    const auto writer_lock = locks / "writer.lock";
+    const auto commit_lock = locks / "commit.lock";
+    require(::chmod(writer_lock.c_str(), 0444) == 0, "cannot chmod writer lock");
+    require(::chmod(commit_lock.c_str(), 0444) == 0, "cannot chmod commit lock");
+    require(::chmod(locks.c_str(), 0555) == 0, "cannot chmod lock directory");
+    {
+        auto reader = throwdb::NativeCollection::open(store);
+        require(reader->count() == 0, "read-only metadata open changed state");
+    }
+    require(::chmod(locks.c_str(), 0755) == 0, "cannot restore lock directory");
+    require(::chmod(writer_lock.c_str(), 0644) == 0, "cannot restore writer lock");
+    require(::chmod(commit_lock.c_str(), 0644) == 0, "cannot restore commit lock");
+
+    require(std::filesystem::remove(writer_lock), "cannot remove writer lock");
+    require_throws<throwdb::StorageError>(
+        [&] { static_cast<void>(throwdb::NativeCollection::open(store)); },
+        "open recreated a missing lock file");
+    require(
+        !std::filesystem::exists(writer_lock),
+        "read-only open recreated missing metadata");
+
+    const auto second_store = temporary.path() / "non-regular";
+    auto second_builder =
+        throwdb::NativeCollectionBuilder::create(second_store, options);
+    second_builder->finish();
+    const auto second_writer_lock = second_store / "locks" / "writer.lock";
+    require(
+        std::filesystem::remove(second_writer_lock),
+        "cannot remove second writer lock");
+    require(
+        std::filesystem::create_directory(second_writer_lock),
+        "cannot replace lock with a directory");
+    require_throws<throwdb::StorageError>(
+        [&] { static_cast<void>(throwdb::NativeCollection::open(second_store)); },
+        "open accepted a non-regular lock path");
+}
+
+void test_forked_builder_and_writer_handles_are_rejected() {
+    TempDirectory temporary;
+    constexpr std::uint32_t dimension = 2;
+    constexpr std::uint64_t record_size = dimension * 2;
+
+    const auto builder_store = temporary.path() / "builder";
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.dimension = dimension;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        builder_store, builder_options);
+    const std::array<std::uint64_t, 1> builder_id{41};
+    const std::vector<std::byte> builder_row = rows(1, record_size, 7);
+
+    pid_t child = ::fork();
+    require(child >= 0, "fork failed for builder regression");
+    if (child == 0) {
+        int result = 10;
+        try {
+            builder->append(builder_id, builder_row);
+        } catch (const throwdb::StorageError& error) {
+            result = std::string(error.what()).find("fork") != std::string::npos
+                ? 0
+                : 11;
+        } catch (...) {
+            result = 12;
+        }
+        builder.reset();
+        ::_exit(result);
+    }
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    require(
+        waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+        "forked builder was not rejected or did not tear down safely");
+    builder->append(builder_id, builder_row);
+    builder->finish();
+
+    const auto store = temporary.path() / "writer";
+    auto finished_builder =
+        throwdb::NativeCollectionBuilder::create(store, builder_options);
+    finished_builder->finish();
+    throwdb::ReaderOptions reader_options;
+    reader_options.io_workers = 2;
+    auto writer = throwdb::NativeCollection::open(
+        store, reader_options, true);
+    const std::array<std::uint64_t, 1> child_id{2};
+    const std::array<std::uint64_t, 1> parent_id{3};
+    const std::vector<std::byte> child_row = rows(1, record_size, 31);
+    const std::vector<std::byte> parent_row = rows(1, record_size, 63);
+
+    int child_ready[2]{};
+    int child_release[2]{};
+    require(::pipe(child_ready) == 0, "cannot create child-ready pipe");
+    require(::pipe(child_release) == 0, "cannot create child-release pipe");
+    child = ::fork();
+    require(child >= 0, "fork failed for writer regression");
+    if (child == 0) {
+        static_cast<void>(::close(child_ready[0]));
+        static_cast<void>(::close(child_release[1]));
+        int result = 20;
+        try {
+            writer->insert(child_id, child_row);
+        } catch (const throwdb::StorageError& error) {
+            result = std::string(error.what()).find("fork") != std::string::npos
+                ? 0
+                : 21;
+        } catch (...) {
+            result = 22;
+        }
+        // This used to risk unlocking the parent's shared flock description
+        // and destroying inherited joinable std::thread objects.
+        writer.reset();
+        const char ready = 'R';
+        if (::write(child_ready[1], &ready, 1) != 1) {
+            result = 23;
+        }
+        char release = 0;
+        if (::read(child_release[0], &release, 1) != 1 || release != 'X') {
+            result = 24;
+        }
+        static_cast<void>(::close(child_ready[1]));
+        static_cast<void>(::close(child_release[0]));
+        ::_exit(result);
+    }
+    static_cast<void>(::close(child_ready[1]));
+    static_cast<void>(::close(child_release[0]));
+    char ready = 0;
+    const bool child_closed_handle =
+        ::read(child_ready[0], &ready, 1) == 1 && ready == 'R';
+
+    bool parent_lease_preserved = false;
+    bool successor_opened_while_child_alive = false;
+    std::exception_ptr parent_error;
+    try {
+        try {
+            static_cast<void>(
+                throwdb::NativeCollection::open(store, {}, true));
+        } catch (const throwdb::StorageError&) {
+            parent_lease_preserved = true;
+        }
+        writer->insert(parent_id, parent_row);
+        writer.reset();
+
+        // The child is deliberately still alive. Its close must have dropped
+        // inherited fd references so it cannot prolong the parent's lease.
+        auto successor = throwdb::NativeCollection::open(store, {}, true);
+        successor_opened_while_child_alive = true;
+        successor.reset();
+    } catch (...) {
+        parent_error = std::current_exception();
+    }
+
+    if (child_closed_handle) {
+        const char release = 'X';
+        static_cast<void>(::write(child_release[1], &release, 1));
+    }
+    static_cast<void>(::close(child_ready[0]));
+    static_cast<void>(::close(child_release[1]));
+    status = 0;
+    waited = -1;
+    do {
+        waited = ::waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (parent_error != nullptr) {
+        std::rethrow_exception(parent_error);
+    }
+    require(child_closed_handle, "forked child did not close its handle");
+    require(
+        waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+        "forked writer was not rejected or did not tear down safely");
+    require(
+        parent_lease_preserved,
+        "child teardown released the still-open parent's writer lease");
+    require(
+        successor_opened_while_child_alive,
+        "closed child handle retained the writer lease until child exit");
+
+    auto reopened = throwdb::NativeCollection::open(store);
+    require(reopened->count() == 1, "fork regression changed committed count");
+    require_equal(
+        reopened->get_bytes(parent_id), parent_row,
+        "parent commit did not survive fork regression");
+    require_throws<throwdb::MissingIdError>(
+        [&] { static_cast<void>(reopened->get_bytes(child_id)); },
+        "rejected child mutation reached the WAL");
+}
+
+void test_native_open_rejects_big_endian_hosts() {
+    if constexpr (std::endian::native != std::endian::little) {
+        require_throws<throwdb::InvalidArgumentError>(
+            [] {
+                static_cast<void>(throwdb::NativeCollection::open(
+                    "/path-does-not-matter-on-big-endian"));
+            },
+            "native collection open accepted a big-endian host");
+    }
+}
+
+}  // namespace
+
+int main() {
+    struct TestCase {
+        const char* name;
+        void (*callback)();
+    };
+    const std::array tests{
+        TestCase{
+            "multisegment_crud_snapshot_and_reopen",
+            test_multisegment_crud_snapshot_and_reopen},
+        TestCase{
+            "active_wal_tail_is_ignored_and_writer_repairs_it",
+            test_active_wal_tail_is_ignored_and_writer_repairs_it},
+        TestCase{
+            "empty_collection_and_empty_batches",
+            test_empty_collection_and_empty_batches},
+        TestCase{
+            "read_only_open_does_not_require_writable_lock_metadata",
+            test_read_only_open_does_not_require_writable_lock_metadata},
+        TestCase{
+            "forked_builder_and_writer_handles_are_rejected",
+            test_forked_builder_and_writer_handles_are_rejected},
+        TestCase{
+            "native_open_rejects_big_endian_hosts",
+            test_native_open_rejects_big_endian_hosts},
+    };
+
+    std::size_t passed = 0;
+    for (const TestCase& test : tests) {
+        try {
+            test.callback();
+            ++passed;
+            std::cout << "[PASS] " << test.name << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << "[FAIL] " << test.name << ": " << error.what()
+                      << '\n';
+            return 1;
+        }
+    }
+    std::cout << passed << " native-collection tests passed\n";
+    return 0;
+}

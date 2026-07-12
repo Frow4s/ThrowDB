@@ -1,11 +1,13 @@
 # ThrowDB product roadmap
 
-The current implementation is a performance and correctness proof for local,
-immutable numeric-ID collections with arbitrary fixed dimension and
-float16/float32 rows, plus internal mutation/WAL foundations. The next work
-turns that proof into an extensible mutable collection engine. Device-specific
-settings such as two io_uring rings at total QD32 remain measured profiles, not
-product architecture.
+The current implementation is a testable local mutable engine for numeric-ID
+collections with arbitrary fixed dimension and float16/float32 rows. It has a
+fresh segmented base format, a flat RowRef index, checksummed WAL recovery,
+atomic batch CRUD, one writer lease, Python bindings, and the existing
+pread/io_uring readers. The remaining local-library work is WAL rotation,
+selective cleaning, UTF-8 IDs, direct prefix I/O, and adaptive scheduling.
+Device-specific settings such as two io_uring rings at total QD32 remain
+measured profiles, not product architecture.
 
 ## Architectural layers
 
@@ -37,21 +39,25 @@ collection on local NVMe.
 
 ## Stage 1: local collection library
 
-Deliver a stable Python wrapper over the C++ engine:
+Deliver a stable Python wrapper over the C++ engine. Implemented and remaining
+Stage 1 slices are called out inline:
 
 - versioned collection schema;
 - arbitrary dimension;
 - `float16` and `float32`, followed by `bfloat16`;
-- canonical unsigned-integer and byte-exact UTF-8 ID domains;
+- canonical unsigned-integer domain; byte-exact UTF-8 remains next;
 - safe Python normalization from `uint8/16/32/64`, non-negative
   `int8/16/32/64`, and Python integers;
 - immutable snapshot construction and atomic publication;
 - atomic insert, update, upsert, and tombstone delete batches;
-- checksummed WAL/delta recovery, one writer lease, and selective segment
-  cleaning;
+- checksummed WAL recovery and one writer lease; WAL rotation and selective
+  segment cleaning remain next;
 - `get`, `get_into`, and prefix-dimension reads;
-- manual and automatic tuning configuration;
-- backward reading of format-v1 collections.
+- manual tuning and an observable conservative `auto` profile; calibrated and
+  request-adaptive tuning remain next;
+- explicit source-array rebuild into the fresh format during the experimental
+  MVP; backward reading remains available only through the legacy low-level
+  API.
 
 The scheduler and backend interfaces are introduced during this stage so the
 public API does not depend on `pread`, thread pools, or io_uring.

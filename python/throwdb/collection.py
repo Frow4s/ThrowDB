@@ -11,7 +11,7 @@ from typing import Final
 
 import numpy as np
 
-from ._throwdb import Storage, Writer
+from ._throwdb import NativeCollection, NativeCollectionBuilder
 
 
 _UINT32_MAX: Final = (1 << 32) - 1
@@ -227,6 +227,20 @@ def _validate_prefix_dimensions(value: object, dimension: int) -> int:
     return prefix
 
 
+def _validate_shard_size_bytes(value: object) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("shard_size_bytes must be an integer, not bool")
+    try:
+        size = operator.index(value)
+    except TypeError as error:
+        raise TypeError("shard_size_bytes must be an integer") from error
+    if not 1 <= size <= _UINT64_MAX:
+        raise ValueError(
+            "shard_size_bytes must be between 1 and 2**64-1"
+        )
+    return size
+
+
 def _validate_output(
     output: object,
     *,
@@ -319,23 +333,29 @@ class Collection:
         self,
         *,
         schema: CollectionSchema,
-        writer: Writer | None = None,
-        storage: Storage | None = None,
+        builder: NativeCollectionBuilder | None = None,
+        native: NativeCollection | None = None,
+        access_mode: str | None = None,
         tuning_profile: Mapping[str, object] | None = None,
     ) -> None:
-        if (writer is None) == (storage is None):
+        if (builder is None) == (native is None):
             raise RuntimeError("collection must wrap exactly one native handle")
+        if builder is not None and access_mode is not None:
+            raise RuntimeError("a collection builder cannot have an open mode")
+        if native is not None and access_mode not in {"r", "r+"}:
+            raise RuntimeError("an opened collection must have mode 'r' or 'r+'")
         self._schema = schema
-        self._writer = writer
-        self._storage = storage
-        self._state = "building" if writer is not None else "readable"
-        if writer is not None:
-            self._count = writer.count
-            self._format_version = writer.format_version
+        self._builder = builder
+        self._native = native
+        self._access_mode = access_mode
+        self._state = "building" if builder is not None else "open"
+        if builder is not None:
+            self._count = builder.count
+            self._format_version = builder.format_version
         else:
-            assert storage is not None
-            self._count = storage.count
-            self._format_version = storage.format_version
+            assert native is not None
+            self._count = 0
+            self._format_version = native.format_version
         self._tuning = dict(tuning_profile) if tuning_profile is not None else None
 
     @classmethod
@@ -352,31 +372,42 @@ class Collection:
             raise TypeError("schema must be a CollectionSchema")
         if schema.id_type != "uint64":
             raise NotImplementedError(
-                "utf8 IDs require the future format-v2 string index"
+                "utf8 IDs are not implemented by the numeric collection format"
             )
-        writer = Writer.create(
+        validated_shard_size = _validate_shard_size_bytes(shard_size_bytes)
+        builder = NativeCollectionBuilder.create(
             path,
             dimension=schema.dimension,
-            shard_size_bytes=shard_size_bytes,
+            shard_size_bytes=validated_shard_size,
             dtype=schema.dtype,
         )
-        return cls(schema=schema, writer=writer)
+        return cls(schema=schema, builder=builder)
 
     @classmethod
     def open(
         cls,
         path: str | bytes | PathLike[str] | PathLike[bytes],
         *,
+        mode: str = "r",
         tuning: str | Mapping[str, object] = "auto",
     ) -> Collection:
+        if not isinstance(mode, str):
+            raise TypeError("mode must be a string")
+        if mode not in {"r", "r+"}:
+            raise ValueError("mode must be 'r' or 'r+'")
         options, profile = _resolve_tuning(tuning)
-        storage = Storage.open(path, **options)
+        native = NativeCollection.open(path, mode=mode, **options)
         schema = CollectionSchema(
             id_type="uint64",
-            dimension=storage.dimension,
-            dtype=storage.dtype,
+            dimension=native.dimension,
+            dtype=native.dtype,
         )
-        return cls(schema=schema, storage=storage, tuning_profile=profile)
+        return cls(
+            schema=schema,
+            native=native,
+            access_mode=mode,
+            tuning_profile=profile,
+        )
 
     @property
     def schema(self) -> CollectionSchema:
@@ -396,6 +427,8 @@ class Collection:
 
     @property
     def count(self) -> int:
+        if self._native is not None:
+            return self._ensure_native_open("count").count
         return self._count
 
     @property
@@ -404,7 +437,9 @@ class Collection:
 
     @property
     def mode(self) -> str:
-        return "write" if self._writer is not None else "read"
+        if self._builder is not None:
+            return "write"
+        return "read_write" if self._access_mode == "r+" else "read"
 
     @property
     def tuning(self) -> dict[str, object] | None:
@@ -412,17 +447,30 @@ class Collection:
 
         return None if self._tuning is None else dict(self._tuning)
 
-    def _ensure_builder_open(self) -> Writer:
-        if self._writer is None:
+    def _ensure_builder_open(self) -> NativeCollectionBuilder:
+        if self._builder is None:
             raise RuntimeError("add is only available on a collection builder")
         if self._state != "building":
             raise RuntimeError(f"collection builder is already {self._state}")
-        return self._writer
+        return self._builder
 
-    def _ensure_reader(self) -> Storage:
-        if self._storage is None:
+    def _ensure_native_open(self, operation: str) -> NativeCollection:
+        if self._native is None:
             raise RuntimeError("get is only available on an opened collection reader")
-        return self._storage
+        if self._state != "open":
+            raise RuntimeError(f"cannot {operation}: collection is closed")
+        return self._native
+
+    def _ensure_reader(self) -> NativeCollection:
+        return self._ensure_native_open("read")
+
+    def _ensure_mutable(self, operation: str) -> NativeCollection:
+        native = self._ensure_native_open(operation)
+        if self._access_mode != "r+":
+            raise RuntimeError(
+                f"{operation} requires Collection.open(..., mode='r+')"
+            )
+        return native
 
     def add(self, ids: object, embeddings: object) -> None:
         writer = self._ensure_builder_open()
@@ -442,27 +490,83 @@ class Collection:
         self._count = writer.count
 
     def finish(self) -> None:
-        if self._writer is None:
+        if self._builder is None:
             raise RuntimeError("finish is only available on a collection builder")
         if self._state == "finished":
             return
         if self._state != "building":
             raise RuntimeError(f"collection builder is already {self._state}")
         try:
-            self._writer.finish()
+            self._builder.finish()
         except BaseException:
             self.abort()
             raise
         self._state = "finished"
-        self._count = self._writer.count
+        self._count = self._builder.count
 
     def abort(self) -> None:
-        if self._writer is None:
+        if self._builder is None:
             raise RuntimeError("abort is only available on a collection builder")
         if self._state in {"finished", "aborted"}:
             return
-        self._writer.abort()
+        self._builder.abort()
         self._state = "aborted"
+
+    def close(self) -> None:
+        """Close an opened collection or abort an unfinished builder."""
+
+        if self._builder is not None:
+            if self._state == "building":
+                self.abort()
+            return
+        if self._state == "closed":
+            return
+        assert self._native is not None
+        try:
+            self._native.close()
+        finally:
+            self._state = "closed"
+
+    def _put(self, operation: str, ids: object, embeddings: object) -> None:
+        native = self._ensure_mutable(operation)
+        normalized_ids = _normalize_numeric_ids(ids)
+        normalized_embeddings = _normalize_embeddings(
+            embeddings,
+            expected_rows=len(normalized_ids),
+            schema=self._schema,
+        )
+        if normalized_ids.size == 0:
+            return
+        getattr(native, operation)(normalized_ids, normalized_embeddings)
+
+    def insert(self, ids: object, embeddings: object) -> None:
+        """Insert a batch whose IDs must all be absent."""
+
+        self._put("insert", ids, embeddings)
+
+    def update(self, ids: object, embeddings: object) -> None:
+        """Replace a batch whose IDs must all already exist."""
+
+        self._put("update", ids, embeddings)
+
+    def upsert(self, ids: object, embeddings: object) -> None:
+        """Insert absent IDs and replace existing IDs atomically."""
+
+        self._put("upsert", ids, embeddings)
+
+    def delete(self, ids: object) -> np.ndarray:
+        """Delete IDs and return one boolean existence result per input ID."""
+
+        native = self._ensure_mutable("delete")
+        normalized_ids = _normalize_numeric_ids(ids)
+        if normalized_ids.size == 0:
+            return np.empty(0, dtype=np.bool_)
+        deleted = native.delete(normalized_ids)
+        if not isinstance(deleted, np.ndarray):
+            raise RuntimeError("native delete returned a non-NumPy result")
+        if deleted.dtype != np.dtype(np.bool_) or deleted.shape != normalized_ids.shape:
+            raise RuntimeError("native delete returned an invalid result array")
+        return deleted
 
     def get(
         self,
@@ -506,8 +610,10 @@ class Collection:
         np.copyto(validated_output, full[:, :prefix], casting="no")
 
     def __enter__(self) -> Collection:
-        if self._writer is not None:
+        if self._builder is not None:
             self._ensure_builder_open()
+        else:
+            self._ensure_native_open("enter")
         return self
 
     def __exit__(
@@ -517,11 +623,13 @@ class Collection:
         traceback: TracebackType | None,
     ) -> bool:
         del exc_value, traceback
-        if self._writer is not None:
+        if self._builder is not None:
             if exc_type is None and self._state == "building":
                 self.finish()
             elif exc_type is not None:
                 self.abort()
+        else:
+            self.close()
         return False
 
 

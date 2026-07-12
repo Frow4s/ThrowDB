@@ -1,9 +1,10 @@
 # MVP verification and benchmark plan
 
-The MVP is considered correct only when the same immutable store can be closed,
-reopened, and queried without relying on writer process state. Tests use small
-dimensions and shard sizes, but exercise the same format and address arithmetic
-as a production `float16[1024]` store.
+The MVP is considered correct only when the same published collection can be
+closed, reopened, queried, mutated, recovered, and restored without relying on
+writer process state. Tests use small dimensions and segment sizes, but
+exercise the same format, WAL framing, and address arithmetic as a production
+`float16[1024]` store.
 
 ## io_uring environment probe
 
@@ -33,9 +34,14 @@ container policy must be changed before an io_uring backend can be tested.
 | Output buffer | Wrong dtype, shape, or non-contiguous output | `get_into` fails before I/O |
 | Lifecycle | Explicit `finish` and successful context-manager exit | Store is published and reopenable |
 | Lifecycle | Exception inside writer context | No readable store is published |
+| CRUD atomicity | Mixed valid/invalid insert or update batch | Complete batch fails with no logical change |
+| WAL recovery | Committed PUT/DELETE batches followed by reopen | Exact latest rows and count are restored |
+| Torn active WAL | Incomplete final append | Read ignores it; next writer truncates and syncs it |
+| Writer lease | Two read-write opens | Exactly one succeeds; readers remain allowed |
+| Process boundary | Reuse a builder or handle after `fork()` | Child operation is rejected and cannot release the parent's lease |
 | Corruption | Truncated shard, index, or manifest | Open or first affected read fails loudly |
 | Format compatibility | New writer emits v1 manifest, index, and every shard at the documented offsets | Existing v1 wire representation stays unchanged |
-| Version dispatch | Manifest, shard, index, or staging advertises v2/unknown version before implementation | Reader rejects it before interpreting v1-specific fields |
+| Version dispatch | Manifest, segment/shard, index, or WAL advertises an unknown version | Reader rejects it before interpreting version-specific fields |
 | Internal I/O | `io_workers` 0, 1, 2, 4, and 8 with a bounded queue | Results remain bit-exact across shards |
 | Chunked I/O | `io_ranges_per_task` 1, 4, 8, and 16, including batches smaller than a task | Results remain bit-exact at every partition boundary |
 | Shared reader | Simultaneous `get` calls on one `Storage` instance | Calls complete without cross-request corruption |
@@ -71,7 +77,7 @@ For meaningful cold-cache numbers, use an isolated host and an agreed cache
 eviction procedure. Running immediately after database construction measures
 the page cache rather than NVMe random-read behavior.
 
-The Python benchmark consumes the original `ids.npy` directly:
+The legacy Python benchmark consumes the original `ids.npy` directly:
 
 ```bash
 python benchmarks/random_read.py \
@@ -89,11 +95,25 @@ python -c 'import numpy as np; np.load("ids.npy").tofile("ids.u64")'
 ./build/throwdb_bench /nvme/store ids.u64 1024 100 20260711
 ```
 
-Both legacy runners are sequential `pread` baselines: they open `Storage` with
+Both runners above are legacy sequential `pread` baselines: they open `Storage` with
 zero internal I/O workers. They sample only known IDs before timing and reuse an
 allocated output buffer. They measure client-visible latency and useful
 throughput; neither claims to measure physical bytes read. Use
-`run_load_test.py` for executor, chunk-size, and concurrent-reader comparisons.
+`run_load_test.py` for executor, chunk-size, and concurrent-reader comparisons;
+it auto-detects both fresh native and legacy immutable manifests.
+
+Before a large read run, exercise the native mutation path on a rebuildable
+collection. Normal completion restores the sampled logical data, although the
+test transactions remain in WAL history:
+
+```bash
+python benchmarks/run_mutable_test.py \
+  --store /nvme/store \
+  --ids /datasets/ids.npy \
+  --source-embeddings /datasets/embeddings.npy \
+  --sample-rows 64 \
+  --results benchmark-results/mutable-smoke.json
+```
 
 ## Internal I/O workers versus reader concurrency
 

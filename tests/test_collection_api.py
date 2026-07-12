@@ -61,7 +61,7 @@ def _create_collection(
 
 def _assert_store_is_unreadable(path: Path) -> None:
     with pytest.raises((OSError, RuntimeError, ValueError)):
-        throwdb.Storage.open(path)
+        throwdb.Collection.open(path)
 
 
 @pytest.mark.parametrize("id_dtype", _INTEGER_DTYPES, ids=lambda dtype: dtype.__name__)
@@ -223,7 +223,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         assert builder.schema is schema
         assert builder.id_type == "uint64"
         assert builder.dtype == "float16"
-        assert builder.format_version == 1
+        assert builder.format_version == 3
         assert builder.dimension == schema.dimension
         assert builder.count == 0
         assert builder.tuning is None
@@ -237,7 +237,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert collection.schema == schema
     assert collection.id_type == "uint64"
     assert collection.dtype == "float16"
-    assert collection.format_version == 1
+    assert collection.format_version == 3
     assert collection.dimension == schema.dimension
     assert collection.count == ids.size
 
@@ -509,13 +509,38 @@ def test_collection_schema_rejects_invalid_values(
 def test_current_writer_reports_future_id_schema_features_explicitly(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="utf8.*format-v2"):
+    with pytest.raises(NotImplementedError, match="utf8.*not implemented"):
         throwdb.Collection.create(
             tmp_path / "utf8",
             schema=throwdb.CollectionSchema(id_type="utf8", dimension=4),
         )
     with pytest.raises(TypeError, match="CollectionSchema"):
         throwdb.Collection.create(tmp_path / "invalid", schema=object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("shard_size_bytes", "error", "message"),
+    [
+        (True, TypeError, "not bool"),
+        (np.bool_(False), TypeError, "not bool"),
+        (1.5, TypeError, "must be an integer"),
+        (0, ValueError, "between 1"),
+        (-1, ValueError, "between 1"),
+        (1 << 64, ValueError, "between 1"),
+    ],
+)
+def test_collection_create_validates_shard_size_before_native_open(
+    tmp_path: Path,
+    shard_size_bytes: object,
+    error: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error, match=message):
+        throwdb.Collection.create(
+            tmp_path / "invalid-shard-size",
+            schema=throwdb.CollectionSchema(dimension=4),
+            shard_size_bytes=shard_size_bytes,  # type: ignore[arg-type]
+        )
 
 
 def test_auto_and_manual_tuning_profiles_are_observable_and_defensive(
@@ -609,7 +634,14 @@ def test_native_api_remains_strict_while_collection_normalizes_ids(
     collection = throwdb.Collection.open(path)
     _assert_same_bits(collection.get(ids), vectors)
 
-    native_storage = throwdb.Storage.open(path)
+    native_path = tmp_path / "native-storage"
+    with throwdb.Writer.create(
+        native_path,
+        dimension=3,
+        shard_size_bytes=1 << 20,
+    ) as native_builder:
+        native_builder.add(ids.astype(np.uint64), vectors)
+    native_storage = throwdb.Storage.open(native_path)
     with pytest.raises(ValueError, match="uint64"):
         native_storage.get(ids)
 

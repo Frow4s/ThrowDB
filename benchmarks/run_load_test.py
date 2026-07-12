@@ -7,7 +7,7 @@ Edit the CONFIGURATION section below, then run:
 
 Command-line flags can override the paths without editing this file. The script
 never drops the system-wide Linux page cache and does not require root
-privileges; cold mode advises only ThrowDB shard pages as no longer needed.
+privileges; cold mode advises only ThrowDB data pages as no longer needed.
 """
 
 from __future__ import annotations
@@ -71,6 +71,12 @@ IO_URING_WORKERS = 1
 MAX_IO_URING_WORKERS = 64
 IO_URING_QUEUE_DEPTH = 32
 MAX_IO_URING_QUEUE_DEPTH = 4096
+ID_VALIDATION_CHUNK_ROWS = 1 << 20
+
+LEGACY_MANIFEST_MAGIC = b"THROWDBM"
+NATIVE_MANIFEST_MAGIC = b"TDBNMNF1"
+LEGACY_STORE_FORMAT = "legacy_immutable"
+NATIVE_STORE_FORMAT = "native_mutable"
 
 
 @dataclass(frozen=True)
@@ -302,6 +308,72 @@ def directory_size(path: Path) -> int:
     return total
 
 
+def detect_store_format(store_path: Path) -> str:
+    """Identify the on-disk format without asking either reader to parse it."""
+
+    manifest_path = store_path / "manifest.bin"
+    try:
+        with manifest_path.open("rb") as manifest:
+            magic = manifest.read(8)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"storage manifest does not exist: {manifest_path}"
+        ) from error
+    if magic == LEGACY_MANIFEST_MAGIC:
+        return LEGACY_STORE_FORMAT
+    if magic == NATIVE_MANIFEST_MAGIC:
+        return NATIVE_STORE_FORMAT
+    if len(magic) != 8:
+        raise ValueError(
+            f"storage manifest is truncated: {manifest_path} "
+            f"contains only {len(magic)} magic bytes"
+        )
+    raise ValueError(
+        f"unsupported storage manifest magic {magic!r}: {manifest_path}"
+    )
+
+
+def open_benchmark_storage(
+    store_path: Path,
+    *,
+    io_workers: int,
+    io_queue_capacity: int,
+    io_ranges_per_task: int,
+    io_backend: str,
+    io_uring_workers: int,
+    io_uring_queue_depth: int,
+) -> tuple[Any, str]:
+    """Open either format through its supported public Python interface."""
+
+    store_format = detect_store_format(store_path)
+    tuning = {
+        "io_workers": io_workers,
+        "io_queue_capacity": io_queue_capacity,
+        "io_ranges_per_task": io_ranges_per_task,
+        "io_backend": io_backend,
+        "io_uring_workers": io_uring_workers,
+        "io_uring_queue_depth": io_uring_queue_depth,
+    }
+    if store_format == NATIVE_STORE_FORMAT:
+        return (
+            throwdb.Collection.open(
+                store_path,
+                mode="r",
+                tuning=tuning,
+            ),
+            store_format,
+        )
+    return throwdb.Storage.open(store_path, **tuning), store_format
+
+
+def close_benchmark_storage(storage: Any) -> None:
+    """Close handles which expose an explicit close operation."""
+
+    close = getattr(storage, "close", None)
+    if callable(close):
+        close()
+
+
 def atomic_json_dump(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as output:
@@ -503,10 +575,13 @@ class ProcDiskstatsMonitor:
 
 def load_ids(path: Path, expected_count: int) -> np.ndarray:
     ids = np.load(path, mmap_mode="r", allow_pickle=False)
-    if ids.dtype != np.dtype(np.uint64):
-        raise ValueError(f"IDs must have dtype uint64, got {ids.dtype}")
     if ids.ndim != 1:
         raise ValueError(f"IDs must have shape (N,), got {ids.shape}")
+    if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {1, 2, 4, 8}:
+        raise ValueError(
+            "IDs must have an 8-, 16-, 32-, or 64-bit integer dtype, "
+            f"got {ids.dtype}"
+        )
     if not ids.flags.c_contiguous:
         raise ValueError("IDs must be C-contiguous")
     if len(ids) != expected_count:
@@ -515,6 +590,15 @@ def load_ids(path: Path, expected_count: int) -> np.ndarray:
         )
     if len(ids) == 0:
         raise ValueError("The benchmark requires a non-empty store")
+    if ids.dtype.kind == "i":
+        for begin in range(0, len(ids), ID_VALIDATION_CHUNK_ROWS):
+            chunk = ids[begin : begin + ID_VALIDATION_CHUNK_ROWS]
+            negative = chunk < 0
+            if bool(negative.any()):
+                position = begin + int(np.flatnonzero(negative)[0])
+                raise ValueError(
+                    f"IDs must be nonnegative; ids[{position}]={int(ids[position])}"
+                )
     return ids
 
 
@@ -523,22 +607,25 @@ def open_source_embeddings(
     kind: str,
     count: int,
     dimension: int,
+    dtype: str,
 ) -> np.ndarray:
+    expected_dtype = np.dtype(dtype)
     if kind == "npy":
         embeddings = np.load(path, mmap_mode="r", allow_pickle=False)
     elif kind == "raw":
         embeddings = np.memmap(
             path,
             mode="r",
-            dtype=np.float16,
+            dtype=expected_dtype,
             shape=(count, dimension),
             order="C",
         )
     else:
         raise ValueError("EMBEDDINGS_KIND must be 'npy' or 'raw'")
-    if embeddings.dtype != np.dtype(np.float16):
+    if embeddings.dtype != expected_dtype:
         raise ValueError(
-            f"source embeddings must have dtype float16, got {embeddings.dtype}"
+            f"source embeddings must have dtype {expected_dtype.name}, "
+            f"got {embeddings.dtype}"
         )
     if embeddings.shape != (count, dimension):
         raise ValueError(
@@ -564,18 +651,29 @@ def correctness_check(
         source_kind,
         storage.count,
         storage.dimension,
+        storage.dtype,
     )
     rows = min(CORRECTNESS_SAMPLE_ROWS, storage.count)
     rng = np.random.default_rng(RANDOM_SEED)
     positions = rng.integers(0, storage.count, size=rows, dtype=np.int64)
     query_ids = np.asarray(population[positions], dtype=np.uint64, order="C")
-    expected = np.asarray(source[positions], dtype=np.float16, order="C")
+    expected_dtype = np.dtype(storage.dtype)
+    expected = np.asarray(source[positions], dtype=expected_dtype, order="C")
     actual = storage.get(query_ids)
+    if actual.dtype != expected_dtype:
+        raise AssertionError(
+            f"storage returned dtype {actual.dtype}, expected {expected_dtype.name}"
+        )
     np.testing.assert_array_equal(
-        actual.view(np.uint16),
-        expected.view(np.uint16),
+        actual.view(np.uint8),
+        expected.view(np.uint8),
     )
-    return {"status": "passed", "sample_rows": rows, "bit_exact": True}
+    return {
+        "status": "passed",
+        "sample_rows": rows,
+        "bit_exact": True,
+        "dtype": expected_dtype.name,
+    }
 
 
 def query_matrix(
@@ -687,29 +785,35 @@ def add_process_metrics(
 
 
 def evict_data_cache(store_path: Path) -> dict[str, int | float]:
-    """Ask Linux to evict clean pages for every immutable data shard."""
+    """Ask Linux to evict clean pages for every base data file."""
     if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
         raise RuntimeError(
             "cold cache mode requires os.posix_fadvise and POSIX_FADV_DONTNEED"
         )
-    shard_paths = sorted((store_path / "data").glob("shard-*.dat"))
-    if not shard_paths:
-        raise RuntimeError(f"no data shards found under {store_path / 'data'}")
+    data_directory = store_path / "data"
+    data_paths = sorted(
+        set(data_directory.glob("shard-*.dat"))
+        | set(data_directory.glob("segment-*.dat"))
+    )
+    if not data_paths:
+        raise RuntimeError(f"no data files found under {data_directory}")
     started = time.perf_counter()
     total_bytes = 0
-    for shard_path in shard_paths:
-        total_bytes += shard_path.stat().st_size
-        fd = os.open(shard_path, os.O_RDONLY)
+    for data_path in data_paths:
+        total_bytes += data_path.stat().st_size
+        fd = os.open(data_path, os.O_RDONLY)
         try:
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         except OSError as error:
             raise RuntimeError(
-                f"POSIX_FADV_DONTNEED failed for {shard_path}: {error}"
+                f"POSIX_FADV_DONTNEED failed for {data_path}: {error}"
             ) from error
         finally:
             os.close(fd)
     return {
-        "shard_count": len(shard_paths),
+        # Keep the historical key so existing report consumers do not break.
+        "shard_count": len(data_paths),
+        "data_file_count": len(data_paths),
         "advised_bytes": total_bytes,
         "seconds": time.perf_counter() - started,
     }
@@ -729,7 +833,7 @@ def sequential_benchmark(
     )
     output = np.empty(
         (scenario.batch_size, storage.dimension),
-        dtype=np.float16,
+        dtype=np.dtype(storage.dtype),
     )
     for query in queries[: scenario.warmups]:
         storage.get_into(query, output)
@@ -749,7 +853,7 @@ def sequential_benchmark(
     cgroup_cpu_after = cgroup_cpu_snapshot()
 
     embeddings = scenario.calls * scenario.batch_size
-    useful_bytes = embeddings * storage.dimension * 2
+    useful_bytes = embeddings * storage.dimension * np.dtype(storage.dtype).itemsize
     result: dict[str, Any] = {
         **asdict(scenario),
         "workers": 1,
@@ -789,7 +893,10 @@ def concurrent_benchmark(
     start = threading.Event()
 
     def run_worker(queries: np.ndarray) -> np.ndarray:
-        output = np.empty((batch_size, storage.dimension), dtype=np.float16)
+        output = np.empty(
+            (batch_size, storage.dimension),
+            dtype=np.dtype(storage.dtype),
+        )
         storage.get_into(queries[0], output)
         samples = np.empty(calls_per_worker, dtype=np.int64)
         ready.wait()
@@ -815,7 +922,7 @@ def concurrent_benchmark(
         cgroup_cpu_after = cgroup_cpu_snapshot()
 
     embeddings = workers * calls_per_worker * batch_size
-    useful_bytes = embeddings * storage.dimension * 2
+    useful_bytes = embeddings * storage.dimension * np.dtype(storage.dtype).itemsize
     result: dict[str, Any] = {
         "workers": workers,
         "batch_size": batch_size,
@@ -921,13 +1028,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-mode",
         choices=("cold", "warm", "both"),
         default=CACHE_MODE,
-        help="evict shard pages, preserve cache, or run paired cold then warm tests",
+        help="evict data pages, preserve cache, or run paired cold then warm tests",
     )
     parser.add_argument(
         "--source-embeddings",
         type=Path,
         default=SOURCE_EMBEDDINGS_PATH,
-        help="optional original float16 .npy or raw memmap file",
+        help="optional original .npy or raw memmap file matching the store dtype",
     )
     parser.add_argument(
         "--source-kind",
@@ -1036,7 +1143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     log(f"opening storage: {args.store}")
     thread_count_before_open = process_thread_count()
     open_started = time.perf_counter()
-    storage = throwdb.Storage.open(
+    storage, store_format = open_benchmark_storage(
         args.store,
         io_workers=args.io_workers,
         io_queue_capacity=args.io_queue_capacity,
@@ -1049,7 +1156,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["storage"] = {
         "count": storage.count,
         "dimension": storage.dimension,
-        "dtype": "float16",
+        "dtype": storage.dtype,
+        "store_format": store_format,
+        "format_version": storage.format_version,
         "directory_bytes": directory_size(args.store),
         "open_seconds": open_seconds,
         "io_workers": args.io_workers,
@@ -1065,7 +1174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     log(
         f"storage opened in {open_seconds:.3f}s: "
-        f"count={storage.count:,}, dimension={storage.dimension}"
+        f"format={store_format}, count={storage.count:,}, "
+        f"dimension={storage.dimension}, dtype={storage.dtype}"
     )
 
     population = load_ids(args.ids, storage.count)
@@ -1103,7 +1213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 eviction = None
                 if cache_mode == "cold":
                     log(
-                        f"evicting shard pages before sequential "
+                        f"evicting data pages before sequential "
                         f"batch={scenario.batch_size:,}"
                     )
                     eviction = evict_data_cache(args.store)
@@ -1138,10 +1248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for cache_mode in cache_modes:
                 eviction = None
                 if cache_mode == "cold":
-                    log(
-                        f"evicting shard pages before concurrent "
-                        f"workers={workers}"
-                    )
+                    log(f"evicting data pages before concurrent workers={workers}")
                     eviction = evict_data_cache(args.store)
                 result = concurrent_benchmark(
                     storage,
@@ -1178,6 +1285,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     log(f"device statistics: {(args.results / 'iostat.log').resolve()}")
     log(f"proc disk statistics: {(args.results / 'diskstats.jsonl').resolve()}")
     log(f"virtual memory statistics: {(args.results / 'vmstat.log').resolve()}")
+    close_benchmark_storage(storage)
     return 0
 
 

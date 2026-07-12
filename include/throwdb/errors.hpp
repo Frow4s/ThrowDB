@@ -41,4 +41,14 @@ private:
     std::uint64_t id_;
 };
 
+class ExistingIdError : public std::invalid_argument {
+public:
+    explicit ExistingIdError(std::uint64_t id);
+
+    [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
+
+private:
+    std::uint64_t id_;
+};
+
 }  // namespace throwdb

@@ -175,6 +175,7 @@ struct IndexData {
     int error_number = errno);
 
 [[nodiscard]] FileDescriptor open_read_only(const std::filesystem::path& path);
+[[nodiscard]] FileDescriptor open_read_write(const std::filesystem::path& path);
 [[nodiscard]] FileDescriptor create_exclusive(const std::filesystem::path& path);
 void write_all(int fd, const void* data, std::size_t size,
                const std::filesystem::path& path);
@@ -185,6 +186,8 @@ void pread_exact(int fd, void* data, std::size_t size,
 void sync_file(int fd, const std::filesystem::path& path);
 void sync_directory(const std::filesystem::path& path);
 [[nodiscard]] std::uint64_t file_size(int fd, const std::filesystem::path& path);
+void truncate_file(int fd, std::uint64_t size,
+                   const std::filesystem::path& path);
 
 [[nodiscard]] std::uint64_t checked_multiply(
     std::uint64_t left, std::uint64_t right, std::string_view description);

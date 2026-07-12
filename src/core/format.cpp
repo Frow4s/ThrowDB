@@ -20,6 +20,10 @@ MissingIdError::MissingIdError(const std::uint64_t id)
 DuplicateIdError::DuplicateIdError(const std::uint64_t id)
     : std::invalid_argument("duplicate embedding ID: " + std::to_string(id)), id_(id) {}
 
+ExistingIdError::ExistingIdError(const std::uint64_t id)
+    : std::invalid_argument("embedding ID already exists: " + std::to_string(id)),
+      id_(id) {}
+
 }  // namespace throwdb
 
 namespace throwdb::detail {
@@ -276,6 +280,14 @@ FileDescriptor open_read_only(const std::filesystem::path& path) {
     return FileDescriptor(fd);
 }
 
+FileDescriptor open_read_write(const std::filesystem::path& path) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        throw StorageError(system_error_message("cannot open read-write", path));
+    }
+    return FileDescriptor(fd);
+}
+
 FileDescriptor create_exclusive(const std::filesystem::path& path) {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (fd < 0) {
@@ -307,6 +319,12 @@ void write_all(const int fd, const void* data, const std::size_t size,
 
 void pwrite_all(const int fd, const void* data, const std::size_t size,
                 std::uint64_t offset, const std::filesystem::path& path) {
+    const auto maximum_offset = static_cast<std::uint64_t>(
+        std::numeric_limits<off_t>::max());
+    if (offset > maximum_offset || size > maximum_offset - offset) {
+        throw InvalidArgumentError(
+            "pwrite range is too large for '" + path.string() + "'");
+    }
     const auto* cursor = static_cast<const std::byte*>(data);
     std::size_t remaining = size;
     while (remaining != 0) {
@@ -330,6 +348,12 @@ void pwrite_all(const int fd, const void* data, const std::size_t size,
 
 void pread_exact(const int fd, void* data, const std::size_t size,
                  std::uint64_t offset, const std::filesystem::path& path) {
+    const auto maximum_offset = static_cast<std::uint64_t>(
+        std::numeric_limits<off_t>::max());
+    if (offset > maximum_offset || size > maximum_offset - offset) {
+        throw CorruptionError(
+            "pread range is too large for '" + path.string() + "'");
+    }
     auto* cursor = static_cast<std::byte*>(data);
     std::size_t remaining = size;
     while (remaining != 0) {
@@ -378,6 +402,18 @@ std::uint64_t file_size(const int fd, const std::filesystem::path& path) {
         throw CorruptionError("negative file size for '" + path.string() + "'");
     }
     return static_cast<std::uint64_t>(status.st_size);
+}
+
+void truncate_file(const int fd, const std::uint64_t size,
+                   const std::filesystem::path& path) {
+    if (size > static_cast<std::uint64_t>(
+                   std::numeric_limits<off_t>::max())) {
+        throw InvalidArgumentError(
+            "truncate size is too large for '" + path.string() + "'");
+    }
+    if (::ftruncate(fd, static_cast<off_t>(size)) < 0) {
+        throw StorageError(system_error_message("ftruncate failed for", path));
+    }
 }
 
 std::uint64_t checked_multiply(const std::uint64_t left,

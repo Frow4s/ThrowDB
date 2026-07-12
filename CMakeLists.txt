@@ -10,13 +10,18 @@ option(THROWDB_BUILD_BENCHMARKS "Build benchmark tools" ON)
 
 add_library(throwdb_core STATIC
     src/core/crc32c.cpp
+    src/core/file_lock.cpp
     src/core/format.cpp
     src/core/index.cpp
     src/core/io_uring_engine.cpp
     src/core/io_uring_pool.cpp
     src/core/mutation_wal.cpp
+    src/core/native_collection.cpp
+    src/core/native_format.cpp
+    src/core/physical_reader.cpp
     src/core/storage_reader.cpp
     src/core/storage_writer.cpp
+    src/core/wal_file.cpp
 )
 add_library(throwdb::core ALIAS throwdb_core)
 
@@ -77,6 +82,24 @@ if(THROWDB_BUILD_TESTS)
     target_compile_features(throwdb_mutation_wal_tests PRIVATE cxx_std_20)
     throwdb_enable_warnings(throwdb_mutation_wal_tests)
     add_test(NAME throwdb_mutation_wal_tests COMMAND throwdb_mutation_wal_tests)
+
+    add_executable(throwdb_physical_reader_tests tests/physical_reader_tests.cpp)
+    target_link_libraries(throwdb_physical_reader_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_physical_reader_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_physical_reader_tests)
+    add_test(NAME throwdb_physical_reader_tests COMMAND throwdb_physical_reader_tests)
+
+    add_executable(throwdb_native_format_tests tests/native_format_tests.cpp)
+    target_link_libraries(throwdb_native_format_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_native_format_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_native_format_tests)
+    add_test(NAME throwdb_native_format_tests COMMAND throwdb_native_format_tests)
+
+    add_executable(throwdb_native_collection_tests tests/native_collection_tests.cpp)
+    target_link_libraries(throwdb_native_collection_tests PRIVATE throwdb::core)
+    target_compile_features(throwdb_native_collection_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_native_collection_tests)
+    add_test(NAME throwdb_native_collection_tests COMMAND throwdb_native_collection_tests)
 endif()
 
 if(THROWDB_BUILD_BENCHMARKS)

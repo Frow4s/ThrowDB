@@ -9,8 +9,7 @@ from typing import Sequence
 
 import numpy as np
 
-from . import Storage, Writer
-from .collection import _normalize_numeric_ids
+from .collection import Collection, CollectionSchema, _normalize_numeric_ids
 
 
 DEFAULT_SHARD_SIZE_GIB = 16
@@ -119,15 +118,19 @@ def _create(args: argparse.Namespace) -> None:
         )
 
     shard_size_bytes = args.shard_size_gib * (1 << 30)
-    with Writer.create(
-        args.storage,
+    schema = CollectionSchema(
+        id_type="uint64",
         dimension=dimension,
-        shard_size_bytes=shard_size_bytes,
         dtype=embeddings.dtype.name,
-    ) as writer:
+    )
+    with Collection.create(
+        args.storage,
+        schema=schema,
+        shard_size_bytes=shard_size_bytes,
+    ) as collection:
         for begin in range(0, ids.shape[0], args.batch_rows):
             end = min(begin + args.batch_rows, ids.shape[0])
-            writer.add(
+            collection.add(
                 _normalize_numeric_ids(
                     ids[begin:end], position_offset=begin
                 ),
@@ -137,55 +140,56 @@ def _create(args: argparse.Namespace) -> None:
 
 def _get(args: argparse.Namespace) -> None:
     ids = _load_ids(args.ids)
-    storage = Storage.open(
+    with Collection.open(
         args.storage,
-        io_workers=args.io_workers,
-        io_queue_capacity=args.io_queue_capacity,
-        io_ranges_per_task=args.io_ranges_per_task,
-        io_backend=args.io_backend,
-        io_uring_queue_depth=args.io_uring_queue_depth,
-        io_uring_workers=args.io_uring_workers,
-    )
-    output = np.lib.format.open_memmap(
-        args.output,
-        mode="w+",
-        dtype=np.dtype(storage.dtype),
-        shape=(ids.shape[0], storage.dimension),
-    )
-    for begin in range(0, ids.shape[0], args.batch_rows):
-        end = min(begin + args.batch_rows, ids.shape[0])
-        storage.get_into(
-            _normalize_numeric_ids(
-                ids[begin:end], position_offset=begin
-            ),
-            output[begin:end],
+        tuning=_reader_tuning(args),
+    ) as collection:
+        output = np.lib.format.open_memmap(
+            args.output,
+            mode="w+",
+            dtype=np.dtype(collection.dtype),
+            shape=(ids.shape[0], collection.dimension),
         )
-    output.flush()
+        for begin in range(0, ids.shape[0], args.batch_rows):
+            end = min(begin + args.batch_rows, ids.shape[0])
+            collection.get_into(
+                _normalize_numeric_ids(
+                    ids[begin:end], position_offset=begin
+                ),
+                output[begin:end],
+            )
+        output.flush()
 
 
 def _inspect(args: argparse.Namespace) -> None:
-    storage = Storage.open(
+    with Collection.open(
         args.storage,
-        io_workers=args.io_workers,
-        io_queue_capacity=args.io_queue_capacity,
-        io_ranges_per_task=args.io_ranges_per_task,
-        io_backend=args.io_backend,
-        io_uring_queue_depth=args.io_uring_queue_depth,
-        io_uring_workers=args.io_uring_workers,
-    )
-    print(
-        json.dumps(
-            {
-                "path": str(args.storage),
-                "count": storage.count,
-                "dimension": storage.dimension,
-                "dtype": storage.dtype,
-                "format_version": storage.format_version,
-            },
-            indent=2,
-            sort_keys=True,
+        tuning=_reader_tuning(args),
+    ) as collection:
+        print(
+            json.dumps(
+                {
+                    "path": str(args.storage),
+                    "count": collection.count,
+                    "dimension": collection.dimension,
+                    "dtype": collection.dtype,
+                    "format_version": collection.format_version,
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
-    )
+
+
+def _reader_tuning(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "io_workers": args.io_workers,
+        "io_queue_capacity": args.io_queue_capacity,
+        "io_ranges_per_task": args.io_ranges_per_task,
+        "io_backend": args.io_backend,
+        "io_uring_queue_depth": args.io_uring_queue_depth,
+        "io_uring_workers": args.io_uring_workers,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:

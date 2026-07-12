@@ -1,22 +1,24 @@
 # Mutable local storage architecture
 
-This document defines the target mutation layer for a logical ThrowDB
-collection. It deliberately does **not** require periodically copying the whole
-base collection. Existing format-v1/v2 shards remain valid immutable segments;
-new writes create smaller immutable resources, and background cleaning rewrites
-only selected segments whose live-data ratio justifies the work.
+This document defines the target selective-cleaning mutation layer for a
+logical ThrowDB collection. It deliberately does **not** require periodically
+copying the whole base collection. New writes eventually become smaller
+immutable resources, and background cleaning rewrites only selected segments
+whose live-data ratio justifies the work.
 
-The first implemented foundation is intentionally narrower than public CRUD:
+The fresh native numeric MVP now implements:
 
 - checked `SegmentId`, `RowRef`, tombstone, and partition-routing types;
-- portable CRC32C;
-- a schema-bound WAL header, recovery-atomic BATCH/COMMIT framing, and strict
-  recovery scanner;
-- tests for corrupt committed data and every incomplete-EOF boundary.
+- CRC32C-protected native headers and WAL frames;
+- immutable base segments plus ID sidecars and a flat `ID -> RowRef` index;
+- one writer lease, a commit lock, RAM overlay, public batch CRUD, and strict
+  active-WAL recovery;
+- generic physical reads spanning base segments and active-WAL payloads.
 
-Writer leases, catalog publication, the RAM overlay, immutable mutation
-segments, and the authoritative partitioned index are separate integration
-slices built on this contract.
+The current collection has one active WAL and no catalog rotation. Frozen WALs,
+immutable mutation segments, partitioned index runs, view generations, and the
+selective cleaner below remain the next integration slices. The exact shipped
+MVP layout and limits are in `native-format-v3.md`.
 
 ## Logical view and resource layout
 
@@ -32,18 +34,17 @@ CollectionView
   RAM overlay captured for this view
 ```
 
-The eventual directory layout is additive. A legacy collection does not have
-to move or rewrite its embedding shards before mutations are enabled:
+The eventual directory layout extends the fresh native base:
 
 ```text
 collection/
-  manifest.bin, index/, data/       # existing immutable v1/v2 base
+  manifest.bin, index/, data/, ids/ # fresh immutable native base
   CURRENT                           # points to exactly one immutable catalog
   catalogs/
   wal/
   segments/
   mutation-index/
-  sidecars/                         # for example IDs by legacy row
+  sidecars/                         # future reverse/cleaner metadata
 ```
 
 `CURRENT` is the sole metadata publication point. It names a catalog by an
@@ -92,25 +93,28 @@ Each catalog segment entry also has a nonzero 128-bit file UUID. A `RowRef`
 resolves its numeric segment ID only inside the captured view, which verifies
 the expected UUID and file metadata.
 
-Legacy base shards receive segment IDs without changing their bytes. With
-`records_per_shard = R`, ordinal `n` maps to:
+Fresh base segments receive IDs while they are built. With
+`records_per_segment = R`, logical build row `n` maps to:
 
 ```text
-segment_id = first_legacy_segment_id + n / R
+segment_id = 1 + n / R
 row_index  = n % R
 ```
+
+Older immutable collections are rebuilt from their source NumPy arrays rather
+than adapted with a global-ordinal compatibility layer.
 
 ## Index transition and steady state
 
 Two explicit modes avoid pretending that selective cleaning works before its
 prerequisites exist.
 
-### Transitional delta-chain mode
+### Current active-WAL overlay mode
 
-The RAM/WAL/delta layers shadow the existing base hash index. Reads are already
-correct and CRUD can be introduced, but legacy base shards cannot yet be
-removed independently because the base index still returns global ordinals.
-Selective cleaning is disabled in this mode.
+The RAM/active-WAL layer shadows the fresh flat base index. Both layers already
+return `RowRef`, and reads plus CRUD are implemented. Selective cleaning is
+still disabled because there is not yet a catalog generation, WAL rotation, or
+partition-level durable index publication.
 
 ### Authoritative partitioned-RowRef mode
 
@@ -351,24 +355,24 @@ An all-garbage segment is simply omitted. Unselected segments are untouched.
 There is no normal operation that copies every embedding in a 1.5 TB
 collection.
 
-Cleaning a legacy base shard requires an ID-by-row sidecar because its payload
-contains only embeddings. For 600 million numeric IDs the sidecar is about
-4.8 GB decimal and can be derived from the existing index without copying
-embedding bytes. A format-v1 build should verify the ordinal bijection while
-creating it (a one-bit-per-row bitmap is about 75 MB for 600 million rows).
+Every fresh base segment already has an ID-by-row sidecar because its data
+payload contains only embeddings. For 600 million numeric IDs all sidecars are
+about 4.8 GB decimal. The initial index build verifies duplicate IDs, and its
+reader validates the RowRef bijection (a one-bit-per-row bitmap is about 75 MB
+for 600 million rows).
 
 A complete collection rewrite remains an explicit administrative operation for
 schema/layout migration or major workload reorganization, not routine garbage
 collection.
 
-Tombstone reclamation follows the lookup mode. In transitional delta-chain
-mode a DELETE must remain until every older source that could contain the ID is
+Tombstone reclamation follows the lookup mode. In the current overlay mode a
+DELETE must remain until every older source that could contain the ID is
 removed or durably shadowed; dropping it early would resurrect a base row. In
 authoritative partitioned mode, partition absence is itself the final
-"missing" answer and never falls back to the legacy base. A DELETE run can be
-folded into that absence only when the new authoritative partition is published
-atomically and no catalog reachable by the new view can reintroduce an older
-mapping.
+"missing" answer and never falls back to an older base mapping. A DELETE run
+can be folded into that absence only when the new authoritative partition is
+published atomically and no catalog reachable by the new view can reintroduce
+an older mapping.
 
 ## Adaptive policy boundary
 

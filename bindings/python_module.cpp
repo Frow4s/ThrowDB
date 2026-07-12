@@ -3,14 +3,18 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
 #include "throwdb/errors.hpp"
+#include "throwdb/native_collection.hpp"
 #include "throwdb/storage.hpp"
 
 namespace py = pybind11;
@@ -120,6 +124,58 @@ struct DTypeInfo {
     }
     throw py::value_error(
         "io_backend must be 'thread_pool' or 'io_uring', got '" + value + "'");
+}
+
+[[nodiscard]] throwdb::ReaderOptions checked_reader_options(
+    const std::int64_t io_workers,
+    const std::int64_t io_queue_capacity,
+    const std::int64_t io_ranges_per_task,
+    const std::string& io_backend,
+    const std::int64_t io_uring_queue_depth,
+    const std::int64_t io_uring_workers) {
+    throwdb::ReaderOptions options;
+    options.io_workers =
+        checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
+    options.io_queue_capacity = checked_io_option(
+        io_queue_capacity,
+        kMaxIoQueueCapacity,
+        "io_queue_capacity");
+    options.io_ranges_per_task =
+        checked_io_ranges_per_task(io_ranges_per_task);
+    options.io_backend = checked_io_backend(io_backend);
+    options.io_uring_queue_depth =
+        checked_io_uring_queue_depth(io_uring_queue_depth);
+    options.io_uring_workers =
+        checked_io_uring_workers(io_uring_workers);
+    if (options.io_backend == throwdb::IoBackend::IoUring
+        && (options.io_workers != 0 || options.io_queue_capacity != 0)) {
+        throw py::value_error(
+            "io_workers and io_queue_capacity must both be 0 when "
+            "io_backend is 'io_uring'");
+    }
+    if (options.io_backend == throwdb::IoBackend::IoUring
+        && options.io_uring_workers > options.io_uring_queue_depth) {
+        throw py::value_error(
+            "io_uring_queue_depth must be at least io_uring_workers");
+    }
+    if (options.io_workers == 0 && options.io_queue_capacity != 0) {
+        throw py::value_error(
+            "io_queue_capacity must be 0 when io_workers is 0");
+    }
+    return options;
+}
+
+template <typename Function>
+decltype(auto) translate_id_errors(Function&& function) {
+    try {
+        return std::forward<Function>(function)();
+    } catch (const throwdb::ExistingIdError& error) {
+        throw py::value_error(error.what());
+    } catch (const throwdb::DuplicateIdError& error) {
+        throw py::value_error(error.what());
+    } catch (const throwdb::MissingIdError& error) {
+        throw py::key_error(error.what());
+    }
 }
 
 void require_native_endian(const py::array& array, const char* name) {
@@ -379,36 +435,13 @@ public:
         const std::string& io_backend,
         const std::int64_t io_uring_queue_depth,
         const std::int64_t io_uring_workers) {
-        throwdb::ReaderOptions options;
-        options.io_workers =
-            checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
-        options.io_queue_capacity = checked_io_option(
+        const throwdb::ReaderOptions options = checked_reader_options(
+            io_workers,
             io_queue_capacity,
-            kMaxIoQueueCapacity,
-            "io_queue_capacity");
-        options.io_ranges_per_task =
-            checked_io_ranges_per_task(io_ranges_per_task);
-        options.io_backend = checked_io_backend(io_backend);
-        options.io_uring_queue_depth =
-            checked_io_uring_queue_depth(io_uring_queue_depth);
-        options.io_uring_workers =
-            checked_io_uring_workers(io_uring_workers);
-        if (options.io_backend == throwdb::IoBackend::IoUring
-            && (options.io_workers != 0
-                || options.io_queue_capacity != 0)) {
-            throw py::value_error(
-                "io_workers and io_queue_capacity must both be 0 when "
-                "io_backend is 'io_uring'");
-        }
-        if (options.io_backend == throwdb::IoBackend::IoUring
-            && options.io_uring_workers > options.io_uring_queue_depth) {
-            throw py::value_error(
-                "io_uring_queue_depth must be at least io_uring_workers");
-        }
-        if (options.io_workers == 0 && options.io_queue_capacity != 0) {
-            throw py::value_error(
-                "io_queue_capacity must be 0 when io_workers is 0");
-        }
+            io_ranges_per_task,
+            io_backend,
+            io_uring_queue_depth,
+            io_uring_workers);
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::Storage> reader;
         {
@@ -471,6 +504,305 @@ private:
     std::unique_ptr<throwdb::Storage> reader_;
 };
 
+class PyNativeCollectionBuilder {
+public:
+    static std::unique_ptr<PyNativeCollectionBuilder> create(
+        const py::object& path,
+        const std::uint32_t dimension,
+        const std::uint64_t shard_size_bytes,
+        const std::string& dtype) {
+        if (dimension == 0) {
+            throw py::value_error("dimension must be greater than zero");
+        }
+        if (shard_size_bytes == 0) {
+            throw py::value_error("shard_size_bytes must be greater than zero");
+        }
+
+        throwdb::NativeBuilderOptions options;
+        options.dimension = dimension;
+        options.dtype = checked_dtype(dtype);
+        options.segment_size_bytes = shard_size_bytes;
+        const auto native_path = filesystem_path(path);
+        std::unique_ptr<throwdb::NativeCollectionBuilder> builder;
+        {
+            py::gil_scoped_release release;
+            builder = throwdb::NativeCollectionBuilder::create(
+                native_path, options);
+        }
+        return std::unique_ptr<PyNativeCollectionBuilder>(
+            new PyNativeCollectionBuilder(std::move(builder)));
+    }
+
+    void add(const py::array& ids, const py::array& embeddings) {
+        ensure_open();
+        const auto id_span = validate_ids(ids);
+        const auto embedding_span = validate_embeddings(
+            embeddings,
+            ids.shape(0),
+            builder_->dimension(),
+            builder_->dtype(),
+            builder_->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            builder_->append(id_span, embedding_span);
+        });
+    }
+
+    void finish() {
+        ensure_alive();
+        if (finished_ || builder_->finished()) {
+            finished_ = true;
+            return;
+        }
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            builder_->finish();
+        });
+        finished_ = true;
+    }
+
+    void abort() {
+        if (builder_ == nullptr || finished_) {
+            return;
+        }
+        {
+            py::gil_scoped_release release;
+            builder_.reset();
+        }
+        finished_ = true;
+    }
+
+    [[nodiscard]] std::uint32_t dimension() const {
+        ensure_alive();
+        return builder_->dimension();
+    }
+
+    [[nodiscard]] std::uint64_t count() const {
+        ensure_alive();
+        return builder_->count();
+    }
+
+    [[nodiscard]] std::string dtype() const {
+        ensure_alive();
+        return dtype_info(builder_->dtype()).name;
+    }
+
+    [[nodiscard]] std::uint32_t format_version() const {
+        ensure_alive();
+        return builder_->format_version();
+    }
+
+private:
+    explicit PyNativeCollectionBuilder(
+        std::unique_ptr<throwdb::NativeCollectionBuilder> builder)
+        : builder_(std::move(builder)) {}
+
+    void ensure_open() const {
+        ensure_alive();
+        if (finished_ || builder_->finished()) {
+            throw std::runtime_error("collection builder is already finished");
+        }
+    }
+
+    void ensure_alive() const {
+        if (builder_ == nullptr) {
+            throw std::runtime_error("collection builder is closed");
+        }
+    }
+
+    std::unique_ptr<throwdb::NativeCollectionBuilder> builder_;
+    bool finished_{false};
+};
+
+class PyNativeCollection {
+public:
+    static std::unique_ptr<PyNativeCollection> open(
+        const py::object& path,
+        const std::string& mode,
+        const std::int64_t io_workers,
+        const std::int64_t io_queue_capacity,
+        const std::int64_t io_ranges_per_task,
+        const std::string& io_backend,
+        const std::int64_t io_uring_queue_depth,
+        const std::int64_t io_uring_workers) {
+        bool writable = false;
+        if (mode == "r") {
+            writable = false;
+        } else if (mode == "r+") {
+            writable = true;
+        } else {
+            throw py::value_error("mode must be 'r' or 'r+'");
+        }
+
+        const throwdb::ReaderOptions options = checked_reader_options(
+            io_workers,
+            io_queue_capacity,
+            io_ranges_per_task,
+            io_backend,
+            io_uring_queue_depth,
+            io_uring_workers);
+        const auto native_path = filesystem_path(path);
+        std::unique_ptr<throwdb::NativeCollection> collection;
+        {
+            py::gil_scoped_release release;
+            collection = throwdb::NativeCollection::open(
+                native_path, options, writable);
+        }
+        return std::unique_ptr<PyNativeCollection>(
+            new PyNativeCollection(std::move(collection)));
+    }
+
+    void close() {
+        std::shared_ptr<throwdb::NativeCollection> collection;
+        {
+            const std::scoped_lock lock(collection_mutex_);
+            collection = std::move(collection_);
+        }
+        if (collection == nullptr) {
+            return;
+        }
+
+        // Native calls release the GIL. Keep an independent shared owner in
+        // every operation so close() can safely race an already-started read
+        // or mutation without destroying its C++ object underneath it.
+        py::gil_scoped_release release;
+        collection.reset();
+    }
+
+    [[nodiscard]] std::uint32_t dimension() const {
+        return acquire_collection()->dimension();
+    }
+
+    [[nodiscard]] std::uint64_t count() const {
+        return acquire_collection()->count();
+    }
+
+    [[nodiscard]] std::string dtype() const {
+        return dtype_info(acquire_collection()->dtype()).name;
+    }
+
+    [[nodiscard]] std::uint32_t format_version() const {
+        return acquire_collection()->format_version();
+    }
+
+    py::array get(const py::array& ids) const {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        py::array output(
+            numpy_dtype(collection->dtype()),
+            {ids.shape(0),
+             static_cast<py::ssize_t>(collection->dimension())});
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->get_into(id_span, output_span);
+        });
+        return output;
+    }
+
+    void get_into(const py::array& ids, py::array output) const {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->get_into(id_span, output_span);
+        });
+    }
+
+    void insert(const py::array& ids, const py::array& embeddings) {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        const auto embedding_span = validate_embeddings(
+            embeddings,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->insert(id_span, embedding_span);
+        });
+    }
+
+    void update(const py::array& ids, const py::array& embeddings) {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        const auto embedding_span = validate_embeddings(
+            embeddings,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->update(id_span, embedding_span);
+        });
+    }
+
+    void upsert(const py::array& ids, const py::array& embeddings) {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        const auto embedding_span = validate_embeddings(
+            embeddings,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->upsert(id_span, embedding_span);
+        });
+    }
+
+    py::array_t<bool> erase(const py::array& ids) {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        std::vector<std::uint8_t> erased = translate_id_errors([&] {
+            py::gil_scoped_release release;
+            return collection->erase(id_span);
+        });
+        if (erased.size() != id_span.size()) {
+            throw std::runtime_error(
+                "native delete returned an invalid result length");
+        }
+
+        py::array_t<bool> output(static_cast<py::ssize_t>(erased.size()));
+        bool* output_data = output.mutable_data();
+        for (std::size_t index = 0; index < erased.size(); ++index) {
+            output_data[index] = erased[index] != 0;
+        }
+        return output;
+    }
+
+private:
+    explicit PyNativeCollection(
+        std::unique_ptr<throwdb::NativeCollection> collection)
+        : collection_(std::move(collection)) {}
+
+    [[nodiscard]] std::shared_ptr<throwdb::NativeCollection>
+    acquire_collection() const {
+        const std::scoped_lock lock(collection_mutex_);
+        if (collection_ == nullptr) {
+            throw std::runtime_error("native collection is closed");
+        }
+        return collection_;
+    }
+
+    mutable std::mutex collection_mutex_;
+    std::shared_ptr<throwdb::NativeCollection> collection_;
+};
+
 }  // namespace
 
 PYBIND11_MODULE(_throwdb, module) {
@@ -512,4 +844,67 @@ PYBIND11_MODULE(_throwdb, module) {
         .def_property_readonly("format_version", &PyStorage::format_version)
         .def("get", &PyStorage::get, py::arg("ids"))
         .def("get_into", &PyStorage::get_into, py::arg("ids"), py::arg("output"));
+
+    py::class_<PyNativeCollectionBuilder>(module, "NativeCollectionBuilder")
+        .def_static(
+            "create",
+            &PyNativeCollectionBuilder::create,
+            py::arg("path"),
+            py::arg("dimension") = 1024,
+            py::arg("shard_size_bytes") = kDefaultShardSizeBytes,
+            py::arg("dtype") = "float16")
+        .def(
+            "add",
+            &PyNativeCollectionBuilder::add,
+            py::arg("ids"),
+            py::arg("embeddings"))
+        .def("finish", &PyNativeCollectionBuilder::finish)
+        .def("abort", &PyNativeCollectionBuilder::abort)
+        .def_property_readonly(
+            "dimension", &PyNativeCollectionBuilder::dimension)
+        .def_property_readonly("count", &PyNativeCollectionBuilder::count)
+        .def_property_readonly("dtype", &PyNativeCollectionBuilder::dtype)
+        .def_property_readonly(
+            "format_version", &PyNativeCollectionBuilder::format_version);
+
+    py::class_<PyNativeCollection>(module, "NativeCollection")
+        .def_static(
+            "open",
+            &PyNativeCollection::open,
+            py::arg("path"),
+            py::arg("mode") = "r",
+            py::arg("io_workers") = 0,
+            py::arg("io_queue_capacity") = 0,
+            py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
+            py::arg("io_backend") = "thread_pool",
+            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers)
+        .def_property_readonly("dimension", &PyNativeCollection::dimension)
+        .def_property_readonly("count", &PyNativeCollection::count)
+        .def_property_readonly("dtype", &PyNativeCollection::dtype)
+        .def_property_readonly(
+            "format_version", &PyNativeCollection::format_version)
+        .def("get", &PyNativeCollection::get, py::arg("ids"))
+        .def(
+            "get_into",
+            &PyNativeCollection::get_into,
+            py::arg("ids"),
+            py::arg("output"))
+        .def(
+            "insert",
+            &PyNativeCollection::insert,
+            py::arg("ids"),
+            py::arg("embeddings"))
+        .def(
+            "update",
+            &PyNativeCollection::update,
+            py::arg("ids"),
+            py::arg("embeddings"))
+        .def(
+            "upsert",
+            &PyNativeCollection::upsert,
+            py::arg("ids"),
+            py::arg("embeddings"))
+        .def("delete", &PyNativeCollection::erase, py::arg("ids"))
+        .def("close", &PyNativeCollection::close);
 }
