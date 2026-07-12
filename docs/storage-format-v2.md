@@ -203,6 +203,31 @@ is stored. Readers validate every referenced interval before exposing the index.
 An implementation may memory-map the arena instead of copying all string bytes
 into anonymous RAM.
 
+## Mutability boundary
+
+The files specified above form one immutable base snapshot. Record CRUD does not
+rewrite these shard or index files in place. A logical mutable collection adds a
+separately versioned mutation layer:
+
+```text
+collection root/
+  CURRENT                 # atomically published collection-view descriptor
+  snapshots/<snapshot>/   # one immutable format-v2 base
+  deltas/                  # committed PUT/DELETE segments
+  wal/                     # active recovery log
+```
+
+Each mutation batch has a monotonic commit sequence, checksummed framing, and an
+explicit commit marker. Readers capture one `CURRENT` view and consult committed
+deltas from newest to oldest before falling back to the base index. DELETE is a
+tombstone; PUT carries a complete fixed-schema embedding row.
+
+Compaction creates another complete format-v2 base from a stable committed
+sequence, validates it, and atomically replaces `CURRENT`. It never modifies the
+only readable snapshot. The exact WAL, delta-segment, and view-descriptor binary
+layouts receive their own specification before CRUD implementation; they are
+not encoded into unused manifest bytes implicitly.
+
 ## Version-1 compatibility
 
 The common-header decoder reads magic, version, and header size before choosing
@@ -231,8 +256,12 @@ only after numeric-v2 round-trip and compatibility tests pass.
    writing v1; prove all existing v1 tests remain unchanged.
 2. Implement v2 numeric/float16 writing and reading with the same payload and
    index algorithms; add cross-version corruption tests.
-3. Generalize item-size arithmetic and add bit-exact float32 round trips.
-4. Add prefix reads to the row-major planner and Python output validation.
-5. Add string staging, arena construction, collision-verified indexing, and
-   UTF-8 Python bindings.
-6. Add explicit scrub/checksum tooling separately from the normal open path.
+3. Add the high-level Python `Collection` numeric-ID normalization layer while
+   keeping the low-level uint64 zero-copy path.
+4. Generalize item-size arithmetic and add bit-exact float32 round trips.
+5. Add prefix reads to the row-major planner and Python output validation.
+6. Specify mutation WAL, delta segments, view publication, and compaction; then
+   implement numeric CRUD.
+7. Add string staging, arena construction, collision-verified indexing, UTF-8
+   bindings, and string CRUD.
+8. Add explicit scrub/checksum tooling separately from the normal open path.

@@ -12,7 +12,7 @@ Python / C++ API / server protocol
                 |
         collection + schema
                 |
-       ID lookup + read planner
+ base index + delta overlay + planner
                 |
    fair scheduler + global I/O budget
                 |
@@ -40,8 +40,12 @@ Deliver a stable Python wrapper over the C++ engine:
 - versioned collection schema;
 - arbitrary dimension;
 - `float16` and `float32`, followed by `bfloat16`;
-- `uint64` and byte-exact UTF-8 IDs;
+- canonical unsigned-integer and byte-exact UTF-8 ID domains;
+- safe Python normalization from `uint8/16/32/64`, non-negative
+  `int8/16/32/64`, and Python integers;
 - immutable snapshot construction and atomic publication;
+- atomic insert, update, upsert, and tombstone delete batches;
+- checksummed WAL/delta recovery, one writer lease, and background compaction;
 - `get`, `get_into`, and prefix-dimension reads;
 - manual and automatic tuning configuration;
 - backward reading of format-v1 collections.
@@ -56,6 +60,7 @@ Run one long-lived collection per server process and add:
 - a binary batched read protocol and Python client;
 - request deadlines, cancellation, backpressure, and maximum batch sizes;
 - server-side fair scheduling and optional batching;
+- network CRUD mapped to the same commit and snapshot-view semantics;
 - health checks, metrics, graceful shutdown, and a minimal trusted-network
   authentication model;
 - one shared RAM index instead of one copy per client process.
@@ -75,8 +80,9 @@ Add a catalog and control plane:
 - authentication, authorization, quotas, routing, and resource isolation;
 - replication, recovery, and background lifecycle operations.
 
-Online mutation is introduced only with an explicit consistency and durability
-model. It must not emerge accidentally from local snapshot APIs.
+The server and multi-collection catalog preserve the local commit-sequence,
+snapshot-view, durability, and compaction contracts rather than inventing a
+second mutation model.
 
 ## Stage 4: log-driven collection optimization
 
@@ -128,11 +134,14 @@ workloads and explainable baselines exist.
 
 ## Immediate implementation order
 
-1. Freeze the local collection contract.
+1. Freeze the local collection and CRUD contracts.
 2. Design format/schema v2 and its v1 compatibility path.
-3. Implement generic numeric dtype/dimension support and prefix reads.
-4. Add compact UTF-8 ID storage and collision-verified lookup.
-5. Introduce `CollectionSchema` and the Python `Collection` wrapper.
-6. Extract `ReadPlan`, fair scheduler, and storage-backend interfaces.
-7. Add an explicit calibration profile and request-policy explanation.
-8. Build the single-collection server on the same engine.
+3. Introduce `CollectionSchema`, canonical numeric-ID normalization, and the
+   Python `Collection` wrapper over the existing numeric store.
+4. Implement generic numeric dtype/dimension support and prefix reads.
+5. Specify and implement checksummed mutation WAL/deltas, snapshot reads, and
+   compaction for numeric IDs.
+6. Add compact UTF-8 ID storage, collision-verified lookup, and string CRUD.
+7. Extract `ReadPlan`, fair scheduler, and storage-backend interfaces.
+8. Add an explicit calibration profile and request-policy explanation.
+9. Build the single-collection server on the same engine.
