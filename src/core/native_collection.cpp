@@ -2,6 +2,7 @@
 
 #include "file_lock.hpp"
 #include "internal.hpp"
+#include "mutation_catalog.hpp"
 #include "mutation_types.hpp"
 #include "mutation_wal.hpp"
 #include "native_format.hpp"
@@ -19,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -32,6 +34,7 @@
 namespace throwdb {
 namespace {
 
+constexpr std::uint32_t kCatalogPublicNativeFormatVersion = 5;
 constexpr std::uint32_t kCurrentPublicNativeFormatVersion = 4;
 constexpr std::uint32_t kLegacyPublicNativeFormatVersion = 3;
 using SteadyClock = std::chrono::steady_clock;
@@ -55,6 +58,8 @@ enum class PutMode {
     Update,
     Upsert,
 };
+
+using OverlayValue = std::optional<detail::VersionedMutationValue>;
 
 [[nodiscard]] detail::DTypeCode dtype_code(const DType dtype) {
     switch (dtype) {
@@ -112,7 +117,8 @@ void create_native_store_directories(const std::filesystem::path& path) {
             "cannot create storage directory: " + error.message());
     }
 
-    for (const char* child : {"data", "ids", "index", "wal", "locks"}) {
+    for (const char* child : {
+             "data", "ids", "index", "wal", "catalogs", "locks"}) {
         if (!std::filesystem::create_directory(path / child, error) || error) {
             throw StorageError(
                 "cannot create storage subdirectory '" + std::string(child)
@@ -156,13 +162,17 @@ void validate_distinct_ids(const std::span<const std::uint64_t> ids) {
 }
 
 [[nodiscard]] detail::WalHeader wal_header_for(
-    const detail::NativeManifest& manifest) {
+    const detail::NativeManifest& manifest,
+    const detail::Uuid128 wal_id = {},
+    const detail::Uuid128 predecessor_wal_id = {},
+    const std::uint64_t previous_sequence = 0) {
     detail::WalHeader header;
     header.collection_id = manifest.collection_id;
     header.schema_id = manifest.schema_id;
-    header.wal_id = manifest.active_wal_id;
-    header.previous_sequence = 0;
-    header.first_sequence = 1;
+    header.wal_id = wal_id.empty() ? manifest.active_wal_id : wal_id;
+    header.predecessor_wal_id = predecessor_wal_id;
+    header.previous_sequence = previous_sequence;
+    header.first_sequence = previous_sequence + 1;
     header.record_size = manifest.record_size;
     header.dimension = manifest.schema.dimension;
     header.dtype = manifest.schema.dtype;
@@ -261,6 +271,8 @@ public:
             manifest.schema.dimension = options_.dimension;
             manifest.base_record_count = count_;
             manifest.segment_payload_capacity = segment_payload_capacity_;
+            manifest.required_feature_bits |=
+                detail::kNativeRequiredFeatureCatalogV1;
             detail::derive_native_manifest_geometry(manifest);
             if (manifest.base_segment_count != segment_count_
                 || manifest.records_per_segment != records_per_segment_) {
@@ -274,10 +286,16 @@ public:
 
             detail::build_and_write_native_index_atomic(path_, manifest);
 
-            detail::WalHeader wal_header = wal_header_for(manifest);
+            const detail::WalHeader wal_header = wal_header_for(manifest);
             detail::create_wal_file(
-                detail::native_active_wal_path(path_), wal_header);
+                detail::mutation_wal_path(path_, manifest.active_wal_id),
+                wal_header);
             detail::sync_directory(path_ / "wal");
+
+            const detail::MutationCatalog catalog =
+                detail::make_initial_mutation_catalog(manifest, make_uuid());
+            static_cast<void>(detail::publish_mutation_catalog(
+                path_, manifest, catalog));
 
             // This is the only initial publication point. Everything it names
             // has already reached stable storage.
@@ -303,7 +321,7 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
-        return kCurrentPublicNativeFormatVersion;
+        return kCatalogPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
         ensure_owner_process();
@@ -453,8 +471,7 @@ public:
           commit_lock_(detail::AdvisoryLockFile::open_existing(
               commit_lock_path(path_), writable)),
           writable_(writable),
-          wal_path_(detail::native_active_wal_path(path_)),
-          wal_header_(wal_header_for(manifest_)),
+          catalog_managed_(detail::mutation_catalog_managed(manifest_)),
           live_count_(manifest_.base_record_count) {
         if (writable_) {
             // Fail a competing writer before loading a potentially very large
@@ -493,21 +510,7 @@ public:
         detail::ScopedAdvisoryLock stable(
             commit_lock_, writable_ ? detail::FileLockMode::Exclusive
                                     : detail::FileLockMode::Shared);
-        wal_fd_ = writable_ ? detail::open_read_write(wal_path_)
-                            : detail::open_read_only(wal_path_);
-        const detail::ExpectedWalIdentity expected =
-            detail::ExpectedWalIdentity::from_trusted_header(wal_header_);
-        const detail::WalScanResult scan = detail::scan_wal_file(
-            wal_fd_.get(), wal_path_, expected, detail::WalScanMode::Active,
-            [this](const detail::RecoveredWalBatch& batch) {
-                apply_recovered_batch(batch);
-            });
-        append_offset_ = scan.valid_end;
-        next_sequence_ = scan.next_sequence;
-        if (writable_ && scan.ignored_tail_bytes != 0) {
-            detail::truncate_file(wal_fd_.get(), scan.valid_end, wal_path_);
-            detail::sync_file(wal_fd_.get(), wal_path_);
-        }
+        open_mutation_logs();
         // This flag is monotonic for the lifetime of the current collection
         // implementation. A clean collection can therefore plan reads from
         // its immutable base index without touching state_mutex_ or overlay_.
@@ -570,12 +573,6 @@ public:
         ensure_healthy();
         std::vector<bool> existed(ids.size(), false);
         std::uint64_t resulting_count = live_count_.load();
-        const std::uint64_t original_wal_rows = wal_payload_offsets_.size();
-        if (ids.size() > detail::RowRef::kMaximumRowsPerSegment
-                             - original_wal_rows) {
-            throw InvalidArgumentError(
-                "active WAL exceeds the 2^32 PUT-row limit");
-        }
         {
             std::unique_lock lock(state_mutex_);
             for (std::size_t index = 0; index != ids.size(); ++index) {
@@ -593,6 +590,19 @@ public:
                     ++resulting_count;
                 }
             }
+        }
+
+        if (ids.size() > detail::RowRef::kMaximumRowsPerSegment
+                             - active_wal().payload_offsets.size()) {
+            if (!catalog_managed_ || !rotate_wal_locked()) {
+                throw InvalidArgumentError(
+                    "active WAL exceeds the 2^32 PUT-row limit");
+            }
+        }
+        const std::uint64_t original_wal_rows =
+            active_wal().payload_offsets.size();
+        {
+            std::unique_lock lock(state_mutex_);
             prepare_publication_capacity(ids.size(), ids.size());
             for (const std::uint64_t id : ids) {
                 prime_overlay_node_unlocked(id);
@@ -647,8 +657,27 @@ public:
             return deleted;
         }
         commit_operations(
-            operations, wal_payload_offsets_.size(), resulting_count);
+            operations, active_wal().payload_offsets.size(), resulting_count);
         return deleted;
+    }
+
+    [[nodiscard]] NativeMutationLogStats mutation_log_stats() const {
+        ensure_healthy();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        return mutation_log_stats_locked(false);
+    }
+
+    [[nodiscard]] NativeMutationLogStats rotate_wal() {
+        ensure_mutable();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        if (!catalog_managed_) {
+            throw InvalidArgumentError(
+                "WAL rotation requires a catalog-managed format-5 collection");
+        }
+        const bool rotated = rotate_wal_locked();
+        return mutation_log_stats_locked(rotated);
     }
 
     [[nodiscard]] std::uint64_t count() const {
@@ -665,6 +694,9 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
+        if (catalog_managed_) {
+            return kCatalogPublicNativeFormatVersion;
+        }
         return open_stats_.index_body_checksum_present
                    ? kCurrentPublicNativeFormatVersion
                    : kLegacyPublicNativeFormatVersion;
@@ -693,7 +725,9 @@ public:
         // Close every inherited descriptor reference without explicitly
         // unlocking the parent's shared flock open description. The mutexes
         // and copied thread objects remain intentionally undestroyed below.
-        wal_fd_.reset();
+        for (const auto& source : wal_resources_->sources) {
+            source->fd.reset();
+        }
         for (BaseSegment& segment : base_segments_) {
             segment.fd.reset();
         }
@@ -706,6 +740,22 @@ private:
     struct BaseSegment {
         detail::NativeDataHeader header;
         detail::FileDescriptor fd;
+    };
+
+    struct WalSource {
+        detail::MutationWalEntry entry;
+        detail::WalHeader header;
+        detail::FileDescriptor fd;
+        std::filesystem::path path;
+        std::vector<std::uint64_t> payload_offsets;
+        std::uint64_t valid_end{detail::kWalFileHeaderSize};
+        std::uint64_t next_sequence{1};
+    };
+
+    struct WalResourceSet {
+        std::vector<std::shared_ptr<WalSource>> sources;
+        std::unordered_map<std::uint32_t, std::size_t> source_indices;
+        std::size_t active_index{0};
     };
 
     template <bool Profiled>
@@ -745,6 +795,10 @@ private:
         }
         std::vector<detail::PhysicalReadRequest> requests;
         requests.reserve(ids.size());
+        // Catalog generations will eventually reclaim retired resources.
+        // Retain every resolver used by this captured state until physical I/O
+        // has completed, rather than relying only on its integer descriptor.
+        std::shared_ptr<WalResourceSet> wal_pin;
         const bool zero_delta_fast_path =
             !mutation_read_path_active_.load(std::memory_order_acquire);
         if constexpr (Profiled) {
@@ -770,6 +824,7 @@ private:
             }
         } else {
             std::shared_lock lock(state_mutex_);
+            wal_pin = wal_resources_;
             for (std::size_t output_index = 0;
                  output_index != ids.size(); ++output_index) {
                 const auto row = logical_lookup_unlocked(ids[output_index]);
@@ -785,7 +840,8 @@ private:
                     }
                 }
                 requests.push_back(resolve_row_unlocked(
-                    *row, static_cast<std::uint64_t>(output_index)));
+                    *row, static_cast<std::uint64_t>(output_index),
+                    *wal_pin));
             }
         }
         if constexpr (Profiled) {
@@ -855,6 +911,115 @@ private:
         }
     }
 
+    void open_mutation_logs() {
+        wal_resources_ = std::make_shared<WalResourceSet>();
+        if (catalog_managed_) {
+            catalog_ = detail::read_current_mutation_catalog(path_, manifest_);
+            if (catalog_.materialized_sequence != 0
+                || !catalog_.terminal_wal_id.empty()) {
+                throw CorruptionError(
+                    "materialized mutation resources are not supported yet");
+            }
+            wal_resources_->sources.reserve(catalog_.wal_entries.size());
+            wal_resources_->source_indices.reserve(
+                catalog_.wal_entries.size());
+            for (const detail::MutationWalEntry& entry : catalog_.wal_entries) {
+                open_catalog_wal(entry);
+            }
+        } else {
+            detail::MutationWalEntry entry;
+            entry.wal_id = manifest_.active_wal_id;
+            entry.segment_id = manifest_.active_wal_segment_id;
+            entry.state = detail::MutationWalState::Active;
+            entry.previous_sequence = 0;
+            entry.first_sequence = 1;
+            open_wal_source(
+                entry, detail::native_active_wal_path(path_), true);
+        }
+
+        if (wal_resources_->sources.empty()
+            || wal_resources_->sources.back()->entry.state
+                   != detail::MutationWalState::Active) {
+            throw CorruptionError(
+                "mutation log does not contain a final active WAL");
+        }
+        wal_resources_->active_index = wal_resources_->sources.size() - 1;
+        append_offset_ = active_wal().valid_end;
+        next_sequence_ = active_wal().next_sequence;
+    }
+
+    void open_catalog_wal(const detail::MutationWalEntry& entry) {
+        open_wal_source(
+            entry, detail::mutation_wal_path(path_, entry.wal_id),
+            entry.state == detail::MutationWalState::Active);
+    }
+
+    void open_wal_source(
+        const detail::MutationWalEntry& entry,
+        const std::filesystem::path& wal_path,
+        const bool active) {
+        auto source = std::make_shared<WalSource>();
+        source->entry = entry;
+        source->header = wal_header_for(
+            manifest_, entry.wal_id, entry.predecessor_wal_id,
+            entry.previous_sequence);
+        source->path = wal_path;
+        source->fd = writable_ && active
+                         ? detail::open_read_write(wal_path)
+                         : detail::open_read_only(wal_path);
+
+        if (!active) {
+            const std::uint64_t actual_size = detail::file_size(
+                source->fd.get(), source->path);
+            if (actual_size != entry.sealed_file_size) {
+                throw CorruptionError(
+                    "frozen WAL size does not match its catalog entry");
+            }
+        }
+
+        const detail::ExpectedWalIdentity expected =
+            detail::ExpectedWalIdentity::from_trusted_header(source->header);
+        const detail::WalScanResult scan = detail::scan_wal_file(
+            source->fd.get(), source->path, expected,
+            active ? detail::WalScanMode::Active
+                   : detail::WalScanMode::Frozen,
+            [this, &source](const detail::RecoveredWalBatch& batch) {
+                apply_recovered_batch(*source, batch);
+            });
+        source->valid_end = scan.valid_end;
+        source->next_sequence = scan.next_sequence;
+
+        if (!active) {
+            if (scan.ignored_tail_bytes != 0
+                || scan.valid_end != entry.sealed_file_size
+                || scan.next_sequence == 0
+                || scan.next_sequence - 1 != entry.last_sequence
+                || source->payload_offsets.size() != entry.put_count) {
+                throw CorruptionError(
+                    "frozen WAL contents do not match its catalog entry");
+            }
+        } else if (writable_ && scan.ignored_tail_bytes != 0) {
+            detail::truncate_file(
+                source->fd.get(), scan.valid_end, source->path);
+            detail::sync_file(source->fd.get(), source->path);
+        }
+
+        wal_resources_->sources.push_back(std::move(source));
+        const std::size_t source_index = wal_resources_->sources.size() - 1;
+        if (!wal_resources_->source_indices.emplace(
+                 entry.segment_id, source_index).second) {
+            throw CorruptionError("mutation WAL segment ID is duplicated");
+        }
+    }
+
+    [[nodiscard]] WalSource& active_wal() {
+        return *wal_resources_->sources.at(wal_resources_->active_index);
+    }
+
+    [[nodiscard]] const WalSource& active_wal() const {
+        return *wal_resources_->sources.at(wal_resources_->active_index);
+    }
+
     [[nodiscard]] bool base_contains(const std::uint64_t id) const noexcept {
         return detail::native_index_lookup(index_, id).has_value();
     }
@@ -862,8 +1027,8 @@ private:
     [[nodiscard]] std::optional<detail::RowRef> logical_lookup_unlocked(
         const std::uint64_t id) const {
         const auto overlay = overlay_.find(id);
-        if (overlay != overlay_.end()) {
-            return overlay->second.row_ref();
+        if (overlay != overlay_.end() && overlay->second.has_value()) {
+            return overlay->second->row_ref();
         }
         return detail::native_index_lookup(index_, id);
     }
@@ -890,28 +1055,40 @@ private:
 
     [[nodiscard]] detail::PhysicalReadRequest resolve_row_unlocked(
         const detail::RowRef row,
-        const std::uint64_t output_index) const {
+        const std::uint64_t output_index,
+        const WalResourceSet& resources) const {
         const std::uint32_t segment = row.segment_id().value();
         const std::uint64_t row_index = row.row_index();
         if (segment <= manifest_.base_segment_count) {
             return resolve_base_row(row, output_index);
         }
         if (segment != manifest_.active_wal_segment_id
-            || row_index >= wal_payload_offsets_.size()) {
+            && !catalog_managed_) {
             throw CorruptionError("overlay RowRef does not resolve to active WAL");
         }
+        const auto source_position = resources.source_indices.find(segment);
+        if (source_position == resources.source_indices.end()) {
+            throw CorruptionError("overlay RowRef does not resolve to a catalog WAL");
+        }
+        const WalSource& source =
+            *resources.sources[source_position->second];
+        if (row_index >= source.payload_offsets.size()) {
+            throw CorruptionError("overlay RowRef exceeds WAL PUT-row count");
+        }
         return detail::PhysicalReadRequest{
-            wal_fd_.get(),
-            wal_payload_offsets_[static_cast<std::size_t>(row_index)],
+            source.fd.get(),
+            source.payload_offsets[static_cast<std::size_t>(row_index)],
             output_index};
     }
 
-    void apply_recovered_batch(const detail::RecoveredWalBatch& batch) {
+    void apply_recovered_batch(
+        WalSource& source,
+        const detail::RecoveredWalBatch& batch) {
         for (const detail::RecoveredWalOperation& operation : batch.operations) {
             const bool existed = [&] {
                 const auto overlay = overlay_.find(operation.id);
-                if (overlay != overlay_.end()) {
-                    return overlay->second.is_put();
+                if (overlay != overlay_.end() && overlay->second.has_value()) {
+                    return overlay->second->is_put();
                 }
                 return base_contains(operation.id);
             }();
@@ -919,27 +1096,169 @@ private:
                 if (operation.payload_size != manifest_.record_size) {
                     throw CorruptionError("WAL PUT has unexpected payload size");
                 }
-                if (wal_payload_offsets_.size()
+                if (source.payload_offsets.size()
                     >= detail::RowRef::kMaximumRowsPerSegment) {
-                    throw CorruptionError("active WAL contains more than 2^32 PUTs");
+                    throw CorruptionError("WAL contains more than 2^32 PUTs");
                 }
                 const detail::RowRef row = detail::RowRef::create(
-                    manifest_.active_wal_segment_id,
-                    wal_payload_offsets_.size());
-                wal_payload_offsets_.push_back(operation.payload_offset);
+                    source.entry.segment_id,
+                    source.payload_offsets.size());
+                source.payload_offsets.push_back(operation.payload_offset);
                 overlay_.insert_or_assign(
-                    operation.id, detail::MutationValue::put(row));
+                    operation.id,
+                    detail::VersionedMutationValue::put(batch.sequence, row));
                 if (!existed) {
                     live_count_.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
                 overlay_.insert_or_assign(
-                    operation.id, detail::MutationValue::tombstone());
+                    operation.id,
+                    detail::VersionedMutationValue::tombstone(batch.sequence));
                 if (existed) {
                     live_count_.fetch_sub(1, std::memory_order_relaxed);
                 }
             }
         }
+    }
+
+    [[nodiscard]] NativeMutationLogStats mutation_log_stats_locked(
+        const bool rotated) const {
+        NativeMutationLogStats stats;
+        stats.catalog_managed = catalog_managed_;
+        stats.generation = catalog_managed_ ? catalog_.generation : 0;
+        stats.committed_sequence = next_sequence_ - 1;
+        stats.active_wal_bytes = append_offset_;
+        stats.active_wal_put_rows = active_wal().payload_offsets.size();
+        stats.rotated = rotated;
+        for (const auto& source : wal_resources_->sources) {
+            if (source->entry.state == detail::MutationWalState::Frozen) {
+                ++stats.frozen_wal_count;
+            }
+            if (stats.total_wal_bytes
+                > std::numeric_limits<std::uint64_t>::max()
+                      - source->valid_end) {
+                throw CorruptionError("mutation WAL byte count overflows uint64");
+            }
+            stats.total_wal_bytes += source->valid_end;
+        }
+        return stats;
+    }
+
+    [[nodiscard]] bool rotate_wal_locked() {
+        if (!catalog_managed_) {
+            throw InvalidArgumentError(
+                "WAL rotation requires a catalog-managed format-5 collection");
+        }
+        WalSource& old_active = active_wal();
+        if (next_sequence_ == old_active.header.first_sequence) {
+            return false;
+        }
+        if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError("mutation catalog generation is exhausted");
+        }
+        if (catalog_.wal_entries.size()
+            >= detail::kMutationCatalogMaxEntries) {
+            throw StorageError("mutation catalog WAL entry limit is exhausted");
+        }
+        if (catalog_.next_segment_id >= detail::SegmentId::kMaximum) {
+            throw StorageError("mutation segment ID space is exhausted");
+        }
+        const std::uint64_t previous_sequence = next_sequence_ - 1;
+        if (previous_sequence
+            >= detail::VersionedMutationValue::kMaximumCommitSequence) {
+            throw StorageError("mutation commit sequence space is exhausted");
+        }
+
+        detail::MutationWalEntry frozen = old_active.entry;
+        frozen.state = detail::MutationWalState::Frozen;
+        frozen.last_sequence = previous_sequence;
+        frozen.put_count = old_active.payload_offsets.size();
+        frozen.sealed_file_size = append_offset_;
+
+        detail::MutationWalEntry successor;
+        successor.wal_id = make_uuid();
+        successor.predecessor_wal_id = old_active.entry.wal_id;
+        successor.segment_id = catalog_.next_segment_id;
+        successor.state = detail::MutationWalState::Active;
+        successor.previous_sequence = previous_sequence;
+        successor.first_sequence = next_sequence_;
+
+        detail::MutationCatalog next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        next_catalog.next_segment_id = successor.segment_id + 1;
+        next_catalog.wal_entries.back() = frozen;
+        next_catalog.wal_entries.push_back(successor);
+
+        const detail::WalHeader successor_header = wal_header_for(
+            manifest_, successor.wal_id, successor.predecessor_wal_id,
+            successor.previous_sequence);
+        const std::filesystem::path successor_path =
+            detail::mutation_wal_path(path_, successor.wal_id);
+
+        try {
+            detail::ScopedAdvisoryLock commit(
+                commit_lock_, detail::FileLockMode::Exclusive);
+            if (detail::file_size(old_active.fd.get(), old_active.path)
+                != append_offset_) {
+                throw CorruptionError(
+                    "active WAL size changed before rotation");
+            }
+            // Every acknowledged transaction was already synced, but this
+            // barrier also establishes an explicit immutable freeze boundary.
+            detail::sync_file(old_active.fd.get(), old_active.path);
+            detail::create_wal_file(successor_path, successor_header);
+            detail::sync_directory(path_ / "wal");
+
+            auto successor_source = std::make_shared<WalSource>();
+            successor_source->entry = successor;
+            successor_source->header = successor_header;
+            successor_source->fd = detail::open_read_write(successor_path);
+            successor_source->path = successor_path;
+            successor_source->valid_end = detail::kWalFileHeaderSize;
+            successor_source->next_sequence = successor.first_sequence;
+
+            auto next_resources = std::make_shared<WalResourceSet>();
+            {
+                std::shared_lock state(state_mutex_);
+                next_resources->sources = wal_resources_->sources;
+                next_resources->source_indices =
+                    wal_resources_->source_indices;
+                next_resources->active_index = wal_resources_->active_index;
+            }
+            next_resources->sources.push_back(std::move(successor_source));
+            if (!next_resources->source_indices.emplace(
+                     successor.segment_id,
+                     next_resources->sources.size() - 1).second) {
+                throw CorruptionError(
+                    "successor WAL reuses a mutation segment ID");
+            }
+
+            // CURRENT is the only durable switch. Everything needed for the
+            // no-throw in-memory publication below has already been allocated.
+            static_cast<void>(detail::publish_mutation_catalog(
+                path_, manifest_, next_catalog));
+
+            {
+                std::unique_lock state(state_mutex_);
+                old_active.entry = frozen;
+                wal_resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+                wal_resources_->active_index =
+                    wal_resources_->sources.size() - 1;
+                append_offset_ = detail::kWalFileHeaderSize;
+                active_wal().valid_end = append_offset_;
+                active_wal().next_sequence = next_sequence_;
+            }
+        } catch (...) {
+            // A publication error can be reported after CURRENT was renamed
+            // but before its directory fsync completed. Never risk appending
+            // to what may now be a catalog-frozen predecessor.
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+        return true;
     }
 
     void prepare_publication_capacity(
@@ -951,32 +1270,32 @@ private:
         }
         if (put_count
             > std::numeric_limits<std::size_t>::max()
-                  - wal_payload_offsets_.size()) {
+                  - active_wal().payload_offsets.size()) {
             throw InvalidArgumentError("WAL RowRef table is too large");
         }
         overlay_.reserve(overlay_.size() + overlay_entries);
-        wal_payload_offsets_.reserve(wal_payload_offsets_.size() + put_count);
+        active_wal().payload_offsets.reserve(
+            active_wal().payload_offsets.size() + put_count);
     }
 
     void prime_overlay_node_unlocked(const std::uint64_t id) {
         if (overlay_.find(id) != overlay_.end()) {
             return;
         }
-        const auto base = detail::native_index_lookup(index_, id);
-        if (base.has_value()) {
-            overlay_.emplace(id, detail::MutationValue::put(*base));
-        } else {
-            overlay_.emplace(id, detail::MutationValue::tombstone());
-        }
+        // A disengaged optional is a preallocated publication node. Until its
+        // durable commit is installed, lookup deliberately falls through to
+        // the immutable base and therefore preserves the pre-commit view.
+        overlay_.emplace(id, std::nullopt);
     }
 
     void commit_operations(
         const std::span<const detail::WalMutation> operations,
         const std::uint64_t original_wal_rows,
         const std::uint64_t resulting_count) {
+        WalSource& active = active_wal();
         const detail::EncodedWalTransaction transaction =
             detail::encode_wal_transaction(
-                wal_header_, next_sequence_, append_offset_, operations);
+                active.header, next_sequence_, append_offset_, operations);
         const std::uint64_t relative_payload_offset = detail::get_u64(
             std::span<const std::byte>(transaction.bytes), 64);
         std::uint64_t payload_cursor = append_offset_ + relative_payload_offset;
@@ -995,7 +1314,7 @@ private:
             detail::ScopedAdvisoryLock commit(
                 commit_lock_, detail::FileLockMode::Exclusive);
             new_end = detail::append_wal_transaction_durable(
-                wal_fd_.get(), wal_path_, append_offset_, transaction);
+                active.fd.get(), active.path, append_offset_, transaction);
 
             try {
                 std::unique_lock lock(state_mutex_);
@@ -1005,20 +1324,25 @@ private:
                         const std::uint64_t row_index =
                             original_wal_rows + put_index;
                         const detail::RowRef row = detail::RowRef::create(
-                            manifest_.active_wal_segment_id, row_index);
-                        wal_payload_offsets_.push_back(put_offsets[put_index]);
+                            active.entry.segment_id, row_index);
+                        active.payload_offsets.push_back(put_offsets[put_index]);
                         overlay_.insert_or_assign(
-                            operation.id, detail::MutationValue::put(row));
+                            operation.id,
+                            detail::VersionedMutationValue::put(
+                                next_sequence_, row));
                         ++put_index;
                     } else {
                         overlay_.insert_or_assign(
                             operation.id,
-                            detail::MutationValue::tombstone());
+                            detail::VersionedMutationValue::tombstone(
+                                next_sequence_));
                     }
                 }
                 live_count_.store(resulting_count, std::memory_order_release);
                 append_offset_ = new_end;
                 ++next_sequence_;
+                active.valid_end = append_offset_;
+                active.next_sequence = next_sequence_;
                 // Publish only after every overlay and WAL RowRef update is
                 // complete. A reader that still observes false is concurrent
                 // with this first commit and may linearize immediately before
@@ -1045,18 +1369,17 @@ private:
     bool writable_{false};
 
     std::vector<BaseSegment> base_segments_;
-    detail::FileDescriptor wal_fd_;
-    std::filesystem::path wal_path_;
-    detail::WalHeader wal_header_;
+    bool catalog_managed_{false};
+    detail::MutationCatalog catalog_;
+    std::shared_ptr<WalResourceSet> wal_resources_;
 
     mutable std::shared_mutex state_mutex_;
-    std::unordered_map<std::uint64_t, detail::MutationValue> overlay_;
-    std::vector<std::uint64_t> wal_payload_offsets_;
+    std::unordered_map<std::uint64_t, OverlayValue> overlay_;
     std::atomic<bool> mutation_read_path_active_{false};
     std::atomic<std::uint64_t> live_count_{0};
     std::uint64_t append_offset_{detail::kWalFileHeaderSize};
     std::uint64_t next_sequence_{1};
-    std::mutex mutation_mutex_;
+    mutable std::mutex mutation_mutex_;
     std::atomic<bool> poisoned_{false};
     const pid_t owner_pid_{::getpid()};
 };
@@ -1181,6 +1504,12 @@ void NativeCollection::upsert(
 std::vector<std::uint8_t> NativeCollection::erase(
     const std::span<const std::uint64_t> ids) {
     return impl_->erase(ids);
+}
+NativeMutationLogStats NativeCollection::mutation_log_stats() const {
+    return impl_->mutation_log_stats();
+}
+NativeMutationLogStats NativeCollection::rotate_wal() {
+    return impl_->rotate_wal();
 }
 std::uint64_t NativeCollection::count() const { return impl_->count(); }
 std::uint32_t NativeCollection::dimension() const {

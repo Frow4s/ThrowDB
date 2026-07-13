@@ -463,6 +463,19 @@ class Collection:
             return None
         return dict(self._ensure_native_open("inspect open stats").open_stats)
 
+    @property
+    def mutation_log_stats(self) -> dict[str, object] | None:
+        """Return a stable snapshot of the durable mutation-log lifecycle."""
+
+        if self._native is None:
+            return None
+        stats = self._ensure_native_open(
+            "inspect mutation log stats"
+        ).mutation_log_stats
+        if not isinstance(stats, dict):
+            raise RuntimeError("native mutation-log stats are invalid")
+        return dict(stats)
+
     def _ensure_builder_open(self) -> NativeCollectionBuilder:
         if self._builder is None:
             raise RuntimeError("add is only available on a collection builder")
@@ -583,6 +596,19 @@ class Collection:
         if deleted.dtype != np.dtype(np.bool_) or deleted.shape != normalized_ids.shape:
             raise RuntimeError("native delete returned an invalid result array")
         return deleted
+
+    def rotate_wal(self) -> dict[str, object]:
+        """Seal a non-empty active WAL and atomically publish its successor.
+
+        Rotation changes only durable mutation resources. It does not rewrite
+        immutable base segments or change the logical contents of a collection.
+        """
+
+        native = self._ensure_mutable("rotate the mutation WAL")
+        stats = native.rotate_wal()
+        if not isinstance(stats, dict):
+            raise RuntimeError("native WAL rotation returned invalid diagnostics")
+        return dict(stats)
 
     def get(
         self,

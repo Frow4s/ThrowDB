@@ -196,8 +196,9 @@ Format version is a storage contract, not a package version.
 - the legacy low-level reader remains available for existing benchmarks, but
   the new `Collection` path need not open format-v1/v2 collections during the
   experimental MVP;
-- source NumPy arrays are the supported migration path into the current native
-  format 4; the reader retains a strict fallback for legacy native format 3;
+- source NumPy arrays are the supported migration path into the current
+  catalog-managed native format 5; the reader retains strict legacy paths for
+  native formats 3 and 4;
 - migration creates a new collection and never rewrites the source arrays;
 - reserved fields and feature flags must be validated rather than silently
   interpreted.

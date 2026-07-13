@@ -56,6 +56,20 @@ struct NativeReadStats {
     bool zero_delta_fast_path = false;
 };
 
+// Durable mutation-log state captured under the collection's mutation lock.
+// rotate_wal() returns the same snapshot with rotated=true when it published a
+// successor WAL. An empty active WAL is a successful no-op.
+struct NativeMutationLogStats {
+    bool catalog_managed = false;
+    std::uint64_t generation = 0;
+    std::uint64_t committed_sequence = 0;
+    std::uint64_t frozen_wal_count = 0;
+    std::uint64_t active_wal_bytes = 0;
+    std::uint64_t active_wal_put_rows = 0;
+    std::uint64_t total_wal_bytes = 0;
+    bool rotated = false;
+};
+
 class NativeCollectionBuilder {
 public:
     static std::unique_ptr<NativeCollectionBuilder> create(
@@ -121,6 +135,9 @@ public:
         std::span<const std::byte> embeddings);
     [[nodiscard]] std::vector<std::uint8_t> erase(
         std::span<const std::uint64_t> ids);
+
+    [[nodiscard]] NativeMutationLogStats mutation_log_stats() const;
+    [[nodiscard]] NativeMutationLogStats rotate_wal();
 
     [[nodiscard]] std::uint64_t count() const;
     [[nodiscard]] std::uint32_t dimension() const;

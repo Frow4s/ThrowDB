@@ -205,6 +205,107 @@ private:
     std::uint64_t raw_row_ref_;
 };
 
+// One durable logical mutation together with the commit that published it.
+// Commit sequence zero means "no committed version" and UINT64_MAX is kept
+// reserved so advancing a sequence can fail before unsigned wraparound. Those
+// sentinel values are never valid in persisted mutation state.
+class VersionedMutationValue {
+public:
+    static constexpr std::uint64_t kMinimumCommitSequence = 1;
+    static constexpr std::uint64_t kMaximumCommitSequence =
+        std::numeric_limits<std::uint64_t>::max() - 1;
+
+    [[nodiscard]] static VersionedMutationValue create(
+        const std::uint64_t sequence,
+        const MutationValue value) {
+        validate_sequence_for_create(sequence);
+        return VersionedMutationValue(sequence, value);
+    }
+
+    [[nodiscard]] static VersionedMutationValue put(
+        const std::uint64_t sequence,
+        const RowRef row_ref) {
+        return create(sequence, MutationValue::put(row_ref));
+    }
+
+    [[nodiscard]] static VersionedMutationValue tombstone(
+        const std::uint64_t sequence) {
+        return create(sequence, MutationValue::tombstone());
+    }
+
+    // Decode is deliberately distinct from create(): invalid persisted
+    // sequences or MutationValue encodings indicate corruption, not a bad API
+    // argument.
+    [[nodiscard]] static VersionedMutationValue decode(
+        const std::uint64_t encoded_sequence,
+        const std::uint8_t encoded_state,
+        const std::uint64_t encoded_row_ref) {
+        validate_sequence_for_decode(encoded_sequence);
+        return VersionedMutationValue(
+            encoded_sequence,
+            MutationValue::decode(encoded_state, encoded_row_ref));
+    }
+
+    [[nodiscard]] constexpr std::uint64_t sequence() const noexcept {
+        return sequence_;
+    }
+
+    [[nodiscard]] constexpr const MutationValue& value() const noexcept {
+        return value_;
+    }
+
+    [[nodiscard]] constexpr MutationValueState state() const noexcept {
+        return value_.state();
+    }
+
+    [[nodiscard]] constexpr std::uint8_t encoded_state() const noexcept {
+        return value_.encoded_state();
+    }
+
+    [[nodiscard]] constexpr std::uint64_t encoded_row_ref() const noexcept {
+        return value_.encoded_row_ref();
+    }
+
+    [[nodiscard]] constexpr bool is_put() const noexcept {
+        return value_.is_put();
+    }
+
+    [[nodiscard]] constexpr bool is_tombstone() const noexcept {
+        return value_.is_tombstone();
+    }
+
+    [[nodiscard]] std::optional<RowRef> row_ref() const {
+        return value_.row_ref();
+    }
+
+    bool operator==(const VersionedMutationValue&) const = default;
+
+private:
+    static void validate_sequence_for_create(const std::uint64_t sequence) {
+        if (sequence < kMinimumCommitSequence
+            || sequence > kMaximumCommitSequence) {
+            throw InvalidArgumentError(
+                "commit sequence must be between 1 and UINT64_MAX-1");
+        }
+    }
+
+    static void validate_sequence_for_decode(const std::uint64_t sequence) {
+        if (sequence < kMinimumCommitSequence
+            || sequence > kMaximumCommitSequence) {
+            throw CorruptionError(
+                "versioned mutation contains a reserved commit sequence");
+        }
+    }
+
+    explicit constexpr VersionedMutationValue(
+        const std::uint64_t sequence,
+        const MutationValue value) noexcept
+        : sequence_(sequence), value_(value) {}
+
+    std::uint64_t sequence_;
+    MutationValue value_;
+};
+
 class PartitionLayout {
 public:
     // A partition ID is uint32. Allowing 32 bits is safe: partition_count() is

@@ -176,7 +176,19 @@ def _inspect(args: argparse.Namespace) -> None:
                     "dtype": collection.dtype,
                     "format_version": collection.format_version,
                     "open_stats": collection.open_stats,
+                    "mutation_log": collection.mutation_log_stats,
                 },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+
+
+def _rotate_wal(args: argparse.Namespace) -> None:
+    with Collection.open(args.storage, mode="r+") as collection:
+        print(
+            json.dumps(
+                collection.rotate_wal(),
                 indent=2,
                 sort_keys=True,
             )
@@ -274,6 +286,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run the complete structural index audit while opening",
     )
     inspect.set_defaults(handler=_inspect)
+
+    rotate_wal = subparsers.add_parser(
+        "rotate-wal",
+        help="seal a non-empty mutation WAL and publish its successor",
+    )
+    rotate_wal.add_argument("--storage", type=Path, required=True)
+    rotate_wal.set_defaults(handler=_rotate_wal)
     return parser
 
 

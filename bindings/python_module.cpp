@@ -60,6 +60,20 @@ struct DTypeInfo {
     return py::dtype::from_args(py::str(dtype_info(dtype).name));
 }
 
+[[nodiscard]] py::dict mutation_log_stats_dict(
+    const throwdb::NativeMutationLogStats& stats) {
+    py::dict result;
+    result["catalog_managed"] = stats.catalog_managed;
+    result["generation"] = stats.generation;
+    result["committed_sequence"] = stats.committed_sequence;
+    result["frozen_wal_count"] = stats.frozen_wal_count;
+    result["active_wal_bytes"] = stats.active_wal_bytes;
+    result["active_wal_put_rows"] = stats.active_wal_put_rows;
+    result["total_wal_bytes"] = stats.total_wal_bytes;
+    result["rotated"] = stats.rotated;
+    return result;
+}
+
 [[nodiscard]] std::filesystem::path filesystem_path(const py::handle& value) {
     py::object path = py::module_::import("os").attr("fspath")(value);
     if (py::isinstance<py::str>(path) || py::isinstance<py::bytes>(path)) {
@@ -731,6 +745,26 @@ public:
         return result;
     }
 
+    [[nodiscard]] py::dict mutation_log_stats() const {
+        const auto collection = acquire_collection();
+        throwdb::NativeMutationLogStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = collection->mutation_log_stats();
+        }
+        return mutation_log_stats_dict(stats);
+    }
+
+    [[nodiscard]] py::dict rotate_wal() {
+        const auto collection = acquire_collection();
+        throwdb::NativeMutationLogStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = collection->rotate_wal();
+        }
+        return mutation_log_stats_dict(stats);
+    }
+
     py::array get(const py::array& ids) const {
         const auto collection = acquire_collection();
         const auto id_span = validate_ids(ids);
@@ -962,6 +996,8 @@ PYBIND11_MODULE(_throwdb, module) {
         .def_property_readonly(
             "format_version", &PyNativeCollection::format_version)
         .def_property_readonly("open_stats", &PyNativeCollection::open_stats)
+        .def_property_readonly(
+            "mutation_log_stats", &PyNativeCollection::mutation_log_stats)
         .def("get", &PyNativeCollection::get, py::arg("ids"))
         .def(
             "get_into",
@@ -989,5 +1025,6 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("ids"),
             py::arg("embeddings"))
         .def("delete", &PyNativeCollection::erase, py::arg("ids"))
+        .def("rotate_wal", &PyNativeCollection::rotate_wal)
         .def("close", &PyNativeCollection::close);
 }

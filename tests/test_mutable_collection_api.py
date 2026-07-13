@@ -68,7 +68,7 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
 
     with throwdb.Collection.open(path, mode="r+") as collection:
         assert collection.mode == "read_write"
-        assert collection.format_version == 4
+        assert collection.format_version == 5
         assert collection.count == 3
 
         collection.insert(np.array([40, 50], dtype=np.int16), inserted)
@@ -232,6 +232,70 @@ def test_profiled_read_reports_zero_delta_and_mutation_paths(
             assert mutated[key] >= 0.0
 
 
+def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
+    path = tmp_path / "store"
+    maximum_id = (1 << 64) - 1
+    boundary_id = 1 << 32
+    base = _vectors(2, 5, "float16", salt=19)
+    first = _vectors(2, 5, "float16", salt=219)
+    second = _vectors(2, 5, "float16", salt=419)
+    _build(path, [0, maximum_id], base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        initial = collection.mutation_log_stats
+        assert initial is not None
+        assert initial["catalog_managed"] is True
+        assert initial["generation"] == 1
+        assert initial["committed_sequence"] == 0
+        assert initial["frozen_wal_count"] == 0
+        assert initial["active_wal_bytes"] == 4096
+        assert initial["active_wal_put_rows"] == 0
+
+        empty = collection.rotate_wal()
+        assert empty["rotated"] is False
+        assert empty["generation"] == 1
+
+        collection.upsert([0, boundary_id], first)
+        before = collection.mutation_log_stats
+        assert before is not None
+        assert before["committed_sequence"] == 1
+        assert before["active_wal_put_rows"] == 2
+
+        rotated = collection.rotate_wal()
+        assert rotated["rotated"] is True
+        assert rotated["generation"] == 2
+        assert rotated["committed_sequence"] == 1
+        assert rotated["frozen_wal_count"] == 1
+        assert rotated["active_wal_bytes"] == 4096
+        assert rotated["active_wal_put_rows"] == 0
+        assert rotated["total_wal_bytes"] > 8192
+
+        np.testing.assert_array_equal(collection.delete([maximum_id]), [True])
+        collection.update([boundary_id], second[:1])
+        collection.insert([maximum_id], second[1:])
+        assert collection.count == 3
+        second_rotation = collection.rotate_wal()
+        assert second_rotation["rotated"] is True
+        assert second_rotation["generation"] == 3
+        assert second_rotation["committed_sequence"] == 4
+        assert second_rotation["frozen_wal_count"] == 2
+
+    with throwdb.Collection.open(path) as reopened:
+        assert reopened.format_version == 5
+        stats = reopened.mutation_log_stats
+        assert stats is not None
+        assert stats["catalog_managed"] is True
+        assert stats["generation"] == 3
+        assert stats["committed_sequence"] == 4
+        assert stats["frozen_wal_count"] == 2
+        _assert_same_bits(
+            reopened.get([maximum_id, 0, boundary_id]),
+            np.stack([second[1], first[0], second[0]]),
+        )
+        with pytest.raises(RuntimeError, match=r"mode='r\+'"):
+            reopened.rotate_wal()
+
+
 def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(
     tmp_path: Path,
 ) -> None:
@@ -244,7 +308,9 @@ def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(
     with throwdb.Collection.open(path, mode="r+") as collection:
         collection.insert([2], inserted)
 
-    wal = path / "wal" / "active.wal"
+    wal_paths = list((path / "wal").glob("*.wal"))
+    assert len(wal_paths) == 1
+    wal = wal_paths[0]
     committed_size = wal.stat().st_size
     with wal.open("ab") as stream:
         stream.write(b"torn-wal-tail")

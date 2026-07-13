@@ -61,25 +61,35 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     collection.update([42], vectors[1:2])
     collection.upsert([100, 300], vectors[:2])
     deleted = collection.delete([200, 999])  # [True, False]
+    lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
 ```
 
 `Collection.create()` now builds the checksummed native numeric format reported
-as `collection.format_version == 4`. The current reader also opens legacy
-checksum-free version-3 collections, using a full structural index validation
-as its safe fallback. UTF-8 IDs remain reserved for the next string index slice.
+as `collection.format_version == 5`. Version 5 adds a checksummed `CURRENT`
+pointer, immutable catalogs, and a UUID-named active/frozen WAL chain. The
+reader also opens legacy version-3/4 single-WAL collections; version 3 uses a
+full structural index validation as its checksum-free fallback. UTF-8 IDs
+remain reserved for the next string index slice.
 Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
 The initial `"auto"` tuning profile deliberately selects the conservative
 thread-pool baseline without running a calibration benchmark; the effective
 selection and reason are visible through `collection.tuning`.
 
-Normal version-4 open verifies the CRC32C persisted for the complete flat-index
+Normal version-5 open verifies the CRC32C persisted for the complete flat-index
 body. Use `Collection.open(path, verify_index=True)` to additionally run the
 much more expensive slot, `RowRef`, uniqueness, and probe-path audit. Per-phase
 durations and the selected validation path are available in
 `collection.open_stats` and are copied into load-test `report.json`.
 `throwdb inspect --storage /data/example` prints the same diagnostics as JSON;
 add `--verify-index` to use that command as a full scrub-on-open check.
+
+`collection.mutation_log_stats` reports the selected catalog generation,
+committed sequence, frozen-WAL count, and active/total WAL bytes. Calling
+`rotate_wal()` seals a non-empty active WAL and atomically publishes its
+successor; it does not rewrite base embeddings or reclaim old WAL space.
+Reclamation starts in the next lifecycle slice, where frozen WALs become
+bounded immutable delta segments.
 
 `Writer` and `Storage` remain the legacy immutable low-level API used by the
 existing benchmark suite. They require native, aligned, C-contiguous `uint64`
@@ -197,6 +207,8 @@ throwdb get \
   --output result.npy
 
 throwdb inspect --storage /data/example
+
+throwdb rotate-wal --storage /data/example
 ```
 
 `ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
@@ -233,9 +245,12 @@ can interrupt cleanup.
   captured when opened and must be reopened to observe another process's later
   commits;
 - buffered `pread` and experimental Linux `io_uring` backends;
-- no WAL rotation/selective cleaning, UTF-8 IDs, payload scrubbing, or network
-  service yet. Until rotation lands, mutation history grows in `wal/active.wal`
-  and is replayed when the collection opens.
+- crash-safe manual WAL rotation through immutable catalogs; automatic
+  rotation is currently only the hard safety valve before a WAL would exceed
+  the 32-bit `RowRef` row limit;
+- no frozen-WAL compaction, selective cleaning, UTF-8 IDs, payload scrubbing,
+  or network service yet. Rotation bounds one WAL but the complete retained
+  WAL chain is still replayed when the collection opens.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and
@@ -246,7 +261,7 @@ complete machine, correctness, sequential-read, and concurrent-reader run, edit
 the configuration at the top of `benchmarks/run_load_test.py` and execute it
 once. The runner auto-detects fresh native and legacy immutable manifests.
 `--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` on immutable base
-segments and the active mutation WAL for rootless eviction on Linux.
+segments and every retained mutation WAL for rootless eviction on Linux.
 Standalone `warm` replays the exact measured query set outside the timed
 interval before measuring it; `both` measures the same deterministic stream
 cold first and warm immediately afterwards. A result's

@@ -249,6 +249,8 @@ struct BuiltStore {
 void test_manifest_is_independent_checksummed_format() {
     using namespace throwdb::detail;
     NativeManifest manifest = make_manifest();
+    manifest.required_feature_bits = kNativeRequiredFeatureCatalogV1;
+    manifest.optional_feature_bits = 0x8000000000000000ULL;
     require_equal(manifest.record_size, std::uint64_t{4},
                   "float16 native record size is wrong");
     require_equal(manifest.records_per_segment, std::uint64_t{2},
@@ -279,6 +281,12 @@ void test_manifest_is_independent_checksummed_format() {
                   "WAL UUID did not round trip");
     require_equal(decoded.index_file_size, manifest.index_file_size,
                   "index geometry did not round trip");
+    require_equal(
+        decoded.required_feature_bits, manifest.required_feature_bits,
+        "required feature bits did not round trip");
+    require_equal(
+        decoded.optional_feature_bits, manifest.optional_feature_bits,
+        "optional feature bits did not round trip");
 
     auto corrupted = encoded;
     corrupted[120] ^= std::byte{1};
@@ -300,6 +308,14 @@ void test_manifest_is_independent_checksummed_format() {
             derive_native_manifest_geometry(too_many_rows);
         },
         "more than 2^32 rows per segment were accepted");
+
+    NativeManifest unsupported = make_manifest();
+    unsupported.required_feature_bits = 1ULL << 63;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&unsupported] {
+            static_cast<void>(encode_native_manifest(unsupported));
+        },
+        "unknown required manifest feature was accepted");
 }
 
 void test_paths_and_atomic_manifest_are_deterministic() {

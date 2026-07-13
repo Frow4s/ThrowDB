@@ -19,7 +19,7 @@ namespace throwdb::detail {
 namespace {
 
 constexpr std::size_t kIndexIoEntries = 1U << 16;
-constexpr std::size_t kManifestKnownBytes = 200;
+constexpr std::size_t kManifestKnownBytes = 216;
 constexpr std::size_t kDataKnownBytes = 120;
 constexpr std::size_t kIdsKnownBytes = 104;
 constexpr std::size_t kIndexKnownBytes = 136;
@@ -240,6 +240,10 @@ void validate_manifest(const NativeManifest& manifest) {
         "manifest next segment ID is not contiguous");
     require_valid_segment_id<Error>(manifest.active_wal_segment_id);
     require_valid_segment_id<Error>(manifest.next_segment_id);
+    require<Error>(
+        (manifest.required_feature_bits
+         & ~kNativeSupportedRequiredFeatureBits) == 0,
+        "manifest requires unsupported features");
 
     require<Error>(
         manifest.index_capacity >= 8
@@ -701,6 +705,8 @@ std::array<std::byte, kNativeHeaderSize> encode_native_manifest(
     put_u64(output, 184, manifest.hash_seed);
     put_u32(output, 192, manifest.active_wal_segment_id);
     put_u32(output, 196, manifest.next_segment_id);
+    put_u64(output, 200, manifest.required_feature_bits);
+    put_u64(output, 208, manifest.optional_feature_bits);
     finish_header_crc(output);
     return output;
 }
@@ -735,6 +741,8 @@ NativeManifest decode_native_manifest(const std::span<const std::byte> bytes) {
     result.hash_seed = get_u64(bytes, 184);
     result.active_wal_segment_id = get_u32(bytes, 192);
     result.next_segment_id = get_u32(bytes, 196);
+    result.required_feature_bits = get_u64(bytes, 200);
+    result.optional_feature_bits = get_u64(bytes, 208);
     validate_manifest<CorruptionError>(result);
     require_reserved_zero(bytes, kManifestKnownBytes, "native manifest");
     return result;

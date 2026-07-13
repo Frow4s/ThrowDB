@@ -143,6 +143,119 @@ void test_tombstone_is_out_of_band() {
         "unknown mutation state was accepted");
 }
 
+void test_versioned_mutation_value_round_trip_and_boundaries() {
+    using throwdb::detail::MutationValue;
+    using throwdb::detail::MutationValueState;
+    using throwdb::detail::RowRef;
+    using throwdb::detail::VersionedMutationValue;
+
+    const RowRef ref = RowRef::create(23, 456);
+    const VersionedMutationValue first =
+        VersionedMutationValue::put(1, ref);
+    require_equal(first.sequence(), std::uint64_t{1},
+                  "versioned PUT lost its sequence");
+    require(first.is_put() && !first.is_tombstone(),
+            "versioned PUT has the wrong state");
+    require_equal(first.state(), MutationValueState::Put,
+                  "versioned PUT state accessor is wrong");
+    require_equal(first.encoded_state(), std::uint8_t{1},
+                  "versioned PUT state encoding changed");
+    require_equal(first.encoded_row_ref(), ref.raw(),
+                  "versioned PUT lost its RowRef encoding");
+    require(first.row_ref().has_value(),
+            "versioned PUT does not expose its RowRef");
+    require_equal(*first.row_ref(), ref,
+                  "versioned PUT exposes the wrong RowRef");
+    require_equal(first.value(), MutationValue::put(ref),
+                  "versioned PUT exposes the wrong MutationValue");
+    require_equal(
+        VersionedMutationValue::decode(
+            first.sequence(), first.encoded_state(), first.encoded_row_ref()),
+        first,
+        "versioned PUT did not round trip through durable fields");
+
+    const std::uint64_t maximum_sequence =
+        VersionedMutationValue::kMaximumCommitSequence;
+    const VersionedMutationValue deleted =
+        VersionedMutationValue::tombstone(maximum_sequence);
+    require_equal(deleted.sequence(), maximum_sequence,
+                  "maximum usable commit sequence was not preserved");
+    require(deleted.is_tombstone() && !deleted.is_put(),
+            "versioned tombstone has the wrong state");
+    require_equal(deleted.state(), MutationValueState::Tombstone,
+                  "versioned tombstone state accessor is wrong");
+    require_equal(deleted.encoded_state(), std::uint8_t{2},
+                  "versioned tombstone state encoding changed");
+    require_equal(deleted.encoded_row_ref(), std::uint64_t{0},
+                  "versioned tombstone stored a RowRef sentinel");
+    require(!deleted.row_ref().has_value(),
+            "versioned tombstone unexpectedly exposes a RowRef");
+    require_equal(
+        VersionedMutationValue::decode(
+            deleted.sequence(), deleted.encoded_state(),
+            deleted.encoded_row_ref()),
+        deleted,
+        "versioned tombstone did not round trip through durable fields");
+
+    require_equal(
+        VersionedMutationValue::create(1, MutationValue::put(ref)), first,
+        "generic versioned factory differs from PUT factory");
+    require(!(VersionedMutationValue::put(2, ref) == first),
+            "versioned equality ignored the commit sequence");
+    require(!(VersionedMutationValue::tombstone(1) == first),
+            "versioned equality ignored the mutation value");
+}
+
+void test_versioned_mutation_value_rejects_reserved_sequences_and_state() {
+    using throwdb::detail::MutationValue;
+    using throwdb::detail::RowRef;
+    using throwdb::detail::VersionedMutationValue;
+
+    const RowRef ref = RowRef::create(7, 8);
+    const std::uint64_t reserved_maximum =
+        std::numeric_limits<std::uint64_t>::max();
+
+    require_throws<throwdb::InvalidArgumentError>(
+        [ref] { static_cast<void>(VersionedMutationValue::put(0, ref)); },
+        "versioned PUT accepted commit sequence zero");
+    require_throws<throwdb::InvalidArgumentError>(
+        [] {
+            static_cast<void>(
+                VersionedMutationValue::tombstone(reserved_maximum));
+        },
+        "versioned tombstone accepted UINT64_MAX sequence");
+    require_throws<throwdb::InvalidArgumentError>(
+        [] {
+            static_cast<void>(VersionedMutationValue::create(
+                0, MutationValue::tombstone()));
+        },
+        "generic versioned factory accepted commit sequence zero");
+
+    require_throws<throwdb::CorruptionError>(
+        [ref] {
+            static_cast<void>(
+                VersionedMutationValue::decode(0, 1, ref.raw()));
+        },
+        "persisted versioned mutation accepted sequence zero");
+    require_throws<throwdb::CorruptionError>(
+        [] {
+            static_cast<void>(VersionedMutationValue::decode(
+                reserved_maximum, 2, 0));
+        },
+        "persisted versioned mutation accepted UINT64_MAX sequence");
+    require_throws<throwdb::CorruptionError>(
+        [] {
+            static_cast<void>(VersionedMutationValue::decode(1, 0, 0));
+        },
+        "versioned mutation accepted an invalid persisted state");
+    require_throws<throwdb::CorruptionError>(
+        [ref] {
+            static_cast<void>(
+                VersionedMutationValue::decode(1, 2, ref.raw()));
+        },
+        "versioned mutation accepted a tombstone with a RowRef");
+}
+
 void test_partition_layout_uses_high_hash_bits() {
     using throwdb::detail::PartitionLayout;
 
@@ -217,12 +330,16 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 5> tests{{
+    const std::array<TestCase, 7> tests{{
         {"segment_id_boundaries_are_checked",
          test_segment_id_boundaries_are_checked},
         {"row_ref_round_trip_and_boundaries",
          test_row_ref_round_trip_and_boundaries},
         {"tombstone_is_out_of_band", test_tombstone_is_out_of_band},
+        {"versioned_mutation_value_round_trip_and_boundaries",
+         test_versioned_mutation_value_round_trip_and_boundaries},
+        {"versioned_mutation_value_rejects_reserved_sequences_and_state",
+         test_versioned_mutation_value_rejects_reserved_sequences_and_state},
         {"partition_layout_uses_high_hash_bits",
          test_partition_layout_uses_high_hash_bits},
         {"partition_layout_rejects_unsafe_boundaries",

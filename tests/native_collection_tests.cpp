@@ -151,7 +151,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
         std::span(base_ids).subspan(3),
         std::span(base).subspan(3 * record_size));
     require(builder->count() == base_ids.size(), "builder count is wrong");
-    require(builder->format_version() == 4, "native public version is wrong");
+    require(builder->format_version() == 5, "native public version is wrong");
     builder->finish();
 
     auto old_snapshot = throwdb::NativeCollection::open(store);
@@ -267,8 +267,8 @@ void test_open_stats_fast_forced_and_legacy_validation() {
 
     {
         auto reader = throwdb::NativeCollection::open(store);
-        require(reader->format_version() == 4,
-                "checksummed collection did not report version 4");
+        require(reader->format_version() == 5,
+                "catalog collection did not report version 5");
         const throwdb::NativeOpenStats stats = reader->open_stats();
         require(stats.total_seconds > 0.0,
                 "open diagnostics have no total duration");
@@ -297,8 +297,8 @@ void test_open_stats_fast_forced_and_legacy_validation() {
 
     remove_index_body_checksum(store);
     auto legacy = throwdb::NativeCollection::open(store);
-    require(legacy->format_version() == 3,
-            "legacy checksum-free collection did not report version 3");
+    require(legacy->format_version() == 5,
+            "catalog collection changed version with index validation mode");
     const throwdb::NativeOpenStats legacy_stats = legacy->open_stats();
     require(!legacy_stats.index_body_checksum_present,
             "legacy open invented an index checksum");
@@ -328,7 +328,14 @@ void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
         writer->insert(inserted_id, inserted);
     }
 
-    const auto wal = store / "wal" / "active.wal";
+    std::vector<std::filesystem::path> wal_paths;
+    for (const auto& entry : std::filesystem::directory_iterator(store / "wal")) {
+        if (entry.is_regular_file() && entry.path().extension() == ".wal") {
+            wal_paths.push_back(entry.path());
+        }
+    }
+    require(wal_paths.size() == 1, "fresh collection has an unexpected WAL set");
+    const auto wal = wal_paths.front();
     const auto committed_size = std::filesystem::file_size(wal);
     {
         std::ofstream stream(wal, std::ios::binary | std::ios::app);

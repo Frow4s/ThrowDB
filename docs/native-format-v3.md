@@ -1,18 +1,21 @@
-# Native mutable numeric formats 3 and 4
+# Native mutable numeric formats 3, 4, and 5
 
 `Collection.create()` publishes a fresh numeric collection reported through
-the public API as format version 4. Version 4 adds a CRC32C for the complete
-flat-index body in fields that were reserved and zero in version 3. Its internal
-wire headers still use native-format version 1; the public version distinguishes
-the new index integrity contract. This format is intentionally independent of the
-earlier immutable format-v1/v2 files: source NumPy arrays are the migration
-path while the mutable format is still experimental.
+the public API as format version 5. Version 4 added a CRC32C for the complete
+flat-index body in fields that were reserved and zero in version 3. Version 5
+adds a required manifest feature bit, a checksummed `CURRENT` pointer,
+immutable catalog generations, and UUID-named active/frozen WALs. The internal
+base and WAL headers still use their respective wire version 1; the public
+version distinguishes the collection-level integrity and lifecycle contract.
+This format is intentionally independent of the earlier immutable format-v1/v2
+files: source NumPy arrays remain the migration path while the mutable format
+is experimental.
 
-The current reader opens both versions. A checksum-free version-3 index falls
-back to the complete structural scan and is reported as version 3. New builders
-write the checksum and report version 4. Older readers reject version 4 because
-they require those header bytes to remain zero; upgrading the reader is
-therefore required before rebuilding a collection in version 4.
+The current reader opens all three versions. A checksum-free version-3 index
+falls back to the complete structural scan. Version 4 uses one fixed
+`wal/active.wal`. New builders write version 5. Older readers reject version 5
+because its manifest catalog-required bit occupies bytes they require to be
+zero; they cannot silently open only the initial WAL anchor.
 
 ## Layout
 
@@ -22,10 +25,15 @@ collection/
   data/segment-N.dat
   ids/segment-N.ids
   index/index.bin
-  wal/active.wal
+  CURRENT
+  catalogs/catalog-<catalog-uuid>.bin
+  wal/wal-<wal-uuid>.wal
   locks/writer.lock
   locks/commit.lock
 ```
+
+Legacy version 3/4 collections retain `wal/active.wal` and have neither
+`CURRENT` nor catalogs.
 
 Every manifest, base-data, ID-sidecar, and index file starts with a 4096-byte
 CRC32C-protected header bound to nonzero collection and schema UUIDs. Base data
@@ -39,7 +47,7 @@ same logical address without changing the public read path. The table targets
 at most 70 percent occupancy. This deliberately favors lookup speed and RAM
 over compactness for the first large-index tests.
 
-Before publishing a version-4 index, the builder performs the complete
+Before publishing a version-4/5 index, the builder performs the complete
 structural validation and then records CRC32C over controls, zero alignment
 padding, and all serialized slots. A normal open verifies that checksum while
 loading the index and does not repeat the expensive per-slot structural audit.
@@ -52,18 +60,30 @@ accidental corruption; it is not a cryptographic authenticity mechanism.
 
 The builder streams embeddings and IDs into immutable base segments. On
 `finish()` it syncs every completed segment, builds and syncs the flat index,
-creates and syncs an empty active WAL, then atomically renames and syncs
-`manifest.bin`. A reader therefore sees either no published collection or the
-complete initial collection; an unfinished builder is not readable.
+creates and syncs an empty UUID-named active WAL, publishes catalog generation
+1 and `CURRENT`, then atomically renames and syncs `manifest.bin`. A reader
+therefore sees either no published collection or the complete initial
+collection; an unfinished builder is not readable.
+
+`CURRENT` is exactly 4096 bytes and binds collection/schema UUIDs, catalog UUID,
+generation, exact catalog size, and CRC32C of the complete catalog. A catalog
+has a 4096-byte checksummed header followed by fixed 128-byte WAL entries. It
+records its predecessor catalog, materialized lineage anchor, monotonic next
+segment ID, and an ordered chain with exactly one active WAL at the end. Frozen
+entries persist exact final sequence, PUT-row count, and file size; the active
+entry derives its changing tail state by scanning the WAL. Catalog and WAL file
+names are derived only from validated UUIDs, never persisted paths.
 
 ## Reads and snapshot semantics
 
 Opening a collection validates its manifest, base segment headers, ID
 sidecars, index checksum (or the complete index structure for legacy and
-explicit-verify opens), and WAL identity. Committed WAL operations rebuild
-an in-memory overlay. Lookup checks that overlay first: a PUT resolves to the
-active WAL and a tombstone stops lookup; absent overlay entries fall through
-to the base index.
+explicit-verify opens), `CURRENT`, the selected catalog, and every referenced
+WAL identity. Frozen WALs are scanned strictly; only the final active WAL may
+discard a torn uncommitted tail. Committed operations rebuild one in-memory
+versioned overlay. Lookup checks that overlay first: a PUT resolves through the
+captured WAL resource set and a tombstone stops lookup; absent entries fall
+through to the base index.
 
 All IDs in one `get` are resolved under one shared state lock before physical
 I/O starts. The generic physical reader then sorts `{fd, offset}` requests,
@@ -94,6 +114,24 @@ open ignores one incomplete active-WAL tail. A read-write open, while holding
 the writer and commit leases, truncates that tail to the last committed byte
 and syncs the repair before accepting new writes.
 
+## Catalog publication and WAL rotation
+
+`rotate_wal()` is serialized with commits by the mutation mutex and holds the
+commit lock exclusively across publication. A header-only WAL is a no-op. For
+a non-empty WAL it syncs the predecessor, creates and syncs a successor whose
+header names the predecessor UUID and exact previous sequence, publishes an
+immutable catalog containing the frozen predecessor plus active successor,
+then atomically replaces and syncs `CURRENT`. Only after that durable switch
+does it replace the in-memory resource view. Any ambiguous publication error
+poisons the writer handle and requires reopen.
+
+Catalog and `CURRENT` temporary names include the new catalog UUID. A crash
+before the `CURRENT` rename leaves harmless orphan files; open never scans the
+directory for the numerically newest catalog. A crash after publication opens
+the complete new view. Readers retain one shared owner of the WAL resource set
+through physical I/O, so later catalog switches cannot invalidate an already
+planned raw file descriptor.
+
 ## Current limits
 
 - Numeric IDs only (`uint64` on disk); the Python layer safely accepts
@@ -102,7 +140,8 @@ and syncs the repair before accepting new writes.
 - Local files only; remote media and a network API are later stages.
 - Prefix reads currently perform a full-row physical read and then copy the
   requested prefix.
-- One active WAL with no rotation or selective cleaner yet. Its PUT row count
-  is bounded by the 32-bit row component of `RowRef`, and open time grows with
-  mutation history until rotation is implemented.
+- Manual crash-safe WAL rotation is implemented, with automatic rotation only
+  before the 32-bit per-WAL PUT-row limit. Frozen WALs are not compacted or
+  reclaimed yet, so total replay time, overlay RAM, file-descriptor count, and
+  disk usage still grow with retained mutation history.
 - Read-only snapshots do not live-refresh cross-process commits.

@@ -12,13 +12,18 @@ The fresh native numeric MVP now implements:
 - CRC32C-protected native headers and WAL frames;
 - immutable base segments plus ID sidecars and a flat `ID -> RowRef` index;
 - one writer lease, a commit lock, RAM overlay, public batch CRUD, and strict
-  active-WAL recovery;
-- generic physical reads spanning base segments and active-WAL payloads.
+  active/frozen WAL recovery;
+- checksummed `CURRENT`, immutable catalog generations, UUID-named WAL chains,
+  and manual plus hard-limit WAL rotation;
+- generic physical reads spanning base segments and multiple WAL payloads,
+  with one shared resource-set pin retained through physical I/O.
 
-The current collection has one active WAL and no catalog rotation. Frozen WALs,
-immutable mutation segments, partitioned index runs, view generations, and the
-selective cleaner below remain the next integration slices. The exact shipped
-MVP layout and limits are in `native-format-v3.md`.
+The current collection can retain multiple frozen WALs and exactly one active
+WAL. Immutable mutation segments, partitioned index runs, cross-process resource
+reclamation, and the selective cleaner below remain the next integration
+slices. Rotation alone does not reduce replay, overlay RAM, descriptor count,
+or disk usage. The exact shipped MVP layout and limits are in
+`native-format-v3.md`.
 
 ## Logical view and resource layout
 
@@ -57,7 +62,7 @@ Publication order is:
 1. Write every new segment, index run/partition, and WAL resource, then sync it.
 2. Write and sync a new immutable catalog.
 3. Rename the catalog to its final derived name and sync `catalogs/`.
-4. Write and sync `CURRENT.tmp`.
+4. Write and sync a UUID-derived `CURRENT.<catalog-uuid>.tmp`.
 5. Atomically rename it to `CURRENT` and sync the collection directory.
 6. Publish the equivalent in-memory view.
 
@@ -109,12 +114,13 @@ than adapted with a global-ordinal compatibility layer.
 Two explicit modes avoid pretending that selective cleaning works before its
 prerequisites exist.
 
-### Current active-WAL overlay mode
+### Current catalog-WAL overlay mode
 
-The RAM/active-WAL layer shadows the fresh flat base index. Both layers already
-return `RowRef`, and reads plus CRUD are implemented. Selective cleaning is
-still disabled because there is not yet a catalog generation, WAL rotation, or
-partition-level durable index publication.
+The versioned RAM overlay rebuilt from the catalog WAL chain shadows the fresh
+flat base index. Both layers return `RowRef`, and reads, CRUD, catalog
+publication, plus WAL rotation are implemented. Selective cleaning is still
+disabled because there are no immutable mutation segments or authoritative
+partition-level durable index publications yet.
 
 ### Authoritative partitioned-RowRef mode
 
@@ -324,6 +330,11 @@ acknowledged commit can never live only in an unreferenced WAL:
    active WAL and every post-freeze resource, and atomically publish a second
    generation replacing only the frozen inputs.
 6. Retire the frozen WAL after older views release it.
+
+The current format-5 slice implements steps 1–3 and deliberately retains every
+frozen WAL. Steps 4–6 are the next lifecycle slice; calling `rotate_wal()` must
+not be described as compaction or checkpointing until that materialization and
+reclamation path exists.
 
 Every immutable mutation segment carries checksummed reverse metadata for each
 dense row: its exact ID and original commit sequence. This may be one compact

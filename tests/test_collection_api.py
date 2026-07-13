@@ -223,7 +223,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         assert builder.schema is schema
         assert builder.id_type == "uint64"
         assert builder.dtype == "float16"
-        assert builder.format_version == 4
+        assert builder.format_version == 5
         assert builder.dimension == schema.dimension
         assert builder.count == 0
         assert builder.tuning is None
@@ -238,7 +238,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert collection.schema == schema
     assert collection.id_type == "uint64"
     assert collection.dtype == "float16"
-    assert collection.format_version == 4
+    assert collection.format_version == 5
     assert collection.dimension == schema.dimension
     assert collection.count == ids.size
     open_stats = collection.open_stats
