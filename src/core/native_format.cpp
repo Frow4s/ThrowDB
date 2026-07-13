@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 namespace throwdb::detail {
@@ -19,7 +22,19 @@ constexpr std::size_t kIndexIoEntries = 1U << 16;
 constexpr std::size_t kManifestKnownBytes = 200;
 constexpr std::size_t kDataKnownBytes = 120;
 constexpr std::size_t kIdsKnownBytes = 104;
-constexpr std::size_t kIndexKnownBytes = 128;
+constexpr std::size_t kIndexKnownBytes = 136;
+
+static_assert(std::is_trivially_copyable_v<IndexSlot>);
+static_assert(sizeof(IndexSlot) == kNativeIndexSlotSize);
+static_assert(offsetof(IndexSlot, id) == 0);
+static_assert(offsetof(IndexSlot, ordinal) == sizeof(std::uint64_t));
+
+using SteadyClock = std::chrono::steady_clock;
+
+[[nodiscard]] double elapsed_seconds(
+    const SteadyClock::time_point started) noexcept {
+    return std::chrono::duration<double>(SteadyClock::now() - started).count();
+}
 
 template <typename Error>
 void require(const bool condition, const std::string_view message) {
@@ -359,6 +374,14 @@ void validate_index_header_fields(const NativeIndexHeader& header) {
     require<Error>(
         header.base_segment_count <= 0xfffffffcULL,
         "native index has invalid base segment count");
+    require<Error>(
+        header.body_checksum_algorithm == 0
+            || header.body_checksum_algorithm
+                   == kNativeIndexBodyCrc32cAlgorithm,
+        "native index has unsupported body checksum algorithm");
+    require<Error>(
+        header.body_checksum_algorithm != 0 || header.body_checksum == 0,
+        "native index without a checksum algorithm has a checksum value");
 }
 
 void write_header_atomic(
@@ -508,6 +531,54 @@ void validate_native_index_body(
     if (occupied != manifest.base_record_count) {
         throw CorruptionError("native index occupancy does not match manifest");
     }
+}
+
+[[nodiscard]] std::uint32_t native_index_body_checksum(
+    const NativeManifest& manifest,
+    const IndexData& index,
+    const std::span<const std::byte> alignment_padding = {}) {
+    Crc32c checksum;
+    checksum.update(std::as_bytes(std::span(index.controls)));
+    const std::uint64_t controls_end = checked_sum<InvalidArgumentError>(
+        manifest.index_control_offset, manifest.index_capacity,
+        "native index controls");
+    const auto padding_size = static_cast<std::size_t>(
+        manifest.index_slots_offset - controls_end);
+    if (alignment_padding.empty()) {
+        checksum.update_zeroes(padding_size);
+    } else {
+        if (alignment_padding.size() != padding_size) {
+            throw InvalidArgumentError(
+                "native index checksum padding has the wrong size");
+        }
+        checksum.update(alignment_padding);
+    }
+
+    if constexpr (std::endian::native == std::endian::little) {
+        checksum.update(std::as_bytes(std::span(index.slots)));
+    } else {
+        std::vector<std::byte> encoded(
+            kIndexIoEntries * kNativeIndexSlotSize);
+        std::uint64_t position = 0;
+        while (position != index.capacity) {
+            const std::uint64_t batch_count = std::min<std::uint64_t>(
+                kIndexIoEntries, index.capacity - position);
+            const std::size_t batch_bytes = static_cast<std::size_t>(
+                batch_count * kNativeIndexSlotSize);
+            std::span<std::byte> bytes(encoded.data(), batch_bytes);
+            for (std::uint64_t item = 0; item != batch_count; ++item) {
+                const IndexSlot& slot = index.slots[
+                    static_cast<std::size_t>(position + item)];
+                const std::size_t item_offset = static_cast<std::size_t>(
+                    item * kNativeIndexSlotSize);
+                put_u64(bytes, item_offset, slot.id);
+                put_u64(bytes, item_offset + 8, slot.ordinal);
+            }
+            checksum.update(bytes);
+            position += batch_count;
+        }
+    }
+    return checksum.value();
 }
 
 }  // namespace
@@ -833,6 +904,8 @@ std::array<std::byte, kNativeHeaderSize> encode_native_index_header(
     put_u32(output, 112, header.control_encoding);
     put_u32(output, 116, header.value_encoding);
     put_u64(output, 120, header.base_segment_count);
+    put_u32(output, 128, header.body_checksum_algorithm);
+    put_u32(output, 132, header.body_checksum);
     finish_header_crc(output);
     return output;
 }
@@ -853,6 +926,8 @@ NativeIndexHeader decode_native_index_header(
     result.control_encoding = get_u32(bytes, 112);
     result.value_encoding = get_u32(bytes, 116);
     result.base_segment_count = get_u64(bytes, 120);
+    result.body_checksum_algorithm = get_u32(bytes, 128);
+    result.body_checksum = get_u32(bytes, 132);
     validate_index_header_fields<CorruptionError>(result);
     require_reserved_zero(bytes, kIndexKnownBytes, "native index");
     return result;
@@ -1031,13 +1106,16 @@ void write_native_index_atomic(
     // Do not make it possible for a caller of the lower-level atomic helper to
     // publish a table that the strict reader would immediately reject.
     validate_native_index_body(manifest, index);
+    NativeIndexHeader index_header = make_native_index_header(manifest);
+    index_header.body_checksum_algorithm =
+        kNativeIndexBodyCrc32cAlgorithm;
+    index_header.body_checksum = native_index_body_checksum(manifest, index);
     const auto directory = store_path / "index";
     const auto temporary = directory / "index.bin.tmp";
     const auto final_path = native_index_path(store_path);
     auto fd = create_exclusive(temporary);
     try {
-        const auto header = encode_native_index_header(
-            make_native_index_header(manifest));
+        const auto header = encode_native_index_header(index_header);
         write_all(fd.get(), header.data(), header.size(), temporary);
         write_all(
             fd.get(), index.controls.data(), index.controls.size(), temporary);
@@ -1053,26 +1131,32 @@ void write_native_index_atomic(
             offset += amount;
         }
 
-        std::vector<std::byte> encoded(
-            kIndexIoEntries * kNativeIndexSlotSize);
-        std::uint64_t position = 0;
-        while (position != index.capacity) {
-            const std::uint64_t batch_count = std::min<std::uint64_t>(
-                kIndexIoEntries, index.capacity - position);
-            const std::size_t batch_bytes = static_cast<std::size_t>(
-                batch_count * kNativeIndexSlotSize);
-            std::span<std::byte> bytes(encoded.data(), batch_bytes);
-            std::fill(bytes.begin(), bytes.end(), std::byte{0});
-            for (std::uint64_t item = 0; item != batch_count; ++item) {
-                const IndexSlot& slot = index.slots[
-                    static_cast<std::size_t>(position + item)];
-                const std::size_t item_offset = static_cast<std::size_t>(
-                    item * kNativeIndexSlotSize);
-                put_u64(bytes, item_offset, slot.id);
-                put_u64(bytes, item_offset + 8, slot.ordinal);
+        if constexpr (std::endian::native == std::endian::little) {
+            static_assert(sizeof(IndexSlot) == kNativeIndexSlotSize);
+            write_all(
+                fd.get(), index.slots.data(),
+                index.slots.size() * sizeof(IndexSlot), temporary);
+        } else {
+            std::vector<std::byte> encoded(
+                kIndexIoEntries * kNativeIndexSlotSize);
+            std::uint64_t position = 0;
+            while (position != index.capacity) {
+                const std::uint64_t batch_count = std::min<std::uint64_t>(
+                    kIndexIoEntries, index.capacity - position);
+                const std::size_t batch_bytes = static_cast<std::size_t>(
+                    batch_count * kNativeIndexSlotSize);
+                std::span<std::byte> bytes(encoded.data(), batch_bytes);
+                for (std::uint64_t item = 0; item != batch_count; ++item) {
+                    const IndexSlot& slot = index.slots[
+                        static_cast<std::size_t>(position + item)];
+                    const std::size_t item_offset = static_cast<std::size_t>(
+                        item * kNativeIndexSlotSize);
+                    put_u64(bytes, item_offset, slot.id);
+                    put_u64(bytes, item_offset + 8, slot.ordinal);
+                }
+                write_all(fd.get(), encoded.data(), batch_bytes, temporary);
+                position += batch_count;
             }
-            write_all(fd.get(), encoded.data(), batch_bytes, temporary);
-            position += batch_count;
         }
         sync_file(fd.get(), temporary);
         fd.reset();
@@ -1099,11 +1183,19 @@ void build_and_write_native_index_atomic(
 
 IndexData read_native_index(
     const std::filesystem::path& store_path,
-    const NativeManifest& manifest) {
+    const NativeManifest& manifest,
+    const NativeIndexValidationMode validation_mode,
+    NativeIndexReadStats* const stats) {
+    NativeIndexReadStats local_stats;
+    NativeIndexReadStats& read_stats = stats == nullptr ? local_stats : *stats;
+    read_stats = {};
     validate_manifest<CorruptionError>(manifest);
-    if (manifest.index_capacity > std::numeric_limits<std::size_t>::max()) {
+    if (manifest.index_capacity > std::numeric_limits<std::size_t>::max()
+        || manifest.index_capacity
+               > std::numeric_limits<std::size_t>::max() / sizeof(IndexSlot)) {
         throw CorruptionError("native index does not fit address space");
     }
+    auto phase_started = SteadyClock::now();
     const auto path = native_index_path(store_path);
     auto fd = open_read_only(path);
     if (file_size(fd.get(), path) != manifest.index_file_size) {
@@ -1128,40 +1220,95 @@ IndexData read_native_index(
         || header.base_segment_count != expected.base_segment_count) {
         throw CorruptionError("native index header does not match manifest");
     }
+    read_stats.header_seconds = elapsed_seconds(phase_started);
+    read_stats.body_checksum_present = header.body_checksum_algorithm != 0;
 
     IndexData index;
     index.count = manifest.base_record_count;
     index.capacity = manifest.index_capacity;
     index.hash_seed = manifest.hash_seed;
+    phase_started = SteadyClock::now();
     index.controls.resize(static_cast<std::size_t>(index.capacity));
     index.slots.resize(static_cast<std::size_t>(index.capacity));
+    read_stats.allocation_seconds = elapsed_seconds(phase_started);
+    phase_started = SteadyClock::now();
     pread_exact(
         fd.get(), index.controls.data(), index.controls.size(),
         manifest.index_control_offset, path);
-
-    std::vector<std::byte> encoded(
-        kIndexIoEntries * kNativeIndexSlotSize);
-    std::uint64_t position = 0;
-    while (position != index.capacity) {
-        const std::uint64_t batch_count = std::min<std::uint64_t>(
-            kIndexIoEntries, index.capacity - position);
-        const std::size_t batch_bytes = static_cast<std::size_t>(
-            batch_count * kNativeIndexSlotSize);
+    const std::uint64_t controls_end = manifest.index_control_offset
+        + manifest.index_capacity;
+    std::vector<std::byte> alignment_padding(static_cast<std::size_t>(
+        manifest.index_slots_offset - controls_end));
+    if (!alignment_padding.empty()) {
         pread_exact(
-            fd.get(), encoded.data(), batch_bytes,
-            manifest.index_slots_offset + position * kNativeIndexSlotSize,
-            path);
-        const std::span<const std::byte> bytes(encoded.data(), batch_bytes);
-        for (std::uint64_t item = 0; item != batch_count; ++item) {
-            const std::size_t item_offset = static_cast<std::size_t>(
-                item * kNativeIndexSlotSize);
-            index.slots[static_cast<std::size_t>(position + item)] = IndexSlot{
-                get_u64(bytes, item_offset),
-                get_u64(bytes, item_offset + 8)};
+            fd.get(), alignment_padding.data(), alignment_padding.size(),
+            controls_end, path);
+        if (std::any_of(
+                alignment_padding.begin(), alignment_padding.end(),
+                [](const std::byte value) { return value != std::byte{0}; })) {
+            throw CorruptionError(
+                "native index alignment padding is not zero-filled");
         }
-        position += batch_count;
     }
-    validate_native_index_body(manifest, index);
+    read_stats.controls_seconds = elapsed_seconds(phase_started);
+
+    phase_started = SteadyClock::now();
+    if constexpr (std::endian::native == std::endian::little) {
+        static_assert(sizeof(IndexSlot) == kNativeIndexSlotSize);
+        pread_exact(
+            fd.get(), index.slots.data(),
+            index.slots.size() * sizeof(IndexSlot),
+            manifest.index_slots_offset, path);
+    } else {
+        std::vector<std::byte> encoded(
+            kIndexIoEntries * kNativeIndexSlotSize);
+        std::uint64_t position = 0;
+        while (position != index.capacity) {
+            const std::uint64_t batch_count = std::min<std::uint64_t>(
+                kIndexIoEntries, index.capacity - position);
+            const std::size_t batch_bytes = static_cast<std::size_t>(
+                batch_count * kNativeIndexSlotSize);
+            pread_exact(
+                fd.get(), encoded.data(), batch_bytes,
+                manifest.index_slots_offset
+                    + position * kNativeIndexSlotSize,
+                path);
+            const std::span<const std::byte> bytes(encoded.data(), batch_bytes);
+            for (std::uint64_t item = 0; item != batch_count; ++item) {
+                const std::size_t item_offset = static_cast<std::size_t>(
+                    item * kNativeIndexSlotSize);
+                index.slots[static_cast<std::size_t>(position + item)] =
+                    IndexSlot{
+                        get_u64(bytes, item_offset),
+                        get_u64(bytes, item_offset + 8)};
+            }
+            position += batch_count;
+        }
+    }
+    read_stats.slots_seconds = elapsed_seconds(phase_started);
+
+    if (header.body_checksum_algorithm != 0) {
+        phase_started = SteadyClock::now();
+        const std::uint32_t actual_checksum =
+            native_index_body_checksum(
+                manifest, index, alignment_padding);
+        read_stats.checksum_seconds = elapsed_seconds(phase_started);
+        if (actual_checksum != header.body_checksum) {
+            throw CorruptionError("native index body checksum mismatch");
+        }
+        read_stats.body_checksum_verified = true;
+    }
+
+    const bool perform_structural_validation =
+        validation_mode == NativeIndexValidationMode::Full
+        || header.body_checksum_algorithm == 0;
+    if (perform_structural_validation) {
+        phase_started = SteadyClock::now();
+        validate_native_index_body(manifest, index);
+        read_stats.structural_validation_seconds =
+            elapsed_seconds(phase_started);
+        read_stats.structural_validation_performed = true;
+    }
     return index;
 }
 

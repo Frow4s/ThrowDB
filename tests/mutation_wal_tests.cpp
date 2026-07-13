@@ -248,6 +248,80 @@ void test_crc32c_known_vector_and_incremental_updates() {
         "incremental CRC32C differs from the known vector");
 }
 
+[[nodiscard]] std::uint32_t reference_crc32c(
+    const std::span<const std::byte> bytes) {
+    constexpr std::uint32_t polynomial = 0x82f63b78U;
+    std::uint32_t state = 0xffffffffU;
+    for (const std::byte byte : bytes) {
+        state ^= std::to_integer<std::uint8_t>(byte);
+        for (unsigned bit = 0; bit != 8; ++bit) {
+            state = (state >> 1)
+                    ^ ((state & 1U) == 0 ? 0U : polynomial);
+        }
+    }
+    return state ^ 0xffffffffU;
+}
+
+void test_crc32c_alignment_fragmentation_and_zero_updates() {
+    std::vector<std::byte> data(4104);
+    std::uint64_t random = 0x9e3779b97f4a7c15ULL;
+    for (std::byte& byte : data) {
+        random ^= random >> 12;
+        random ^= random << 25;
+        random ^= random >> 27;
+        byte = static_cast<std::byte>(random);
+    }
+
+    for (std::size_t offset = 0; offset != 8; ++offset) {
+        for (std::size_t length = 0; length != 257; ++length) {
+            const auto bytes = std::span<const std::byte>(data).subspan(
+                offset, length);
+            require_equal(
+                throwdb::detail::crc32c(bytes), reference_crc32c(bytes),
+                "CRC32C differs from bitwise reference for an alignment/length");
+        }
+    }
+
+    const auto large = std::span<const std::byte>(data).subspan(3, 4096);
+    throwdb::detail::Crc32c fragmented;
+    std::size_t position = 0;
+    constexpr std::array<std::size_t, 9> chunk_sizes{
+        0, 1, 7, 8, 9, 31, 64, 255, 1024};
+    std::size_t chunk_index = 0;
+    while (position != large.size()) {
+        const std::size_t chunk_size = std::min(
+            chunk_sizes[chunk_index++ % chunk_sizes.size()],
+            large.size() - position);
+        fragmented.update(large.subspan(position, chunk_size));
+        position += chunk_size;
+    }
+    require_equal(
+        fragmented.value(), reference_crc32c(large),
+        "fragmented CRC32C differs from bitwise reference");
+
+    constexpr std::size_t prefix_size = 13;
+    constexpr std::size_t suffix_size = 17;
+    for (std::size_t zero_count = 0; zero_count != 130; ++zero_count) {
+        std::vector<std::byte> expected;
+        expected.insert(
+            expected.end(), data.begin(), data.begin() + prefix_size);
+        expected.insert(expected.end(), zero_count, std::byte{0});
+        expected.insert(
+            expected.end(), data.begin() + prefix_size,
+            data.begin() + prefix_size + suffix_size);
+
+        throwdb::detail::Crc32c with_zeroes;
+        with_zeroes.update(
+            std::span<const std::byte>(data).first(prefix_size));
+        with_zeroes.update_zeroes(zero_count);
+        with_zeroes.update(std::span<const std::byte>(data).subspan(
+            prefix_size, suffix_size));
+        require_equal(
+            with_zeroes.value(), reference_crc32c(expected),
+            "update_zeroes differs from explicit zero bytes");
+    }
+}
+
 void test_wal_header_round_trip_and_corruption() {
     const WalHeader header = make_header();
     auto encoded = throwdb::detail::encode_wal_header(header);
@@ -974,9 +1048,11 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 10> tests{{
+    const std::array<TestCase, 11> tests{{
         {"crc32c_known_vector_and_incremental_updates",
          test_crc32c_known_vector_and_incremental_updates},
+        {"crc32c_alignment_fragmentation_and_zero_updates",
+         test_crc32c_alignment_fragmentation_and_zero_updates},
         {"wal_header_round_trip_and_corruption",
          test_wal_header_round_trip_and_corruption},
         {"mixed_transaction_has_golden_offsets_and_bit_exact_payloads",

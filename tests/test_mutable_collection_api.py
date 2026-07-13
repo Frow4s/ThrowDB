@@ -68,7 +68,7 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
 
     with throwdb.Collection.open(path, mode="r+") as collection:
         assert collection.mode == "read_write"
-        assert collection.format_version == 3
+        assert collection.format_version == 4
         assert collection.count == 3
 
         collection.insert(np.array([40, 50], dtype=np.int16), inserted)
@@ -187,6 +187,46 @@ def test_delete_is_idempotent_tombstones_base_and_allows_reinsert(
     reopened = throwdb.Collection.open(path)
     _assert_same_bits(reopened.get([11, 22]), np.stack([replacement[0], base[1]]))
     reopened.close()
+
+
+def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "store"
+    base = _vectors(1, 6, "float32", salt=11)
+    inserted = _vectors(1, 6, "float32", salt=111)
+    replacement = _vectors(2, 6, "float32", salt=211)
+    _build(path, [1], base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        collection.insert([2], inserted)
+
+    wal = path / "wal" / "active.wal"
+    committed_size = wal.stat().st_size
+    with wal.open("ab") as stream:
+        stream.write(b"torn-wal-tail")
+    assert wal.stat().st_size == committed_size + 13
+
+    # Read-only recovery exposes only committed transactions and never mutates
+    # collection files as a side effect of opening them.
+    with throwdb.Collection.open(path) as reader:
+        assert reader.count == 2
+        _assert_same_bits(reader.get([1, 2]), np.concatenate([base, inserted]))
+        assert wal.stat().st_size == committed_size + 13
+
+    # A writer repairs the ignored tail before accepting a new transaction.
+    with throwdb.Collection.open(path, mode="r+") as writer:
+        assert writer.count == 2
+        assert wal.stat().st_size == committed_size
+        writer.upsert([1, 3], replacement)
+        assert writer.count == 3
+
+    with throwdb.Collection.open(path) as recovered:
+        assert recovered.count == 3
+        _assert_same_bits(
+            recovered.get([3, 2, 1]),
+            np.stack([replacement[1], inserted[0], replacement[0]]),
+        )
 
 
 def test_mutations_apply_public_id_and_embedding_normalization(

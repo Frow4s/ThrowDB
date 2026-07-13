@@ -102,6 +102,13 @@ def test_storage_open_is_routed_with_identical_reader_tuning(
         assert calls[0][2] == tuning
 
 
+def test_optional_storage_open_stats_are_normalized_to_a_dict() -> None:
+    stats = {"total_seconds": 1.25, "index_validation_seconds": 0.75}
+
+    assert BENCHMARK.storage_open_stats(SimpleNamespace(open_stats=stats)) == stats
+    assert BENCHMARK.storage_open_stats(SimpleNamespace()) is None
+
+
 def test_float32_correctness_and_throughput_use_the_store_dtype(
     tmp_path: Path,
 ) -> None:
@@ -199,3 +206,146 @@ def test_cache_eviction_includes_legacy_shards_and_native_segments(
     assert result["data_file_count"] == 2
     assert result["advised_bytes"] == 24
     assert len(advised) == 2
+
+
+def test_sequential_warm_only_replays_measured_queries_before_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    population = np.arange(32, dtype=np.uint64)
+    scenario = BENCHMARK.SequentialScenario(batch_size=2, calls=2, warmups=1)
+    expected = BENCHMARK.query_matrix(
+        population,
+        scenario.calls + scenario.warmups,
+        scenario.batch_size,
+        seed=17,
+    )
+    events: list[tuple[str, tuple[int, ...] | None]] = []
+
+    class Storage:
+        dimension = 3
+        dtype = "float16"
+
+        @staticmethod
+        def get_into(ids: np.ndarray, output: np.ndarray) -> None:
+            events.append(("get", tuple(int(value) for value in ids)))
+            output.fill(0)
+
+    original_usage_snapshot = BENCHMARK.usage_snapshot
+
+    def usage_snapshot() -> dict[str, int | float]:
+        events.append(("usage", None))
+        return original_usage_snapshot()
+
+    monkeypatch.setattr(BENCHMARK, "usage_snapshot", usage_snapshot)
+
+    result = BENCHMARK.sequential_benchmark(
+        Storage,
+        population,
+        scenario,
+        seed=17,
+        prewarm_measurement=True,
+    )
+
+    expected_gets = [tuple(int(value) for value in query) for query in expected]
+    assert events[:4] == [
+        ("get", expected_gets[0]),
+        ("get", expected_gets[1]),
+        ("get", expected_gets[2]),
+        ("usage", None),
+    ]
+    assert [value for event, value in events if event == "get"] == [
+        expected_gets[0],
+        expected_gets[1],
+        expected_gets[2],
+        expected_gets[1],
+        expected_gets[2],
+    ]
+    assert result["explicit_measurement_prewarm"] is True
+
+
+def test_concurrent_warm_only_replays_measured_queries_before_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    population = np.arange(32, dtype=np.uint64)
+    expected = BENCHMARK.query_matrix(
+        population,
+        rows=3,
+        batch_size=2,
+        seed=23,
+    )
+    events: list[tuple[str, tuple[int, ...] | None]] = []
+
+    class Storage:
+        dimension = 3
+        dtype = "float16"
+
+        @staticmethod
+        def get_into(ids: np.ndarray, output: np.ndarray) -> None:
+            events.append(("get", tuple(int(value) for value in ids)))
+            output.fill(0)
+
+    original_usage_snapshot = BENCHMARK.usage_snapshot
+
+    def usage_snapshot() -> dict[str, int | float]:
+        events.append(("usage", None))
+        return original_usage_snapshot()
+
+    monkeypatch.setattr(BENCHMARK, "usage_snapshot", usage_snapshot)
+
+    result = BENCHMARK.concurrent_benchmark(
+        Storage,
+        population,
+        workers=1,
+        batch_size=2,
+        calls_per_worker=2,
+        seed=23,
+        prewarm_measurement=True,
+    )
+
+    expected_gets = [tuple(int(value) for value in query) for query in expected]
+    assert events[:4] == [
+        ("get", expected_gets[0]),
+        ("get", expected_gets[1]),
+        ("get", expected_gets[2]),
+        ("usage", None),
+    ]
+    assert [value for event, value in events if event == "get"] == [
+        expected_gets[0],
+        expected_gets[1],
+        expected_gets[2],
+        expected_gets[1],
+        expected_gets[2],
+    ]
+    assert result["explicit_measurement_prewarm"] is True
+
+
+def test_diskstats_summary_reports_current_ios_in_progress_not_delta() -> None:
+    fields = {
+        "reads_completed": 10,
+        "reads_merged": 0,
+        "sectors_read": 100,
+        "read_time_ms": 20,
+        "writes_completed": 0,
+        "writes_merged": 0,
+        "sectors_written": 0,
+        "write_time_ms": 0,
+        "ios_in_progress": 5,
+        "io_time_ms": 20,
+        "weighted_io_time_ms": 20,
+    }
+    monitor = BENCHMARK.ProcDiskstatsMonitor(Path("unused"))
+    monitor._first = {"nvme0n1": fields}
+    monitor._last = {
+        "nvme0n1": {
+            **fields,
+            "reads_completed": 11,
+            "sectors_read": 108,
+            "ios_in_progress": 2,
+        }
+    }
+    monitor._started = 1.0
+    monitor._finished = 2.0
+
+    summary = monitor.summary()
+
+    assert summary["active_devices"]["nvme0n1"]["ios_in_progress"] == 2

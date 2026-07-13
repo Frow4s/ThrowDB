@@ -73,6 +73,12 @@ must additionally report bytes actually read, read amplification, syscall count,
 and queue depth. Random ID generation and output allocation are kept outside
 the timed interval.
 
+In `benchmarks/run_load_test.py`, standalone `--cache-mode warm` first replays
+the exact deterministic measured query set outside the timed interval. Its
+result records `explicit_measurement_prewarm: true`. Mode `both` instead evicts
+and measures that stream cold, then immediately measures the same stream warm;
+the warm phase needs no additional replay and records the field as false.
+
 For meaningful cold-cache numbers, use an isolated host and an agreed cache
 eviction procedure. Running immediately after database construction measures
 the page cache rather than NVMe random-read behavior.

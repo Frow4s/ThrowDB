@@ -22,6 +22,7 @@ inline constexpr std::uint64_t kNativeIdEntrySize = 8;
 inline constexpr std::uint32_t kNativeCrc32cAlgorithm = 1;
 inline constexpr std::uint32_t kNativeFlatControlEncoding = 1;
 inline constexpr std::uint32_t kNativeRowRefValueEncoding = 1;
+inline constexpr std::uint32_t kNativeIndexBodyCrc32cAlgorithm = 1;
 inline constexpr std::size_t kNativeHeaderChecksumOffset = 20;
 
 inline constexpr std::array<char, 8> kNativeManifestMagic{
@@ -97,6 +98,31 @@ struct NativeIndexHeader {
     std::uint32_t control_encoding{kNativeFlatControlEncoding};
     std::uint32_t value_encoding{kNativeRowRefValueEncoding};
     std::uint64_t base_segment_count{0};
+    // Zero denotes a legacy index without a body checksum. New writers store
+    // CRC32C over every byte after the header (controls, alignment padding,
+    // and slots). The header checksum protects both fields themselves.
+    std::uint32_t body_checksum_algorithm{0};
+    std::uint32_t body_checksum{0};
+};
+
+enum class NativeIndexValidationMode {
+    // Verify a persisted body checksum when available. Legacy indexes fall
+    // back to the full structural scan rather than silently skipping it.
+    ChecksumOrFull,
+    // Always run the complete slot/RowRef/probe validation after loading.
+    Full,
+};
+
+struct NativeIndexReadStats {
+    double header_seconds{0.0};
+    double allocation_seconds{0.0};
+    double controls_seconds{0.0};
+    double slots_seconds{0.0};
+    double checksum_seconds{0.0};
+    double structural_validation_seconds{0.0};
+    bool body_checksum_present{false};
+    bool body_checksum_verified{false};
+    bool structural_validation_performed{false};
 };
 
 // Fills every derived schema, segment, index, and reserved-segment field.
@@ -176,7 +202,10 @@ void build_and_write_native_index_atomic(
     const NativeManifest& manifest);
 [[nodiscard]] IndexData read_native_index(
     const std::filesystem::path& store_path,
-    const NativeManifest& manifest);
+    const NativeManifest& manifest,
+    NativeIndexValidationMode validation_mode =
+        NativeIndexValidationMode::Full,
+    NativeIndexReadStats* stats = nullptr);
 [[nodiscard]] std::optional<RowRef> native_index_lookup(
     const IndexData& index, std::uint64_t id);
 

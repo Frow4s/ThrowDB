@@ -390,13 +390,21 @@ class Collection:
         *,
         mode: str = "r",
         tuning: str | Mapping[str, object] = "auto",
+        verify_index: bool = False,
     ) -> Collection:
         if not isinstance(mode, str):
             raise TypeError("mode must be a string")
         if mode not in {"r", "r+"}:
             raise ValueError("mode must be 'r' or 'r+'")
+        if not isinstance(verify_index, bool):
+            raise TypeError("verify_index must be a bool")
         options, profile = _resolve_tuning(tuning)
-        native = NativeCollection.open(path, mode=mode, **options)
+        native = NativeCollection.open(
+            path,
+            mode=mode,
+            verify_native_index=verify_index,
+            **options,
+        )
         schema = CollectionSchema(
             id_type="uint64",
             dimension=native.dimension,
@@ -446,6 +454,14 @@ class Collection:
         """Return the selected reader profile, or ``None`` for a builder."""
 
         return None if self._tuning is None else dict(self._tuning)
+
+    @property
+    def open_stats(self) -> dict[str, object] | None:
+        """Return phase timings and index-validation details for this open."""
+
+        if self._native is None:
+            return None
+        return dict(self._ensure_native_open("inspect open stats").open_stats)
 
     def _ensure_builder_open(self) -> NativeCollectionBuilder:
         if self._builder is None:

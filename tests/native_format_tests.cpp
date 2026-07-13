@@ -144,6 +144,44 @@ void write_u64_at(
     require(stream.good(), "cannot mutate test uint64");
 }
 
+void write_at(
+    const std::filesystem::path& path,
+    const std::uint64_t offset,
+    const std::span<const std::byte> bytes) {
+    std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+    require(stream.good(), "cannot open test file for byte-range mutation");
+    stream.seekp(static_cast<std::streamoff>(offset));
+    stream.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    stream.close();
+    require(stream.good(), "cannot mutate test byte range");
+}
+
+[[nodiscard]] std::array<std::byte, throwdb::detail::kNativeHeaderSize>
+read_native_header(const std::filesystem::path& path) {
+    std::array<std::byte, throwdb::detail::kNativeHeaderSize> bytes{};
+    std::ifstream stream(path, std::ios::binary);
+    require(stream.good(), "cannot open native header for reading");
+    stream.read(
+        reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    require(
+        stream.gcount() == static_cast<std::streamsize>(bytes.size()),
+        "cannot read complete native header");
+    return bytes;
+}
+
+void remove_index_body_checksum(const std::filesystem::path& index_path) {
+    using namespace throwdb::detail;
+    NativeIndexHeader header =
+        decode_native_index_header(read_native_header(index_path));
+    header.body_checksum_algorithm = 0;
+    header.body_checksum = 0;
+    const auto encoded = encode_native_index_header(header);
+    write_at(index_path, 0, encoded);
+}
+
 void materialize_base(
     const std::filesystem::path& path,
     const throwdb::detail::NativeManifest& manifest,
@@ -364,18 +402,131 @@ void test_index_builds_from_sidecars_and_round_trips_rowrefs() {
         "duplicate sidecar ID was accepted");
 }
 
+void test_index_checksum_fast_path_legacy_fallback_and_forced_verify() {
+    using namespace throwdb::detail;
+    BuiltStore built;
+    const auto index_path = native_index_path(built.store);
+    const NativeIndexHeader header =
+        decode_native_index_header(read_native_header(index_path));
+    require_equal(
+        header.body_checksum_algorithm,
+        kNativeIndexBodyCrc32cAlgorithm,
+        "new native index has no body checksum");
+    NativeIndexHeader invalid_header = header;
+    invalid_header.body_checksum_algorithm = 0;
+    invalid_header.body_checksum = 1;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] { static_cast<void>(encode_native_index_header(invalid_header)); },
+        "index header accepted a checksum without an algorithm");
+    invalid_header = header;
+    invalid_header.body_checksum_algorithm = 99;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] { static_cast<void>(encode_native_index_header(invalid_header)); },
+        "index header accepted an unknown checksum algorithm");
+
+    NativeIndexReadStats fast_stats;
+    const IndexData valid = read_native_index(
+        built.store, built.manifest,
+        NativeIndexValidationMode::ChecksumOrFull, &fast_stats);
+    require(fast_stats.body_checksum_present,
+            "fast open did not discover the body checksum");
+    require(fast_stats.body_checksum_verified,
+            "fast open did not verify the body checksum");
+    require(!fast_stats.structural_validation_performed,
+            "fast open unexpectedly ran the full structural scan");
+
+    NativeIndexReadStats full_stats;
+    static_cast<void>(read_native_index(
+        built.store, built.manifest,
+        NativeIndexValidationMode::Full, &full_stats));
+    require(full_stats.body_checksum_verified,
+            "forced verification skipped the body checksum");
+    require(full_stats.structural_validation_performed,
+            "forced verification skipped the structural scan");
+
+    std::size_t occupied = 0;
+    while (valid.controls[occupied] == 0) {
+        ++occupied;
+    }
+    write_u8_at(
+        index_path, built.manifest.index_control_offset + occupied, 0);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(read_native_index(
+                built.store, built.manifest,
+                NativeIndexValidationMode::ChecksumOrFull));
+        },
+        "checksummed fast open accepted body corruption");
+
+    write_native_index_atomic(built.store, built.manifest, valid);
+    write_u64_at(
+        index_path,
+        built.manifest.index_slots_offset
+            + occupied * kNativeIndexSlotSize,
+        valid.slots[occupied].id ^ 1U);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(read_native_index(
+                built.store, built.manifest,
+                NativeIndexValidationMode::ChecksumOrFull));
+        },
+        "checksummed fast open accepted slot corruption");
+
+    write_native_index_atomic(built.store, built.manifest, valid);
+    const std::uint64_t controls_end = built.manifest.index_control_offset
+        + built.manifest.index_capacity;
+    require(
+        controls_end < built.manifest.index_slots_offset,
+        "test index unexpectedly has no alignment padding");
+    write_u8_at(index_path, controls_end, 1);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(read_native_index(
+                built.store, built.manifest,
+                NativeIndexValidationMode::ChecksumOrFull));
+        },
+        "fast open accepted nonzero index alignment padding");
+
+    write_native_index_atomic(built.store, built.manifest, valid);
+    remove_index_body_checksum(index_path);
+    NativeIndexReadStats legacy_stats;
+    static_cast<void>(read_native_index(
+        built.store, built.manifest,
+        NativeIndexValidationMode::ChecksumOrFull, &legacy_stats));
+    require(!legacy_stats.body_checksum_present,
+            "legacy index unexpectedly reports a body checksum");
+    require(!legacy_stats.body_checksum_verified,
+            "legacy index reports a verified absent checksum");
+    require(legacy_stats.structural_validation_performed,
+            "legacy index did not fall back to full validation");
+
+    write_u8_at(
+        index_path, built.manifest.index_control_offset + occupied, 2);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(read_native_index(
+                built.store, built.manifest,
+                NativeIndexValidationMode::ChecksumOrFull));
+        },
+        "legacy fallback accepted structurally invalid body corruption");
+}
+
 void test_index_reader_rejects_header_and_body_corruption() {
     using namespace throwdb::detail;
     BuiltStore built;
     const auto index_path = native_index_path(built.store);
     const IndexData valid = read_native_index(built.store, built.manifest);
+    const auto restore_legacy_index = [&] {
+        write_native_index_atomic(built.store, built.manifest, valid);
+        remove_index_body_checksum(index_path);
+    };
 
     write_u8_at(index_path, 24, 0xff);
     require_throws<throwdb::CorruptionError>(
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "index header corruption was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     std::size_t occupied = 0;
     while (valid.controls[occupied] == 0) {
         ++occupied;
@@ -403,7 +554,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "invalid index control byte was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     write_u64_at(
         index_path,
         built.manifest.index_slots_offset
@@ -413,7 +564,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "base index RowRef into active WAL was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     std::size_t last_segment_slot = 0;
     while (last_segment_slot != valid.slots.size()) {
         if (valid.controls[last_segment_slot] != 0
@@ -439,7 +590,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "out-of-range base segment row was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     write_u64_at(
         index_path,
         built.manifest.index_slots_offset
@@ -449,7 +600,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "duplicate RowRef was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     write_u64_at(
         index_path,
         built.manifest.index_slots_offset
@@ -459,7 +610,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "duplicate occupied ID was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     write_u64_at(
         index_path,
         built.manifest.index_slots_offset + empty * kNativeIndexSlotSize,
@@ -468,7 +619,7 @@ void test_index_reader_rejects_header_and_body_corruption() {
         [&] { static_cast<void>(read_native_index(built.store, built.manifest)); },
         "nonzero empty index slot was accepted");
 
-    write_native_index_atomic(built.store, built.manifest, valid);
+    restore_legacy_index();
     std::uint64_t unreachable_id = 0;
     bool found_unreachable = false;
     for (std::uint64_t candidate = 1; candidate != 1'000'000; ++candidate) {
@@ -498,7 +649,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 5> tests{{
+    const std::array<TestCase, 6> tests{{
         {"manifest_is_independent_checksummed_format",
          test_manifest_is_independent_checksummed_format},
         {"paths_and_atomic_manifest_are_deterministic",
@@ -507,6 +658,8 @@ int main() {
          test_data_and_ids_headers_are_bound_and_exact},
         {"index_builds_from_sidecars_and_round_trips_rowrefs",
          test_index_builds_from_sidecars_and_round_trips_rowrefs},
+        {"index_checksum_fast_path_legacy_fallback_and_forced_verify",
+         test_index_checksum_fast_path_legacy_fallback_and_forced_verify},
         {"index_reader_rejects_header_and_body_corruption",
          test_index_reader_rejects_header_and_body_corruption},
     }};

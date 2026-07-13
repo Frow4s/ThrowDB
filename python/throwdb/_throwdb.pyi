@@ -132,6 +132,7 @@ class NativeCollection:
         io_backend: str = "thread_pool",
         io_uring_queue_depth: int = 32,
         io_uring_workers: int = 1,
+        verify_native_index: bool = False,
     ) -> NativeCollection: ...
 
     @property
@@ -145,6 +146,9 @@ class NativeCollection:
 
     @property
     def format_version(self) -> int: ...
+
+    @property
+    def open_stats(self) -> dict[str, object]: ...
 
     def get(self, ids: npt.NDArray[np.uint64]) -> _EmbeddingArray: ...
 

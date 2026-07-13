@@ -111,13 +111,13 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
         shard_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
     ) as builder:
         assert builder.dtype == "float32"
-        assert builder.format_version == 3
+        assert builder.format_version == 4
         builder.add(ids, embeddings)
 
     collection = throwdb.Collection.open(path)
     assert collection.schema == schema
     assert collection.dtype == "float32"
-    assert collection.format_version == 3
+    assert collection.format_version == 4
 
     positions = np.array([2, 0, 3, 1, 2], dtype=np.intp)
     query = ids[positions].astype(np.int64)
@@ -218,4 +218,19 @@ def test_cli_preserves_float32_dtype_and_bits(
     cli_main(["inspect", "--storage", str(store_path)])
     metadata = json.loads(capsys.readouterr().out)
     assert metadata["dtype"] == "float32"
-    assert metadata["format_version"] == 3
+    assert metadata["format_version"] == 4
+    assert metadata["open_stats"]["index_validation"] == "checksum"
+    assert metadata["open_stats"]["index_body_checksum_verified"] is True
+
+    cli_main(["inspect", "--storage", str(store_path), "--verify-index"])
+    verified_metadata = json.loads(capsys.readouterr().out)
+    assert (
+        verified_metadata["open_stats"]["index_validation"]
+        == "checksum_and_full"
+    )
+    assert (
+        verified_metadata["open_stats"][
+            "index_structural_validation_performed"
+        ]
+        is True
+    )

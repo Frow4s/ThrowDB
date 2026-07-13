@@ -32,7 +32,23 @@
 namespace throwdb {
 namespace {
 
-constexpr std::uint32_t kPublicNativeFormatVersion = 3;
+constexpr std::uint32_t kCurrentPublicNativeFormatVersion = 4;
+constexpr std::uint32_t kLegacyPublicNativeFormatVersion = 3;
+using SteadyClock = std::chrono::steady_clock;
+
+[[nodiscard]] double elapsed_seconds(
+    const SteadyClock::time_point started) noexcept {
+    return std::chrono::duration<double>(SteadyClock::now() - started).count();
+}
+
+[[nodiscard]] detail::NativeManifest read_manifest_timed(
+    const std::filesystem::path& path,
+    NativeOpenStats& stats) {
+    const auto started = SteadyClock::now();
+    detail::NativeManifest manifest = detail::read_native_manifest(path);
+    stats.manifest_seconds = elapsed_seconds(started);
+    return manifest;
+}
 
 enum class PutMode {
     Insert,
@@ -287,7 +303,7 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
-        return kPublicNativeFormatVersion;
+        return kCurrentPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
         ensure_owner_process();
@@ -427,9 +443,10 @@ public:
     Impl(
         std::filesystem::path path,
         const ReaderOptions& reader_options,
-        const bool writable)
+        const bool writable,
+        const SteadyClock::time_point open_started)
         : path_(std::move(path)),
-          manifest_(detail::read_native_manifest(path_)),
+          manifest_(read_manifest_timed(path_, open_stats_)),
           physical_reader_(reader_options),
           writer_lock_(detail::AdvisoryLockFile::open_existing(
               writer_lock_path(path_), writable)),
@@ -444,9 +461,35 @@ public:
             // base index into a second process.
             writer_lock_.lock(detail::FileLockMode::Exclusive, true);
         }
-        index_ = detail::read_native_index(path_, manifest_);
-        open_base_segments();
+        detail::NativeIndexReadStats index_stats;
+        auto phase_started = SteadyClock::now();
+        index_ = detail::read_native_index(
+            path_, manifest_,
+            reader_options.verify_native_index
+                ? detail::NativeIndexValidationMode::Full
+                : detail::NativeIndexValidationMode::ChecksumOrFull,
+            &index_stats);
+        open_stats_.index_seconds = elapsed_seconds(phase_started);
+        open_stats_.index_header_seconds = index_stats.header_seconds;
+        open_stats_.index_allocation_seconds = index_stats.allocation_seconds;
+        open_stats_.index_controls_seconds = index_stats.controls_seconds;
+        open_stats_.index_slots_seconds = index_stats.slots_seconds;
+        open_stats_.index_checksum_seconds = index_stats.checksum_seconds;
+        open_stats_.index_structural_validation_seconds =
+            index_stats.structural_validation_seconds;
+        open_stats_.index_file_bytes = manifest_.index_file_size;
+        open_stats_.index_body_checksum_present =
+            index_stats.body_checksum_present;
+        open_stats_.index_body_checksum_verified =
+            index_stats.body_checksum_verified;
+        open_stats_.index_structural_validation_performed =
+            index_stats.structural_validation_performed;
 
+        phase_started = SteadyClock::now();
+        open_base_segments();
+        open_stats_.base_segments_seconds = elapsed_seconds(phase_started);
+
+        phase_started = SteadyClock::now();
         detail::ScopedAdvisoryLock stable(
             commit_lock_, writable_ ? detail::FileLockMode::Exclusive
                                     : detail::FileLockMode::Shared);
@@ -465,6 +508,8 @@ public:
             detail::truncate_file(wal_fd_.get(), scan.valid_end, wal_path_);
             detail::sync_file(wal_fd_.get(), wal_path_);
         }
+        open_stats_.wal_replay_seconds = elapsed_seconds(phase_started);
+        open_stats_.total_seconds = elapsed_seconds(open_started);
     }
 
     ~Impl() {
@@ -632,7 +677,9 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
-        return kPublicNativeFormatVersion;
+        return open_stats_.index_body_checksum_present
+                   ? kCurrentPublicNativeFormatVersion
+                   : kLegacyPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
         ensure_owner_process();
@@ -641,6 +688,10 @@ public:
     [[nodiscard]] bool writable() const {
         ensure_owner_process();
         return writable_;
+    }
+    [[nodiscard]] NativeOpenStats open_stats() const {
+        ensure_owner_process();
+        return open_stats_;
     }
 
     [[nodiscard]] bool owned_by_current_process() const noexcept {
@@ -883,6 +934,7 @@ private:
     }
 
     std::filesystem::path path_;
+    NativeOpenStats open_stats_;
     detail::NativeManifest manifest_;
     detail::IndexData index_;
     detail::PhysicalReader physical_reader_;
@@ -978,7 +1030,8 @@ std::unique_ptr<NativeCollection> NativeCollection::open(
             "native collection access requires a little-endian host");
     }
     return std::unique_ptr<NativeCollection>(new NativeCollection(
-        std::make_unique<Impl>(path, reader_options, writable)));
+        std::make_unique<Impl>(
+            path, reader_options, writable, SteadyClock::now())));
 }
 
 NativeCollection::NativeCollection(std::unique_ptr<Impl> impl)
@@ -1033,5 +1086,8 @@ std::uint64_t NativeCollection::record_size() const {
     return impl_->record_size();
 }
 bool NativeCollection::writable() const { return impl_->writable(); }
+NativeOpenStats NativeCollection::open_stats() const {
+    return impl_->open_stats();
+}
 
 }  // namespace throwdb

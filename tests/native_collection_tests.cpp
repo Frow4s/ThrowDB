@@ -21,6 +21,7 @@
 
 #include "throwdb/errors.hpp"
 #include "throwdb/native_collection.hpp"
+#include "../src/core/native_format.hpp"
 
 namespace {
 
@@ -102,6 +103,33 @@ void require_equal(
         message);
 }
 
+void remove_index_body_checksum(const std::filesystem::path& store) {
+    using namespace throwdb::detail;
+    const auto path = native_index_path(store);
+    std::array<std::byte, kNativeHeaderSize> encoded{};
+    {
+        std::ifstream stream(path, std::ios::binary);
+        require(stream.good(), "cannot open index header for reading");
+        stream.read(
+            reinterpret_cast<char*>(encoded.data()),
+            static_cast<std::streamsize>(encoded.size()));
+        require(
+            stream.gcount() == static_cast<std::streamsize>(encoded.size()),
+            "cannot read complete index header");
+    }
+    NativeIndexHeader header = decode_native_index_header(encoded);
+    header.body_checksum_algorithm = 0;
+    header.body_checksum = 0;
+    encoded = encode_native_index_header(header);
+    std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
+    require(stream.good(), "cannot open index header for legacy rewrite");
+    stream.write(
+        reinterpret_cast<const char*>(encoded.data()),
+        static_cast<std::streamsize>(encoded.size()));
+    stream.close();
+    require(stream.good(), "cannot rewrite legacy index header");
+}
+
 void test_multisegment_crud_snapshot_and_reopen() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
@@ -122,7 +150,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
         std::span(base_ids).subspan(3),
         std::span(base).subspan(3 * record_size));
     require(builder->count() == base_ids.size(), "builder count is wrong");
-    require(builder->format_version() == 3, "native public version is wrong");
+    require(builder->format_version() == 4, "native public version is wrong");
     builder->finish();
 
     auto old_snapshot = throwdb::NativeCollection::open(store);
@@ -223,6 +251,58 @@ void test_multisegment_crud_snapshot_and_reopen() {
     append_row(updated, 0);
     append_row(base, 4);
     require_equal(actual, expected, "reopened CRUD state is wrong");
+}
+
+void test_open_stats_fast_forced_and_legacy_validation() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    const std::array<std::uint64_t, 2> ids{7, 11};
+    const std::vector<std::byte> embeddings = rows(2, 4, 29);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    {
+        auto reader = throwdb::NativeCollection::open(store);
+        require(reader->format_version() == 4,
+                "checksummed collection did not report version 4");
+        const throwdb::NativeOpenStats stats = reader->open_stats();
+        require(stats.total_seconds > 0.0,
+                "open diagnostics have no total duration");
+        require(stats.index_file_bytes == std::filesystem::file_size(
+                    throwdb::detail::native_index_path(store)),
+                "open diagnostics report the wrong index size");
+        require(stats.index_body_checksum_present,
+                "normal open did not report the index checksum");
+        require(stats.index_body_checksum_verified,
+                "normal open did not verify the index checksum");
+        require(!stats.index_structural_validation_performed,
+                "normal open unexpectedly ran the full structural scan");
+    }
+
+    {
+        throwdb::ReaderOptions reader_options;
+        reader_options.verify_native_index = true;
+        auto reader = throwdb::NativeCollection::open(
+            store, reader_options);
+        const throwdb::NativeOpenStats stats = reader->open_stats();
+        require(stats.index_body_checksum_verified,
+                "forced open did not verify the checksum");
+        require(stats.index_structural_validation_performed,
+                "forced open did not perform structural verification");
+    }
+
+    remove_index_body_checksum(store);
+    auto legacy = throwdb::NativeCollection::open(store);
+    require(legacy->format_version() == 3,
+            "legacy checksum-free collection did not report version 3");
+    const throwdb::NativeOpenStats legacy_stats = legacy->open_stats();
+    require(!legacy_stats.index_body_checksum_present,
+            "legacy open invented an index checksum");
+    require(legacy_stats.index_structural_validation_performed,
+            "legacy open skipped its full-validation fallback");
 }
 
 void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
@@ -514,6 +594,9 @@ int main() {
         TestCase{
             "multisegment_crud_snapshot_and_reopen",
             test_multisegment_crud_snapshot_and_reopen},
+        TestCase{
+            "open_stats_fast_forced_and_legacy_validation",
+            test_open_stats_fast_forced_and_legacy_validation},
         TestCase{
             "active_wal_tail_is_ignored_and_writer_repairs_it",
             test_active_wal_tail_is_ignored_and_writer_repairs_it},

@@ -44,9 +44,9 @@ RESULTS_DIR = Path("./benchmark-results")
 # and reads substantially more data from the NVMe device.
 PROFILE = "full"
 
-# "cold" asks Linux to evict clean shard pages before every scenario, "warm"
-# leaves the page cache untouched, and "both" runs the same deterministic query
-# stream cold first and warm immediately afterwards.
+# "cold" asks Linux to evict clean data pages before every scenario. Standalone
+# "warm" replays the exact measured query set before timing it. "both" runs the
+# same deterministic query stream cold first and warm immediately afterwards.
 CACHE_MODE = "both"
 
 # Optional bit-exact correctness check against the original embeddings.
@@ -374,6 +374,17 @@ def close_benchmark_storage(storage: Any) -> None:
         close()
 
 
+def storage_open_stats(storage: Any) -> dict[str, Any] | None:
+    """Return optional native open diagnostics as a JSON-compatible mapping."""
+
+    stats = getattr(storage, "open_stats", None)
+    if stats is None:
+        return None
+    if callable(stats):
+        stats = stats()
+    return dict(stats)
+
+
 def atomic_json_dump(path: Path, value: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as output:
@@ -542,6 +553,11 @@ class ProcDiskstatsMonitor:
             if before is None:
                 continue
             delta = counter_delta(before, after)
+            # Unlike the other base diskstats fields, ios_in_progress is an
+            # instantaneous gauge rather than a monotonically increasing
+            # counter.  Report the final observation instead of a meaningless
+            # (and potentially negative) delta.
+            delta["ios_in_progress"] = after["ios_in_progress"]
             if not any(
                 int(delta.get(field, 0))
                 for field in (
@@ -824,6 +840,7 @@ def sequential_benchmark(
     population: np.ndarray,
     scenario: SequentialScenario,
     seed: int,
+    prewarm_measurement: bool = False,
 ) -> dict[str, Any]:
     queries = query_matrix(
         population,
@@ -837,13 +854,17 @@ def sequential_benchmark(
     )
     for query in queries[: scenario.warmups]:
         storage.get_into(query, output)
+    measured_queries = queries[scenario.warmups :]
+    if prewarm_measurement:
+        for query in measured_queries:
+            storage.get_into(query, output)
 
     samples_ns = np.empty(scenario.calls, dtype=np.int64)
     usage_before = usage_snapshot()
     io_before = proc_io_snapshot()
     cgroup_cpu_before = cgroup_cpu_snapshot()
     wall_started = time.perf_counter()
-    for index, query in enumerate(queries[scenario.warmups :]):
+    for index, query in enumerate(measured_queries):
         started = time.perf_counter_ns()
         storage.get_into(query, output)
         samples_ns[index] = time.perf_counter_ns() - started
@@ -861,6 +882,7 @@ def sequential_benchmark(
         "seconds": seconds,
         "embeddings_per_second": embeddings / seconds,
         "useful_gib_per_second": useful_bytes / seconds / (1 << 30),
+        "explicit_measurement_prewarm": prewarm_measurement,
     }
     result.update(latency_metrics(samples_ns))
     add_process_metrics(
@@ -884,6 +906,7 @@ def concurrent_benchmark(
     batch_size: int,
     calls_per_worker: int,
     seed: int,
+    prewarm_measurement: bool = False,
 ) -> dict[str, Any]:
     prepared = [
         query_matrix(population, calls_per_worker + 1, batch_size, seed + worker)
@@ -898,10 +921,14 @@ def concurrent_benchmark(
             dtype=np.dtype(storage.dtype),
         )
         storage.get_into(queries[0], output)
+        measured_queries = queries[1:]
+        if prewarm_measurement:
+            for query in measured_queries:
+                storage.get_into(query, output)
         samples = np.empty(calls_per_worker, dtype=np.int64)
         ready.wait()
         start.wait()
-        for index, query in enumerate(queries[1:]):
+        for index, query in enumerate(measured_queries):
             started = time.perf_counter_ns()
             storage.get_into(query, output)
             samples[index] = time.perf_counter_ns() - started
@@ -931,6 +958,7 @@ def concurrent_benchmark(
         "seconds": seconds,
         "embeddings_per_second": embeddings / seconds,
         "useful_gib_per_second": useful_bytes / seconds / (1 << 30),
+        "explicit_measurement_prewarm": prewarm_measurement,
     }
     result.update(latency_metrics(samples_ns))
     add_process_metrics(
@@ -1028,7 +1056,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-mode",
         choices=("cold", "warm", "both"),
         default=CACHE_MODE,
-        help="evict data pages, preserve cache, or run paired cold then warm tests",
+        help=(
+            "cold evicts data pages; warm replays measured queries before "
+            "timing; both runs paired cold then warm tests"
+        ),
     )
     parser.add_argument(
         "--source-embeddings",
@@ -1172,6 +1203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "process_thread_count_before_open": thread_count_before_open,
         "process_thread_count_after_open": process_thread_count(),
     }
+    open_stats = storage_open_stats(storage)
+    if open_stats is not None:
+        report["storage"]["open_stats"] = open_stats
     log(
         f"storage opened in {open_seconds:.3f}s: "
         f"format={store_format}, count={storage.count:,}, "
@@ -1222,6 +1256,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     population,
                     scenario,
                     RANDOM_SEED + index * 1000,
+                    prewarm_measurement=(
+                        cache_mode == "warm" and args.cache_mode == "warm"
+                    ),
                 )
                 result["cache_mode"] = cache_mode
                 result["external_reader_workers"] = 1
@@ -1257,6 +1294,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     concurrency["batch_size"],
                     concurrency["calls_per_worker"],
                     RANDOM_SEED + workers * 1000,
+                    prewarm_measurement=(
+                        cache_mode == "warm" and args.cache_mode == "warm"
+                    ),
                 )
                 result["cache_mode"] = cache_mode
                 result["external_reader_workers"] = workers

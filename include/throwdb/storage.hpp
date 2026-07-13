@@ -49,6 +49,11 @@ struct ReaderOptions {
     // Number of independent io_uring lanes. One preserves the caller-driven
     // baseline; two or more create dedicated ring-owner worker threads.
     std::uint32_t io_uring_workers = 1;
+    // Native mutable collections normally verify the persisted index-body
+    // checksum and fall back to a full structural scan for legacy indexes.
+    // Set this to also run the complete structural verification on every
+    // open. Immutable Storage readers ignore this native-only option.
+    bool verify_native_index = false;
 };
 
 class Writer {

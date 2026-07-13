@@ -223,10 +223,11 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         assert builder.schema is schema
         assert builder.id_type == "uint64"
         assert builder.dtype == "float16"
-        assert builder.format_version == 3
+        assert builder.format_version == 4
         assert builder.dimension == schema.dimension
         assert builder.count == 0
         assert builder.tuning is None
+        assert builder.open_stats is None
         builder.add(ids[:2], vectors[:2])
         assert builder.count == 2
         builder.add(ids[2:], vectors[2:])
@@ -237,9 +238,29 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert collection.schema == schema
     assert collection.id_type == "uint64"
     assert collection.dtype == "float16"
-    assert collection.format_version == 3
+    assert collection.format_version == 4
     assert collection.dimension == schema.dimension
     assert collection.count == ids.size
+    open_stats = collection.open_stats
+    assert open_stats is not None
+    assert open_stats["index_validation"] == "checksum"
+    assert open_stats["index_body_checksum_present"] is True
+    assert open_stats["index_body_checksum_verified"] is True
+    assert open_stats["index_structural_validation_performed"] is False
+    assert open_stats["total_seconds"] > 0
+    assert open_stats["index_allocation_seconds"] >= 0
+    open_stats["index_validation"] = "caller mutation"
+    assert collection.open_stats["index_validation"] == "checksum"  # type: ignore[index]
+
+    verified = throwdb.Collection.open(path, verify_index=True)
+    verified_stats = verified.open_stats
+    assert verified_stats is not None
+    assert verified_stats["index_validation"] == "checksum_and_full"
+    assert verified_stats["index_structural_validation_performed"] is True
+    verified.close()
+
+    with pytest.raises(TypeError, match="verify_index must be a bool"):
+        throwdb.Collection.open(path, verify_index=1)  # type: ignore[arg-type]
 
     order = np.array([3, 0, 3, 2, 1], dtype=np.intp)
     query = ids[order].astype(np.int64)
@@ -653,3 +674,23 @@ def test_native_api_remains_strict_while_collection_normalizes_ids(
     with pytest.raises(ValueError, match="uint64"):
         native_writer.add(ids, vectors)
     native_writer.abort()
+
+
+def test_low_level_native_verify_flag_requires_a_python_bool(
+    tmp_path: Path,
+) -> None:
+    from throwdb._throwdb import NativeCollection
+
+    path = tmp_path / "store"
+    _create_collection(path, [1], _vectors(1, 2))
+
+    for invalid in (1, None, np.bool_(True)):
+        with pytest.raises(TypeError, match="verify_native_index must be a bool"):
+            NativeCollection.open(
+                path,
+                verify_native_index=invalid,
+            )
+
+    reader = NativeCollection.open(path, verify_native_index=True)
+    assert reader.open_stats["index_validation"] == "checksum_and_full"
+    reader.close()

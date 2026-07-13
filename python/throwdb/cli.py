@@ -165,6 +165,7 @@ def _inspect(args: argparse.Namespace) -> None:
     with Collection.open(
         args.storage,
         tuning=_reader_tuning(args),
+        verify_index=args.verify_index,
     ) as collection:
         print(
             json.dumps(
@@ -174,6 +175,7 @@ def _inspect(args: argparse.Namespace) -> None:
                     "dimension": collection.dimension,
                     "dtype": collection.dtype,
                     "format_version": collection.format_version,
+                    "open_stats": collection.open_stats,
                 },
                 indent=2,
                 sort_keys=True,
@@ -265,6 +267,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--io-uring-queue-depth",
         type=_io_uring_queue_depth,
         default=DEFAULT_IO_URING_QUEUE_DEPTH,
+    )
+    inspect.add_argument(
+        "--verify-index",
+        action="store_true",
+        help="run the complete structural index audit while opening",
     )
     inspect.set_defaults(handler=_inspect)
     return parser

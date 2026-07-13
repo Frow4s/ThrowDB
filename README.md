@@ -63,13 +63,23 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     deleted = collection.delete([200, 999])  # [True, False]
 ```
 
-`Collection.create()` now builds the fresh native numeric format reported as
-`collection.format_version == 3`. UTF-8 IDs remain reserved for the next string
-index slice. Prefix reads are API-correct today but the dense-row backend still
+`Collection.create()` now builds the checksummed native numeric format reported
+as `collection.format_version == 4`. The current reader also opens legacy
+checksum-free version-3 collections, using a full structural index validation
+as its safe fallback. UTF-8 IDs remain reserved for the next string index slice.
+Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
 The initial `"auto"` tuning profile deliberately selects the conservative
 thread-pool baseline without running a calibration benchmark; the effective
 selection and reason are visible through `collection.tuning`.
+
+Normal version-4 open verifies the CRC32C persisted for the complete flat-index
+body. Use `Collection.open(path, verify_index=True)` to additionally run the
+much more expensive slot, `RowRef`, uniqueness, and probe-path audit. Per-phase
+durations and the selected validation path are available in
+`collection.open_stats` and are copied into load-test `report.json`.
+`throwdb inspect --storage /data/example` prints the same diagnostics as JSON;
+add `--verify-index` to use that command as a full scrub-on-open check.
 
 `Writer` and `Storage` remain the legacy immutable low-level API used by the
 existing benchmark suite. They require native, aligned, C-contiguous `uint64`
@@ -212,12 +222,16 @@ See [the storage format](docs/storage-format.md),
 benchmarks: they open `Storage` without enabling the internal executor. For a
 complete machine, correctness, sequential-read, and concurrent-reader run, edit
 the configuration at the top of `benchmarks/run_load_test.py` and execute it
-once. The runner auto-detects fresh native and legacy immutable manifests. Its
-`--cache-mode cold|warm|both` option uses per-file `POSIX_FADV_DONTNEED` for
-rootless paired cache measurements on Linux. Use `--io-ranges-per-task` to record
-and compare executor task granularity; see the benchmark plan for the remote
-`1/4/8/16` sweep. On cgroup v2 systems the report also records the effective CPU
-quota and per-scenario `cpu.stat` deltas, including throttled periods and time.
+once. The runner auto-detects fresh native and legacy immutable manifests.
+`--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` for rootless eviction on
+Linux. Standalone `warm` replays the exact measured query set outside the timed
+interval before measuring it; `both` measures the same deterministic stream
+cold first and warm immediately afterwards. A result's
+`explicit_measurement_prewarm` is true only when that standalone replay ran.
+Use `--io-ranges-per-task` to record and compare executor task granularity; see
+the benchmark plan for the remote `1/4/8/16` sweep. On cgroup v2 systems the
+report also records the effective CPU quota and per-scenario `cpu.stat` deltas,
+including throttled periods and time.
 
 The on-disk format is versioned but still experimental. Format-v1 compatibility
 is covered by a byte-level golden test; format v2 may still evolve before its

@@ -19,6 +19,24 @@ struct NativeBuilderOptions {
     std::uint64_t segment_size_bytes = 16ULL << 30;
 };
 
+struct NativeOpenStats {
+    double total_seconds = 0.0;
+    double manifest_seconds = 0.0;
+    double index_seconds = 0.0;
+    double index_header_seconds = 0.0;
+    double index_allocation_seconds = 0.0;
+    double index_controls_seconds = 0.0;
+    double index_slots_seconds = 0.0;
+    double index_checksum_seconds = 0.0;
+    double index_structural_validation_seconds = 0.0;
+    double base_segments_seconds = 0.0;
+    double wal_replay_seconds = 0.0;
+    std::uint64_t index_file_bytes = 0;
+    bool index_body_checksum_present = false;
+    bool index_body_checksum_verified = false;
+    bool index_structural_validation_performed = false;
+};
+
 class NativeCollectionBuilder {
 public:
     static std::unique_ptr<NativeCollectionBuilder> create(
@@ -88,6 +106,7 @@ public:
     [[nodiscard]] std::uint32_t format_version() const;
     [[nodiscard]] std::uint64_t record_size() const;
     [[nodiscard]] bool writable() const;
+    [[nodiscard]] NativeOpenStats open_stats() const;
 
 private:
     class Impl;

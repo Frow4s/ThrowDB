@@ -114,6 +114,14 @@ struct DTypeInfo {
     return static_cast<std::uint32_t>(value);
 }
 
+[[nodiscard]] bool checked_python_bool(
+    const py::handle value, const char* name) {
+    if (!py::isinstance<py::bool_>(value)) {
+        throw py::type_error(std::string(name) + " must be a bool");
+    }
+    return py::cast<bool>(value);
+}
+
 [[nodiscard]] throwdb::IoBackend checked_io_backend(
     const std::string& value) {
     if (value == "thread_pool") {
@@ -132,7 +140,8 @@ struct DTypeInfo {
     const std::int64_t io_ranges_per_task,
     const std::string& io_backend,
     const std::int64_t io_uring_queue_depth,
-    const std::int64_t io_uring_workers) {
+    const std::int64_t io_uring_workers,
+    const bool verify_native_index = false) {
     throwdb::ReaderOptions options;
     options.io_workers =
         checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
@@ -147,6 +156,7 @@ struct DTypeInfo {
         checked_io_uring_queue_depth(io_uring_queue_depth);
     options.io_uring_workers =
         checked_io_uring_workers(io_uring_workers);
+    options.verify_native_index = verify_native_index;
     if (options.io_backend == throwdb::IoBackend::IoUring
         && (options.io_workers != 0 || options.io_queue_capacity != 0)) {
         throw py::value_error(
@@ -624,7 +634,8 @@ public:
         const std::int64_t io_ranges_per_task,
         const std::string& io_backend,
         const std::int64_t io_uring_queue_depth,
-        const std::int64_t io_uring_workers) {
+        const std::int64_t io_uring_workers,
+        const py::object& verify_native_index) {
         bool writable = false;
         if (mode == "r") {
             writable = false;
@@ -640,7 +651,9 @@ public:
             io_ranges_per_task,
             io_backend,
             io_uring_queue_depth,
-            io_uring_workers);
+            io_uring_workers,
+            checked_python_bool(
+                verify_native_index, "verify_native_index"));
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::NativeCollection> collection;
         {
@@ -683,6 +696,39 @@ public:
 
     [[nodiscard]] std::uint32_t format_version() const {
         return acquire_collection()->format_version();
+    }
+
+    [[nodiscard]] py::dict open_stats() const {
+        const throwdb::NativeOpenStats stats =
+            acquire_collection()->open_stats();
+        py::dict result;
+        result["total_seconds"] = stats.total_seconds;
+        result["manifest_seconds"] = stats.manifest_seconds;
+        result["index_seconds"] = stats.index_seconds;
+        result["index_header_seconds"] = stats.index_header_seconds;
+        result["index_allocation_seconds"] = stats.index_allocation_seconds;
+        result["index_controls_seconds"] = stats.index_controls_seconds;
+        result["index_slots_seconds"] = stats.index_slots_seconds;
+        result["index_checksum_seconds"] = stats.index_checksum_seconds;
+        result["index_structural_validation_seconds"] =
+            stats.index_structural_validation_seconds;
+        result["base_segments_seconds"] = stats.base_segments_seconds;
+        result["wal_replay_seconds"] = stats.wal_replay_seconds;
+        result["index_file_bytes"] = stats.index_file_bytes;
+        result["index_body_checksum_present"] =
+            stats.index_body_checksum_present;
+        result["index_body_checksum_verified"] =
+            stats.index_body_checksum_verified;
+        result["index_structural_validation_performed"] =
+            stats.index_structural_validation_performed;
+        const char* validation = "checksum";
+        if (stats.index_structural_validation_performed) {
+            validation = stats.index_body_checksum_present
+                ? "checksum_and_full"
+                : "full_legacy_fallback";
+        }
+        result["index_validation"] = validation;
+        return result;
     }
 
     py::array get(const py::array& ids) const {
@@ -878,12 +924,14 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
             py::arg("io_backend") = "thread_pool",
             py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
-            py::arg("io_uring_workers") = kDefaultIoUringWorkers)
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers,
+            py::arg("verify_native_index") = false)
         .def_property_readonly("dimension", &PyNativeCollection::dimension)
         .def_property_readonly("count", &PyNativeCollection::count)
         .def_property_readonly("dtype", &PyNativeCollection::dtype)
         .def_property_readonly(
             "format_version", &PyNativeCollection::format_version)
+        .def_property_readonly("open_stats", &PyNativeCollection::open_stats)
         .def("get", &PyNativeCollection::get, py::arg("ids"))
         .def(
             "get_into",

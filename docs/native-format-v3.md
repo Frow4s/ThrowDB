@@ -1,10 +1,18 @@
-# Native mutable numeric format
+# Native mutable numeric formats 3 and 4
 
 `Collection.create()` publishes a fresh numeric collection reported through
-the public API as format version 3. Its internal wire headers currently use
-native-format version 1. This format is intentionally independent of the
+the public API as format version 4. Version 4 adds a CRC32C for the complete
+flat-index body in fields that were reserved and zero in version 3. Its internal
+wire headers still use native-format version 1; the public version distinguishes
+the new index integrity contract. This format is intentionally independent of the
 earlier immutable format-v1/v2 files: source NumPy arrays are the migration
 path while the mutable format is still experimental.
+
+The current reader opens both versions. A checksum-free version-3 index falls
+back to the complete structural scan and is reported as version 3. New builders
+write the checksum and report version 4. Older readers reject version 4 because
+they require those header bytes to remain zero; upgrading the reader is
+therefore required before rebuilding a collection in version 4.
 
 ## Layout
 
@@ -31,6 +39,15 @@ same logical address without changing the public read path. The table targets
 at most 70 percent occupancy. This deliberately favors lookup speed and RAM
 over compactness for the first large-index tests.
 
+Before publishing a version-4 index, the builder performs the complete
+structural validation and then records CRC32C over controls, zero alignment
+padding, and all serialized slots. A normal open verifies that checksum while
+loading the index and does not repeat the expensive per-slot structural audit.
+`Collection.open(..., verify_index=True)` requests both checksum verification
+and the full slot/`RowRef`/uniqueness/probe-path audit. The lower-level binding
+uses the equivalent `verify_native_index=True` argument. This checksum detects
+accidental corruption; it is not a cryptographic authenticity mechanism.
+
 ## Bulk publication
 
 The builder streams embeddings and IDs into immutable base segments. On
@@ -42,7 +59,8 @@ complete initial collection; an unfinished builder is not readable.
 ## Reads and snapshot semantics
 
 Opening a collection validates its manifest, base segment headers, ID
-sidecars, index structure, and WAL identity. Committed WAL operations rebuild
+sidecars, index checksum (or the complete index structure for legacy and
+explicit-verify opens), and WAL identity. Committed WAL operations rebuild
 an in-memory overlay. Lookup checks that overlay first: a PUT resolves to the
 active WAL and a tombstone stops lookup; absent overlay entries fall through
 to the base index.
