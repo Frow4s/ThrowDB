@@ -250,3 +250,96 @@ throughput, and no return of cgroup throttling. Compare p50/p99, CPU time,
 context switches, diskstats, and `/proc/self/task` count. Whole-batch FIFO can
 still cause head-of-line blocking between very different batch sizes; a fair
 quantum scheduler is intentionally deferred until measurements justify it.
+
+## Fixed v4 reader A/B profile
+
+Use `run_v4_reader_ab.py` as the regression gate before and after changing the
+mutable read path or automatic tuning. It runs one report containing the
+following fixed comparison:
+
+- synchronous `thread_pool` with zero internal workers;
+- `thread_pool` with 16 workers, queue capacity 32, and 8 ranges per task;
+- `io_uring` with 2 ring workers and aggregate QD32;
+- batches 1,024 and 10,000 with 1, 8, and 16 external readers;
+- three repetitions, each paired cold then warm.
+
+```bash
+python benchmarks/run_v4_reader_ab.py \
+  --store /tmp/throwdb-prod-test-store \
+  --ids /mnt/dataset/ids.npy \
+  --source-embeddings /mnt/dataset/embeddings.npy \
+  --source-kind npy \
+  --results benchmark-results/v4-reader-ab
+```
+
+The defaults perform 100 calls per reader for batch 1,024 and 10 calls per
+reader for batch 10,000, keeping measured embeddings per reader close to
+100,000 in both cases. Override `--calls-1024` and `--calls-10000` only when a
+shorter smoke run or a longer device qualification is intentional.
+
+The matrix is scenario-blocked and paired. Inside each repetition it selects
+one `(batch_size, external_readers)` scenario, then runs all three policies on
+the same deterministic query stream before moving to the next scenario. The
+policy order uses a three-way Latin rotation across repetitions. This keeps a
+candidate close to its synchronous control while balancing first/last policy
+position. The generated `summary` reports per-policy distributions and
+repetition-paired throughput speedups. With the default `both` cache mode there
+are 108 timed results. Standalone `--cache-mode warm` retains the explicit
+measured-query replay guarantee used by `run_load_test.py`.
+
+To keep memory bounded, each policy-scenario block opens one collection handle,
+runs its adjacent cold/warm pair, and closes it before the next policy. The
+default matrix therefore performs 54 measured-policy opens in addition to the
+three preflight opens. Open time is recorded in `storage_opens` but is outside
+read throughput and latency. This intentionally trades extra index loads for
+temporal pairing without retaining three multi-gigabyte indexes at once.
+
+Before monitors or timed work start, all three policies are opened and checked.
+Candidates must return a byte-for-byte match to the synchronous baseline even
+when `--source-embeddings` is omitted; the optional source additionally checks
+that baseline against the original NumPy data. Per-policy open metadata,
+correctness status, error details, and one profiled-read telemetry sample are
+persisted under `policy_preflight`. An unavailable `io_uring` environment or a
+backend mismatch therefore fails before the expensive matrix begins.
+
+By default the preflight also requires
+`telemetry.zero_delta_fast_path: true`. A mutation smoke leaves entries in the
+active WAL even after restoring their logical values, so use a freshly built
+collection with no committed WAL mutations for the empty mutable-read
+regression gate. Selective compaction will later be another way to restore that
+state. To intentionally measure a collection with mutation overlay state, opt
+out explicitly:
+
+```bash
+python benchmarks/run_v4_reader_ab.py \
+  --store /tmp/throwdb-prod-test-store-with-mutations \
+  --ids /mnt/dataset/ids.npy \
+  --results benchmark-results/v4-reader-ab-mutations \
+  --no-require-zero-delta
+```
+
+Do not mutate or replace the collection during a run. This profile requires
+native format v4 or newer and refuses to overwrite an existing `report.json`.
+The report is updated atomically after every preflight and measured result, so
+a stopped run leaves its completed raw measurements available for diagnosis;
+start a replacement run in a new results directory.
+
+For a short installation and correctness smoke test of the same matrix, reduce
+the work without changing its policies or scenarios:
+
+```bash
+python benchmarks/run_v4_reader_ab.py \
+  --store /tmp/throwdb-prod-test-store \
+  --ids /mnt/dataset/ids.npy \
+  --source-embeddings /mnt/dataset/embeddings.npy \
+  --results benchmark-results/v4-reader-ab-smoke \
+  --repeats 1 \
+  --calls-1024 2 \
+  --calls-10000 1
+```
+
+The timed A/B path deliberately uses ordinary uninstrumented `get_into()`.
+Preflight uses `Collection.get_into_profiled()` once per policy outside the
+acceptance measurement and stores the result in the report. Its
+`physical_backend_seconds` combines admission/queue wait, I/O, and scatter;
+`planned_ranges`, `planned_read_bytes`, and `backend_tasks` describe the plan.

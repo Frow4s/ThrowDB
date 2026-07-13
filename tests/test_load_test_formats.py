@@ -180,15 +180,19 @@ def test_id_population_keeps_supported_integer_dtype_and_rejects_negatives(
         BENCHMARK.load_ids(signed_path, expected_count=4)
 
 
-def test_cache_eviction_includes_legacy_shards_and_native_segments(
+def test_cache_eviction_includes_base_segments_and_active_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     data = tmp_path / "data"
     data.mkdir()
+    wal = tmp_path / "wal"
+    wal.mkdir()
     (data / "shard-000001.dat").write_bytes(bytes(11))
     (data / "segment-00000001.dat").write_bytes(bytes(13))
     (data / "unrelated.dat").write_bytes(bytes(17))
+    (wal / "active.wal").write_bytes(bytes(19))
+    (wal / "unrelated.bin").write_bytes(bytes(23))
     advised: list[tuple[int, int, int, int]] = []
     monkeypatch.setattr(BENCHMARK.os, "POSIX_FADV_DONTNEED", 4, raising=False)
     monkeypatch.setattr(
@@ -204,8 +208,10 @@ def test_cache_eviction_includes_legacy_shards_and_native_segments(
 
     assert result["shard_count"] == 2
     assert result["data_file_count"] == 2
-    assert result["advised_bytes"] == 24
-    assert len(advised) == 2
+    assert result["wal_file_count"] == 1
+    assert result["advised_file_count"] == 3
+    assert result["advised_bytes"] == 43
+    assert len(advised) == 3
 
 
 def test_sequential_warm_only_replays_measured_queries_before_metrics(

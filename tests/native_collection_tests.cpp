@@ -13,6 +13,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <sys/stat.h>
@@ -358,6 +359,89 @@ void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
     }
 }
 
+void test_zero_delta_read_path_transitions_on_first_commit() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::uint64_t record_size = dimension * 2;
+    constexpr std::size_t row_count = 512;
+
+    std::vector<std::uint64_t> ids(row_count);
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        ids[index] = 10'000 + index;
+    }
+    const std::vector<std::byte> base = rows(row_count, record_size, 13);
+    const std::vector<std::byte> updated = rows(row_count, record_size, 149);
+
+    throwdb::NativeBuilderOptions options;
+    options.dimension = dimension;
+    options.segment_size_bytes = 64 * record_size;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->append(ids, base);
+    builder->finish();
+
+    auto writer = throwdb::NativeCollection::open(store, {}, true);
+    require_equal(
+        writer->get_bytes(ids), base,
+        "zero-delta base-only read is not bit exact");
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> finished{false};
+    std::exception_ptr update_error;
+    std::thread updater([&] {
+        while (!start.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        try {
+            writer->update(ids, updated);
+        } catch (...) {
+            update_error = std::current_exception();
+        }
+        finished.store(true, std::memory_order_release);
+    });
+
+    start.store(true, std::memory_order_release);
+    std::size_t concurrent_reads = 0;
+    bool valid_concurrent_snapshot = true;
+    std::exception_ptr read_error;
+    try {
+        do {
+            const std::vector<std::byte> actual = writer->get_bytes(ids);
+            const bool complete_base =
+                std::equal(actual.begin(), actual.end(), base.begin());
+            const bool complete_update =
+                std::equal(actual.begin(), actual.end(), updated.begin());
+            if (!complete_base && !complete_update) {
+                valid_concurrent_snapshot = false;
+                break;
+            }
+            ++concurrent_reads;
+        } while (!finished.load(std::memory_order_acquire));
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    updater.join();
+    if (read_error != nullptr) {
+        std::rethrow_exception(read_error);
+    }
+    if (update_error != nullptr) {
+        std::rethrow_exception(update_error);
+    }
+    require(concurrent_reads != 0, "concurrent read loop did not execute");
+    require(
+        valid_concurrent_snapshot,
+        "first commit produced a mixed or torn read snapshot");
+    require_equal(
+        writer->get_bytes(ids), updated,
+        "read path did not switch to the committed mutation overlay");
+
+    writer.reset();
+    auto reopened = throwdb::NativeCollection::open(store);
+    require_equal(
+        reopened->get_bytes(ids), updated,
+        "WAL recovery did not activate the mutation read path");
+}
+
 void test_empty_collection_and_empty_batches() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
@@ -600,6 +684,9 @@ int main() {
         TestCase{
             "active_wal_tail_is_ignored_and_writer_repairs_it",
             test_active_wal_tail_is_ignored_and_writer_repairs_it},
+        TestCase{
+            "zero_delta_read_path_transitions_on_first_commit",
+            test_zero_delta_read_path_transitions_on_first_commit},
         TestCase{
             "empty_collection_and_empty_batches",
             test_empty_collection_and_empty_batches},

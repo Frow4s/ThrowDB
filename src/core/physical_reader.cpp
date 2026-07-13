@@ -6,6 +6,7 @@
 #include "task_partition.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -246,6 +247,30 @@ public:
         const std::uint64_t record_size,
         const std::span<const PhysicalReadRequest> input,
         const std::span<std::byte> output) const {
+        execute_impl<false>(record_size, input, output, nullptr);
+    }
+
+    [[nodiscard]] PhysicalReadStats execute_profiled(
+        const std::uint64_t record_size,
+        const std::span<const PhysicalReadRequest> input,
+        const std::span<std::byte> output) const {
+        PhysicalReadStats stats;
+        execute_impl<true>(record_size, input, output, &stats);
+        return stats;
+    }
+
+private:
+    template <bool Profiled>
+    void execute_impl(
+        const std::uint64_t record_size,
+        const std::span<const PhysicalReadRequest> input,
+        const std::span<std::byte> output,
+        PhysicalReadStats* const stats) const {
+        using Clock = std::chrono::steady_clock;
+        Clock::time_point plan_started;
+        if constexpr (Profiled) {
+            plan_started = Clock::now();
+        }
         if (!owned_by_current_process()) {
             throw StorageError(
                 "physical reader was inherited across fork; reopen its "
@@ -268,6 +293,10 @@ public:
                 "output byte count does not equal requests.size() * record_size");
         }
         if (input.empty()) {
+            if constexpr (Profiled) {
+                stats->plan_seconds = std::chrono::duration<double>(
+                    Clock::now() - plan_started).count();
+            }
             return;
         }
 
@@ -344,18 +373,67 @@ public:
             begin = end;
         }
 
+        if constexpr (Profiled) {
+            std::size_t task_count = 0;
+            if (ranges.size() == 1) {
+                task_count = 1;
+            } else if (io_uring_pool_ != nullptr) {
+                task_count = std::min<std::size_t>(
+                    io_uring_pool_->worker_count(), ranges.size());
+            } else if (io_uring_ != nullptr) {
+                task_count = 1;
+            } else if (executor_ == nullptr) {
+                task_count = ranges.size();
+            } else {
+                task_count = plan_range_tasks(
+                    ranges.size(), options_.io_workers,
+                    options_.io_ranges_per_task).task_count;
+            }
+            stats->request_count = input.size();
+            stats->range_count = ranges.size();
+            stats->task_count = task_count;
+            for (const PlannedRange& range : ranges) {
+                const std::uint64_t range_bytes =
+                    range.end_offset - range.first_offset;
+                if (range_bytes
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - stats->planned_read_bytes) {
+                    stats->planned_read_bytes =
+                        std::numeric_limits<std::uint64_t>::max();
+                    break;
+                }
+                stats->planned_read_bytes += range_bytes;
+            }
+            stats->plan_seconds = std::chrono::duration<double>(
+                Clock::now() - plan_started).count();
+        }
+
+        Clock::time_point backend_started;
+        if constexpr (Profiled) {
+            backend_started = Clock::now();
+        }
+        const auto finish_backend = [&] {
+            if constexpr (Profiled) {
+                stats->backend_seconds = std::chrono::duration<double>(
+                    Clock::now() - backend_started).count();
+            }
+        };
+
         if (ranges.size() == 1) {
             read_range(requests, ranges.front(), record_size, output);
+            finish_backend();
             return;
         }
         if (io_uring_ != nullptr || io_uring_pool_ != nullptr) {
             read_ranges_io_uring(requests, ranges, record_size, output);
+            finish_backend();
             return;
         }
         if (executor_ == nullptr) {
             for (const PlannedRange& range : ranges) {
                 read_range(requests, range, record_size, output);
             }
+            finish_backend();
             return;
         }
 
@@ -396,9 +474,9 @@ public:
         if (std::exception_ptr error = state->wait(); error != nullptr) {
             std::rethrow_exception(error);
         }
+        finish_backend();
     }
 
-private:
     static void read_range(
         const std::vector<Request>& requests,
         const PlannedRange& range,
@@ -542,6 +620,13 @@ void PhysicalReader::execute(
     const std::span<const PhysicalReadRequest> requests,
     const std::span<std::byte> output) const {
     impl_->execute(record_size, requests, output);
+}
+
+PhysicalReadStats PhysicalReader::execute_profiled(
+    const std::uint64_t record_size,
+    const std::span<const PhysicalReadRequest> requests,
+    const std::span<std::byte> output) const {
+    return impl_->execute_profiled(record_size, requests, output);
 }
 
 void PhysicalReader::abandon_after_fork() noexcept {

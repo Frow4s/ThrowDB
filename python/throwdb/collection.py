@@ -625,6 +625,30 @@ class Collection:
         full = storage.get(normalized_ids)
         np.copyto(validated_output, full[:, :prefix], casting="no")
 
+    def get_into_profiled(
+        self,
+        ids: object,
+        output: object,
+    ) -> dict[str, object]:
+        """Read full rows and return opt-in native phase diagnostics.
+
+        Unlike :meth:`get_into`, this diagnostic method reads clocks inside
+        the native engine. Normal application reads remain uninstrumented.
+        """
+
+        storage = self._ensure_reader()
+        normalized_ids = _normalize_numeric_ids(ids)
+        validated_output = _validate_output(
+            output,
+            expected_rows=len(normalized_ids),
+            expected_columns=self.dimension,
+            dtype=self.dtype,
+        )
+        stats = storage.get_into_profiled(normalized_ids, validated_output)
+        if not isinstance(stats, dict):
+            raise RuntimeError("native profiled read returned invalid diagnostics")
+        return dict(stats)
+
     def __enter__(self) -> Collection:
         if self._builder is not None:
             self._ensure_builder_open()

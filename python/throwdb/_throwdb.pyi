@@ -158,6 +158,12 @@ class NativeCollection:
         output: _EmbeddingArray,
     ) -> None: ...
 
+    def get_into_profiled(
+        self,
+        ids: npt.NDArray[np.uint64],
+        output: _EmbeddingArray,
+    ) -> dict[str, object]: ...
+
     def insert(
         self,
         ids: npt.NDArray[np.uint64],

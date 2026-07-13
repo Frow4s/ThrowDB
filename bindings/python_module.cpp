@@ -766,6 +766,36 @@ public:
         });
     }
 
+    [[nodiscard]] py::dict get_into_profiled(
+        const py::array& ids, py::array output) const {
+        const auto collection = acquire_collection();
+        const auto id_span = validate_ids(ids);
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        const throwdb::NativeReadStats stats = translate_id_errors([&] {
+            py::gil_scoped_release release;
+            return collection->get_into_profiled(id_span, output_span);
+        });
+        py::dict result;
+        result["total_seconds"] = stats.total_seconds;
+        result["lookup_seconds"] = stats.lookup_seconds;
+        result["physical_plan_seconds"] = stats.physical_plan_seconds;
+        result["physical_backend_seconds"] =
+            stats.physical_backend_seconds;
+        result["requested_rows"] = stats.requested_rows;
+        result["base_rows"] = stats.base_rows;
+        result["mutation_rows"] = stats.mutation_rows;
+        result["planned_ranges"] = stats.planned_ranges;
+        result["planned_read_bytes"] = stats.planned_read_bytes;
+        result["backend_tasks"] = stats.backend_tasks;
+        result["zero_delta_fast_path"] = stats.zero_delta_fast_path;
+        return result;
+    }
+
     void insert(const py::array& ids, const py::array& embeddings) {
         const auto collection = acquire_collection();
         const auto id_span = validate_ids(ids);
@@ -936,6 +966,11 @@ PYBIND11_MODULE(_throwdb, module) {
         .def(
             "get_into",
             &PyNativeCollection::get_into,
+            py::arg("ids"),
+            py::arg("output"))
+        .def(
+            "get_into_profiled",
+            &PyNativeCollection::get_into_profiled,
             py::arg("ids"),
             py::arg("output"))
         .def(

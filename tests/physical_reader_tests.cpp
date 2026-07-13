@@ -195,6 +195,109 @@ void test_gap_merging_scatters_to_original_output_order() {
     require_record(output, 2, data, 1, "merged range lost output row 2");
 }
 
+void test_profiled_execute_reports_plan_and_matches_default_output() {
+    TempDirectory temporary;
+    const std::vector<std::byte> data = pattern(35, 8);
+    const auto path = temporary.path() / "profiled-merged.bin";
+    write_bytes(path, data);
+    const ScopedFd fd(path);
+
+    throwdb::ReaderOptions options;
+    options.max_gap_bytes = 2 * kRecordSize;
+    options.max_read_range_bytes = 64;
+    throwdb::detail::PhysicalReader reader(options);
+    const std::vector<throwdb::detail::PhysicalReadRequest> requests{
+        {fd.get(), 4 * kRecordSize, 0},
+        {fd.get(), 2 * kRecordSize, 1},
+        {fd.get(), 1 * kRecordSize, 2},
+    };
+    std::vector<std::byte> expected(requests.size() * kRecordSize);
+    std::vector<std::byte> actual(requests.size() * kRecordSize);
+    reader.execute(kRecordSize, requests, expected);
+
+    const throwdb::detail::PhysicalReadStats stats =
+        reader.execute_profiled(kRecordSize, requests, actual);
+
+    require(actual == expected, "profiled execute changed output bytes");
+    require(stats.request_count == 3, "profiled request count is wrong");
+    require(stats.range_count == 1, "merged range count is wrong");
+    require(stats.task_count == 1, "inline backend task count is wrong");
+    require(
+        stats.planned_read_bytes == 4 * kRecordSize,
+        "merged planned byte count is wrong");
+    require(stats.plan_seconds >= 0.0, "plan duration is negative");
+    require(stats.backend_seconds >= 0.0, "backend duration is negative");
+}
+
+void test_concurrent_profiled_thread_pool_calls_keep_per_call_stats() {
+    TempDirectory temporary;
+    const std::vector<std::byte> data = pattern(65, 8);
+    const auto path = temporary.path() / "profiled-pool.bin";
+    write_bytes(path, data);
+    const ScopedFd fd(path);
+
+    throwdb::ReaderOptions options;
+    options.max_read_range_bytes = kRecordSize;
+    options.io_workers = 2;
+    options.io_queue_capacity = 2;
+    options.io_ranges_per_task = 2;
+    throwdb::detail::PhysicalReader reader(options);
+    const std::vector<throwdb::detail::PhysicalReadRequest> requests{
+        {fd.get(), 0 * kRecordSize, 0},
+        {fd.get(), 2 * kRecordSize, 1},
+        {fd.get(), 4 * kRecordSize, 2},
+        {fd.get(), 6 * kRecordSize, 3},
+    };
+
+    constexpr std::size_t kCallerCount = 4;
+    std::array<std::vector<std::byte>, kCallerCount> outputs;
+    std::array<throwdb::detail::PhysicalReadStats, kCallerCount> stats;
+    std::vector<std::thread> callers;
+    callers.reserve(kCallerCount);
+    std::mutex error_mutex;
+    std::exception_ptr first_error;
+    for (std::size_t caller = 0; caller != kCallerCount; ++caller) {
+        outputs[caller].resize(requests.size() * kRecordSize);
+        callers.emplace_back([&, caller] {
+            try {
+                stats[caller] = reader.execute_profiled(
+                    kRecordSize, requests, outputs[caller]);
+            } catch (...) {
+                std::lock_guard lock(error_mutex);
+                if (first_error == nullptr) {
+                    first_error = std::current_exception();
+                }
+            }
+        });
+    }
+    for (std::thread& caller : callers) {
+        caller.join();
+    }
+    if (first_error != nullptr) {
+        std::rethrow_exception(first_error);
+    }
+
+    for (std::size_t caller = 0; caller != kCallerCount; ++caller) {
+        require_record(outputs[caller], 0, data, 0, "profiled pool row 0 is wrong");
+        require_record(outputs[caller], 1, data, 2, "profiled pool row 1 is wrong");
+        require_record(outputs[caller], 2, data, 4, "profiled pool row 2 is wrong");
+        require_record(outputs[caller], 3, data, 6, "profiled pool row 3 is wrong");
+        require(
+            stats[caller].request_count == requests.size(),
+            "concurrent profiled request count is wrong");
+        require(
+            stats[caller].range_count == requests.size(),
+            "concurrent profiled range count is wrong");
+        require(
+            stats[caller].task_count == 2,
+            "concurrent profiled task count is wrong");
+        require(
+            stats[caller].planned_read_bytes
+                == requests.size() * kRecordSize,
+            "concurrent profiled planned byte count is wrong");
+    }
+}
+
 void test_thread_pool_and_concurrent_execute() {
     TempDirectory temporary;
     const std::vector<std::byte> first_data = pattern(50, 8);
@@ -326,6 +429,12 @@ int main() {
         TestCase{
             "gap_merging_scatters_to_original_output_order",
             test_gap_merging_scatters_to_original_output_order},
+        TestCase{
+            "profiled_execute_reports_plan_and_matches_default_output",
+            test_profiled_execute_reports_plan_and_matches_default_output},
+        TestCase{
+            "concurrent_profiled_thread_pool_calls_keep_per_call_stats",
+            test_concurrent_profiled_thread_pool_calls_keep_per_call_stats},
         TestCase{
             "thread_pool_and_concurrent_execute",
             test_thread_pool_and_concurrent_execute},

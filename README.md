@@ -161,6 +161,28 @@ output = np.empty(
 db.get_into(query_ids, output)
 ```
 
+For an occasional phase-level diagnosis, use the opt-in profiled variant. It
+performs the same bit-exact full-row read and returns native timings plus the
+physical plan shape; ordinary `get()` and `get_into()` calls do not read clocks
+or update telemetry counters.
+
+```python
+stats = db.get_into_profiled(query_ids, output)
+print(
+    stats["lookup_seconds"],
+    stats["physical_plan_seconds"],
+    stats["physical_backend_seconds"],
+    stats["planned_ranges"],
+    stats["planned_read_bytes"],
+    stats["zero_delta_fast_path"],
+)
+```
+
+`physical_backend_seconds` currently combines queue/admission wait, physical
+I/O, and scatter copies because those operations overlap in parallel backends.
+The value is intended for diagnosis, not for instrumentation of every
+production request.
+
 ## CLI
 
 ```bash
@@ -223,8 +245,9 @@ benchmarks: they open `Storage` without enabling the internal executor. For a
 complete machine, correctness, sequential-read, and concurrent-reader run, edit
 the configuration at the top of `benchmarks/run_load_test.py` and execute it
 once. The runner auto-detects fresh native and legacy immutable manifests.
-`--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` for rootless eviction on
-Linux. Standalone `warm` replays the exact measured query set outside the timed
+`--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` on immutable base
+segments and the active mutation WAL for rootless eviction on Linux.
+Standalone `warm` replays the exact measured query set outside the timed
 interval before measuring it; `both` measures the same deterministic stream
 cold first and warm immediately afterwards. A result's
 `explicit_measurement_prewarm` is true only when that standalone replay ran.

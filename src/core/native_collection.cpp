@@ -508,6 +508,12 @@ public:
             detail::truncate_file(wal_fd_.get(), scan.valid_end, wal_path_);
             detail::sync_file(wal_fd_.get(), wal_path_);
         }
+        // This flag is monotonic for the lifetime of the current collection
+        // implementation. A clean collection can therefore plan reads from
+        // its immutable base index without touching state_mutex_ or overlay_.
+        // Recovered mutations are fully built before the handle is published.
+        mutation_read_path_active_.store(
+            !overlay_.empty(), std::memory_order_relaxed);
         open_stats_.wal_replay_seconds = elapsed_seconds(phase_started);
         open_stats_.total_seconds = elapsed_seconds(open_started);
     }
@@ -525,33 +531,15 @@ public:
     void get_into(
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
-        ensure_healthy();
-        const std::uint64_t expected = detail::checked_multiply(
-            ids.size(), manifest_.record_size, "get output");
-        if (expected > std::numeric_limits<std::size_t>::max()
-            || output.size() != static_cast<std::size_t>(expected)) {
-            throw InvalidArgumentError(
-                "output byte count does not equal ids.size() * record_size");
-        }
-        if (ids.empty()) {
-            return;
-        }
+        get_into_impl<false>(ids, output, nullptr);
+    }
 
-        std::vector<detail::PhysicalReadRequest> requests;
-        requests.reserve(ids.size());
-        {
-            std::shared_lock lock(state_mutex_);
-            for (std::size_t output_index = 0;
-                 output_index != ids.size(); ++output_index) {
-                const auto row = logical_lookup_unlocked(ids[output_index]);
-                if (!row.has_value()) {
-                    throw MissingIdError(ids[output_index]);
-                }
-                requests.push_back(resolve_row_unlocked(
-                    *row, static_cast<std::uint64_t>(output_index)));
-            }
-        }
-        physical_reader_.execute(manifest_.record_size, requests, output);
+    [[nodiscard]] NativeReadStats get_into_profiled(
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output) const {
+        NativeReadStats stats;
+        get_into_impl<true>(ids, output, &stats);
+        return stats;
     }
 
     [[nodiscard]] std::vector<std::byte> get_bytes(
@@ -720,6 +708,103 @@ private:
         detail::FileDescriptor fd;
     };
 
+    template <bool Profiled>
+    void get_into_impl(
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output,
+        NativeReadStats* const stats) const {
+        SteadyClock::time_point total_started;
+        if constexpr (Profiled) {
+            total_started = SteadyClock::now();
+        }
+
+        ensure_healthy();
+        const std::uint64_t expected = detail::checked_multiply(
+            ids.size(), manifest_.record_size, "get output");
+        if (expected > std::numeric_limits<std::size_t>::max()
+            || output.size() != static_cast<std::size_t>(expected)) {
+            throw InvalidArgumentError(
+                "output byte count does not equal ids.size() * record_size");
+        }
+        if constexpr (Profiled) {
+            stats->requested_rows = ids.size();
+        }
+        if (ids.empty()) {
+            if constexpr (Profiled) {
+                stats->zero_delta_fast_path =
+                    !mutation_read_path_active_.load(
+                        std::memory_order_acquire);
+                stats->total_seconds = elapsed_seconds(total_started);
+            }
+            return;
+        }
+
+        SteadyClock::time_point lookup_started;
+        if constexpr (Profiled) {
+            lookup_started = SteadyClock::now();
+        }
+        std::vector<detail::PhysicalReadRequest> requests;
+        requests.reserve(ids.size());
+        const bool zero_delta_fast_path =
+            !mutation_read_path_active_.load(std::memory_order_acquire);
+        if constexpr (Profiled) {
+            stats->zero_delta_fast_path = zero_delta_fast_path;
+        }
+        if (zero_delta_fast_path) {
+            // index_ and base_segments_ never change after open. If the first
+            // mutation is published concurrently after the acquire load, this
+            // read is a valid snapshot immediately before that publication and
+            // does not race with any mutable object.
+            for (std::size_t output_index = 0;
+                 output_index != ids.size(); ++output_index) {
+                const auto row = detail::native_index_lookup(
+                    index_, ids[output_index]);
+                if (!row.has_value()) {
+                    throw MissingIdError(ids[output_index]);
+                }
+                requests.push_back(resolve_base_row(
+                    *row, static_cast<std::uint64_t>(output_index)));
+            }
+            if constexpr (Profiled) {
+                stats->base_rows = ids.size();
+            }
+        } else {
+            std::shared_lock lock(state_mutex_);
+            for (std::size_t output_index = 0;
+                 output_index != ids.size(); ++output_index) {
+                const auto row = logical_lookup_unlocked(ids[output_index]);
+                if (!row.has_value()) {
+                    throw MissingIdError(ids[output_index]);
+                }
+                if constexpr (Profiled) {
+                    if (row->segment_id().value()
+                        <= manifest_.base_segment_count) {
+                        ++stats->base_rows;
+                    } else {
+                        ++stats->mutation_rows;
+                    }
+                }
+                requests.push_back(resolve_row_unlocked(
+                    *row, static_cast<std::uint64_t>(output_index)));
+            }
+        }
+        if constexpr (Profiled) {
+            stats->lookup_seconds = elapsed_seconds(lookup_started);
+            const detail::PhysicalReadStats physical =
+                physical_reader_.execute_profiled(
+                    manifest_.record_size, requests, output);
+            stats->physical_plan_seconds = physical.plan_seconds;
+            stats->physical_backend_seconds = physical.backend_seconds;
+            stats->planned_ranges = physical.range_count;
+            stats->planned_read_bytes = physical.planned_read_bytes;
+            stats->backend_tasks = physical.task_count;
+            stats->total_seconds = elapsed_seconds(total_started);
+        } else {
+            physical_reader_.execute(
+                manifest_.record_size, requests, output);
+        }
+    }
+
     void ensure_healthy() const {
         ensure_owner_process();
         if (poisoned_.load(std::memory_order_acquire)) {
@@ -783,22 +868,33 @@ private:
         return detail::native_index_lookup(index_, id);
     }
 
+    [[nodiscard]] detail::PhysicalReadRequest resolve_base_row(
+        const detail::RowRef row,
+        const std::uint64_t output_index) const {
+        const std::uint32_t segment = row.segment_id().value();
+        const std::uint64_t row_index = row.row_index();
+        if (segment == 0 || segment > manifest_.base_segment_count) {
+            throw CorruptionError(
+                "base index RowRef does not resolve to a base segment");
+        }
+        const BaseSegment& base =
+            base_segments_[static_cast<std::size_t>(segment - 1)];
+        if (row_index >= base.header.row_count) {
+            throw CorruptionError("base RowRef exceeds segment row count");
+        }
+        return detail::PhysicalReadRequest{
+            base.fd.get(),
+            base.header.payload_offset + row_index * manifest_.record_size,
+            output_index};
+    }
+
     [[nodiscard]] detail::PhysicalReadRequest resolve_row_unlocked(
         const detail::RowRef row,
         const std::uint64_t output_index) const {
         const std::uint32_t segment = row.segment_id().value();
         const std::uint64_t row_index = row.row_index();
         if (segment <= manifest_.base_segment_count) {
-            const BaseSegment& base =
-                base_segments_[static_cast<std::size_t>(segment - 1)];
-            if (row_index >= base.header.row_count) {
-                throw CorruptionError("base RowRef exceeds segment row count");
-            }
-            return detail::PhysicalReadRequest{
-                base.fd.get(),
-                base.header.payload_offset
-                    + row_index * manifest_.record_size,
-                output_index};
+            return resolve_base_row(row, output_index);
         }
         if (segment != manifest_.active_wal_segment_id
             || row_index >= wal_payload_offsets_.size()) {
@@ -923,6 +1019,12 @@ private:
                 live_count_.store(resulting_count, std::memory_order_release);
                 append_offset_ = new_end;
                 ++next_sequence_;
+                // Publish only after every overlay and WAL RowRef update is
+                // complete. A reader that still observes false is concurrent
+                // with this first commit and may linearize immediately before
+                // it; a reader that observes true takes state_mutex_.
+                mutation_read_path_active_.store(
+                    true, std::memory_order_release);
             } catch (...) {
                 poisoned_.store(true, std::memory_order_release);
                 throw;
@@ -950,6 +1052,7 @@ private:
     mutable std::shared_mutex state_mutex_;
     std::unordered_map<std::uint64_t, detail::MutationValue> overlay_;
     std::vector<std::uint64_t> wal_payload_offsets_;
+    std::atomic<bool> mutation_read_path_active_{false};
     std::atomic<std::uint64_t> live_count_{0};
     std::uint64_t append_offset_{detail::kWalFileHeaderSize};
     std::uint64_t next_sequence_{1};
@@ -1050,6 +1153,11 @@ void NativeCollection::get_into(
     const std::span<const std::uint64_t> ids,
     const std::span<std::byte> output) const {
     impl_->get_into(ids, output);
+}
+NativeReadStats NativeCollection::get_into_profiled(
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    return impl_->get_into_profiled(ids, output);
 }
 std::vector<std::byte> NativeCollection::get_bytes(
     const std::span<const std::uint64_t> ids) const {

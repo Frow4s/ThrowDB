@@ -37,6 +37,25 @@ struct NativeOpenStats {
     bool index_structural_validation_performed = false;
 };
 
+// Per-call diagnostics collected only by get_into_profiled(). The ordinary
+// get/get_into path does not read clocks or update telemetry counters.
+struct NativeReadStats {
+    double total_seconds = 0.0;
+    double lookup_seconds = 0.0;
+    double physical_plan_seconds = 0.0;
+    // Queue/admission wait, physical I/O, and scatter copies currently share
+    // one wall-clock phase because those operations overlap in parallel
+    // backends. More detailed backend hooks can extend this later.
+    double physical_backend_seconds = 0.0;
+    std::uint64_t requested_rows = 0;
+    std::uint64_t base_rows = 0;
+    std::uint64_t mutation_rows = 0;
+    std::uint64_t planned_ranges = 0;
+    std::uint64_t planned_read_bytes = 0;
+    std::uint64_t backend_tasks = 0;
+    bool zero_delta_fast_path = false;
+};
+
 class NativeCollectionBuilder {
 public:
     static std::unique_ptr<NativeCollectionBuilder> create(
@@ -83,6 +102,9 @@ public:
     NativeCollection& operator=(NativeCollection&&) = delete;
 
     void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+    [[nodiscard]] NativeReadStats get_into_profiled(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const;
     [[nodiscard]] std::vector<std::byte> get_bytes(

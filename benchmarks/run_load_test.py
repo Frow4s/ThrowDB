@@ -801,7 +801,11 @@ def add_process_metrics(
 
 
 def evict_data_cache(store_path: Path) -> dict[str, int | float]:
-    """Ask Linux to evict clean pages for every base data file."""
+    """Ask Linux to evict clean pages for every current payload file.
+
+    Native mutation rows are read directly from the active WAL, so evicting
+    only immutable base segments would produce a mixed cold/warm result.
+    """
     if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
         raise RuntimeError(
             "cold cache mode requires os.posix_fadvise and POSIX_FADV_DONTNEED"
@@ -811,18 +815,20 @@ def evict_data_cache(store_path: Path) -> dict[str, int | float]:
         set(data_directory.glob("shard-*.dat"))
         | set(data_directory.glob("segment-*.dat"))
     )
+    wal_paths = sorted((store_path / "wal").glob("*.wal"))
     if not data_paths:
         raise RuntimeError(f"no data files found under {data_directory}")
+    payload_paths = data_paths + wal_paths
     started = time.perf_counter()
     total_bytes = 0
-    for data_path in data_paths:
-        total_bytes += data_path.stat().st_size
-        fd = os.open(data_path, os.O_RDONLY)
+    for payload_path in payload_paths:
+        total_bytes += payload_path.stat().st_size
+        fd = os.open(payload_path, os.O_RDONLY)
         try:
             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
         except OSError as error:
             raise RuntimeError(
-                f"POSIX_FADV_DONTNEED failed for {data_path}: {error}"
+                f"POSIX_FADV_DONTNEED failed for {payload_path}: {error}"
             ) from error
         finally:
             os.close(fd)
@@ -830,6 +836,8 @@ def evict_data_cache(store_path: Path) -> dict[str, int | float]:
         # Keep the historical key so existing report consumers do not break.
         "shard_count": len(data_paths),
         "data_file_count": len(data_paths),
+        "wal_file_count": len(wal_paths),
+        "advised_file_count": len(payload_paths),
         "advised_bytes": total_bytes,
         "seconds": time.perf_counter() - started,
     }

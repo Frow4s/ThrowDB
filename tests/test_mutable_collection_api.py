@@ -189,6 +189,49 @@ def test_delete_is_idempotent_tombstones_base_and_allows_reinsert(
     reopened.close()
 
 
+def test_profiled_read_reports_zero_delta_and_mutation_paths(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "store"
+    dimension = 6
+    ids = np.array([11, 22], dtype=np.uint64)
+    base = _vectors(2, dimension, "float16", salt=17)
+    replacement = _vectors(1, dimension, "float16", salt=317)
+    _build(path, ids, base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        output = np.empty_like(base)
+        clean = collection.get_into_profiled(ids, output)
+        _assert_same_bits(output, base)
+        assert clean["zero_delta_fast_path"] is True
+        assert clean["requested_rows"] == 2
+        assert clean["base_rows"] == 2
+        assert clean["mutation_rows"] == 0
+        assert clean["planned_ranges"] == 1
+        assert clean["planned_read_bytes"] == base.nbytes
+        assert clean["backend_tasks"] == 1
+
+        collection.update([22], replacement)
+        mutated = collection.get_into_profiled(ids, output)
+        _assert_same_bits(output, np.stack([base[0], replacement[0]]))
+        assert mutated["zero_delta_fast_path"] is False
+        assert mutated["requested_rows"] == 2
+        assert mutated["base_rows"] == 1
+        assert mutated["mutation_rows"] == 1
+        assert mutated["planned_ranges"] == 2
+        assert mutated["planned_read_bytes"] == base.nbytes
+        assert mutated["backend_tasks"] == 2
+
+        for key in (
+            "total_seconds",
+            "lookup_seconds",
+            "physical_plan_seconds",
+            "physical_backend_seconds",
+        ):
+            assert isinstance(mutated[key], float)
+            assert mutated[key] >= 0.0
+
+
 def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(
     tmp_path: Path,
 ) -> None:

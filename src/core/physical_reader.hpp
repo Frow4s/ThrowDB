@@ -18,6 +18,21 @@ struct PhysicalReadRequest {
     std::uint64_t output_index{0};
 };
 
+// Per-call diagnostics for an explicitly profiled physical read. Planning
+// covers request validation, sorting, range merging, and task partitioning.
+// Backend time deliberately covers the complete synchronous execution phase:
+// queue/admission wait, physical I/O, and scatter copies. Those operations can
+// overlap when a parallel backend is active, so this first diagnostic surface
+// does not pretend that they are independent wall-clock phases.
+struct PhysicalReadStats {
+    double plan_seconds{0.0};
+    double backend_seconds{0.0};
+    std::uint64_t request_count{0};
+    std::uint64_t range_count{0};
+    std::uint64_t task_count{0};
+    std::uint64_t planned_read_bytes{0};
+};
+
 // Executes physical reads after logical ID lookup and RowRef resolution have
 // completed. One instance owns a bounded backend shared by all concurrent
 // execute() calls; execution is synchronous from each caller's perspective.
@@ -35,6 +50,14 @@ public:
     // validated before output is touched. output_index values must form an
     // exact permutation of [0, requests.size()).
     void execute(
+        std::uint64_t record_size,
+        std::span<const PhysicalReadRequest> requests,
+        std::span<std::byte> output) const;
+
+    // Execute the same read while collecting diagnostics for this call only.
+    // The ordinary execute() path is a separate compile-time specialization
+    // and performs no telemetry clock reads, atomics, or locking.
+    [[nodiscard]] PhysicalReadStats execute_profiled(
         std::uint64_t record_size,
         std::span<const PhysicalReadRequest> requests,
         std::span<std::byte> output) const;
