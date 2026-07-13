@@ -135,8 +135,8 @@ void build_store(
     options.segment_size_bytes = segment_size_bytes;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     require_equal(
-        builder->format_version(), std::uint32_t{5},
-        "catalog builder did not report native format 5");
+        builder->format_version(), std::uint32_t{6},
+        "delta builder did not report native format 6");
     builder->append(ids, embeddings);
     builder->finish();
 }
@@ -227,8 +227,8 @@ void test_builder_stats_empty_and_delete_only_rotation() {
 
     {
         auto reader = throwdb::NativeCollection::open(store);
-        require_equal(reader->format_version(), std::uint32_t{5},
-                      "catalog reader did not report native format 5");
+        require_equal(reader->format_version(), std::uint32_t{6},
+                      "delta reader did not report native format 6");
         require_fresh_catalog_stats(
             reader->mutation_log_stats(), "fresh read-only open");
         require_throws<throwdb::InvalidArgumentError>(
@@ -440,8 +440,8 @@ void test_crud_across_multiple_rotations_and_reopen() {
     writer.reset();
 
     auto reopened = throwdb::NativeCollection::open(store);
-    require_equal(reopened->format_version(), std::uint32_t{5},
-                  "reopened catalog store lost format 5");
+    require_equal(reopened->format_version(), std::uint32_t{6},
+                  "reopened delta store lost format 6");
     require_equal(reopened->count(), std::uint64_t{5},
                   "reopened multi-WAL count is wrong");
     require_bytes_equal(
@@ -612,8 +612,8 @@ void test_legacy_v4_reports_uncatalogued_and_rejects_rotation() {
 
     // Reproduce the exact pre-catalog v4 layout from freshly written resources:
     // the immutable base/index stay unchanged, the same empty WAL moves back to
-    // its legacy fixed path, and only the catalog-required manifest bit is
-    // cleared. CURRENT and catalog orphans must be ignored by the legacy open.
+    // its legacy fixed path, and the catalog/delta manifest bits are cleared.
+    // CURRENT and catalog orphans must be ignored by the legacy open.
     throwdb::detail::NativeManifest manifest = manifest_for(store);
     const throwdb::detail::MutationWalEntry active = active_entry_for(store);
     const std::filesystem::path catalog_wal = wal_path_for(store, active);
@@ -624,7 +624,8 @@ void test_legacy_v4_reports_uncatalogued_and_rejects_rotation() {
     require(!rename_error,
             "cannot move catalog WAL into the legacy v4 location");
     manifest.required_feature_bits &=
-        ~throwdb::detail::kNativeRequiredFeatureCatalogV1;
+        ~(throwdb::detail::kNativeRequiredFeatureCatalogV1
+          | throwdb::detail::kNativeRequiredFeatureDeltaV1);
     throwdb::detail::write_native_manifest_atomic(store, manifest);
 
     auto writer = throwdb::NativeCollection::open(store, {}, true);

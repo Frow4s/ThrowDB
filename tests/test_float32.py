@@ -111,13 +111,13 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
         shard_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
     ) as builder:
         assert builder.dtype == "float32"
-        assert builder.format_version == 5
+        assert builder.format_version == 6
         builder.add(ids, embeddings)
 
     collection = throwdb.Collection.open(path)
     assert collection.schema == schema
     assert collection.dtype == "float32"
-    assert collection.format_version == 5
+    assert collection.format_version == 6
 
     positions = np.array([2, 0, 3, 1, 2], dtype=np.intp)
     query = ids[positions].astype(np.int64)
@@ -218,7 +218,7 @@ def test_cli_preserves_float32_dtype_and_bits(
     cli_main(["inspect", "--storage", str(store_path)])
     metadata = json.loads(capsys.readouterr().out)
     assert metadata["dtype"] == "float32"
-    assert metadata["format_version"] == 5
+    assert metadata["format_version"] == 6
     assert metadata["mutation_log"]["catalog_managed"] is True
     assert metadata["mutation_log"]["generation"] == 1
     assert metadata["open_stats"]["index_validation"] == "checksum"
@@ -245,3 +245,10 @@ def test_cli_preserves_float32_dtype_and_bits(
     assert rotation["generation"] == 2
     assert rotation["committed_sequence"] == 1
     assert rotation["frozen_wal_count"] == 1
+
+    cli_main(["materialize", "--storage", str(store_path)])
+    materialized = json.loads(capsys.readouterr().out)
+    assert materialized["materialized"] is True
+    assert materialized["materialized_sequence"] == 1
+    assert materialized["delta_run_count"] == 1
+    assert materialized["frozen_wal_count"] == 0

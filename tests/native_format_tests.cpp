@@ -249,7 +249,8 @@ struct BuiltStore {
 void test_manifest_is_independent_checksummed_format() {
     using namespace throwdb::detail;
     NativeManifest manifest = make_manifest();
-    manifest.required_feature_bits = kNativeRequiredFeatureCatalogV1;
+    manifest.required_feature_bits =
+        kNativeRequiredFeatureCatalogV1 | kNativeRequiredFeatureDeltaV1;
     manifest.optional_feature_bits = 0x8000000000000000ULL;
     require_equal(manifest.record_size, std::uint64_t{4},
                   "float16 native record size is wrong");
@@ -272,6 +273,9 @@ void test_manifest_is_independent_checksummed_format() {
                   "native header size is wrong");
     require(get_u32(encoded, kNativeHeaderChecksumOffset) != 0,
             "native manifest checksum is zero");
+    require_equal(
+        get_u64(encoded, 200), manifest.required_feature_bits,
+        "required feature bits are not persisted in the manifest wire");
     const NativeManifest decoded = decode_native_manifest(encoded);
     require_equal(decoded.collection_id, manifest.collection_id,
                   "collection UUID did not round trip");
@@ -316,6 +320,15 @@ void test_manifest_is_independent_checksummed_format() {
             static_cast<void>(encode_native_manifest(unsupported));
         },
         "unknown required manifest feature was accepted");
+
+    NativeManifest delta_without_catalog = make_manifest();
+    delta_without_catalog.required_feature_bits =
+        kNativeRequiredFeatureDeltaV1;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&delta_without_catalog] {
+            static_cast<void>(encode_native_manifest(delta_without_catalog));
+        },
+        "DeltaV1 without CatalogV1 was accepted");
 }
 
 void test_paths_and_atomic_manifest_are_deterministic() {

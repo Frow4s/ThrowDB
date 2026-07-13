@@ -244,6 +244,11 @@ void validate_manifest(const NativeManifest& manifest) {
         (manifest.required_feature_bits
          & ~kNativeSupportedRequiredFeatureBits) == 0,
         "manifest requires unsupported features");
+    require<Error>(
+        (manifest.required_feature_bits & kNativeRequiredFeatureDeltaV1) == 0
+            || (manifest.required_feature_bits
+                & kNativeRequiredFeatureCatalogV1) != 0,
+        "manifest requires mutation deltas without a mutation catalog");
 
     require<Error>(
         manifest.index_capacity >= 8

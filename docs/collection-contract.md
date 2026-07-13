@@ -4,8 +4,10 @@ This document fixes the contract for the first user-facing ThrowDB product.
 The fresh native numeric subset is implemented through the Python `Collection`
 API: safe uint64 normalization, float16/float32 rows, arbitrary fixed
 dimensions, semantic prefix reads, and durable batch CRUD. The public format
-version is 4. UTF-8 IDs, WAL rotation, and selective cleaning remain the next
-local-library slices.
+version produced by new builders is 6. WAL rotation and frozen-WAL-prefix
+materialization are implemented; UTF-8 IDs, delta merging, and selective base
+cleaning remain later local-library slices. Format 5 remains a readable and
+writable catalog/WAL-only format, but it rejects materialization.
 
 ## Product boundary
 
@@ -145,6 +147,8 @@ collection.insert(ids, embeddings)   # every ID must be absent
 collection.update(ids, embeddings)   # every ID must exist
 collection.upsert(ids, embeddings)   # explicit insert-or-replace
 deleted = collection.delete(ids)     # boolean result per requested ID
+collection.rotate_wal()              # freeze a non-empty active WAL
+collection.materialize_frozen_wals() # replace frozen prefix with DeltaV1
 ```
 
 Mutation rules:
@@ -180,6 +184,24 @@ otherwise lookup falls back to the base index. Mutation batches receive a
 monotonic commit sequence and are protected by checksummed WAL framing and a
 commit marker. Recovery ignores incomplete/uncommitted tails.
 
+In format 6, `materialize_frozen_wals()` collapses the currently selected
+frozen WAL prefix into one immutable DeltaV1 `.dat/.idx` pair. It first
+publishes a metadata-only catalog generation that durably reserves a segment
+ID, builds the pair without holding the mutation lock, then briefly pauses
+writes to rebase and atomically switch `CURRENT`. The active WAL and WALs frozen
+after the build began remain in the new catalog and take precedence by their
+newer commit sequences. Replaced WAL pathnames are unlinked best-effort only
+after the switch. No base segment or base-index entry is copied.
+
+The delta index stores version metadata sorted by numeric ID plus reverse
+`{id, original commit sequence}` metadata for every dense PUT row. Today these
+records are loaded into the RAM overlay on open. Normal open verifies the whole
+delta-index body but does not stream the complete embedding payload to recompute
+its stored CRC. Delta-run merge, base compaction, and a public payload scrub are
+not yet implemented. The publication and old-reader behavior currently rely on
+local POSIX filesystem semantics; network filesystems are outside the supported
+durability contract.
+
 After a partitioned `ID -> RowRef` index becomes authoritative, the cleaner
 selects segments with enough garbage, copies only rows that are still live in a
 stable view, and atomically publishes the replacement segments and affected
@@ -197,8 +219,8 @@ Format version is a storage contract, not a package version.
   the new `Collection` path need not open format-v1/v2 collections during the
   experimental MVP;
 - source NumPy arrays are the supported migration path into the current
-  catalog-managed native format 5; the reader retains strict legacy paths for
-  native formats 3 and 4;
+  DeltaV1 native format 6; the reader retains strict paths for catalog/WAL-only
+  format 5 and legacy native formats 3 and 4;
 - migration creates a new collection and never rewrites the source arrays;
 - reserved fields and feature flags must be validated rather than silently
   interpreted.

@@ -195,6 +195,17 @@ def _rotate_wal(args: argparse.Namespace) -> None:
         )
 
 
+def _materialize(args: argparse.Namespace) -> None:
+    with Collection.open(args.storage, mode="r+") as collection:
+        print(
+            json.dumps(
+                collection.materialize_frozen_wals(),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+
+
 def _reader_tuning(args: argparse.Namespace) -> dict[str, object]:
     return {
         "io_workers": args.io_workers,
@@ -293,6 +304,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rotate_wal.add_argument("--storage", type=Path, required=True)
     rotate_wal.set_defaults(handler=_rotate_wal)
+
+    materialize = subparsers.add_parser(
+        "materialize",
+        help="replace the frozen WAL prefix with an immutable delta run",
+    )
+    materialize.add_argument("--storage", type=Path, required=True)
+    materialize.set_defaults(handler=_materialize)
     return parser
 
 

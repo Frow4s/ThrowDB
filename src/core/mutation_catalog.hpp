@@ -8,11 +8,13 @@
 #include <vector>
 
 #include "native_format.hpp"
+#include "mutation_delta.hpp"
 
 namespace throwdb::detail {
 
 inline constexpr std::uint64_t kMutationCatalogHeaderSize = 4096;
 inline constexpr std::uint64_t kMutationCatalogEntrySize = 128;
+inline constexpr std::uint64_t kMutationCatalogDeltaEntrySize = 192;
 inline constexpr std::uint64_t kMutationCurrentFileSize = 4096;
 inline constexpr std::uint64_t kMutationCatalogMaxEntries = 1'000'000;
 
@@ -52,6 +54,9 @@ struct MutationCatalog {
     // catalogs use sequence zero and an empty terminal UUID.
     std::uint64_t materialized_sequence{0};
     Uuid128 terminal_wal_id;
+    // Oldest materialized sequence interval first. Catalog wire v2 stores
+    // these immutable delta descriptors before the retained WAL entries.
+    std::vector<MutationDeltaDescriptor> delta_entries;
     // Oldest retained frozen WAL first; exactly one active WAL is last.
     std::vector<MutationWalEntry> wal_entries;
 
@@ -70,6 +75,8 @@ struct MutationCurrent {
 };
 
 [[nodiscard]] bool mutation_catalog_managed(
+    const NativeManifest& manifest) noexcept;
+[[nodiscard]] bool mutation_delta_managed(
     const NativeManifest& manifest) noexcept;
 
 [[nodiscard]] std::filesystem::path mutation_catalogs_directory(

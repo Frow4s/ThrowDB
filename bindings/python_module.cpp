@@ -64,13 +64,23 @@ struct DTypeInfo {
     const throwdb::NativeMutationLogStats& stats) {
     py::dict result;
     result["catalog_managed"] = stats.catalog_managed;
+    result["delta_managed"] = stats.delta_managed;
     result["generation"] = stats.generation;
     result["committed_sequence"] = stats.committed_sequence;
+    result["materialized_sequence"] = stats.materialized_sequence;
     result["frozen_wal_count"] = stats.frozen_wal_count;
     result["active_wal_bytes"] = stats.active_wal_bytes;
     result["active_wal_put_rows"] = stats.active_wal_put_rows;
     result["total_wal_bytes"] = stats.total_wal_bytes;
+    result["delta_run_count"] = stats.delta_run_count;
+    result["delta_entry_count"] = stats.delta_entry_count;
+    result["delta_put_rows"] = stats.delta_put_rows;
+    result["total_delta_bytes"] = stats.total_delta_bytes;
+    result["reclaimed_wal_count"] = stats.reclaimed_wal_count;
+    result["reclaimed_wal_bytes"] = stats.reclaimed_wal_bytes;
     result["rotated"] = stats.rotated;
+    result["materialized"] = stats.materialized;
+    result["reclamation_complete"] = stats.reclamation_complete;
     return result;
 }
 
@@ -765,6 +775,16 @@ public:
         return mutation_log_stats_dict(stats);
     }
 
+    [[nodiscard]] py::dict materialize_frozen_wals() {
+        const auto collection = acquire_collection();
+        throwdb::NativeMutationLogStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = collection->materialize_frozen_wals();
+        }
+        return mutation_log_stats_dict(stats);
+    }
+
     py::array get(const py::array& ids) const {
         const auto collection = acquire_collection();
         const auto id_span = validate_ids(ids);
@@ -1026,5 +1046,8 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("embeddings"))
         .def("delete", &PyNativeCollection::erase, py::arg("ids"))
         .def("rotate_wal", &PyNativeCollection::rotate_wal)
+        .def(
+            "materialize_frozen_wals",
+            &PyNativeCollection::materialize_frozen_wals)
         .def("close", &PyNativeCollection::close);
 }

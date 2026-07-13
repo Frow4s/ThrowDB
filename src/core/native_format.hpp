@@ -25,8 +25,9 @@ inline constexpr std::uint32_t kNativeRowRefValueEncoding = 1;
 inline constexpr std::uint32_t kNativeIndexBodyCrc32cAlgorithm = 1;
 inline constexpr std::size_t kNativeHeaderChecksumOffset = 20;
 inline constexpr std::uint64_t kNativeRequiredFeatureCatalogV1 = 1ULL << 0;
+inline constexpr std::uint64_t kNativeRequiredFeatureDeltaV1 = 1ULL << 1;
 inline constexpr std::uint64_t kNativeSupportedRequiredFeatureBits =
-    kNativeRequiredFeatureCatalogV1;
+    kNativeRequiredFeatureCatalogV1 | kNativeRequiredFeatureDeltaV1;
 
 inline constexpr std::array<char, 8> kNativeManifestMagic{
     'T', 'D', 'B', 'N', 'M', 'N', 'F', '1'};
@@ -58,8 +59,10 @@ struct NativeManifest {
 
     std::uint32_t active_wal_segment_id{1};
     std::uint32_t next_segment_id{2};
-    // Catalog-managed collections set CatalogV1. A reader must reject an
-    // unknown required bit instead of silently opening an incomplete view.
+    // Catalog-managed collections set CatalogV1. Collections whose catalog
+    // may reference immutable mutation deltas additionally set DeltaV1. A
+    // reader must reject an unknown required bit instead of silently opening
+    // an incomplete view.
     std::uint64_t required_feature_bits{0};
     std::uint64_t optional_feature_bits{0};
 };

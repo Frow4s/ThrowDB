@@ -151,7 +151,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
         std::span(base_ids).subspan(3),
         std::span(base).subspan(3 * record_size));
     require(builder->count() == base_ids.size(), "builder count is wrong");
-    require(builder->format_version() == 5, "native public version is wrong");
+    require(builder->format_version() == 6, "native public version is wrong");
     builder->finish();
 
     auto old_snapshot = throwdb::NativeCollection::open(store);
@@ -267,8 +267,8 @@ void test_open_stats_fast_forced_and_legacy_validation() {
 
     {
         auto reader = throwdb::NativeCollection::open(store);
-        require(reader->format_version() == 5,
-                "catalog collection did not report version 5");
+        require(reader->format_version() == 6,
+                "delta collection did not report version 6");
         const throwdb::NativeOpenStats stats = reader->open_stats();
         require(stats.total_seconds > 0.0,
                 "open diagnostics have no total duration");
@@ -297,7 +297,7 @@ void test_open_stats_fast_forced_and_legacy_validation() {
 
     remove_index_body_checksum(store);
     auto legacy = throwdb::NativeCollection::open(store);
-    require(legacy->format_version() == 5,
+    require(legacy->format_version() == 6,
             "catalog collection changed version with index validation mode");
     const throwdb::NativeOpenStats legacy_stats = legacy->open_stats();
     require(!legacy_stats.index_body_checksum_present,

@@ -610,6 +610,21 @@ class Collection:
             raise RuntimeError("native WAL rotation returned invalid diagnostics")
         return dict(stats)
 
+    def materialize_frozen_wals(self) -> dict[str, object]:
+        """Replace the frozen WAL prefix with an immutable delta run.
+
+        The durable catalog is switched atomically. Referenced WAL files are
+        reclaimed only after the new view is published.
+        """
+
+        native = self._ensure_mutable("materialize frozen mutation WALs")
+        stats = native.materialize_frozen_wals()
+        if not isinstance(stats, dict):
+            raise RuntimeError(
+                "native WAL materialization returned invalid diagnostics"
+            )
+        return dict(stats)
+
     def get(
         self,
         ids: object,

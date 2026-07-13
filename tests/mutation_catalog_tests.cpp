@@ -22,6 +22,7 @@ namespace {
 
 using throwdb::detail::MutationCatalog;
 using throwdb::detail::MutationCurrent;
+using throwdb::detail::MutationDeltaDescriptor;
 using throwdb::detail::MutationWalEntry;
 using throwdb::detail::MutationWalState;
 using throwdb::detail::NativeManifest;
@@ -108,6 +109,50 @@ void require_throws(Callback&& callback, const std::string& message) {
     return manifest;
 }
 
+[[nodiscard]] NativeManifest make_delta_manifest() {
+    NativeManifest manifest = make_manifest();
+    manifest.required_feature_bits |=
+        throwdb::detail::kNativeRequiredFeatureDeltaV1;
+    return manifest;
+}
+
+[[nodiscard]] MutationDeltaDescriptor make_delta_descriptor(
+    const NativeManifest& manifest,
+    const Uuid128 delta_id,
+    const Uuid128 predecessor_wal_id,
+    const Uuid128 terminal_wal_id,
+    const std::uint64_t first_sequence,
+    const std::uint64_t last_sequence,
+    const std::uint32_t segment_id,
+    const std::uint64_t entry_count,
+    const std::uint64_t put_count) {
+    MutationDeltaDescriptor descriptor;
+    descriptor.delta_id = delta_id;
+    descriptor.source_predecessor_wal_id = predecessor_wal_id;
+    descriptor.source_terminal_wal_id = terminal_wal_id;
+    descriptor.first_sequence = first_sequence;
+    descriptor.last_sequence = last_sequence;
+    descriptor.segment_id = segment_id;
+    descriptor.source_wal_count = 1;
+    descriptor.entry_count = entry_count;
+    descriptor.put_count = put_count;
+    descriptor.data_file_size =
+        throwdb::detail::kMutationDeltaHeaderSize
+        + put_count * manifest.record_size;
+    const std::uint64_t records_end =
+        throwdb::detail::kMutationDeltaHeaderSize
+        + entry_count * throwdb::detail::kMutationDeltaVersionRecordSize;
+    const std::uint64_t reverse_offset =
+        (records_end + throwdb::detail::kMutationDeltaIndexAlignment - 1)
+        & ~(throwdb::detail::kMutationDeltaIndexAlignment - 1);
+    descriptor.index_file_size =
+        reverse_offset
+        + put_count * throwdb::detail::kMutationDeltaReverseRecordSize;
+    descriptor.data_payload_crc32c = 0x12345678U;
+    descriptor.index_body_crc32c = 0x90abcdefU;
+    return descriptor;
+}
+
 [[nodiscard]] MutationCatalog make_rotated_catalog(
     const NativeManifest& manifest,
     const Uuid128 catalog_id,
@@ -134,6 +179,53 @@ void require_throws(Callback&& callback, const std::string& message) {
         0,
         0});
     catalog.next_segment_id = manifest.next_segment_id + 1;
+    return catalog;
+}
+
+[[nodiscard]] MutationCatalog make_delta_catalog(
+    const NativeManifest& manifest) {
+    MutationCatalog catalog = make_rotated_catalog(
+        manifest, Uuid128{3, 4}, Uuid128{1, 2});
+    const MutationWalEntry frozen = catalog.wal_entries.front();
+    catalog.generation = 3;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = {5, 6};
+    catalog.materialized_sequence = frozen.last_sequence;
+    catalog.terminal_wal_id = frozen.wal_id;
+    catalog.delta_entries.push_back(make_delta_descriptor(
+        manifest, Uuid128{0xd1, 0xd2}, frozen.predecessor_wal_id,
+        frozen.wal_id, frozen.first_sequence, frozen.last_sequence,
+        catalog.next_segment_id, 3, 2));
+    ++catalog.next_segment_id;
+    catalog.wal_entries.erase(catalog.wal_entries.begin());
+    return catalog;
+}
+
+[[nodiscard]] MutationCatalog make_two_delta_catalog(
+    const NativeManifest& manifest) {
+    MutationCatalog catalog = make_delta_catalog(manifest);
+    const MutationWalEntry second_source = catalog.wal_entries.front();
+    const Uuid128 final_active_id{0xc1, 0xc2};
+    catalog.delta_entries.push_back(make_delta_descriptor(
+        manifest, Uuid128{0xe1, 0xe2}, catalog.terminal_wal_id,
+        second_source.wal_id, second_source.first_sequence, 11,
+        catalog.next_segment_id + 1, 2, 1));
+    catalog.materialized_sequence = 11;
+    catalog.terminal_wal_id = second_source.wal_id;
+    catalog.wal_entries.front() = MutationWalEntry{
+        final_active_id,
+        second_source.wal_id,
+        catalog.next_segment_id,
+        MutationWalState::Active,
+        11,
+        12,
+        0,
+        0,
+        0};
+    catalog.next_segment_id += 2;
+    catalog.generation = 4;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = {7, 8};
     return catalog;
 }
 
@@ -247,6 +339,262 @@ void test_rotated_and_materialized_chain_roundtrip() {
             throwdb::detail::encode_mutation_catalog(manifest, materialized),
             manifest),
         materialized, "materialized-prefix catalog is not representable");
+}
+
+void test_catalog_v1_v2_compatibility() {
+    const NativeManifest v1_manifest = make_manifest();
+    const MutationCatalog initial =
+        throwdb::detail::make_initial_mutation_catalog(
+            v1_manifest, Uuid128{3, 4});
+    const std::vector<std::byte> v1_bytes =
+        throwdb::detail::encode_mutation_catalog(v1_manifest, initial);
+    require_equal(
+        throwdb::detail::get_u32(v1_bytes, 8), std::uint32_t{1},
+        "catalog without DeltaV1 was not encoded as wire v1");
+    require_equal(
+        throwdb::detail::decode_mutation_catalog(v1_bytes, v1_manifest),
+        initial, "catalog wire v1 no longer decodes");
+
+    const NativeManifest v2_manifest = make_delta_manifest();
+    const std::vector<std::byte> v2_bytes =
+        throwdb::detail::encode_mutation_catalog(v2_manifest, initial);
+    require_equal(
+        throwdb::detail::get_u32(v2_bytes, 8), std::uint32_t{2},
+        "DeltaV1 catalog was not encoded as wire v2");
+    require_equal(
+        throwdb::detail::get_u64(v2_bytes, 160), std::uint64_t{0},
+        "initial wire v2 catalog unexpectedly has deltas");
+    require_equal(
+        throwdb::detail::get_u64(v2_bytes, 168),
+        throwdb::detail::kMutationCatalogHeaderSize,
+        "wire v2 delta offset is wrong");
+    require_equal(
+        throwdb::detail::decode_mutation_catalog(v2_bytes, v2_manifest),
+        initial, "empty catalog wire v2 does not roundtrip");
+
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(throwdb::detail::decode_mutation_catalog(
+                v1_bytes, v2_manifest));
+        },
+        "wire v1 was accepted when DeltaV1 requires wire v2");
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(throwdb::detail::decode_mutation_catalog(
+                v2_bytes, v1_manifest));
+        },
+        "wire v2 was accepted without the DeltaV1 required feature");
+}
+
+void test_delta_v2_roundtrip_and_geometry() {
+    const NativeManifest manifest = make_delta_manifest();
+    const MutationCatalog catalog = make_delta_catalog(manifest);
+    const std::vector<std::byte> encoded =
+        throwdb::detail::encode_mutation_catalog(manifest, catalog);
+    const std::uint64_t expected_wal_offset =
+        throwdb::detail::kMutationCatalogHeaderSize
+        + throwdb::detail::kMutationCatalogDeltaEntrySize;
+    const std::uint64_t expected_size =
+        expected_wal_offset + throwdb::detail::kMutationCatalogEntrySize;
+    require_equal(
+        encoded.size(), static_cast<std::size_t>(expected_size),
+        "wire v2 catalog size is wrong");
+    require_equal(
+        throwdb::detail::get_u32(encoded, 8), std::uint32_t{2},
+        "delta catalog has the wrong wire version");
+    require_equal(
+        throwdb::detail::get_u32(encoded, 152),
+        static_cast<std::uint32_t>(
+            throwdb::detail::kMutationCatalogDeltaEntrySize),
+        "wire v2 delta entry size is wrong");
+    require_equal(
+        throwdb::detail::get_u64(encoded, 160), std::uint64_t{1},
+        "wire v2 delta count is wrong");
+    require_equal(
+        throwdb::detail::get_u64(encoded, 112), expected_wal_offset,
+        "wire v2 does not place deltas before WAL entries");
+    require_equal(
+        throwdb::detail::get_u64(encoded, 120), expected_size,
+        "wire v2 file size is wrong");
+    require_equal(
+        throwdb::detail::decode_mutation_catalog(encoded, manifest), catalog,
+        "delta catalog roundtrip changed fields");
+
+    const MutationCatalog two_deltas = make_two_delta_catalog(manifest);
+    require_equal(
+        throwdb::detail::decode_mutation_catalog(
+            throwdb::detail::encode_mutation_catalog(manifest, two_deltas),
+            manifest),
+        two_deltas, "two-delta catalog roundtrip changed fields");
+
+    MutationCurrent current;
+    current.collection_id = manifest.collection_id;
+    current.schema_id = manifest.schema_id;
+    current.generation = catalog.generation;
+    current.catalog_id = catalog.catalog_id;
+    current.catalog_file_size = encoded.size();
+    current.catalog_crc32c = throwdb::detail::crc32c(encoded);
+    require_equal(
+        throwdb::detail::decode_mutation_current(
+            throwdb::detail::encode_mutation_current(manifest, current),
+            manifest),
+        current, "CURRENT does not accept wire v2 catalog geometry");
+
+    MutationCurrent invalid = current;
+    ++invalid.catalog_file_size;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                throwdb::detail::encode_mutation_current(manifest, invalid));
+        },
+        "CURRENT accepted non-integral wire v2 geometry");
+    invalid = current;
+    invalid.catalog_file_size =
+        throwdb::detail::kMutationCatalogHeaderSize
+        + throwdb::detail::kMutationCatalogDeltaEntrySize;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                throwdb::detail::encode_mutation_current(manifest, invalid));
+        },
+        "CURRENT accepted wire v2 geometry without a WAL entry");
+    invalid = current;
+    invalid.catalog_file_size =
+        throwdb::detail::kMutationCatalogHeaderSize
+        + throwdb::detail::kMutationCatalogMaxEntries
+              * throwdb::detail::kMutationCatalogDeltaEntrySize
+        + 64;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                throwdb::detail::encode_mutation_current(manifest, invalid));
+        },
+        "CURRENT accepted a catalog larger than the wire v2 maximum");
+}
+
+void test_delta_v2_lineage_and_resource_invariants() {
+    const NativeManifest manifest = make_delta_manifest();
+    const MutationCatalog valid = make_two_delta_catalog(manifest);
+    const auto rejected = [&](MutationCatalog catalog, const std::string& name) {
+        require_throws<throwdb::InvalidArgumentError>(
+            [&] {
+                static_cast<void>(
+                    throwdb::detail::encode_mutation_catalog(manifest, catalog));
+            },
+            name);
+    };
+
+    MutationCatalog broken = valid;
+    broken.delta_entries.clear();
+    rejected(broken, "materialized anchor without deltas was accepted");
+    broken = valid;
+    broken.materialized_sequence = 0;
+    broken.terminal_wal_id = {};
+    rejected(broken, "deltas without a materialized anchor were accepted");
+    broken = valid;
+    broken.delta_entries.front().first_sequence = 2;
+    rejected(broken, "delta prefix not starting at sequence 1 was accepted");
+    broken = valid;
+    broken.delta_entries.front().source_predecessor_wal_id = {9, 10};
+    rejected(broken, "first delta source predecessor was accepted");
+    broken = valid;
+    ++broken.delta_entries.back().first_sequence;
+    rejected(broken, "gap between delta sequence intervals was accepted");
+    broken = valid;
+    broken.delta_entries.back().source_predecessor_wal_id = {9, 10};
+    rejected(broken, "broken delta WAL lineage was accepted");
+    broken = valid;
+    --broken.materialized_sequence;
+    rejected(broken, "delta prefix not reaching materialized sequence was accepted");
+    broken = valid;
+    broken.terminal_wal_id = {9, 10};
+    rejected(broken, "delta prefix not reaching terminal WAL was accepted");
+    broken = valid;
+    broken.delta_entries.back().delta_id =
+        broken.delta_entries.front().delta_id;
+    rejected(broken, "duplicate delta UUID was accepted");
+    broken = valid;
+    broken.delta_entries.front().delta_id = broken.wal_entries.front().wal_id;
+    rejected(broken, "delta UUID aliasing a retained WAL was accepted");
+    broken = valid;
+    broken.delta_entries.front().delta_id =
+        broken.delta_entries.back().source_terminal_wal_id;
+    rejected(broken, "delta UUID aliasing a materialized WAL was accepted");
+    broken = valid;
+    broken.delta_entries.front().source_wal_count = 0;
+    rejected(broken, "delta with zero source WALs was accepted");
+    broken = valid;
+    broken.delta_entries.front().source_wal_count =
+        static_cast<std::uint32_t>(
+            broken.delta_entries.front().last_sequence
+            - broken.delta_entries.front().first_sequence + 2);
+    rejected(broken, "delta with too many source WALs was accepted");
+    broken = valid;
+    broken.delta_entries.front().entry_count = 0;
+    rejected(broken, "empty catalog delta was accepted");
+    broken = valid;
+    broken.delta_entries.front().segment_id =
+        broken.wal_entries.front().segment_id;
+    rejected(broken, "duplicate delta/WAL segment ID was accepted");
+    broken = valid;
+    broken.next_segment_id = broken.delta_entries.back().segment_id;
+    rejected(broken, "next segment ID not after every resource was accepted");
+    broken = valid;
+    ++broken.delta_entries.front().data_file_size;
+    rejected(broken, "invalid delta data geometry was accepted");
+    broken = valid;
+    ++broken.delta_entries.front().index_file_size;
+    rejected(broken, "invalid delta index geometry was accepted");
+    broken = valid;
+    broken.delta_entries.front().put_count =
+        broken.delta_entries.front().entry_count + 1;
+    rejected(broken, "delta with more PUTs than index entries was accepted");
+}
+
+void test_delta_v2_wire_corruption_is_rejected() {
+    const NativeManifest manifest = make_delta_manifest();
+    const MutationCatalog catalog = make_delta_catalog(manifest);
+    const std::vector<std::byte> valid =
+        throwdb::detail::encode_mutation_catalog(manifest, catalog);
+    const auto rejected = [&](
+        std::vector<std::byte> corrupted, const std::string& name) {
+        reseal(corrupted);
+        require_throws<throwdb::CorruptionError>(
+            [&] {
+                static_cast<void>(throwdb::detail::decode_mutation_catalog(
+                    corrupted, manifest));
+            },
+            name);
+    };
+
+    std::vector<std::byte> corrupted = valid;
+    corrupted[throwdb::detail::kMutationCatalogHeaderSize + 120] =
+        std::byte{1};
+    rejected(std::move(corrupted), "nonzero delta reserved byte was accepted");
+    corrupted = valid;
+    throwdb::detail::put_u64(
+        corrupted, throwdb::detail::kMutationCatalogHeaderSize + 112, 1);
+    rejected(std::move(corrupted), "unsupported delta flags were accepted");
+    corrupted = valid;
+    throwdb::detail::put_u32(corrupted, 152, 128);
+    rejected(std::move(corrupted), "wrong delta entry size was accepted");
+    corrupted = valid;
+    throwdb::detail::put_u64(corrupted, 168, 0);
+    rejected(std::move(corrupted), "wrong delta entries offset was accepted");
+    corrupted = valid;
+    throwdb::detail::put_u64(
+        corrupted, 112,
+        throwdb::detail::get_u64(corrupted, 112) + 64);
+    rejected(std::move(corrupted), "wrong WAL entries offset was accepted");
+    corrupted = valid;
+    throwdb::detail::put_u64(
+        corrupted, throwdb::detail::kMutationCatalogHeaderSize + 88,
+        catalog.delta_entries.front().data_file_size + 1);
+    rejected(std::move(corrupted), "corrupt delta geometry was accepted");
+    corrupted = valid;
+    throwdb::detail::put_u64(
+        corrupted, 160, throwdb::detail::kMutationCatalogMaxEntries);
+    rejected(std::move(corrupted), "unbounded delta entry count was accepted");
 }
 
 void test_strict_catalog_invariants() {
@@ -466,6 +814,18 @@ int main() {
         TestCase{
             "rotated_and_materialized_chain_roundtrip",
             test_rotated_and_materialized_chain_roundtrip},
+        TestCase{
+            "catalog_v1_v2_compatibility",
+            test_catalog_v1_v2_compatibility},
+        TestCase{
+            "delta_v2_roundtrip_and_geometry",
+            test_delta_v2_roundtrip_and_geometry},
+        TestCase{
+            "delta_v2_lineage_and_resource_invariants",
+            test_delta_v2_lineage_and_resource_invariants},
+        TestCase{
+            "delta_v2_wire_corruption_is_rejected",
+            test_delta_v2_wire_corruption_is_rejected},
         TestCase{
             "strict_catalog_invariants", test_strict_catalog_invariants},
         TestCase{

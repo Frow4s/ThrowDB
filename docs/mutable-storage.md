@@ -15,14 +15,20 @@ The fresh native numeric MVP now implements:
   active/frozen WAL recovery;
 - checksummed `CURRENT`, immutable catalog generations, UUID-named WAL chains,
   and manual plus hard-limit WAL rotation;
-- generic physical reads spanning base segments and multiple WAL payloads,
+- DeltaV1 materialization of a frozen WAL prefix into immutable data/index
+  pairs, with durable segment-ID reservation and an atomic catalog switch;
+- generic physical reads spanning base segments, mutation deltas, and multiple
+  WAL payloads,
   with one shared resource-set pin retained through physical I/O.
 
-The current collection can retain multiple frozen WALs and exactly one active
-WAL. Immutable mutation segments, partitioned index runs, cross-process resource
-reclamation, and the selective cleaner below remain the next integration
-slices. Rotation alone does not reduce replay, overlay RAM, descriptor count,
-or disk usage. The exact shipped MVP layout and limits are in
+The current format-6 collection can retain immutable mutation-delta runs,
+multiple frozen WALs, and exactly one active WAL. Manual materialization removes
+a frozen WAL prefix from the current catalog without rewriting the base;
+format 5 remains catalog/WAL-only and rejects that operation. Partitioned index
+runs, delta merging, base-segment selective cleaning, and a general orphan
+collector remain later integration slices. Materialization reduces retained WAL
+replay and descriptors, but all delta version metadata is still rebuilt into a
+RAM overlay on open. The exact shipped MVP layout and limits are in
 `native-format-v3.md`.
 
 ## Logical view and resource layout
@@ -34,12 +40,11 @@ CollectionView
   collection/schema identity
   visible commit sequence
   segment catalog
-  active/frozen WAL resolvers
-  immutable index partitions and small runs
+  immutable delta and active/frozen WAL resolvers
   RAM overlay captured for this view
 ```
 
-The eventual directory layout extends the fresh native base:
+The current format-6 directory layout extends the fresh native base:
 
 ```text
 collection/
@@ -47,10 +52,11 @@ collection/
   CURRENT                           # points to exactly one immutable catalog
   catalogs/
   wal/
-  segments/
-  mutation-index/
-  sidecars/                         # future reverse/cleaner metadata
+  deltas/                           # immutable delta-UUID.dat/.idx pairs
 ```
+
+Future partitioned index and cleaner resources will extend this layout without
+changing `CURRENT` as the only selected-view pointer.
 
 `CURRENT` is the sole metadata publication point. It names a catalog by an
 immutable generation and UUID and records its expected size/checksums. Open
@@ -66,10 +72,12 @@ Publication order is:
 5. Atomically rename it to `CURRENT` and sync the collection directory.
 6. Publish the equivalent in-memory view.
 
-Readers own a shared reference to their view and its open files. Resources
-removed from a newer catalog are reclaimed only after the final older view is
-released. This is both the snapshot-isolation mechanism and the protection
-against segment-ID ABA.
+Readers own a shared reference to their view and its open files. Materialization
+may unlink replaced WAL pathnames only after the new catalog is durable; POSIX
+keeps their inodes alive until older readers release the final open descriptor.
+Segment IDs are durably reserved before a long delta build and are never reused,
+which protects against segment-ID ABA. Network filesystem and object-store
+semantics are not yet part of this contract.
 
 ## Row references and tombstones
 
@@ -114,13 +122,16 @@ than adapted with a global-ordinal compatibility layer.
 Two explicit modes avoid pretending that selective cleaning works before its
 prerequisites exist.
 
-### Current catalog-WAL overlay mode
+### Current DeltaV1 catalog-overlay mode
 
-The versioned RAM overlay rebuilt from the catalog WAL chain shadows the fresh
-flat base index. Both layers return `RowRef`, and reads, CRUD, catalog
-publication, plus WAL rotation are implemented. Selective cleaning is still
-disabled because there are no immutable mutation segments or authoritative
-partition-level durable index publications yet.
+The versioned RAM overlay rebuilt from catalog delta runs followed by the
+retained WAL chain shadows the fresh flat base index. Delta `.idx` records are
+applied oldest run first; retained frozen/active WAL commits then win by commit
+sequence. Both layers return `RowRef`, and reads, CRUD, catalog publication, WAL
+rotation, and frozen-prefix materialization are implemented. The delta index
+body contains durable sorted version metadata and reverse `{id, sequence}` rows,
+but those records are still loaded into RAM on open. Selective base cleaning is
+disabled because no authoritative partition-level index publication exists yet.
 
 ### Authoritative partitioned-RowRef mode
 
@@ -315,8 +326,9 @@ reordered WAL is corruption even when every individual file scans correctly.
 
 ## WAL rotation and immutable segments
 
-Rotation does not rewrite the base. It has two publication transactions so an
-acknowledged commit can never live only in an unreferenced WAL:
+Rotation does not rewrite the base. It freezes one non-empty active WAL and
+publishes its successor in one catalog transaction, so an acknowledged commit
+can never live only in an unreferenced WAL:
 
 1. Pause the writer under its metadata lock and freeze the current WAL at a
    known sequence.
@@ -324,27 +336,59 @@ acknowledged commit can never live only in an unreferenced WAL:
    sequence as predecessor metadata.
 3. Publish a catalog/CURRENT generation containing both the frozen WAL and the
    new active WAL. Only then may the writer append or acknowledge new commits.
-4. Offline, collapse obsolete versions inside the frozen range where safe and
-   write immutable mutation segments plus affected partition runs.
-5. Under the publication lock, rebase on the latest catalog, preserve the
-   active WAL and every post-freeze resource, and atomically publish a second
-   generation replacing only the frozen inputs.
-6. Retire the frozen WAL after older views release it.
 
-The current format-5 slice implements steps 1–3 and deliberately retains every
-frozen WAL. Steps 4–6 are the next lifecycle slice; calling `rotate_wal()` must
-not be described as compaction or checkpointing until that materialization and
-reclamation path exists.
+Format 5 stops there and deliberately retains every frozen WAL. Format 6 adds
+`materialize_frozen_wals()` (CLI: `throwdb materialize --storage PATH`) with two
+short catalog publications around an unlocked data build:
 
-Every immutable mutation segment carries checksummed reverse metadata for each
-dense row: its exact ID and original commit sequence. This may be one compact
-row-metadata table or catalog-bound sidecars, but it is part of the segment's
-validated identity. Without it the cleaner cannot prove whether a physical row
-is still authoritative.
+1. Under the mutation/commit locks, publish a metadata-only generation that
+   advances `next_segment_id`. This durably reserves the output segment ID even
+   if the process crashes or the later build becomes an orphan.
+2. Release the mutation lock. Strictly rescan the captured complete frozen WAL
+   prefix and collapse each ID to its newest `{sequence, PUT/DELETE}` in that
+   interval. Concurrent commits and rotations continue during this phase.
+3. Stream bit-exact live PUT rows into a synced immutable
+   `deltas/delta-<uuid>.dat`. Write and sync its matching `.idx`, whose 32-byte
+   version records are sorted by ID and whose 16-byte reverse `{id, sequence}`
+   records correspond one-for-one with dense payload rows. CRC32C binds both
+   bodies through the catalog descriptor.
+4. Reacquire the mutation lock, verify the selected prefix and lineage still
+   match, and rebase on the latest catalog. Retain the active WAL and every WAL
+   frozen after the build started, so their newer sequences continue to shadow
+   the delta.
+5. Publish a second catalog and atomically replace `CURRENT`, removing only the
+   selected WAL prefix and adding the delta descriptor. Switch the in-memory
+   view after the durable pointer change.
+6. Best-effort unlink the replaced WAL pathnames. Failure leaves harmless
+   unreferenced files for a future sweeper; it does not roll back the selected
+   catalog. Already-open POSIX descriptors remain valid for older reads.
 
-Segment size is configurable and much smaller than the original 16 GiB build
-shards; a practical starting range is hundreds of MiB to roughly 1 GiB. The
-cleaning policy can therefore recover space in bounded units.
+Thus materialization is not a base compaction: it bounds the selected mutation
+history without copying any base embedding or flat-index entry. A later delta
+merge and selective cleaner can use the persisted original sequence and
+reverse metadata to prove whether each physical row is still authoritative.
+There is currently no automatic size/age policy, delta-run merge, or rewrite of
+garbage inside base segments.
+
+### Current DeltaV1 limits
+
+- Delta version records still populate the full mutation overlay in RAM when a
+  collection opens; `.idx` is durable metadata, not yet an on-demand or
+  partitioned lookup structure.
+- Writes and WAL rotation continue while the delta files are built, but the
+  initial segment-ID reservation and final rebase/catalog switch briefly pause
+  mutations.
+- Normal open checks each delta data header, exact size, index geometry, reverse
+  rows, and the complete `.idx` body CRC. It intentionally does not stream the
+  complete `.dat` embedding payload to verify its stored CRC; no public payload
+  scrub operation exists yet.
+- Delta runs are not merged, and base segments are not compacted. Repeated
+  materializations can therefore accumulate delta files and their in-RAM
+  metadata.
+- Publication, old-view safety, and post-switch WAL unlink currently rely on
+  local POSIX `rename`, `fsync`, open-descriptor, and unlink semantics. CephFS,
+  other network filesystems, and object storage require a separately validated
+  backend protocol.
 
 ## Selective segment cleaner
 

@@ -3,7 +3,8 @@
 ThrowDB is a local, disk-backed store for fixed-width embeddings. The native
 collection engine supports arbitrary numeric IDs, bit-exact `float16` or
 `float32` NumPy matrices, immutable base segments on local NVMe, a fast flat
-in-memory index, and durable WAL-backed record CRUD.
+in-memory index, durable WAL-backed record CRUD, and immutable mutation-delta
+materialization without rewriting the base.
 
 The fresh mutable format is documented in
 [`docs/native-format-v3.md`](docs/native-format-v3.md). The earlier immutable
@@ -62,34 +63,44 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     collection.upsert([100, 300], vectors[:2])
     deleted = collection.delete([200, 999])  # [True, False]
     lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
+    materialized = collection.materialize_frozen_wals()
 ```
 
 `Collection.create()` now builds the checksummed native numeric format reported
-as `collection.format_version == 5`. Version 5 adds a checksummed `CURRENT`
-pointer, immutable catalogs, and a UUID-named active/frozen WAL chain. The
-reader also opens legacy version-3/4 single-WAL collections; version 3 uses a
-full structural index validation as its checksum-free fallback. UTF-8 IDs
-remain reserved for the next string index slice.
+as `collection.format_version == 6`. Version 6 adds the required `DeltaV1`
+feature to the version-5 checksummed `CURRENT`, immutable catalogs, and
+UUID-named active/frozen WAL chain. It can replace a frozen WAL prefix with an
+immutable mutation-delta data/index pair. The reader also opens format 5 and
+legacy version-3/4 collections; format 5 remains catalog/WAL-only and rejects
+materialization. Version 3 uses a full structural index validation as its
+checksum-free fallback. UTF-8 IDs remain reserved for the next string index
+slice.
 Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
 The initial `"auto"` tuning profile deliberately selects the conservative
 thread-pool baseline without running a calibration benchmark; the effective
 selection and reason are visible through `collection.tuning`.
 
-Normal version-5 open verifies the CRC32C persisted for the complete flat-index
-body. Use `Collection.open(path, verify_index=True)` to additionally run the
-much more expensive slot, `RowRef`, uniqueness, and probe-path audit. Per-phase
+Normal format-6 open verifies the CRC32C persisted for the complete flat-index
+body and for every immutable delta-index body. It validates delta version and
+reverse-row metadata but deliberately does not rescan potentially large delta
+embedding payloads to recompute their CRC. Use
+`Collection.open(path, verify_index=True)` to additionally run the much more
+expensive base-index slot, `RowRef`, uniqueness, and probe-path audit. Per-phase
 durations and the selected validation path are available in
 `collection.open_stats` and are copied into load-test `report.json`.
 `throwdb inspect --storage /data/example` prints the same diagnostics as JSON;
-add `--verify-index` to use that command as a full scrub-on-open check.
+add `--verify-index` to run the full base-index structural audit. Delta payload
+scrubbing is a separate future operation and is not implied by this flag.
 
 `collection.mutation_log_stats` reports the selected catalog generation,
-committed sequence, frozen-WAL count, and active/total WAL bytes. Calling
-`rotate_wal()` seals a non-empty active WAL and atomically publishes its
-successor; it does not rewrite base embeddings or reclaim old WAL space.
-Reclamation starts in the next lifecycle slice, where frozen WALs become
-bounded immutable delta segments.
+committed/materialized sequence, frozen-WAL count, delta-run count, and
+active/total WAL and delta bytes. Calling `rotate_wal()` seals a non-empty
+active WAL and atomically publishes its successor. Calling
+`materialize_frozen_wals()` collapses the currently frozen WAL prefix into one
+immutable DeltaV1 run, atomically switches `CURRENT`, and then best-effort
+unlinks the replaced WAL pathnames. Neither operation rewrites base embeddings.
+An empty frozen prefix is a successful no-op.
 
 `Writer` and `Storage` remain the legacy immutable low-level API used by the
 existing benchmark suite. They require native, aligned, C-contiguous `uint64`
@@ -209,6 +220,8 @@ throwdb get \
 throwdb inspect --storage /data/example
 
 throwdb rotate-wal --storage /data/example
+
+throwdb materialize --storage /data/example
 ```
 
 `ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
@@ -248,9 +261,15 @@ can interrupt cleanup.
 - crash-safe manual WAL rotation through immutable catalogs; automatic
   rotation is currently only the hard safety valve before a WAL would exceed
   the 32-bit `RowRef` row limit;
-- no frozen-WAL compaction, selective cleaning, UTF-8 IDs, payload scrubbing,
-  or network service yet. Rotation bounds one WAL but the complete retained
-  WAL chain is still replayed when the collection opens.
+- manual frozen-WAL-prefix materialization into immutable DeltaV1 `.dat/.idx`
+  pairs. The build permits concurrent writes, pauses them for the two short
+  catalog publications, preserves newer/active WAL precedence, and never
+  rewrites the immutable base;
+- no delta-run merge, base compaction/selective cleaning, UTF-8 IDs, delta
+  payload scrub command, or network service yet. Delta version metadata is
+  still loaded into the RAM overlay on open. The lifecycle currently relies on
+  local POSIX rename, `fsync`, open-file, and unlink semantics; network
+  filesystems are outside this contract.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and

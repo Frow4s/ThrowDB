@@ -3,6 +3,7 @@
 #include "file_lock.hpp"
 #include "internal.hpp"
 #include "mutation_catalog.hpp"
+#include "mutation_delta.hpp"
 #include "mutation_types.hpp"
 #include "mutation_wal.hpp"
 #include "native_format.hpp"
@@ -25,6 +26,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -34,6 +36,7 @@
 namespace throwdb {
 namespace {
 
+constexpr std::uint32_t kDeltaPublicNativeFormatVersion = 6;
 constexpr std::uint32_t kCatalogPublicNativeFormatVersion = 5;
 constexpr std::uint32_t kCurrentPublicNativeFormatVersion = 4;
 constexpr std::uint32_t kLegacyPublicNativeFormatVersion = 3;
@@ -118,7 +121,7 @@ void create_native_store_directories(const std::filesystem::path& path) {
     }
 
     for (const char* child : {
-             "data", "ids", "index", "wal", "catalogs", "locks"}) {
+             "data", "ids", "index", "wal", "catalogs", "deltas", "locks"}) {
         if (!std::filesystem::create_directory(path / child, error) || error) {
             throw StorageError(
                 "cannot create storage subdirectory '" + std::string(child)
@@ -273,6 +276,8 @@ public:
             manifest.segment_payload_capacity = segment_payload_capacity_;
             manifest.required_feature_bits |=
                 detail::kNativeRequiredFeatureCatalogV1;
+            manifest.required_feature_bits |=
+                detail::kNativeRequiredFeatureDeltaV1;
             detail::derive_native_manifest_geometry(manifest);
             if (manifest.base_segment_count != segment_count_
                 || manifest.records_per_segment != records_per_segment_) {
@@ -321,7 +326,7 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
-        return kCatalogPublicNativeFormatVersion;
+        return kDeltaPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
         ensure_owner_process();
@@ -472,6 +477,7 @@ public:
               commit_lock_path(path_), writable)),
           writable_(writable),
           catalog_managed_(detail::mutation_catalog_managed(manifest_)),
+          delta_managed_(detail::mutation_delta_managed(manifest_)),
           live_count_(manifest_.base_record_count) {
         if (writable_) {
             // Fail a competing writer before loading a potentially very large
@@ -680,6 +686,314 @@ public:
         return mutation_log_stats_locked(rotated);
     }
 
+    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals() {
+        ensure_mutable();
+        std::unique_lock lifecycle(materialization_mutex_);
+
+        std::shared_ptr<WalResourceSet> source_resources;
+        std::vector<detail::MutationWalEntry> selected_wals;
+        detail::MutationDeltaBuildSpec build_spec;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            if (!delta_managed_) {
+                throw InvalidArgumentError(
+                    "WAL materialization requires a delta-managed "
+                    "format-6 collection");
+            }
+
+            std::size_t frozen_count = 0;
+            while (frozen_count < catalog_.wal_entries.size()
+                   && catalog_.wal_entries[frozen_count].state
+                          == detail::MutationWalState::Frozen) {
+                ++frozen_count;
+            }
+            if (frozen_count == 0) {
+                return mutation_log_stats_locked(false);
+            }
+            if (catalog_.generation
+                > std::numeric_limits<std::uint64_t>::max() - 2) {
+                throw StorageError(
+                    "mutation catalog lacks two generations for materialization");
+            }
+            if (catalog_.next_segment_id >= detail::SegmentId::kMaximum) {
+                throw StorageError("mutation segment ID space is exhausted");
+            }
+
+            selected_wals.assign(
+                catalog_.wal_entries.begin(),
+                catalog_.wal_entries.begin()
+                    + static_cast<std::ptrdiff_t>(frozen_count));
+            source_resources = wal_resources_;
+            build_spec.delta_id = make_uuid();
+            build_spec.source_predecessor_wal_id =
+                selected_wals.front().predecessor_wal_id;
+            build_spec.source_terminal_wal_id =
+                selected_wals.back().wal_id;
+            build_spec.first_sequence =
+                selected_wals.front().first_sequence;
+            build_spec.last_sequence =
+                selected_wals.back().last_sequence;
+            build_spec.segment_id = catalog_.next_segment_id;
+            if (frozen_count
+                > std::numeric_limits<std::uint32_t>::max()) {
+                throw StorageError(
+                    "materialized WAL prefix count exceeds uint32");
+            }
+            build_spec.source_wal_count =
+                static_cast<std::uint32_t>(frozen_count);
+
+            detail::MutationCatalog reservation = catalog_;
+            reservation.generation = catalog_.generation + 1;
+            reservation.catalog_id = make_uuid();
+            reservation.previous_catalog_id = catalog_.catalog_id;
+            reservation.next_segment_id = build_spec.segment_id + 1;
+            try {
+                detail::ScopedAdvisoryLock commit(
+                    commit_lock_, detail::FileLockMode::Exclusive);
+                static_cast<void>(detail::publish_mutation_catalog(
+                    path_, manifest_, reservation));
+                std::swap(catalog_, reservation);
+            } catch (...) {
+                poisoned_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+
+        std::unordered_map<std::uint64_t, detail::VersionedMutationValue>
+            collapsed;
+        for (std::size_t source_index = 0;
+             source_index != selected_wals.size(); ++source_index) {
+            const detail::MutationWalEntry& entry =
+                selected_wals[source_index];
+            const std::shared_ptr<WalSource>& source =
+                source_resources->sources[source_index];
+            std::uint64_t put_index = 0;
+            const detail::ExpectedWalIdentity expected =
+                detail::ExpectedWalIdentity::from_trusted_header(
+                    source->header);
+            const detail::WalScanResult scan = detail::scan_wal_file(
+                source->fd.get(), source->path, expected,
+                detail::WalScanMode::Frozen,
+                [&collapsed, &entry, &put_index](
+                    const detail::RecoveredWalBatch& batch) {
+                    for (const detail::RecoveredWalOperation& operation :
+                         batch.operations) {
+                        if (operation.kind
+                            == detail::WalOperationKind::Put) {
+                            if (put_index
+                                >= detail::RowRef::kMaximumRowsPerSegment) {
+                                throw CorruptionError(
+                                    "frozen WAL PUT count exceeds RowRef capacity");
+                            }
+                            collapsed.insert_or_assign(
+                                operation.id,
+                                detail::VersionedMutationValue::put(
+                                    batch.sequence,
+                                    detail::RowRef::create(
+                                        entry.segment_id, put_index)));
+                            ++put_index;
+                        } else {
+                            collapsed.insert_or_assign(
+                                operation.id,
+                                detail::VersionedMutationValue::tombstone(
+                                    batch.sequence));
+                        }
+                    }
+                });
+            if (scan.valid_end != entry.sealed_file_size
+                || scan.ignored_tail_bytes != 0
+                || scan.next_sequence == 0
+                || scan.next_sequence - 1 != entry.last_sequence
+                || put_index != entry.put_count) {
+                throw CorruptionError(
+                    "frozen WAL changed during materialization");
+            }
+        }
+
+        std::vector<detail::MutationDeltaBuildEntry> build_entries;
+        build_entries.reserve(collapsed.size());
+        for (auto& [id, value] : collapsed) {
+            build_entries.push_back(
+                detail::MutationDeltaBuildEntry{id, value});
+        }
+        collapsed.clear();
+        collapsed.rehash(0);
+
+        const detail::MutationDeltaDescriptor descriptor =
+            detail::write_mutation_delta(
+                path_, manifest_, build_spec, build_entries,
+                [this, source_resources](
+                    const std::span<const detail::RowRef> source_rows,
+                    const std::span<std::byte> destination) {
+                    std::vector<detail::PhysicalReadRequest> requests;
+                    requests.reserve(source_rows.size());
+                    for (std::size_t index = 0;
+                         index != source_rows.size(); ++index) {
+                        requests.push_back(resolve_row_unlocked(
+                            source_rows[index], index, *source_resources));
+                    }
+                    physical_reader_.execute(
+                        manifest_.record_size, requests, destination);
+                });
+        detail::OpenMutationDelta opened = detail::open_mutation_delta(
+            path_, manifest_, descriptor);
+
+        std::uint64_t reclaimed_wal_count = 0;
+        std::uint64_t reclaimed_wal_bytes = 0;
+        bool reclamation_complete = true;
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+
+        if (catalog_.materialized_sequence
+                != build_spec.first_sequence - 1
+            || catalog_.terminal_wal_id
+                   != build_spec.source_predecessor_wal_id
+            || catalog_.wal_entries.size() <= selected_wals.size()) {
+            throw StorageError(
+                "mutation catalog changed incompatibly during materialization");
+        }
+        for (std::size_t index = 0; index != selected_wals.size(); ++index) {
+            if (catalog_.wal_entries[index] != selected_wals[index]) {
+                throw StorageError(
+                    "materialized WAL prefix changed while delta was built");
+            }
+        }
+        if (catalog_.generation
+            == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError("mutation catalog generation is exhausted");
+        }
+
+        detail::MutationCatalog next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        next_catalog.materialized_sequence = descriptor.last_sequence;
+        next_catalog.terminal_wal_id = descriptor.source_terminal_wal_id;
+        next_catalog.delta_entries.push_back(descriptor);
+        next_catalog.wal_entries.erase(
+            next_catalog.wal_entries.begin(),
+            next_catalog.wal_entries.begin()
+                + static_cast<std::ptrdiff_t>(selected_wals.size()));
+
+        auto delta_source = std::make_shared<DeltaSource>();
+        delta_source->descriptor = descriptor;
+        delta_source->header = opened.data_header;
+        delta_source->fd = std::move(opened.data_fd);
+        delta_source->path = detail::mutation_delta_data_path(
+            path_, descriptor.delta_id);
+
+        auto next_resources = std::make_shared<WalResourceSet>();
+        {
+            std::shared_lock state(state_mutex_);
+            next_resources->delta_sources = wal_resources_->delta_sources;
+            next_resources->delta_source_indices =
+                wal_resources_->delta_source_indices;
+            next_resources->sources.assign(
+                wal_resources_->sources.begin()
+                    + static_cast<std::ptrdiff_t>(selected_wals.size()),
+                wal_resources_->sources.end());
+        }
+        const std::size_t delta_index =
+            next_resources->delta_sources.size();
+        next_resources->delta_sources.push_back(std::move(delta_source));
+        if (!next_resources->delta_source_indices.emplace(
+                 descriptor.segment_id, delta_index).second) {
+            throw CorruptionError(
+                "materialized delta reuses a mutation segment ID");
+        }
+        next_resources->source_indices.reserve(
+            next_resources->sources.size());
+        for (std::size_t index = 0;
+             index != next_resources->sources.size(); ++index) {
+            if (!next_resources->source_indices.emplace(
+                     next_resources->sources[index]->entry.segment_id,
+                     index).second) {
+                throw CorruptionError(
+                    "retained WAL segment ID is duplicated");
+            }
+        }
+        if (next_resources->sources.empty()) {
+            throw CorruptionError(
+                "materialization removed the active WAL");
+        }
+        next_resources->active_index = next_resources->sources.size() - 1;
+
+        struct OverlayPatch {
+            OverlayValue* destination;
+            detail::VersionedMutationValue replacement;
+        };
+        static_assert(std::is_nothrow_copy_assignable_v<OverlayValue>);
+        std::vector<OverlayPatch> overlay_patches;
+        overlay_patches.reserve(opened.records.size());
+        {
+            std::shared_lock state(state_mutex_);
+            for (const detail::MutationDeltaVersionRecord& record :
+                 opened.records) {
+                const auto current = overlay_.find(record.id);
+                if (current == overlay_.end()
+                    || !current->second.has_value()
+                    || current->second->sequence()
+                           < record.value.sequence()) {
+                    throw CorruptionError(
+                        "materialized delta is newer than the live overlay");
+                }
+                if (current->second->sequence() == record.value.sequence()) {
+                    overlay_patches.push_back(
+                        OverlayPatch{&current->second, record.value});
+                }
+            }
+        }
+
+        try {
+            detail::ScopedAdvisoryLock commit(
+                commit_lock_, detail::FileLockMode::Exclusive);
+            static_cast<void>(detail::publish_mutation_catalog(
+                path_, manifest_, next_catalog));
+            {
+                std::unique_lock state(state_mutex_);
+                for (const OverlayPatch& patch : overlay_patches) {
+                    *patch.destination = patch.replacement;
+                }
+                wal_resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+            }
+
+            for (const detail::MutationWalEntry& entry : selected_wals) {
+                std::error_code error;
+                const bool removed = std::filesystem::remove(
+                    detail::mutation_wal_path(path_, entry.wal_id), error);
+                if (error) {
+                    reclamation_complete = false;
+                } else if (removed) {
+                    ++reclaimed_wal_count;
+                    if (reclaimed_wal_bytes
+                        > std::numeric_limits<std::uint64_t>::max()
+                              - entry.sealed_file_size) {
+                        reclamation_complete = false;
+                    } else {
+                        reclaimed_wal_bytes += entry.sealed_file_size;
+                    }
+                } else {
+                    reclamation_complete = false;
+                }
+            }
+            if (reclaimed_wal_count != 0) {
+                try {
+                    detail::sync_directory(path_ / "wal");
+                } catch (...) {
+                    reclamation_complete = false;
+                }
+            }
+        } catch (...) {
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+        return mutation_log_stats_locked(
+            false, true, reclaimed_wal_count, reclaimed_wal_bytes,
+            reclamation_complete);
+    }
+
     [[nodiscard]] std::uint64_t count() const {
         ensure_owner_process();
         return live_count_.load(std::memory_order_acquire);
@@ -694,6 +1008,9 @@ public:
     }
     [[nodiscard]] std::uint32_t format_version() const {
         ensure_owner_process();
+        if (delta_managed_) {
+            return kDeltaPublicNativeFormatVersion;
+        }
         if (catalog_managed_) {
             return kCatalogPublicNativeFormatVersion;
         }
@@ -728,6 +1045,9 @@ public:
         for (const auto& source : wal_resources_->sources) {
             source->fd.reset();
         }
+        for (const auto& source : wal_resources_->delta_sources) {
+            source->fd.reset();
+        }
         for (BaseSegment& segment : base_segments_) {
             segment.fd.reset();
         }
@@ -752,9 +1072,18 @@ private:
         std::uint64_t next_sequence{1};
     };
 
+    struct DeltaSource {
+        detail::MutationDeltaDescriptor descriptor;
+        detail::MutationDeltaDataHeader header;
+        detail::FileDescriptor fd;
+        std::filesystem::path path;
+    };
+
     struct WalResourceSet {
         std::vector<std::shared_ptr<WalSource>> sources;
         std::unordered_map<std::uint32_t, std::size_t> source_indices;
+        std::vector<std::shared_ptr<DeltaSource>> delta_sources;
+        std::unordered_map<std::uint32_t, std::size_t> delta_source_indices;
         std::size_t active_index{0};
     };
 
@@ -915,10 +1244,17 @@ private:
         wal_resources_ = std::make_shared<WalResourceSet>();
         if (catalog_managed_) {
             catalog_ = detail::read_current_mutation_catalog(path_, manifest_);
-            if (catalog_.materialized_sequence != 0
-                || !catalog_.terminal_wal_id.empty()) {
+            if (!delta_managed_ && !catalog_.delta_entries.empty()) {
                 throw CorruptionError(
-                    "materialized mutation resources are not supported yet");
+                    "catalog references deltas without the required feature");
+            }
+            wal_resources_->delta_sources.reserve(
+                catalog_.delta_entries.size());
+            wal_resources_->delta_source_indices.reserve(
+                catalog_.delta_entries.size());
+            for (const detail::MutationDeltaDescriptor& descriptor :
+                 catalog_.delta_entries) {
+                open_delta_source(descriptor);
             }
             wal_resources_->sources.reserve(catalog_.wal_entries.size());
             wal_resources_->source_indices.reserve(
@@ -946,6 +1282,30 @@ private:
         wal_resources_->active_index = wal_resources_->sources.size() - 1;
         append_offset_ = active_wal().valid_end;
         next_sequence_ = active_wal().next_sequence;
+    }
+
+    void open_delta_source(
+        const detail::MutationDeltaDescriptor& descriptor) {
+        detail::OpenMutationDelta opened = detail::open_mutation_delta(
+            path_, manifest_, descriptor);
+        auto source = std::make_shared<DeltaSource>();
+        source->descriptor = descriptor;
+        source->header = opened.data_header;
+        source->fd = std::move(opened.data_fd);
+        source->path = detail::mutation_delta_data_path(
+            path_, descriptor.delta_id);
+
+        const std::size_t source_index =
+            wal_resources_->delta_sources.size();
+        wal_resources_->delta_sources.push_back(std::move(source));
+        if (!wal_resources_->delta_source_indices.emplace(
+                 descriptor.segment_id, source_index).second) {
+            throw CorruptionError("mutation delta segment ID is duplicated");
+        }
+        for (const detail::MutationDeltaVersionRecord& record :
+             opened.records) {
+            apply_recovered_delta(record);
+        }
     }
 
     void open_catalog_wal(const detail::MutationWalEntry& entry) {
@@ -1062,6 +1422,21 @@ private:
         if (segment <= manifest_.base_segment_count) {
             return resolve_base_row(row, output_index);
         }
+        const auto delta_position =
+            resources.delta_source_indices.find(segment);
+        if (delta_position != resources.delta_source_indices.end()) {
+            const DeltaSource& source =
+                *resources.delta_sources[delta_position->second];
+            if (row_index >= source.descriptor.put_count) {
+                throw CorruptionError(
+                    "overlay RowRef exceeds mutation delta row count");
+            }
+            return detail::PhysicalReadRequest{
+                source.fd.get(),
+                source.header.payload_offset
+                    + row_index * manifest_.record_size,
+                output_index};
+        }
         if (segment != manifest_.active_wal_segment_id
             && !catalog_managed_) {
             throw CorruptionError("overlay RowRef does not resolve to active WAL");
@@ -1081,10 +1456,36 @@ private:
             output_index};
     }
 
+    void apply_recovered_delta(
+        const detail::MutationDeltaVersionRecord& record) {
+        const auto existing = overlay_.find(record.id);
+        if (existing != overlay_.end() && existing->second.has_value()
+            && existing->second->sequence() >= record.value.sequence()) {
+            throw CorruptionError(
+                "mutation delta versions are not strictly chronological");
+        }
+        const bool existed =
+            existing != overlay_.end() && existing->second.has_value()
+                ? existing->second->is_put()
+                : base_contains(record.id);
+        overlay_.insert_or_assign(record.id, record.value);
+        if (record.value.is_put() && !existed) {
+            live_count_.fetch_add(1, std::memory_order_relaxed);
+        } else if (record.value.is_tombstone() && existed) {
+            live_count_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
     void apply_recovered_batch(
         WalSource& source,
         const detail::RecoveredWalBatch& batch) {
         for (const detail::RecoveredWalOperation& operation : batch.operations) {
+            const auto prior = overlay_.find(operation.id);
+            if (prior != overlay_.end() && prior->second.has_value()
+                && prior->second->sequence() >= batch.sequence) {
+                throw CorruptionError(
+                    "WAL versions are not strictly chronological");
+            }
             const bool existed = [&] {
                 const auto overlay = overlay_.find(operation.id);
                 if (overlay != overlay_.end() && overlay->second.has_value()) {
@@ -1122,14 +1523,25 @@ private:
     }
 
     [[nodiscard]] NativeMutationLogStats mutation_log_stats_locked(
-        const bool rotated) const {
+        const bool rotated,
+        const bool materialized = false,
+        const std::uint64_t reclaimed_wal_count = 0,
+        const std::uint64_t reclaimed_wal_bytes = 0,
+        const bool reclamation_complete = true) const {
         NativeMutationLogStats stats;
         stats.catalog_managed = catalog_managed_;
+        stats.delta_managed = delta_managed_;
         stats.generation = catalog_managed_ ? catalog_.generation : 0;
         stats.committed_sequence = next_sequence_ - 1;
+        stats.materialized_sequence =
+            catalog_managed_ ? catalog_.materialized_sequence : 0;
         stats.active_wal_bytes = append_offset_;
         stats.active_wal_put_rows = active_wal().payload_offsets.size();
         stats.rotated = rotated;
+        stats.materialized = materialized;
+        stats.reclaimed_wal_count = reclaimed_wal_count;
+        stats.reclaimed_wal_bytes = reclaimed_wal_bytes;
+        stats.reclamation_complete = reclamation_complete;
         for (const auto& source : wal_resources_->sources) {
             if (source->entry.state == detail::MutationWalState::Frozen) {
                 ++stats.frozen_wal_count;
@@ -1140,6 +1552,34 @@ private:
                 throw CorruptionError("mutation WAL byte count overflows uint64");
             }
             stats.total_wal_bytes += source->valid_end;
+        }
+        for (const auto& source : wal_resources_->delta_sources) {
+            ++stats.delta_run_count;
+            if (stats.delta_entry_count
+                > std::numeric_limits<std::uint64_t>::max()
+                      - source->descriptor.entry_count
+                || stats.delta_put_rows
+                       > std::numeric_limits<std::uint64_t>::max()
+                             - source->descriptor.put_count) {
+                throw CorruptionError("mutation delta row count overflows uint64");
+            }
+            stats.delta_entry_count += source->descriptor.entry_count;
+            stats.delta_put_rows += source->descriptor.put_count;
+            if (source->descriptor.data_file_size
+                > std::numeric_limits<std::uint64_t>::max()
+                      - source->descriptor.index_file_size) {
+                throw CorruptionError(
+                    "mutation delta byte count overflows uint64");
+            }
+            const std::uint64_t bytes =
+                source->descriptor.data_file_size
+                + source->descriptor.index_file_size;
+            if (stats.total_delta_bytes
+                > std::numeric_limits<std::uint64_t>::max() - bytes) {
+                throw CorruptionError(
+                    "mutation delta byte count overflows uint64");
+            }
+            stats.total_delta_bytes += bytes;
         }
         return stats;
     }
@@ -1225,6 +1665,10 @@ private:
                 next_resources->sources = wal_resources_->sources;
                 next_resources->source_indices =
                     wal_resources_->source_indices;
+                next_resources->delta_sources =
+                    wal_resources_->delta_sources;
+                next_resources->delta_source_indices =
+                    wal_resources_->delta_source_indices;
                 next_resources->active_index = wal_resources_->active_index;
             }
             next_resources->sources.push_back(std::move(successor_source));
@@ -1370,6 +1814,7 @@ private:
 
     std::vector<BaseSegment> base_segments_;
     bool catalog_managed_{false};
+    bool delta_managed_{false};
     detail::MutationCatalog catalog_;
     std::shared_ptr<WalResourceSet> wal_resources_;
 
@@ -1380,6 +1825,7 @@ private:
     std::uint64_t append_offset_{detail::kWalFileHeaderSize};
     std::uint64_t next_sequence_{1};
     mutable std::mutex mutation_mutex_;
+    mutable std::mutex materialization_mutex_;
     std::atomic<bool> poisoned_{false};
     const pid_t owner_pid_{::getpid()};
 };
@@ -1510,6 +1956,9 @@ NativeMutationLogStats NativeCollection::mutation_log_stats() const {
 }
 NativeMutationLogStats NativeCollection::rotate_wal() {
     return impl_->rotate_wal();
+}
+NativeMutationLogStats NativeCollection::materialize_frozen_wals() {
+    return impl_->materialize_frozen_wals();
 }
 std::uint64_t NativeCollection::count() const { return impl_->count(); }
 std::uint32_t NativeCollection::dimension() const {

@@ -68,7 +68,7 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
 
     with throwdb.Collection.open(path, mode="r+") as collection:
         assert collection.mode == "read_write"
-        assert collection.format_version == 5
+        assert collection.format_version == 6
         assert collection.count == 3
 
         collection.insert(np.array([40, 50], dtype=np.int16), inserted)
@@ -281,7 +281,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert second_rotation["frozen_wal_count"] == 2
 
     with throwdb.Collection.open(path) as reopened:
-        assert reopened.format_version == 5
+        assert reopened.format_version == 6
         stats = reopened.mutation_log_stats
         assert stats is not None
         assert stats["catalog_managed"] is True
@@ -294,6 +294,76 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         )
         with pytest.raises(RuntimeError, match=r"mode='r\+'"):
             reopened.rotate_wal()
+
+
+def test_frozen_wals_materialize_into_reopenable_delta_runs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "materialized"
+    maximum_id = (1 << 64) - 1
+    boundary_id = 1 << 32
+    base = _vectors(2, 6, "float16", salt=31)
+    first = _vectors(2, 6, "float16", salt=231)
+    second = _vectors(2, 6, "float16", salt=431)
+    _build(path, [0, maximum_id], base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        initial = collection.materialize_frozen_wals()
+        assert initial["materialized"] is False
+        assert initial["generation"] == 1
+        assert initial["delta_managed"] is True
+
+        collection.upsert([0, boundary_id], first)  # sequence 1
+        collection.rotate_wal()
+        np.testing.assert_array_equal(collection.delete([maximum_id]), [True])
+        collection.update([boundary_id], second[:1])  # sequences 2 and 3
+        collection.rotate_wal()
+        collection.insert([maximum_id], second[1:])  # sequence 4, active WAL
+
+        materialized = collection.materialize_frozen_wals()
+        assert materialized["materialized"] is True
+        assert materialized["generation"] == 5  # two rotations + reserve + switch
+        assert materialized["committed_sequence"] == 4
+        assert materialized["materialized_sequence"] == 3
+        assert materialized["frozen_wal_count"] == 0
+        assert materialized["delta_run_count"] == 1
+        assert materialized["delta_entry_count"] == 3
+        assert materialized["delta_put_rows"] == 2
+        assert materialized["reclaimed_wal_count"] == 2
+        assert materialized["reclamation_complete"] is True
+        assert len(list((path / "wal").glob("*.wal"))) == 1
+        assert len(list((path / "deltas").glob("*.dat"))) == 1
+        assert len(list((path / "deltas").glob("*.idx"))) == 1
+        _assert_same_bits(
+            collection.get([maximum_id, boundary_id, 0]),
+            np.stack([second[1], second[0], first[0]]),
+        )
+
+    with throwdb.Collection.open(path, mode="r+") as reopened:
+        stats = reopened.mutation_log_stats
+        assert stats is not None
+        assert stats["materialized_sequence"] == 3
+        assert stats["delta_run_count"] == 1
+        assert stats["frozen_wal_count"] == 0
+        _assert_same_bits(
+            reopened.get([0, maximum_id, boundary_id]),
+            np.stack([first[0], second[1], second[0]]),
+        )
+
+        reopened.rotate_wal()
+        second_materialization = reopened.materialize_frozen_wals()
+        assert second_materialization["materialized"] is True
+        assert second_materialization["materialized_sequence"] == 4
+        assert second_materialization["delta_run_count"] == 2
+        assert second_materialization["frozen_wal_count"] == 0
+
+    with throwdb.Collection.open(path) as read_only:
+        _assert_same_bits(
+            read_only.get([maximum_id, 0, boundary_id]),
+            np.stack([second[1], first[0], second[0]]),
+        )
+        with pytest.raises(RuntimeError, match=r"mode='r\+'"):
+            read_only.materialize_frozen_wals()
 
 
 def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(

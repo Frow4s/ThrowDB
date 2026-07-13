@@ -61,13 +61,23 @@ struct NativeReadStats {
 // successor WAL. An empty active WAL is a successful no-op.
 struct NativeMutationLogStats {
     bool catalog_managed = false;
+    bool delta_managed = false;
     std::uint64_t generation = 0;
     std::uint64_t committed_sequence = 0;
+    std::uint64_t materialized_sequence = 0;
     std::uint64_t frozen_wal_count = 0;
     std::uint64_t active_wal_bytes = 0;
     std::uint64_t active_wal_put_rows = 0;
     std::uint64_t total_wal_bytes = 0;
+    std::uint64_t delta_run_count = 0;
+    std::uint64_t delta_entry_count = 0;
+    std::uint64_t delta_put_rows = 0;
+    std::uint64_t total_delta_bytes = 0;
+    std::uint64_t reclaimed_wal_count = 0;
+    std::uint64_t reclaimed_wal_bytes = 0;
     bool rotated = false;
+    bool materialized = false;
+    bool reclamation_complete = true;
 };
 
 class NativeCollectionBuilder {
@@ -138,6 +148,7 @@ public:
 
     [[nodiscard]] NativeMutationLogStats mutation_log_stats() const;
     [[nodiscard]] NativeMutationLogStats rotate_wal();
+    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals();
 
     [[nodiscard]] std::uint64_t count() const;
     [[nodiscard]] std::uint32_t dimension() const;
