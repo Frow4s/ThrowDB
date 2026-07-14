@@ -16,6 +16,23 @@ semantics and staged product plan are documented in
 The numeric version-2 binary representation is specified in
 [`docs/storage-format-v2.md`](docs/storage-format-v2.md).
 
+## Install
+
+Release CI is configured to build precompiled CPython 3.10-3.14 wheels for
+Linux x86_64 on the `manylinux_2_28` baseline. Install a downloaded artifact
+without a compiler:
+
+```bash
+python -m pip install throwdb-0.1.0-cp311-cp311-manylinux_2_28_x86_64.whl
+throwdb --help
+```
+
+Installing directly from a source checkout builds the C++20 extension locally:
+
+```bash
+python -m pip install .
+```
+
 ## Install for development
 
 ThrowDB requires a C++20 compiler, CMake, Python 3.10+, NumPy and pybind11.
@@ -23,9 +40,15 @@ ThrowDB requires a C++20 compiler, CMake, Python 3.10+, NumPy and pybind11.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install -e . pytest
+python -m pip install -e '.[test]'
 pytest -q
 ```
+
+The wheel workflow performs a black-box CRUD, prefix-read, orphan-inspection,
+and CLI smoke test from an isolated installation. The source CI separately runs
+the complete Python suite on CPython 3.10-3.14, native tests with `-Werror`, and
+ASan/UBSan. Publishing to a package index remains a release decision; the
+workflow only creates downloadable artifacts.
 
 ## Python API
 

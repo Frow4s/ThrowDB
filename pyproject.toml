@@ -13,12 +13,31 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [project.scripts]
 throwdb = "throwdb.cli:main"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
 wheel.packages = ["python/throwdb"]
+
+[tool.scikit-build.cmake.define]
+THROWDB_BUILD_TESTS = "OFF"
+THROWDB_BUILD_BENCHMARKS = "OFF"
+THROWDB_INSTALL_CPP_SDK = "OFF"
+
+[tool.cibuildwheel]
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-manylinux_i686"
+build-verbosity = 1
+test-command = "python {project}/tools/wheel_smoke.py"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+manylinux-x86_64-image = "manylinux_2_28"
+environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

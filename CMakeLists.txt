@@ -7,6 +7,7 @@ find_package(Threads REQUIRED)
 option(THROWDB_BUILD_PYTHON "Build the Python extension" ON)
 option(THROWDB_BUILD_TESTS "Build the C++ tests" ON)
 option(THROWDB_BUILD_BENCHMARKS "Build benchmark tools" ON)
+option(THROWDB_INSTALL_CPP_SDK "Install the C++ static library and headers" ON)
 
 add_library(throwdb_core STATIC
     src/core/crc32c.cpp
@@ -216,8 +217,10 @@ if(THROWDB_BUILD_BENCHMARKS)
 endif()
 
 include(GNUInstallDirs)
-install(TARGETS throwdb_core
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(THROWDB_INSTALL_CPP_SDK)
+    install(TARGETS throwdb_core
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+    install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()

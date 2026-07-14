@@ -1,0 +1,43 @@
+name: Linux wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: manylinux x86_64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v4.1.0
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: throwdb-manylinux-x86_64
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Build sdist
+        run: python -m pip install build && python -m build --sdist
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: throwdb-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
