@@ -1224,10 +1224,11 @@ def probe_collection_storage(
     """Return redacted media/runtime fingerprints for a collection.
 
     ``collection_salt`` is owned by the collection's tuning registry and must
-    travel with it.  Default discovery probes the collection root plus base,
-    delta, and WAL payloads: any of those can serve embedding bytes. Explicit
-    ``data_paths`` replace discovery and are primarily useful for native-fd
-    integration and deterministic tests. Discovery stops after
+    travel with it.  Default discovery probes the collection root plus legacy
+    base, delta, partitioned-segment, and WAL payloads: any of those can serve
+    embedding bytes. Explicit ``data_paths`` replace discovery and are
+    primarily useful for native-fd integration and deterministic tests.
+    Discovery stops after
     ``discovery_entry_limit`` directory entries and fails closed instead of reusing a
     potentially incomplete media identity.
     """
@@ -1250,6 +1251,7 @@ def probe_collection_storage(
         directories_and_patterns = (
             (os.path.join(root, "data"), "segment-*.dat"),
             (os.path.join(root, "deltas"), "delta-*.dat"),
+            (os.path.join(root, "segments"), "segment-*.dat"),
             (os.path.join(root, "wal"), "*.wal"),
         )
         for directory, name_pattern in directories_and_patterns:

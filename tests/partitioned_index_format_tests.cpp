@@ -436,6 +436,12 @@ void test_catalog_rejects_resource_aliases_and_lineage_gaps() {
     static_cast<void>(encode_partitioned_catalog_v3(invalid));
 
     invalid = catalog();
+    invalid.snapshots[0].epoch = invalid.runs[0].epoch;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] { static_cast<void>(encode_partitioned_catalog_v3(invalid)); },
+        "catalog kept a run active behind an equal-epoch snapshot");
+
+    invalid = catalog();
     invalid.runs[0].covered_partitions = {std::byte{0x07}};
     invalid.runs[0].active_partitions = {std::byte{0x08}};
     require_throws<throwdb::InvalidArgumentError>(

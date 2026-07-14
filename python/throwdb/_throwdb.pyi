@@ -102,7 +102,7 @@ class NativeCollectionBuilder:
         dimension: int = 1024,
         shard_size_bytes: int = 17_179_869_184,
         dtype: _DTypeName = "float16",
-        format_version: int = 6,
+        format_version: int = 7,
     ) -> NativeCollectionBuilder: ...
 
     @property
@@ -277,9 +277,22 @@ class NativeCollection:
     ) -> dict[str, object]: ...
     def compact_delta_runs(
         self,
-        max_runs: int = 8,
+        max_runs: int | None = None,
         max_input_bytes: int = 8_589_934_592,
         max_input_entries: int = 1_000_000,
+    ) -> dict[str, object]: ...
+    def clean_segments(
+        self,
+        dry_run: bool = True,
+        max_candidate_segments: int = 8,
+        max_sidecar_scan_bytes: int = 1_073_741_824,
+        max_source_bytes: int = 34_359_738_368,
+        max_output_bytes: int = 34_359_738_368,
+        max_memory_bytes: int = 2_147_483_648,
+        min_garbage_rows: int = 1,
+        min_reclaimable_bytes: int = 536_870_912,
+        min_garbage_ratio_ppm: int = 300_000,
+        start_after_segment_id: int = 0,
     ) -> dict[str, object]: ...
 
     def close(self) -> None: ...

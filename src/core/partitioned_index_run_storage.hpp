@@ -25,6 +25,8 @@ struct PartitionIndexRunBuildSpec {
     const std::filesystem::path& store_path);
 [[nodiscard]] std::filesystem::path partitioned_index_run_path(
     const std::filesystem::path& store_path, Uuid128 run_id);
+[[nodiscard]] std::uint64_t partitioned_index_run_file_size(
+    std::uint32_t partition_bits, std::uint64_t entry_count);
 
 // Writes one UUID-addressed immutable run directly into index/runs.  The
 // destination namespace must already exist.  The file is created O_EXCL and

@@ -35,8 +35,8 @@ constexpr std::uint64_t kDefaultMaxReadRangeBytes = 1ULL << 20;
 constexpr std::uint64_t kDefaultMaxGapBytes = 0;
 constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 20;
 constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 24;
-constexpr std::uint64_t kDefaultDeltaCompactionMaxRuns = 8;
 constexpr std::uint64_t kMaximumDeltaCompactionMaxRuns = 64;
+constexpr std::uint64_t kMaximumPartitionedFoldRuns = 4096;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
 constexpr std::uint64_t kDefaultOrphanMaxFiles = 1024;
@@ -82,10 +82,15 @@ struct DTypeInfo {
     result["frozen_wal_count"] = stats.frozen_wal_count;
     result["active_wal_bytes"] = stats.active_wal_bytes;
     result["active_wal_put_rows"] = stats.active_wal_put_rows;
+    result["active_wal_transaction_count"] =
+        stats.active_wal_transaction_count;
     result["total_wal_bytes"] = stats.total_wal_bytes;
     result["delta_run_count"] = stats.delta_run_count;
     result["delta_entry_count"] = stats.delta_entry_count;
     result["delta_put_rows"] = stats.delta_put_rows;
+    result["total_delta_run_bytes"] = stats.total_delta_run_bytes;
+    result["total_delta_segment_bytes"] =
+        stats.total_delta_segment_bytes;
     result["total_delta_bytes"] = stats.total_delta_bytes;
     result["reclaimed_wal_count"] = stats.reclaimed_wal_count;
     result["reclaimed_wal_bytes"] = stats.reclaimed_wal_bytes;
@@ -101,11 +106,54 @@ struct DTypeInfo {
     result["reclaimed_delta_run_count"] =
         stats.reclaimed_delta_run_count;
     result["reclaimed_delta_bytes"] = stats.reclaimed_delta_bytes;
+    result["compacted_partition_count"] =
+        stats.compacted_partition_count;
+    result["compacted_run_section_count"] =
+        stats.compacted_run_section_count;
+    result["compacted_snapshot_input_entries"] =
+        stats.compacted_snapshot_input_entries;
+    result["compacted_snapshot_input_bytes"] =
+        stats.compacted_snapshot_input_bytes;
+    result["compacted_output_entries"] =
+        stats.compacted_output_entries;
+    result["compacted_output_bytes"] =
+        stats.compacted_output_bytes;
     result["rotated"] = stats.rotated;
     result["materialized"] = stats.materialized;
     result["materialization_budget_blocked"] =
         stats.materialization_budget_blocked;
     result["compacted"] = stats.compacted;
+    result["compaction_budget_blocked"] =
+        stats.compaction_budget_blocked;
+    result["reclamation_complete"] = stats.reclamation_complete;
+    return result;
+}
+
+[[nodiscard]] py::dict segment_cleaning_stats_dict(
+    const throwdb::NativeSegmentCleaningStats& stats) {
+    py::dict result;
+    result["generation"] = stats.generation;
+    result["scanned_segment_count"] = stats.scanned_segment_count;
+    result["scanned_row_count"] = stats.scanned_row_count;
+    result["scanned_sidecar_bytes"] = stats.scanned_sidecar_bytes;
+    result["skipped_budget_segment_count"] =
+        stats.skipped_budget_segment_count;
+    result["next_start_after_segment_id"] =
+        stats.next_start_after_segment_id;
+    result["candidate_segment_id"] = stats.candidate_segment_id;
+    result["source_rows"] = stats.source_rows;
+    result["relocated_rows"] = stats.relocated_rows;
+    result["garbage_rows"] = stats.garbage_rows;
+    result["source_bytes"] = stats.source_bytes;
+    result["output_segment_count"] = stats.output_segment_count;
+    result["output_segment_bytes"] = stats.output_segment_bytes;
+    result["output_run_bytes"] = stats.output_run_bytes;
+    result["reclaimable_bytes"] = stats.reclaimable_bytes;
+    result["dry_run"] = stats.dry_run;
+    result["candidate_found"] = stats.candidate_found;
+    result["cleaned"] = stats.cleaned;
+    result["budget_blocked"] = stats.budget_blocked;
+    result["cycle_complete"] = stats.cycle_complete;
     result["reclamation_complete"] = stats.reclamation_complete;
     return result;
 }
@@ -127,6 +175,14 @@ struct DTypeInfo {
         return "partial_unreferenced_delta_pair";
     case throwdb::NativeOrphanClass::UnknownDoNotTouch:
         return "unknown_do_not_touch";
+    case throwdb::NativeOrphanClass::CompleteUnreferencedSegmentPair:
+        return "complete_unreferenced_segment_pair";
+    case throwdb::NativeOrphanClass::PartialUnreferencedSegmentPair:
+        return "partial_unreferenced_segment_pair";
+    case throwdb::NativeOrphanClass::UnreferencedSnapshot:
+        return "unreferenced_snapshot";
+    case throwdb::NativeOrphanClass::UnreferencedRun:
+        return "unreferenced_run";
     }
     throw std::runtime_error("orphan inventory contains an unknown class");
 }
@@ -138,6 +194,7 @@ struct DTypeInfo {
         py::dict item;
         item["path"] = entry.path;
         item["classification"] = orphan_class_name(entry.classification);
+        item["candidate"] = entry.candidate;
         item["bytes"] = entry.bytes;
         item["modified_unix_ns"] = entry.modified_unix_ns;
         entries.append(std::move(item));
@@ -182,6 +239,7 @@ struct DTypeInfo {
         item["path"] = entry.file.path;
         item["classification"] =
             orphan_class_name(entry.file.classification);
+        item["candidate"] = entry.file.candidate;
         item["bytes"] = entry.file.bytes;
         item["modified_unix_ns"] = entry.file.modified_unix_ns;
         item["disposition"] =
@@ -1273,13 +1331,21 @@ public:
         const py::object& max_runs,
         const py::object& max_input_bytes,
         const py::object& max_input_entries) {
-        const std::uint64_t checked_max_runs = checked_uint64_option(
-            max_runs, "max_runs", false);
+        const auto collection = acquire_collection();
+        const std::uint64_t maximum_runs =
+            collection->format_version() == 7
+                ? kMaximumPartitionedFoldRuns
+                : kMaximumDeltaCompactionMaxRuns;
+        const std::uint64_t checked_max_runs = max_runs.is_none()
+            ? (collection->format_version() == 7
+                   ? kMaximumPartitionedFoldRuns
+                   : std::uint64_t{8})
+            : checked_uint64_option(max_runs, "max_runs", false);
         if (checked_max_runs < 2
-            || checked_max_runs > kMaximumDeltaCompactionMaxRuns) {
+            || checked_max_runs > maximum_runs) {
             throw py::value_error(
                 "max_runs must be between 2 and "
-                + std::to_string(kMaximumDeltaCompactionMaxRuns));
+                + std::to_string(maximum_runs));
         }
         const std::uint64_t checked_max_input_bytes =
             checked_uint64_option(
@@ -1288,7 +1354,6 @@ public:
             checked_uint64_option(
                 max_input_entries, "max_input_entries", false);
 
-        const auto collection = acquire_collection();
         throwdb::NativeMutationLogStats stats;
         {
             py::gil_scoped_release release;
@@ -1298,6 +1363,37 @@ public:
                 checked_max_input_entries);
         }
         return mutation_log_stats_dict(stats);
+    }
+
+    [[nodiscard]] py::dict clean_segments(
+        const bool dry_run,
+        const std::uint64_t max_candidate_segments,
+        const std::uint64_t max_sidecar_scan_bytes,
+        const std::uint64_t max_source_bytes,
+        const std::uint64_t max_output_bytes,
+        const std::uint64_t max_memory_bytes,
+        const std::uint64_t min_garbage_rows,
+        const std::uint64_t min_reclaimable_bytes,
+        const std::uint32_t min_garbage_ratio_ppm,
+        const std::uint32_t start_after_segment_id) {
+        throwdb::NativeSegmentCleaningOptions options;
+        options.dry_run = dry_run;
+        options.max_candidate_segments = max_candidate_segments;
+        options.max_sidecar_scan_bytes = max_sidecar_scan_bytes;
+        options.max_source_bytes = max_source_bytes;
+        options.max_output_bytes = max_output_bytes;
+        options.max_memory_bytes = max_memory_bytes;
+        options.min_garbage_rows = min_garbage_rows;
+        options.min_reclaimable_bytes = min_reclaimable_bytes;
+        options.min_garbage_ratio_ppm = min_garbage_ratio_ppm;
+        options.start_after_segment_id = start_after_segment_id;
+        const auto collection = acquire_collection();
+        throwdb::NativeSegmentCleaningStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = collection->clean_segments(options);
+        }
+        return segment_cleaning_stats_dict(stats);
     }
 
     py::array get(const py::array& ids) const {
@@ -1489,7 +1585,7 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("dimension") = 1024,
             py::arg("shard_size_bytes") = kDefaultShardSizeBytes,
             py::arg("dtype") = "float16",
-            py::arg("format_version") = 6)
+            py::arg("format_version") = 7)
         .def(
             "add",
             &PyNativeCollectionBuilder::add,
@@ -1625,10 +1721,23 @@ PYBIND11_MODULE(_throwdb, module) {
         .def(
             "compact_delta_runs",
             &PyNativeCollection::compact_delta_runs,
-            py::arg("max_runs") = kDefaultDeltaCompactionMaxRuns,
+            py::arg("max_runs") = py::none(),
             py::arg("max_input_bytes") =
                 kDefaultDeltaCompactionMaxInputBytes,
             py::arg("max_input_entries") =
                 kDefaultDeltaCompactionMaxInputEntries)
+        .def(
+            "clean_segments",
+            &PyNativeCollection::clean_segments,
+            py::arg("dry_run") = true,
+            py::arg("max_candidate_segments") = 8,
+            py::arg("max_sidecar_scan_bytes") = 1ULL << 30,
+            py::arg("max_source_bytes") = 32ULL << 30,
+            py::arg("max_output_bytes") = 32ULL << 30,
+            py::arg("max_memory_bytes") = 2ULL << 30,
+            py::arg("min_garbage_rows") = 1,
+            py::arg("min_reclaimable_bytes") = 512ULL << 20,
+            py::arg("min_garbage_ratio_ppm") = 300'000,
+            py::arg("start_after_segment_id") = 0)
         .def("close", &PyNativeCollection::close);
 }

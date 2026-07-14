@@ -8,10 +8,11 @@ logical rows, ID index, mutation catalog, or durability state.
 
 `Collection.open(path, tuning="auto")` performs a bounded, metadata-only
 lookup. It does not benchmark the device and does not write to the collection.
-Payload discovery stops after examining 4096 directory entries across the
-base/delta/WAL directories. Overflow is observable as incomplete discovery and
-makes the profile ineligible instead of extending open time with an unbounded
-directory walk.
+Payload discovery stops after examining 4096 directory entries across legacy
+base data, format-6 deltas, format-7 `segments/`, and WAL directories. Any of
+those files can serve embedding bytes. Overflow is observable as incomplete
+discovery and makes the profile ineligible instead of extending open time with
+an unbounded directory walk.
 
 An automatic match requires the same three compatibility dimensions:
 
@@ -66,6 +67,9 @@ process, or host identity. A changed effective CPU allocation or io_uring
 capability produces a miss; reassignment to different CPU numbers with the same
 effective resources does not by itself invalidate a profile. Memory is not yet
 part of the key because current reader profiles do not size a memory cache.
+The current `throwdb-reader-v2` ABI includes the shared fair-coordinator
+semantics, so a profile measured against the earlier admission/runtime behavior
+cannot match silently after upgrading.
 
 Backend construction has a distinct native error type. If thread or ring
 resources disappear after selection, only `auto` retries once with sequential
@@ -142,12 +146,13 @@ through all workloads. This absorbs one-time thread-pool/ring initialization;
 it is not included in throughput, CV, scoring, or baseline drift. No candidate
 reopens the collection or duplicates its multi-gigabyte index.
 
-ID input is not required. The native sampler walks a deterministic permutation
-of at most 8,388,608 loaded hash slots and returns at most 1,048,576 currently
-live base IDs. It filters base tombstones under the stable mutation snapshot
-and never scans the complete population. A collection whose live population
-exists only in mutation inserts must be rebuilt or compacted before this
-sampler can tune it.
+ID input is not required. The native sampler returns at most 1,048,576 live IDs
+after inspecting at most 8,388,608 bounded index locations. Format 6 samples
+its loaded flat base slots and filters them through the stable mutation view.
+Format 7 samples the current WAL overlay, active run sections, and authoritative
+partition snapshots while deduplicating IDs and rechecking the logical view.
+It therefore includes live format-7 inserts that do not exist in an initial
+segment and never needs a complete population scan.
 
 Matrix v2 contains at most eight candidates:
 
@@ -271,8 +276,13 @@ collection data or mutation state.
 
 ## Current boundary
 
-Profiles currently select one policy when a collection handle opens. They do
-not yet choose a different backend per request and do not implement fair
-scheduling across mixed batch sizes. Those mechanisms belong in the shared C++
-physical-reader scheduler so that they operate on one loaded index and one
-global I/O budget.
+Profiles select one backend topology and range/task policy when a collection
+handle opens; they do not yet choose a different backend per request. When
+that topology enables a parallel thread-pool or io_uring coordinator, the
+shared C++ physical reader applies bounded FIFO admission and deficit round
+robin across mixed-size concurrent calls. It charges range pressure and
+rounded physical bytes under one backend budget, including one-range requests.
+Sequential `io_workers=0` reads intentionally bypass the coordinator because
+they have no shared parallel backend capacity to schedule.
+User-visible priorities, deadlines, and per-request backend selection remain
+later policy extensions.

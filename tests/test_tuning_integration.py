@@ -23,6 +23,7 @@ def _create_collection(path: Path) -> np.ndarray:
         path,
         schema=throwdb.CollectionSchema(dimension=4),
         shard_size_bytes=1 << 20,
+        format_version=6,
     ) as collection:
         collection.add(np.array([11, 22, 33], dtype=np.uint64), vectors)
     return vectors

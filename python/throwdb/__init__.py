@@ -12,6 +12,7 @@ from .collection import (
     OrphanCollectionExecutionReport,
     OrphanCollectionReport,
     OrphanInventoryEntry,
+    SegmentCleaningReport,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "OrphanCollectionExecutionReport",
     "OrphanCollectionReport",
     "OrphanInventoryEntry",
+    "SegmentCleaningReport",
     "CalibrationError",
     "ReaderBackendError",
     "Storage",

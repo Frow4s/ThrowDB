@@ -4,6 +4,8 @@ This document defines the implementation target for format version 2. Version 2
 represents the local collection contract without changing the dense ordinal data
 model. It adds explicit schema, typed IDs, format capabilities, snapshot identity,
 and room for integrity metadata. Version 1 remains a supported read format.
+The UTF-8 portions below are a reserved design, not a claim of current product
+support; the public collection API remains numeric-only.
 
 All metadata integers and numeric payload values are little-endian. Every file
 starts with the existing 16-byte common prefix:
@@ -228,14 +230,15 @@ partitioned mode an index answer or absence is final and there is no base
 fallback. DELETE is a tombstone; PUT carries a complete fixed-schema embedding
 row.
 
-The mutation layer assigns legacy shards stable segment IDs and eventually
-publishes an authoritative partitioned `ID -> RowRef` index. Routine cleaning
-then rewrites only selected high-garbage segments and copy-on-write index
-resources before atomically replacing `CURRENT`; it never requires a complete
-base copy. A full rewrite is an explicit migration tool. The WAL framing,
-catalog invariants, recovery boundary, and selective-cleaner contract are
-specified in `mutable-storage.md`; they are not encoded into unused manifest
-bytes implicitly.
+Public format 7 implements this boundary directly: every immutable segment has
+a stable segment ID and `{id, sequence}` sidecar, while partition snapshots plus
+active immutable run sections form the authoritative `ID -> RowRef` index.
+Routine cleaning rewrites at most one selected high-garbage segment per call
+and atomically publishes its replacement descriptors and cleaner run; it never
+requires a complete base copy. A full rewrite is an explicit migration tool.
+The WAL framing, catalog invariants, recovery boundary, and selective-cleaner
+contract are specified in `mutable-storage.md`; they are not encoded into
+unused manifest bytes implicitly.
 
 ## Version-1 compatibility
 
@@ -277,11 +280,11 @@ The version-dispatching reader supports v1 float16 and numeric v2 float16/float3
 schema, while the current public writer selects v2 for float32. This rollout can
 later move float16 creation to v2 without changing the collection API.
 
-Prefix-optimized physical layout, base-payload scrub checksums, UTF-8 IDs,
-catalog publication, and public CRUD remain later steps. Checked RowRef and
-partition types plus CRC32C WAL framing/recovery are implemented as internal
-foundation. The current Python prefix API reads full dense rows before copying
-the requested columns.
+Prefix-optimized physical layout, a standalone payload scrub, and UTF-8 IDs
+remain later steps. Numeric catalog publication, public CRUD, authoritative
+partition snapshots/runs, WAL materialization, selective folding, and selective
+segment cleaning are implemented by public format 7. The current Python prefix
+API still reads full dense rows before copying the requested columns.
 
 ## Incremental implementation order
 
@@ -295,6 +298,7 @@ the requested columns.
 5. Add prefix reads to the row-major planner and Python output validation.
 6. Implement catalog publication, mutation segments, partitioned RowRef lookup,
    selective cleaning, and numeric CRUD on the specified WAL foundation.
+   Implemented as public format 7.
 7. Add string staging, arena construction, collision-verified indexing, UTF-8
-   bindings, and string CRUD.
+   bindings, and string CRUD. Postponed until the numeric lifecycle is stable.
 8. Add explicit scrub/checksum tooling separately from the normal open path.

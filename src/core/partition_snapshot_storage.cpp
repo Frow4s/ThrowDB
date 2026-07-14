@@ -383,7 +383,8 @@ public:
         const Uuid128 schema_id,
         const std::uint32_t partition_bits,
         const std::uint64_t hash_seed,
-        PartitionSnapshotDescriptor expected_descriptor)
+        PartitionSnapshotDescriptor expected_descriptor,
+        const bool verify_structure)
         : descriptor_(std::move(expected_descriptor)),
           partition_bits_(partition_bits),
           hash_seed_(hash_seed) {
@@ -434,6 +435,9 @@ public:
             crc32c(bytes.subspan(kPartitionedHeaderSize))
                 == descriptor_.body_crc32c,
             "partition snapshot body checksum mismatch");
+        if (!verify_structure) {
+            return;
+        }
         const std::uint64_t controls_end =
             kPartitionedHeaderSize + descriptor_.capacity;
         validate_zero_range(controls_end, geometry_.lookup_offset);
@@ -592,10 +596,11 @@ PartitionSnapshotReader::PartitionSnapshotReader(
     const Uuid128 schema_id,
     const std::uint32_t partition_bits,
     const std::uint64_t hash_seed,
-    PartitionSnapshotDescriptor expected_descriptor)
+    PartitionSnapshotDescriptor expected_descriptor,
+    const bool verify_structure)
     : impl_(std::make_unique<Impl>(
           std::move(store_path), collection_id, schema_id, partition_bits,
-          hash_seed, std::move(expected_descriptor))) {}
+          hash_seed, std::move(expected_descriptor), verify_structure)) {}
 
 PartitionSnapshotReader::~PartitionSnapshotReader() = default;
 PartitionSnapshotReader::PartitionSnapshotReader(

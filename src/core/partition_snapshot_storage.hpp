@@ -60,7 +60,8 @@ public:
         Uuid128 schema_id,
         std::uint32_t partition_bits,
         std::uint64_t hash_seed,
-        PartitionSnapshotDescriptor expected_descriptor);
+        PartitionSnapshotDescriptor expected_descriptor,
+        bool verify_structure = true);
     ~PartitionSnapshotReader();
 
     PartitionSnapshotReader(const PartitionSnapshotReader&) = delete;

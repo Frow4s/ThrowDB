@@ -1,9 +1,9 @@
 # Native mutable numeric formats 3 through 6
 
-`Collection.create()` publishes a fresh numeric collection reported through
-the public API as format version 6. Version 4 added a CRC32C for the complete
-flat-index body in fields that were reserved and zero in version 3. Version 5
-added the required `CatalogV1` manifest feature, a checksummed `CURRENT`
+`Collection.create(..., format_version=6)` publishes the numeric layout
+described here and reports public format version 6. Version 4 added a CRC32C for
+the complete flat-index body in fields that were reserved and zero in version
+3. Version 5 added the required `CatalogV1` manifest feature, a checksummed `CURRENT`
 pointer, immutable catalog generations, and UUID-named active/frozen WALs.
 Version 6 additionally requires `DeltaV1`, uses catalog wire version 2, and may
 replace a frozen WAL prefix with checksummed immutable mutation-delta data and
@@ -17,9 +17,10 @@ The current reader opens all four versions. A checksum-free version-3 index
 falls back to the complete structural scan. Version 4 uses one fixed
 `wal/active.wal`. Version 5 is catalog/WAL-only: it supports rotation but
 `materialize_frozen_wals()` and `compact_deltas()` reject it because the
-manifest does not require DeltaV1. New builders write version 6. Readers that
-do not implement a required manifest feature reject formats 5/6 instead of
-silently opening an incomplete view.
+manifest does not require DeltaV1. Explicit format-6 builders write version 6.
+Readers that do not implement a required manifest feature reject formats 5/6
+instead of silently opening an incomplete view. Format 7 is a separate
+authoritative partitioned layout documented in `mutable-storage.md`.
 
 ## Layout
 
@@ -250,7 +251,7 @@ Publication deliberately uses two short metadata transactions:
    The in-memory view switches only after durable publication.
 5. Best-effort unlink the replaced WAL pathnames and sync `wal/`. An unlink
    failure does not roll back the published logical view; it leaves an orphan
-   that a future resource sweeper may remove.
+   that the explicit collector may remove.
 
 Both immutable files begin with a checksummed 4096-byte wire-version-1 header
 and redundantly bind the catalog descriptor, collection/schema UUIDs, exact
@@ -303,7 +304,7 @@ a total-I/O limit: source payload verification, rereading winning PUT rows, and
 replacement verification are separate physical reads. The input-entry limit
 bounds the version metadata admitted to one in-memory merge.
 
-## Current limits
+## Format-3-through-6 limits
 
 - Numeric IDs only (`uint64` on disk); the Python layer safely accepts
   `uint8/16/32/64`, non-negative `int8/16/32/64`, and Python integers.
@@ -315,10 +316,10 @@ bounds the version metadata admitted to one in-memory merge.
   safety rotation before the 32-bit per-WAL PUT-row limit. Format 6 can
   bounded-materialize a frozen prefix, compact a bounded oldest delta prefix,
   and reclaim unreachable mutation resources; format 5 cannot materialize.
-- Delta version metadata is still loaded into the RAM overlay. There is no
-  background lifecycle worker, standalone payload-scrub command, partitioned
-  authoritative index, or selective base compaction. Explicit `maintain()` and
-  orphan execute mode are available.
+- Delta version metadata is loaded into the RAM overlay. These formats have no
+  partitioned authoritative index or selective base compaction; format 7 adds
+  both. There is no background lifecycle worker or standalone payload-scrub
+  command. Explicit `maintain()` and orphan execute mode are available.
 - Materialization permits writes during its data build, but briefly pauses
   mutations for the initial segment-ID reservation and final catalog switch.
 - Only local POSIX publication/open-file/unlink semantics are supported;

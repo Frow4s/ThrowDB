@@ -26,8 +26,10 @@ add_library(throwdb_core STATIC
     src/core/native_format.cpp
     src/core/partition_snapshot_storage.cpp
     src/core/partitioned_index_format.cpp
+    src/core/partitioned_index_merge.cpp
     src/core/partitioned_index_run_storage.cpp
     src/core/partitioned_index_storage.cpp
+    src/core/partitioned_resource_inventory.cpp
     src/core/partitioned_segment_storage.cpp
     src/core/physical_reader.cpp
     src/core/read_scheduler.cpp
@@ -126,6 +128,18 @@ if(THROWDB_BUILD_TESTS)
         COMMAND throwdb_partition_snapshot_storage_tests)
 
     add_executable(
+        throwdb_partitioned_index_merge_tests
+        tests/partitioned_index_merge_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_index_merge_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_index_merge_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_index_merge_tests)
+    add_test(
+        NAME throwdb_partitioned_index_merge_tests
+        COMMAND throwdb_partitioned_index_merge_tests)
+
+    add_executable(
         throwdb_partitioned_index_storage_tests
         tests/partitioned_index_storage_tests.cpp)
     target_link_libraries(
@@ -138,6 +152,18 @@ if(THROWDB_BUILD_TESTS)
         COMMAND throwdb_partitioned_index_storage_tests)
 
     add_executable(
+        throwdb_partitioned_segment_cleaning_tests
+        tests/partitioned_segment_cleaning_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_segment_cleaning_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_segment_cleaning_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_segment_cleaning_tests)
+    add_test(
+        NAME throwdb_partitioned_segment_cleaning_tests
+        COMMAND throwdb_partitioned_segment_cleaning_tests)
+
+    add_executable(
         throwdb_partitioned_segment_storage_tests
         tests/partitioned_segment_storage_tests.cpp)
     target_link_libraries(
@@ -148,6 +174,18 @@ if(THROWDB_BUILD_TESTS)
     add_test(
         NAME throwdb_partitioned_segment_storage_tests
         COMMAND throwdb_partitioned_segment_storage_tests)
+
+    add_executable(
+        throwdb_partitioned_resource_inventory_tests
+        tests/partitioned_resource_inventory_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_resource_inventory_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_resource_inventory_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_resource_inventory_tests)
+    add_test(
+        NAME throwdb_partitioned_resource_inventory_tests
+        COMMAND throwdb_partitioned_resource_inventory_tests)
 
     add_executable(throwdb_mutation_wal_tests tests/mutation_wal_tests.cpp)
     target_link_libraries(throwdb_mutation_wal_tests PRIVATE throwdb::core)

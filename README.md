@@ -2,11 +2,14 @@
 
 ThrowDB is a local, disk-backed store for fixed-width embeddings. The native
 collection engine supports arbitrary numeric IDs, bit-exact `float16` or
-`float32` NumPy matrices, immutable base segments on local NVMe, a fast flat
-in-memory index, durable WAL-backed record CRUD, and immutable mutation-delta
-materialization without rewriting the base.
+`float32` NumPy matrices, immutable segments on local NVMe, durable WAL-backed
+record CRUD, and bounded mutation maintenance. Format 7 adds an authoritative
+partitioned `ID -> RowRef` index, immutable mutation runs, selective partition
+folding, and selective segment cleaning without periodically copying the whole
+collection.
 
-The fresh mutable format is documented in
+The authoritative format-7 lifecycle is documented in
+[`docs/mutable-storage.md`](docs/mutable-storage.md); formats 3 through 6 are in
 [`docs/native-format-v3.md`](docs/native-format-v3.md). The earlier immutable
 format-v1 contract is documented in
 [`docs/storage-format.md`](docs/storage-format.md). The target local collection
@@ -32,6 +35,11 @@ Installing directly from a source checkout builds the C++20 extension locally:
 ```bash
 python -m pip install .
 ```
+
+The optional C++ SDK is experimental and source-compatible within this MVP,
+not a stable binary ABI. Recompile C++ consumers against the exact installed
+ThrowDB headers/library after upgrading; pre-1.0 object files are not drop-in
+compatible across releases.
 
 ## Install for development
 
@@ -70,7 +78,9 @@ schema = throwdb.CollectionSchema(
     dimension=1024,
     dtype="float32",       # float16 is also supported
 )
-with throwdb.Collection.create("/data/example", schema=schema) as collection:
+with throwdb.Collection.create(
+    "/data/example", schema=schema, format_version=7
+) as collection:
     collection.add(ids, vectors)
 
 collection = throwdb.Collection.open("/data/example", tuning="auto")
@@ -87,7 +97,9 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     deleted = collection.delete([200, 999])  # [True, False]
     lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
     materialized = collection.materialize_frozen_wals()
-    compacted = collection.compact_deltas()   # bounded oldest-prefix merge
+    compacted = collection.compact_deltas()   # format 7: selective partition fold
+    cleaner_plan = collection.clean_segments(dry_run=True)
+    cleaned = collection.clean_segments(dry_run=False)
     orphan_plan = collection.collect_orphans(
         dry_run=True,
         min_age_seconds=3600,
@@ -103,19 +115,20 @@ without loading the base index. A previous plan is never accepted as deletion
 authorization. `collect_orphans(dry_run=False)` on an `r+` handle performs a
 fresh locked scan, applies hard file/byte budgets, revalidates every pathname
 without following symlinks, unlinks it, and syncs each affected directory.
-Superseded catalogs remain retained by policy.
+Format-7 superseded catalogs and interrupted segment-pair singletons converge
+through the same age, budget, and identity checks; format 6 keeps its historical
+catalog-retention policy.
 
-`Collection.create()` builds the checksummed native numeric format reported as
-`collection.format_version == 6` by default. Format 7 creation is an explicit
-opt-in through `Collection.create(..., format_version=7)`; the public boundary
-accepts only versions 6 and 7. Version 6 adds the required `DeltaV1`
-feature to the version-5 checksummed `CURRENT`, immutable catalogs, and
-UUID-named active/frozen WAL chain. It can replace a frozen WAL prefix with an
-immutable mutation-delta data/index pair. The reader also opens format 5 and
-legacy version-3/4 collections; format 5 remains catalog/WAL-only and rejects
-materialization. Version 3 uses a full structural index validation as its
-checksum-free fallback. UTF-8 IDs remain reserved for the next string index
-slice.
+`Collection.create()` builds format 7 when `format_version` is omitted. The
+public boundary accepts versions 6 and 7; `format_version=6` remains available
+for legacy compatibility. Version 6 retains a flat base index plus immutable
+DeltaV1 runs. Version 7 makes partition snapshots and their active immutable run
+sections authoritative, stores every immutable embedding segment with a
+reverse `{id, sequence}` sidecar, and supports selective segment replacement.
+The reader also opens format 5 and legacy version-3/4 collections; format 5
+remains catalog/WAL-only and rejects materialization. Version 3 uses a full
+structural index validation as its checksum-free fallback. UTF-8 IDs are
+explicitly postponed; the current product accepts numeric IDs only.
 Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
 `"auto"` never runs a calibration benchmark while opening. It selects the
@@ -175,29 +188,38 @@ Each target summary includes `profile_reuse_level`, so an opaque-overlay
 compatible result is distinguishable from an exact local identity.
 
 Normal format-6 open verifies the CRC32C persisted for the complete flat-index
-body and for every immutable delta-index body. It validates delta version and
-reverse-row metadata but deliberately does not rescan potentially large delta
-embedding payloads to recompute their CRC. Use
-`Collection.open(path, verify_index=True)` to additionally run the much more
-expensive base-index slot, `RowRef`, uniqueness, and probe-path audit. Per-phase
-durations and the selected validation path are available in
+body and every immutable delta index. Normal format-7 open verifies the
+catalog-selected partition snapshots and immutable run bodies, plus every
+segment header, descriptor, sidecar geometry, and payload size. Large embedding
+payloads are not rescanned solely to recompute their CRC during ordinary open.
+Use `Collection.open(path, verify_index=True)` to additionally run the much
+more expensive format-specific structural and embedding-payload audit. For
+format 6 this includes flat-index slots, `RowRef`s, uniqueness, and probe paths;
+format 7 verifies complete segment payload CRCs and authoritative snapshot
+structure. Per-phase durations and the selected validation path are available in
 `collection.open_stats` and are copied into load-test `report.json`.
 `throwdb inspect --storage /data/example` prints the same diagnostics as JSON;
-add `--verify-index` to run the full base-index structural audit. Delta payload
-scrubbing is a separate future operation and is not implied by this flag.
+add `--verify-index` for the full format-specific audit. A standalone scrub
+command and complete format-6 DeltaV1 payload scrubbing remain separate work.
 
 `collection.mutation_log_stats` reports the selected catalog generation,
-committed/materialized sequence, frozen-WAL count, delta-run count, and
-active/total WAL and delta bytes. Lifecycle results additionally report the
-selected/reclaimed resources and bytes. Calling `rotate_wal()` seals a non-empty
-active WAL and atomically publishes its successor. Calling
-`materialize_frozen_wals()` collapses the currently frozen WAL prefix into one
-immutable DeltaV1 run, atomically switches `CURRENT`, and then best-effort
-unlinks the replaced WAL pathnames. Calling `compact_deltas()` verifies and
-merges a bounded oldest contiguous DeltaV1 prefix while preserving original
-sequences and tombstones, then best-effort unlinks only the replaced delta
-pairs. None of these operations rewrites base embeddings. An empty frozen
-prefix or fewer than two eligible delta runs is a successful no-op.
+committed/indexed sequence, frozen-WAL count, immutable-run count, and
+active/total WAL, run, and segment bytes. Calling `rotate_wal()` seals a
+non-empty active WAL and atomically publishes its successor. On format 7,
+`materialize_frozen_wals()` collapses a bounded frozen-WAL prefix, streams its
+winning PUT rows into immutable segments, writes one partitioned mutation run,
+and atomically advances the indexed sequence. `compact_deltas()` then folds
+complete active run sections for selected partitions into new authoritative
+partition snapshots; it does not rewrite embedding payloads. Format 6 keeps
+the older DeltaV1 materialization and oldest-prefix merge semantics.
+
+`clean_segments()` is format-7-only. It scans a bounded number of immutable ID
+sidecars, chooses at most one segment whose garbage and reclaimable-byte
+thresholds are met, copies only rows still authoritative at the indexed
+sequence, and publishes replacement segments plus a cleaner run. Dry-run uses
+the same deterministic candidate policy without writing. Materialization,
+folding, and cleaning deliberately leave retired pathnames for the separately
+locked orphan collector; already-open readers keep their pinned old inodes.
 
 `Writer` and `Storage` remain the legacy immutable low-level API used by the
 existing benchmark suite. They require native, aligned, C-contiguous `uint64`
@@ -230,15 +252,17 @@ db = throwdb.Collection.open(
 )
 ```
 
-Multi-range requests from all simultaneous callers of one collection handle
-share the same executor and queue, so their aggregate I/O concurrency is
-bounded rather than multiplied per request. A zero queue capacity with positive workers selects
-`2 * workers`. Each executor task processes up to `io_ranges_per_task` physical
-ranges; grouping ranges reduces queue and wake-up overhead for page-cache hits.
-A request whose planner produces exactly one physical range uses a synchronous
-direct-read fast path. This also applies to concurrent callers: those one-range
-reads bypass the executor and queue and are not included in the global
-multi-range concurrency bound.
+All requests from simultaneous callers of one collection handle share one
+thread-pool coordinator when workers are enabled. It applies FIFO bounded
+admission and deficit round robin (DRR) between requests, while a global worker
+credit bound prevents callers from multiplying device concurrency. Each work
+unit contains at most `io_ranges_per_task` physical ranges, and its scheduling
+cost accounts for both range count and 4-KiB-rounded physical bytes. Small
+requests can therefore complete between units of a large request while the
+large request continues to make progress. A one-range request uses the same
+coordinator and fairness bound; the synchronous direct-read path exists only
+when the thread pool is disabled. A zero queue capacity with positive workers
+selects `2 * workers` queued tasks.
 
 An experimental Linux-only backend drives buffered reads through the raw
 io_uring kernel ABI and does not require `liburing`:
@@ -254,16 +278,14 @@ db = throwdb.Collection.open(
 )
 ```
 
-`io_uring_workers=1` preserves the original caller-driven, mutex-serialized
-ring. Two or more workers create independent dedicated ring-owner threads and
-partition every multi-range call across them. `io_uring_queue_depth` is the
-total backend depth, so two workers at depth 32 receive 16 entries each. The
-default remains one worker until the multi-ring experiment is benchmarked.
-Multi-ring admission allows at most `2 * io_uring_workers` synchronous batches
-inside the worker queues; additional callers apply FIFO ticket-based
-backpressure before enqueue, so a fast caller cannot repeatedly bypass waiters.
-Requests planned as one range retain the direct `pread` fast path. `io_workers`
-and `io_queue_capacity` must both be zero in io_uring mode.
+`io_uring_workers=1` uses one persistent caller-driven ring. Two or more workers
+create independent persistent ring lanes with one owner thread per lane.
+`io_uring_queue_depth` is the aggregate depth and is divided across lanes. The
+same DRR model schedules bounded range/byte work units between concurrent calls
+and owns the aggregate ring credits; FIFO ticket admission bounds the number of
+jobs waiting inside the coordinator. One-range requests also pass through this
+coordinator and its ring lane. `io_workers` and `io_queue_capacity` must both be
+zero in io_uring mode.
 
 Large inputs should be appended in batches; `finish()` writes the immutable
 hash index and publishes `manifest.bin` only after the shards and index are
@@ -308,7 +330,8 @@ production request.
 throwdb create \
   --storage /data/example \
   --ids ids.npy \
-  --embeddings embeddings.npy
+  --embeddings embeddings.npy \
+  --format-version 7
 
 throwdb get \
   --storage /data/example \
@@ -336,6 +359,14 @@ throwdb compact-deltas \
   --max-input-gib 8 \
   --max-input-entries 1000000
 
+throwdb clean-segments \
+  --storage /data/example \
+  --dry-run
+
+throwdb clean-segments \
+  --storage /data/example \
+  --execute
+
 throwdb collect-orphans \
   --storage /data/example \
   --dry-run \
@@ -354,14 +385,44 @@ throwdb maintain --storage /data/example --execute
 
 `collect-orphans` requires exactly one explicit mode. `--dry-run` is advisory;
 `--execute` always rescans under the writer and commit leases before deleting.
-It considers only old temporary publications, unreferenced WALs, and complete
-or partial unreferenced delta pairs. Reachable files, superseded catalogs
-retained by policy, symlinks, and unknown entries are never removed.
+It considers only old temporary publications and catalog-unreferenced mutable
+resources. For format 6 these are WALs and delta pairs; superseded catalogs stay
+retained. Format 7 additionally collects superseded catalogs, complete segment
+pairs, safe partial segment singletons left by interrupted cleanup, partition
+snapshots, and index runs. A half still named by CURRENT remains reachable and
+is never a candidate. Reachable files, symlinks, and unknown entries are never
+removed.
 
-`maintain` is an explicit one-pass policy, not a background thread. In fixed
-order it may rotate a large active WAL, materialize a bounded oldest frozen
-prefix, compact a bounded oldest delta prefix, and collect bounded orphans.
-Its wall-clock limit is cooperative and checked only between durable actions.
+`maintain` is an explicit one-pass policy, not a background thread. Format 7
+uses the fixed order rotate WAL, materialize a bounded frozen prefix, fold
+selected partitions, clean at most one segment, then collect bounded orphans.
+Format 6 omits the cleaner and keeps its oldest-prefix DeltaV1 merge. Its
+wall-clock limit is cooperative and checked only between durable actions.
+
+A practical local format-7 lifecycle is:
+
+```bash
+# One-time build from rebuildable NumPy sources.
+throwdb create --storage /nvme/catalog \
+  --ids ids.npy --embeddings embeddings.npy --format-version 7
+
+# Application processes use Collection.open(...), CRUD, and get/get_into.
+# Run maintenance explicitly from one operator process.
+throwdb maintain --storage /nvme/catalog --dry-run
+throwdb maintain --storage /nvme/catalog --execute
+
+# Inspect deferred reclamation independently when needed.
+throwdb collect-orphans --storage /nvme/catalog --dry-run
+```
+
+The stages solve different costs. WALs make small commits durable with little
+write amplification but add recovery/overlay work. Materialization bounds WAL
+replay and writes only winning changed rows. Partition folding reduces lookup
+layers but writes only index state. Cleaning is the payload-expensive stage: it
+reads one candidate and copies its still-live rows, so conservative garbage and
+reclaimable-byte thresholds avoid churn. Orphan age and byte/file budgets mean
+disk space is intentionally reclaimed after logical publication, not as part of
+its critical section.
 
 `ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
 dtype whose values are all non-negative. `embeddings.npy` must use `float16` or
@@ -400,20 +461,22 @@ can interrupt cleanup.
 - crash-safe manual WAL rotation through immutable catalogs; automatic
   rotation is currently only the hard safety valve before a WAL would exceed
   the 32-bit `RowRef` row limit;
-- manual frozen-WAL-prefix materialization into immutable DeltaV1 `.dat/.idx`
-  pairs. The build permits concurrent writes, pauses them for the two short
-  catalog publications, preserves newer/active WAL precedence, and never
-  rewrites the immutable base;
-- manual bounded oldest-prefix DeltaV1 compaction with source-payload
-  verification, newest-version collapse, tombstone preservation, atomic
-  publication, and best-effort source reclamation;
+- format-7 frozen-WAL-prefix materialization into immutable embedding segments
+  and a partitioned mutation run, with concurrent commits outside the two short
+  catalog publications;
+- bounded selective folding of complete active run sections into authoritative
+  partition snapshots, without rewriting embedding segments;
+- bounded format-7 cleaning of at most one high-garbage segment per call,
+  publishing replacement segments and an index fence while preserving old
+  reader views;
 - public lightweight orphan inspection, fail-closed bounded orphan deletion,
   bounded frozen-WAL materialization, and explicit deterministic `maintain()`;
-- no base compaction/selective cleaning, UTF-8 IDs, delta payload scrub command,
-  or network service yet. Delta version metadata is still loaded into the RAM
-  overlay on open. The lifecycle currently relies on local POSIX rename,
+- fair DRR scheduling and one shared I/O budget for mixed-size concurrent reads
+  whenever the thread-pool or io_uring parallel coordinator is enabled;
+- no UTF-8 IDs, payload scrub command, direct prefix-only physical layout, or
+  network service yet. The lifecycle currently relies on local POSIX rename,
   `fsync`, open-file, and unlink semantics; network filesystems are outside
-  this contract.
+  this durability contract.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and

@@ -1,9 +1,9 @@
-"""Black-box smoke test for an installed ThrowDB wheel.
+"""Black-box smoke test for an installed ThrowDB distribution.
 
 This file deliberately imports only the installed package and public API. It is
-used by cibuildwheel from an isolated test environment, so a passing run proves
-that the extension, Python wrapper, CLI entry point, and mutable format were all
-packaged together correctly.
+used by cibuildwheel and the isolated sdist test environment, so a passing run
+proves that the extension, Python wrapper, CLI entry point, and format-7
+mutation lifecycle were all packaged together correctly.
 """
 
 from __future__ import annotations
@@ -17,6 +17,15 @@ from pathlib import Path
 import numpy as np
 
 import throwdb
+
+
+def _assert_rows(store: Path, expected: np.ndarray) -> None:
+    with throwdb.Collection.open(store, verify_index=True) as reader:
+        np.testing.assert_array_equal(reader.get([2, 3, 4]), expected)
+        np.testing.assert_array_equal(
+            reader.get([4, 2], prefix_dimensions=3),
+            expected[[2, 0], :3],
+        )
 
 
 def main() -> None:
@@ -34,6 +43,8 @@ def main() -> None:
             ),
             shard_size_bytes=1 << 20,
         ) as builder:
+            if builder.format_version != 7:
+                raise AssertionError("installed package default is not format 7")
             builder.add(ids, embeddings)
 
         with throwdb.Collection.open(store) as reader:
@@ -44,21 +55,68 @@ def main() -> None:
             )
 
         replacement = np.full((1, 8), 7, dtype=np.float16)
+        inserted = np.full((1, 8), 9, dtype=np.float16)
+        expected = np.concatenate(
+            [replacement, embeddings[[2]], inserted],
+            axis=0,
+        )
         with throwdb.Collection.open(store, mode="r+") as writer:
+            if writer.format_version != 7:
+                raise AssertionError("installed package did not create format 7")
             writer.update(np.array([2], dtype=np.int32), replacement)
-            writer.insert([4], np.full((1, 8), 9, dtype=np.float16))
+            writer.insert([4], inserted)
             deleted = writer.delete([1, 999])
             np.testing.assert_array_equal(
                 deleted,
                 np.array([True, False], dtype=np.bool_),
             )
-
-        with throwdb.Collection.open(store) as reader:
-            np.testing.assert_array_equal(reader.get([2]), replacement)
-            np.testing.assert_array_equal(
-                reader.get([4]),
-                np.full((1, 8), 9, dtype=np.float16),
+            rotated = writer.rotate_wal()
+            if not rotated["rotated"]:
+                raise AssertionError("format-7 WAL did not rotate")
+            materialized = writer.materialize_frozen_wals(
+                max_wals=8,
+                max_input_bytes=8 << 20,
             )
+            if not materialized["materialized"]:
+                raise AssertionError("format-7 WAL did not materialize")
+            folded = writer.compact_deltas(
+                max_runs=8,
+                max_input_bytes=8 << 20,
+                max_input_entries=64,
+            )
+            if not folded["compacted"] or folded["delta_run_count"] != 0:
+                raise AssertionError("format-7 partitions did not fold")
+
+            cleaner_options = {
+                "max_candidate_segments": 8,
+                "max_sidecar_scan_bytes": 8 << 20,
+                "max_source_bytes": 8 << 20,
+                "max_output_bytes": 8 << 20,
+                "max_memory_bytes": 16 << 20,
+                "min_garbage_rows": 1,
+                "min_reclaimable_bytes": 0,
+                "min_garbage_ratio_ppm": 0,
+                "start_after_segment_id": 0,
+            }
+            clean_plan = writer.clean_segments(
+                dry_run=True,
+                **cleaner_options,
+            )
+            if not clean_plan["candidate_found"] or clean_plan["cleaned"]:
+                raise AssertionError("format-7 cleaner returned an invalid plan")
+            cleaned = writer.clean_segments(
+                dry_run=False,
+                **cleaner_options,
+            )
+            if (
+                not cleaned["candidate_found"]
+                or not cleaned["cleaned"]
+                or cleaned["candidate_segment_id"]
+                != clean_plan["candidate_segment_id"]
+            ):
+                raise AssertionError("format-7 cleaner did not execute its plan")
+
+        _assert_rows(store, expected)
 
         orphan_report = throwdb.Collection.inspect_orphans(
             store,
@@ -66,6 +124,41 @@ def main() -> None:
         )
         if orphan_report["format"] != "throwdb-orphan-collection-plan":
             raise AssertionError("installed wheel returned an invalid orphan plan")
+        if orphan_report["eligible_file_count"] == 0:
+            raise AssertionError("format-7 lifecycle produced no collectible files")
+
+        with throwdb.Collection.open(store, mode="r+", verify_index=True) as writer:
+            maintenance = writer.maintain(
+                dry_run=False,
+                max_seconds=30,
+                max_actions=5,
+                rotate_wal_bytes=1,
+                materialize_max_wals=8,
+                materialize_max_input_bytes=8 << 20,
+                compact_max_input_bytes=8 << 20,
+                compact_max_input_entries=64,
+                orphan_min_age_seconds=0,
+                orphan_max_files=1024,
+                orphan_max_bytes=64 << 20,
+            )
+        if maintenance["format"] != "throwdb-maintenance-report":
+            raise AssertionError("installed package returned invalid maintenance")
+        compact_action = next(
+            action
+            for action in maintenance["actions"]
+            if action["name"] == "compact_deltas"
+        )
+        if not compact_action["attempted"] or not compact_action["performed"]:
+            raise AssertionError("maintenance did not fold the Cleaner run")
+        orphan_action = next(
+            action
+            for action in maintenance["actions"]
+            if action["name"] == "collect_orphans"
+        )
+        if not orphan_action["attempted"] or not orphan_action["performed"]:
+            raise AssertionError("maintenance did not collect lifecycle orphans")
+
+        _assert_rows(store, expected)
 
         executable = shutil.which("throwdb")
         if executable is None:

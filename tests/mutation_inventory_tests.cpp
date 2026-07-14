@@ -154,6 +154,7 @@ void build_store(const std::filesystem::path& store) {
     const std::array<std::uint64_t, 2> ids{1, 2};
     const std::vector<std::byte> embeddings = rows(2, record_size, 3);
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 1ULL << 20;
@@ -629,6 +630,8 @@ void require_public_inventories_equal(
                       context + ": path changed");
         require_equal(left.classification, right.classification,
                       context + ": classification changed");
+        require_equal(left.candidate, right.candidate,
+                      context + ": candidate policy changed");
         require_equal(left.bytes, right.bytes,
                       context + ": byte count changed");
         require_equal(left.modified_unix_ns, right.modified_unix_ns,
@@ -650,6 +653,11 @@ void test_public_inventory_is_lightweight_stable_and_writable_only() {
     const auto orphan_path =
         throwdb::detail::mutation_wal_path(store, orphan_id);
     write_sized_file(orphan_path, 71, 'o');
+    const Uuid128 historical_id{0x8877665544332211ULL,
+                                0x00ffeeddccbbaa99ULL};
+    const auto historical_path =
+        throwdb::detail::mutation_catalog_path(store, historical_id);
+    write_sized_file(historical_path, 73, 'h');
 
     // Static inventory must not load or validate the potentially huge flat
     // base index. Temporarily hiding it makes an accidental index read fail.
@@ -680,10 +688,20 @@ void test_public_inventory_is_lightweight_stable_and_writable_only() {
     require_equal(orphan.classification,
                   throwdb::NativeOrphanClass::UnreferencedWal,
                   "public inventory maps orphan WAL class incorrectly");
+    require(orphan.candidate,
+            "public inventory did not mark a format-6 orphan WAL as a "
+            "candidate");
     require_equal(orphan.bytes, std::uint64_t{71},
                   "public inventory reports the wrong orphan size");
     require(orphan.modified_unix_ns > 0,
             "public inventory did not expose the lstat modification time");
+    const auto& historical = public_entry_for(
+        lightweight, relative_path(store, historical_path));
+    require_equal(historical.classification,
+                  throwdb::NativeOrphanClass::SupersededCatalog,
+                  "public inventory maps superseded catalog incorrectly");
+    require(!historical.candidate,
+            "format-6 superseded catalog unexpectedly became a candidate");
 
     {
         auto reader = throwdb::NativeCollection::open(store);
@@ -718,6 +736,7 @@ void test_lightweight_inventory_excludes_builder_and_ignores_format5_deltas() {
     TempDirectory temporary;
     const auto building_store = temporary.path() / "building-store";
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 4;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 1ULL << 20;

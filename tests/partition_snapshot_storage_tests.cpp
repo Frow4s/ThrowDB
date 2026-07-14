@@ -218,11 +218,12 @@ void reseal_raw_header(const std::span<std::byte> header) {
 
 [[nodiscard]] PartitionSnapshotReader open_fixture(
     const std::filesystem::path& root,
-    const PartitionSnapshotDescriptor& descriptor) {
+    const PartitionSnapshotDescriptor& descriptor,
+    const bool verify_structure = true) {
     const PartitionSnapshotBuildSpec spec = build_spec(descriptor.snapshot_id);
     return PartitionSnapshotReader(
         root, spec.collection_id, spec.schema_id, spec.partition_bits,
-        spec.hash_seed, descriptor);
+        spec.hash_seed, descriptor, verify_structure);
 }
 
 [[nodiscard]] std::vector<std::uint64_t> occupied_slots(
@@ -416,8 +417,35 @@ void test_checksum_header_padding_and_size_corruption() {
         bytes[kPartitionedHeaderSize] ^= std::byte{0x80};
         write_file(path, bytes);
         require_throws<throwdb::CorruptionError>(
-            [&] { static_cast<void>(open_fixture(temporary.path(), descriptor)); },
+            [&] {
+                static_cast<void>(
+                    open_fixture(temporary.path(), descriptor, false));
+            },
             "snapshot body checksum damage was accepted");
+    }
+    {
+        TempDirectory temporary;
+        PartitionSnapshotDescriptor descriptor =
+            build_fixture(temporary.path());
+        const auto path = partitioned_partition_snapshot_path(
+            temporary.path(), descriptor);
+        std::vector<std::byte> bytes = read_file(path);
+        for (std::uint64_t slot = 0; slot != descriptor.capacity; ++slot) {
+            bytes[static_cast<std::size_t>(
+                kPartitionedHeaderSize + slot)] = std::byte{1};
+        }
+        write_file(path, bytes);
+        reseal_body(path, descriptor);
+        PartitionSnapshotReader fast =
+            open_fixture(temporary.path(), descriptor, false);
+        require(
+            fast.lookup(fixture_records().front().id).has_value(),
+            "fast snapshot open cannot serve a valid lookup");
+        require_throws<throwdb::CorruptionError>(
+            [&] {
+                static_cast<void>(fast.lookup(id_for(kPartition, 1000)));
+            },
+            "fast snapshot lookup did not bound a corrupt full probe cycle");
     }
     {
         TempDirectory temporary;

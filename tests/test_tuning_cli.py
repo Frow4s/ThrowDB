@@ -7,23 +7,23 @@ from pathlib import Path
 import pytest
 
 from throwdb.cli import _build_parser, _reader_tuning, main
+from throwdb.collection import Collection
 
 
-def test_create_cli_defaults_to_format6_and_accepts_format7_opt_in() -> None:
+def test_create_cli_defaults_to_format7_and_accepts_explicit_format6() -> None:
     parser = _build_parser()
     required = [
         "--storage", "/tmp/store", "--ids", "/tmp/ids.npy",
         "--embeddings", "/tmp/embeddings.npy",
     ]
-    assert parser.parse_args(["create", *required]).format_version == 6
+    assert parser.parse_args(["create", *required]).format_version == 7
     assert parser.parse_args(
-        ["create", *required, "--format-version", "7"]
-    ).format_version == 7
+        ["create", *required, "--format-version", "6"]
+    ).format_version == 6
     with pytest.raises(SystemExit):
         parser.parse_args(
             ["create", *required, "--format-version", "5"]
         )
-from throwdb.collection import Collection
 
 
 def test_reader_cli_defaults_to_auto_instead_of_manual_defaults() -> None:
@@ -170,9 +170,23 @@ def test_compact_deltas_command_has_bounded_defaults_and_forwards_limits(
     defaults = _build_parser().parse_args(
         ["compact-deltas", "--storage", "/tmp/store"]
     )
-    assert defaults.max_runs == 8
+    assert defaults.max_runs is None
     assert defaults.max_input_gib == 8
     assert defaults.max_input_entries == 1_000_000
+    assert _build_parser().parse_args(
+        [
+            "compact-deltas", "--storage", "/tmp/store",
+            "--max-runs", "4096",
+        ]
+    ).max_runs == 4096
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "compact-deltas", "--storage", "/tmp/store",
+                "--max-runs", "4097",
+            ]
+        )
+    capsys.readouterr()
 
     observed: dict[str, object] = {}
     report = {
@@ -349,6 +363,28 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
     with pytest.raises(SystemExit):
         parser.parse_args(["maintain", "--storage", "/tmp/store"])
     capsys.readouterr()
+    defaults = parser.parse_args(
+        ["maintain", "--storage", "/tmp/store", "--dry-run"]
+    )
+    assert defaults.max_actions == 5
+    assert defaults.compact_min_runs is None
+    assert defaults.compact_max_runs is None
+    limits = parser.parse_args(
+        [
+            "maintain", "--storage", "/tmp/store", "--dry-run",
+            "--compact-min-runs", "1", "--compact-max-runs", "4096",
+        ]
+    )
+    assert limits.compact_min_runs == 1
+    assert limits.compact_max_runs == 4096
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "maintain", "--storage", "/tmp/store", "--dry-run",
+                "--compact-max-runs", "4097",
+            ]
+        )
+    capsys.readouterr()
     report = {"format": "throwdb-maintenance-report", "version": 1}
     observed: dict[str, object] = {}
 
@@ -382,6 +418,15 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
             "--compact-min-runs", "4", "--compact-max-runs", "5",
             "--compact-max-input-bytes", "30",
             "--compact-max-input-entries", "40",
+            "--clean-max-candidate-segments", "9",
+            "--clean-max-sidecar-scan-bytes", "60",
+            "--clean-max-source-bytes", "70",
+            "--clean-max-output-bytes", "80",
+            "--clean-max-memory-bytes", "90",
+            "--clean-min-garbage-rows", "2",
+            "--clean-min-reclaimable-bytes", "100",
+            "--clean-min-garbage-ratio-ppm", "200000",
+            "--clean-start-after-segment-id", "11",
             "--orphan-min-age-seconds", "6",
             "--orphan-max-files", "7", "--orphan-max-bytes", "50",
         ]
@@ -399,6 +444,15 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
         "compact_max_runs": 5,
         "compact_max_input_bytes": 30,
         "compact_max_input_entries": 40,
+        "clean_max_candidate_segments": 9,
+        "clean_max_sidecar_scan_bytes": 60,
+        "clean_max_source_bytes": 70,
+        "clean_max_output_bytes": 80,
+        "clean_max_memory_bytes": 90,
+        "clean_min_garbage_rows": 2,
+        "clean_min_reclaimable_bytes": 100,
+        "clean_min_garbage_ratio_ppm": 200_000,
+        "clean_start_after_segment_id": 11,
         "orphan_min_age_seconds": 6.0,
         "orphan_max_files": 7,
         "orphan_max_bytes": 50,

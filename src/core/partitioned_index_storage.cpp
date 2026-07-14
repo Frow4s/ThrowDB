@@ -3,7 +3,12 @@
 #include "crc32c.hpp"
 #include "file_lock.hpp"
 #include "mutation_wal.hpp"
+#include "native_collection_test_hooks.hpp"
+#include "partition_snapshot_storage.hpp"
 #include "partitioned_index_format.hpp"
+#include "partitioned_index_merge.hpp"
+#include "partitioned_index_run_storage.hpp"
+#include "partitioned_segment_storage.hpp"
 #include "wal_file.hpp"
 
 #include <algorithm>
@@ -36,6 +41,18 @@ namespace {
 constexpr std::array<char, 8> kPartitionedManifestDiscriminator{
     'T', 'D', 'B', 'N', 'M', 'N', 'F', '2'};
 constexpr std::size_t kChecksumBufferBytes = 1U << 20;
+constexpr std::uint64_t kCleanerReadBatchBytes = 8ULL << 20;
+constexpr std::uint64_t kCleanerRatioScale = 1'000'000;
+// Covers two candidate plans during deterministic comparison and the later
+// plan + run writer sort peak, including conservative allocator headroom.
+constexpr std::uint64_t kCleanerEstimatedBytesPerRow = 128;
+// The run writer holds a decoded TOC and its serialized form at the same
+// time, while descriptor/header construction and the reopened reader add
+// bitmap and TOC scratch.  Charging 64 bytes per partition is deliberately
+// above those simultaneous allocations (two 16-byte TOCs plus bitmaps), and
+// the fixed allowance covers vector/control-object allocator overhead.
+constexpr std::uint64_t kCleanerEstimatedBytesPerPartition = 64;
+constexpr std::uint64_t kCleanerFixedMemoryOverhead = 64ULL << 10;
 using SteadyClock = std::chrono::steady_clock;
 
 [[nodiscard]] double elapsed_seconds(
@@ -284,7 +301,9 @@ void write_atomic(
 void publish_partitioned_catalog(
     const std::filesystem::path& root,
     const PartitionedManifestV2& manifest,
-    const PartitionedCatalogV3& catalog) {
+    const PartitionedCatalogV3& catalog,
+    const NativeCollectionTestOperation operation =
+        NativeCollectionTestOperation::None) {
     const std::vector<std::byte> bytes =
         encode_partitioned_catalog_v3(catalog);
     const std::filesystem::path destination =
@@ -292,6 +311,12 @@ void publish_partitioned_catalog(
     write_atomic(
         root, destination.string() + ".tmp", destination, bytes,
         "partitioned catalog");
+    invoke_native_collection_test_hook({
+        NativeCollectionTestHookPoint::MutationCatalogDurableBeforeCurrent,
+        operation,
+        NativeCollectionTestResourceKind::None,
+        catalog.generation,
+        0});
 
     PartitionedCurrentV1 current;
     current.collection_id = manifest.collection_id;
@@ -305,6 +330,12 @@ void publish_partitioned_catalog(
         root,
         root / ("CURRENT." + uuid_token(catalog.catalog_id) + ".tmp"),
         partitioned_current_path(root), encoded, "partitioned CURRENT");
+    invoke_native_collection_test_hook({
+        NativeCollectionTestHookPoint::MutationCurrentDurable,
+        operation,
+        NativeCollectionTestResourceKind::None,
+        catalog.generation,
+        0});
 }
 
 void validate_embedding_batch(
@@ -352,6 +383,16 @@ void validate_distinct_ids(const std::span<const std::uint64_t> ids) {
     const std::uint64_t hash,
     const std::uint32_t partition_bits) noexcept {
     return partition_bits == 0 ? 0 : hash >> (64 - partition_bits);
+}
+
+[[nodiscard]] bool partition_bitmap_contains(
+    const std::span<const std::byte> bitmap,
+    const std::uint32_t partition) noexcept {
+    const std::size_t byte = partition / 8;
+    const std::uint8_t mask = static_cast<std::uint8_t>(
+        std::uint32_t{1} << (partition % 8));
+    return byte < bitmap.size()
+           && (std::to_integer<std::uint8_t>(bitmap[byte]) & mask) != 0;
 }
 
 [[nodiscard]] std::uint64_t choose_capacity(const std::uint64_t count) {
@@ -720,6 +761,7 @@ private:
                  std::filesystem::path("segments"),
                  std::filesystem::path("index"),
                  std::filesystem::path("index/partitions"),
+                 std::filesystem::path("index/runs"),
                  std::filesystem::path("wal"),
                  std::filesystem::path("catalogs"),
                  std::filesystem::path("locks")}) {
@@ -995,19 +1037,24 @@ public:
             writer_lock_.lock(FileLockMode::Exclusive, true);
         }
         for (const char* child : {
-                 "segments", "index", "index/partitions", "wal", "catalogs",
-                 "locks"}) {
+                 "segments", "index", "index/partitions", "index/runs",
+                 "wal", "catalogs", "locks"}) {
             require_regular_directory(root_ / child);
         }
 
         commit_lock_ = AdvisoryLockFile::open_existing(
             commit_lock_path(root_), writable_);
-        view_lock_ = AdvisoryLockFile::open_existing(view_lock_path(root_), false);
+        // Writable handles later take view.lock exclusively while unlinking
+        // orphaned immutable resources; keep that portable by opening the
+        // lock inode read-write just like commit.lock.
+        view_lock_ = AdvisoryLockFile::open_existing(
+            view_lock_path(root_), writable_);
         commit_lock_.lock(
             writable_ ? FileLockMode::Exclusive : FileLockMode::Shared);
         try {
             view_lock_.lock(FileLockMode::Shared);
             open_catalog();
+            resources_ = std::make_shared<ResourceSet>();
 
             phase_started = SteadyClock::now();
             // view.lock protects pathnames only while immutable inodes are
@@ -1017,6 +1064,7 @@ public:
             // publication locks.
             pin_segments(options.verify_native_index);
             pin_snapshots();
+            pin_runs();
             open_and_replay_wals();
             view_lock_.unlock();
             commit_lock_.unlock();
@@ -1085,45 +1133,42 @@ public:
         }
         std::vector<PhysicalReadRequest> requests;
         requests.reserve(ids.size());
-        std::shared_ptr<WalResourceSet> wal_pin;
-        const bool zero_delta_fast_path =
-            !mutation_read_path_active_.load(std::memory_order_acquire);
-        if constexpr (Profiled) {
-            stats->zero_delta_fast_path = zero_delta_fast_path;
-        }
-        if (zero_delta_fast_path) {
-            for (std::size_t output_index = 0;
-                 output_index != ids.size(); ++output_index) {
-                const std::optional<RowRef> row =
-                    snapshot_lookup(ids[output_index]);
-                if (!row.has_value()) {
-                    throw MissingIdError(ids[output_index]);
-                }
-                requests.push_back(resolve_base(
-                    *row, static_cast<std::uint64_t>(output_index)));
-            }
-            if constexpr (Profiled) {
-                stats->base_rows = ids.size();
-            }
-        } else {
+        std::shared_ptr<ResourceSet> resource_pin;
+        {
             std::shared_lock state(state_mutex_);
-            wal_pin = wal_resources_;
+            resource_pin = resources_;
+            const bool zero_delta_fast_path =
+                resource_pin->runs.empty()
+                && !mutation_read_path_active_.load(
+                    std::memory_order_relaxed);
+            if constexpr (Profiled) {
+                stats->zero_delta_fast_path = zero_delta_fast_path;
+            }
             for (std::size_t output_index = 0;
                  output_index != ids.size(); ++output_index) {
-                const std::optional<RowRef> row =
-                    logical_lookup_unlocked(ids[output_index]);
+                const std::optional<RowRef> row = zero_delta_fast_path
+                    ? [&]() -> std::optional<RowRef> {
+                          const std::optional<IndexedVersion> indexed =
+                              snapshot_version(
+                                  ids[output_index], *resource_pin);
+                          return indexed.has_value()
+                                     ? indexed->row_ref()
+                                     : std::nullopt;
+                      }()
+                    : logical_lookup_unlocked(
+                          ids[output_index], *resource_pin);
                 if (!row.has_value()) {
                     throw MissingIdError(ids[output_index]);
                 }
                 const bool mutation =
-                    wal_pin->source_indices.contains(
+                    !resource_pin->initial_segment_indices.contains(
                         row->segment_id().value());
                 if constexpr (Profiled) {
                     mutation ? ++stats->mutation_rows : ++stats->base_rows;
                 }
                 requests.push_back(resolve_unlocked(
                     *row, static_cast<std::uint64_t>(output_index),
-                    *wal_pin));
+                    *resource_pin));
             }
         }
         if constexpr (Profiled) {
@@ -1155,56 +1200,81 @@ public:
             throw InvalidArgumentError("requested sample does not fit memory");
         }
         result.ids.reserve(static_cast<std::size_t>(requested));
-        const bool mutation_path =
-            mutation_read_path_active_.load(std::memory_order_acquire);
-        std::shared_lock state(state_mutex_, std::defer_lock);
-        if (mutation_path) {
-            state.lock();
-        }
+        std::shared_lock state(state_mutex_);
+        const std::shared_ptr<ResourceSet> resource_pin = resources_;
         std::vector<std::pair<std::uint64_t, const VersionedMutationValue*>>
             overlay_entries;
-        std::unordered_set<std::uint64_t> shadowed;
-        if (mutation_path) {
-            overlay_entries.reserve(overlay_.size());
-            shadowed.reserve(overlay_.size());
-            for (const auto& [id, value] : overlay_) {
-                if (!value.has_value()) {
-                    continue;
-                }
+        overlay_entries.reserve(overlay_.size());
+        for (const auto& [id, value] : overlay_) {
+            if (value.has_value()) {
                 overlay_entries.emplace_back(id, &*value);
-                shadowed.insert(id);
-            }
-            std::sort(
-                overlay_entries.begin(), overlay_entries.end(),
-                [seed](const auto& left, const auto& right) {
-                    const std::uint64_t left_hash = hash_id(left.first, seed);
-                    const std::uint64_t right_hash = hash_id(right.first, seed);
-                    return left_hash != right_hash
-                               ? left_hash < right_hash
-                               : left.first < right.first;
-                });
-            for (const auto& [id, value] : overlay_entries) {
-                if (result.inspected_slots == max_inspected_slots
-                    || result.ids.size() == requested) {
-                    break;
-                }
-                ++result.inspected_slots;
-                if (value->is_put()) {
-                    result.ids.push_back(id);
-                }
-            }
-            if (result.ids.size() == requested) {
-                result.complete = true;
-                return result;
             }
         }
-        const std::size_t partitions = snapshots_.size();
+        std::sort(
+            overlay_entries.begin(), overlay_entries.end(),
+            [seed](const auto& left, const auto& right) {
+                const std::uint64_t left_hash = hash_id(left.first, seed);
+                const std::uint64_t right_hash = hash_id(right.first, seed);
+                return left_hash != right_hash ? left_hash < right_hash
+                                               : left.first < right.first;
+            });
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(std::min<std::size_t>(
+            static_cast<std::size_t>(requested),
+            overlay_entries.size() + catalog_.runs.size()
+                + catalog_.snapshots.size()));
+        const auto inspect_id = [&](const std::uint64_t id) {
+            ++result.inspected_slots;
+            if (!seen.insert(id).second) {
+                return;
+            }
+            if (logical_lookup_unlocked(id, *resource_pin).has_value()) {
+                result.ids.push_back(id);
+            }
+        };
+        for (const auto& [id, value] : overlay_entries) {
+            static_cast<void>(value);
+            if (result.inspected_slots == max_inspected_slots
+                || result.ids.size() == requested) {
+                break;
+            }
+            inspect_id(id);
+        }
+        for (auto run = resource_pin->runs.rbegin();
+             run != resource_pin->runs.rend()
+             && result.inspected_slots != max_inspected_slots
+             && result.ids.size() != requested;
+             ++run) {
+            for (std::uint32_t partition = 0;
+                 partition != manifest_.partition_count
+                 && result.inspected_slots != max_inspected_slots
+                 && result.ids.size() != requested;
+                 ++partition) {
+                if (!partition_bitmap_contains(
+                        run->catalog.active_partitions, partition)) {
+                    continue;
+                }
+                const PartitionRunTocEntry section =
+                    run->file->partition_records(partition);
+                for (std::uint64_t offset = 0;
+                     offset != section.record_count
+                     && result.inspected_slots != max_inspected_slots
+                     && result.ids.size() != requested;
+                     ++offset) {
+                    inspect_id(run->file
+                                   ->record_at(
+                                       section.first_record + offset)
+                                   .id);
+                }
+            }
+        }
+        const std::size_t partitions = resource_pin->snapshots.size();
         std::vector<std::uint64_t> inspected(partitions, 0);
         std::vector<std::uint64_t> starts(partitions, 0);
         std::uint64_t total_capacity = 0;
         for (std::size_t index = 0; index != partitions; ++index) {
             const std::uint64_t capacity =
-                snapshots_[index].header.descriptor.capacity;
+                resource_pin->snapshots[index]->header.descriptor.capacity;
             total_capacity = checked_sum(
                 total_capacity, capacity, "partition sample capacity");
             starts[index] = hash_id(
@@ -1219,21 +1289,20 @@ public:
         while (base_inspected != limit
                && result.ids.size() != requested) {
             while (inspected[partition]
-                   == snapshots_[partition].header.descriptor.capacity) {
+                   == resource_pin->snapshots[partition]
+                          ->header.descriptor.capacity) {
                 partition = (partition + 1) % partitions;
             }
-            const Snapshot& snapshot = snapshots_[partition];
+            const Snapshot& snapshot = *resource_pin->snapshots[partition];
             const std::uint64_t slot =
                 (starts[partition] + inspected[partition])
                 & (snapshot.header.descriptor.capacity - 1);
             ++inspected[partition];
             ++base_inspected;
-            ++result.inspected_slots;
             if (control(snapshot, slot) == 1) {
-                const std::uint64_t id = slot_id(snapshot, slot);
-                if (!mutation_path || !shadowed.contains(id)) {
-                    result.ids.push_back(id);
-                }
+                inspect_id(slot_id(snapshot, slot));
+            } else {
+                ++result.inspected_slots;
             }
             partition = (partition + 1) % partitions;
         }
@@ -1259,7 +1328,8 @@ public:
         {
             std::unique_lock state(state_mutex_);
             for (const std::uint64_t id : ids) {
-                const bool exists = logical_lookup_unlocked(id).has_value();
+                const bool exists =
+                    logical_lookup_unlocked(id, *resources_).has_value();
                 if (mode == PartitionedPutMode::Insert && exists) {
                     throw ExistingIdError(id);
                 }
@@ -1323,7 +1393,8 @@ public:
         {
             std::unique_lock state(state_mutex_);
             for (std::size_t index = 0; index != ids.size(); ++index) {
-                if (!logical_lookup_unlocked(ids[index]).has_value()) {
+                if (!logical_lookup_unlocked(ids[index], *resources_)
+                         .has_value()) {
                     continue;
                 }
                 deleted[index] = 1;
@@ -1353,11 +1424,1482 @@ public:
         return mutation_log_stats_locked(false);
     }
 
+    [[nodiscard]] PartitionedResourceInventory collect_orphans() {
+        ensure_mutable();
+        std::unique_lock lifecycle(lifecycle_mutex_);
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        ScopedAdvisoryLock commit(
+            commit_lock_, FileLockMode::Exclusive);
+        ScopedAdvisoryLock view(
+            view_lock_, FileLockMode::Exclusive);
+        PartitionedResourceInventory inventory =
+            inspect_partitioned_resources(root_);
+        if (inventory.current_generation != catalog_.generation
+            || inventory.current_catalog_id != catalog_.catalog_id) {
+            throw StorageError(
+                "format-7 orphan inventory CURRENT differs from the open "
+                "writer snapshot; reopen the collection");
+        }
+        return inventory;
+    }
+
+    [[nodiscard]] PartitionedOrphanCollectionResult reclaim_orphans(
+        const PartitionedOrphanCollectionOptions options) {
+        ensure_mutable();
+        std::unique_lock lifecycle(lifecycle_mutex_);
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        ScopedAdvisoryLock commit(
+            commit_lock_, FileLockMode::Exclusive);
+        ScopedAdvisoryLock view(
+            view_lock_, FileLockMode::Exclusive);
+        return collect_partitioned_orphans(
+            root_, catalog_.generation, catalog_.catalog_id, options);
+    }
+
     [[nodiscard]] NativeMutationLogStats rotate_wal() {
         ensure_mutable();
         std::lock_guard mutation(mutation_mutex_);
         ensure_healthy();
         return mutation_log_stats_locked(rotate_wal_locked());
+    }
+
+    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
+        const PhysicalReader& physical_reader,
+        const std::uint64_t max_wals,
+        const std::uint64_t max_input_bytes) {
+        ensure_mutable();
+        if (max_wals == 0 || max_input_bytes == 0) {
+            throw InvalidArgumentError(
+                "WAL materialization budgets must be positive");
+        }
+        std::unique_lock lifecycle(lifecycle_mutex_);
+
+        std::shared_ptr<ResourceSet> source_resources;
+        std::vector<MutationWalEntry> selected_wals;
+        std::uint64_t selected_input_bytes = 0;
+        std::uint64_t indexed_sequence = 0;
+        std::uint64_t indexed_live_count = 0;
+        Uuid128 terminal_wal_id;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            std::size_t frozen_count = 0;
+            while (frozen_count < catalog_.wal_entries.size()
+                   && frozen_count < max_wals
+                   && catalog_.wal_entries[frozen_count].state
+                          == MutationWalState::Frozen) {
+                const std::uint64_t bytes =
+                    catalog_.wal_entries[frozen_count].sealed_file_size;
+                if (bytes > max_input_bytes - selected_input_bytes) {
+                    break;
+                }
+                selected_input_bytes += bytes;
+                ++frozen_count;
+            }
+            if (frozen_count == 0) {
+                return mutation_log_stats_locked(
+                    false, false, 0, 0,
+                    !catalog_.wal_entries.empty()
+                        && catalog_.wal_entries.front().state
+                               == MutationWalState::Frozen);
+            }
+            selected_wals.assign(
+                catalog_.wal_entries.begin(),
+                catalog_.wal_entries.begin()
+                    + static_cast<std::ptrdiff_t>(frozen_count));
+            {
+                std::shared_lock state(state_mutex_);
+                source_resources = resources_;
+            }
+            if (source_resources->sources.size() < selected_wals.size()) {
+                throw CorruptionError(
+                    "partitioned WAL resources do not cover frozen prefix");
+            }
+            indexed_sequence = catalog_.indexed_sequence;
+            indexed_live_count = catalog_.indexed_live_count;
+            terminal_wal_id = catalog_.terminal_wal_id;
+        }
+
+        struct CollapsedRecord {
+            std::uint64_t id{0};
+            VersionedMutationValue value =
+                VersionedMutationValue::tombstone(1);
+            std::uint64_t materialized_value_raw{0};
+        };
+        std::unordered_map<std::uint64_t, VersionedMutationValue> collapsed;
+        for (std::size_t source_index = 0;
+             source_index != selected_wals.size(); ++source_index) {
+            const MutationWalEntry& entry = selected_wals[source_index];
+            const std::shared_ptr<WalSource>& source =
+                source_resources->sources[source_index];
+            if (source->entry != entry) {
+                throw CorruptionError(
+                    "partitioned WAL resource does not match selected prefix");
+            }
+            std::uint64_t put_index = 0;
+            const WalScanResult scan = scan_wal_file(
+                source->fd.get(), source->path,
+                ExpectedWalIdentity::from_trusted_header(source->header),
+                WalScanMode::Frozen,
+                [&collapsed, &entry, &put_index](
+                    const RecoveredWalBatch& batch) {
+                    for (const RecoveredWalOperation& operation :
+                         batch.operations) {
+                        if (operation.kind == WalOperationKind::Put) {
+                            if (put_index
+                                >= RowRef::kMaximumRowsPerSegment) {
+                                throw CorruptionError(
+                                    "frozen partitioned WAL exceeds RowRef "
+                                    "capacity");
+                            }
+                            collapsed.insert_or_assign(
+                                operation.id,
+                                VersionedMutationValue::put(
+                                    batch.sequence,
+                                    RowRef::create(
+                                        entry.segment_id, put_index)));
+                            ++put_index;
+                        } else {
+                            collapsed.insert_or_assign(
+                                operation.id,
+                                VersionedMutationValue::tombstone(
+                                    batch.sequence));
+                        }
+                    }
+                });
+            if (scan.valid_end != entry.sealed_file_size
+                || scan.ignored_tail_bytes != 0
+                || scan.next_sequence == 0
+                || scan.next_sequence - 1 != entry.last_sequence
+                || put_index != entry.put_count) {
+                throw CorruptionError(
+                    "frozen partitioned WAL changed during materialization");
+            }
+        }
+        if (collapsed.empty()) {
+            throw CorruptionError(
+                "nonempty frozen partitioned WAL prefix has no operations");
+        }
+
+        std::vector<CollapsedRecord> records;
+        records.reserve(collapsed.size());
+        std::uint64_t final_put_count = 0;
+        std::uint64_t resulting_indexed_live_count = indexed_live_count;
+        for (auto& [id, value] : collapsed) {
+            const std::optional<IndexedVersion> previous =
+                indexed_version(id, *source_resources);
+            const bool previously_live =
+                previous.has_value() && !previous->tombstone();
+            if (value.is_put()) {
+                ++final_put_count;
+                if (!previously_live) {
+                    resulting_indexed_live_count = checked_sum(
+                        resulting_indexed_live_count, 1,
+                        "partitioned indexed live count");
+                }
+            } else if (previously_live) {
+                if (resulting_indexed_live_count == 0) {
+                    throw CorruptionError(
+                        "partitioned indexed live count underflows");
+                }
+                --resulting_indexed_live_count;
+            }
+            records.push_back(CollapsedRecord{id, value, 0});
+        }
+        collapsed.clear();
+        collapsed.rehash(0);
+
+        const std::uint64_t rows_per_segment =
+            partitioned_segment_row_capacity(manifest_);
+        const std::uint64_t required_segment_count =
+            final_put_count / rows_per_segment
+            + (final_put_count % rows_per_segment == 0 ? 0 : 1);
+        std::uint32_t first_segment_id = 0;
+        std::uint64_t reserved_epoch = 0;
+        std::uint64_t reservation_generation = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            validate_materialization_anchor(
+                selected_wals, indexed_sequence, terminal_wal_id);
+            if (catalog_.generation
+                > std::numeric_limits<std::uint64_t>::max() - 2) {
+                throw StorageError(
+                    "partitioned catalog lacks two materialization "
+                    "generations");
+            }
+            if (catalog_.runs.size() >= kPartitionedMaximumRuns) {
+                throw StorageError("partitioned index run limit is exhausted");
+            }
+            if (required_segment_count
+                > kPartitionedMaximumResourceEntries
+                      - catalog_.segments.size()) {
+                throw StorageError(
+                    "partitioned segment catalog limit is exhausted");
+            }
+            if (required_segment_count
+                > static_cast<std::uint64_t>(SegmentId::kMaximum)
+                      - catalog_.next_segment_id) {
+                throw StorageError(
+                    "partitioned materialization segment ID space is "
+                    "exhausted");
+            }
+            if (catalog_.next_index_epoch
+                == std::numeric_limits<std::uint64_t>::max()) {
+                throw StorageError(
+                    "partitioned index epoch space is exhausted");
+            }
+            first_segment_id = catalog_.next_segment_id;
+            reserved_epoch = catalog_.next_index_epoch;
+
+            PartitionedCatalogV3 reservation = catalog_;
+            reservation.generation = catalog_.generation + 1;
+            reservation.catalog_id = make_uuid();
+            reservation.previous_catalog_id = catalog_.catalog_id;
+            reservation.next_segment_id = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(catalog_.next_segment_id)
+                + required_segment_count);
+            reservation.next_index_epoch = reserved_epoch + 1;
+            reservation_generation = reservation.generation;
+            try {
+                ScopedAdvisoryLock commit(
+                    commit_lock_, FileLockMode::Exclusive);
+                publish_partitioned_catalog(
+                    root_, manifest_, reservation,
+                    NativeCollectionTestOperation::MaterializeFrozenWals);
+                invoke_native_collection_test_hook({
+                    NativeCollectionTestHookPoint::
+                        MutationReservationDurable,
+                    NativeCollectionTestOperation::MaterializeFrozenWals,
+                    NativeCollectionTestResourceKind::None,
+                    reservation.generation,
+                    0});
+                std::unique_lock state(state_mutex_);
+                std::swap(catalog_, reservation);
+            } catch (...) {
+                poisoned_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+
+        std::vector<CollapsedRecord*> put_records;
+        put_records.reserve(static_cast<std::size_t>(final_put_count));
+        for (CollapsedRecord& record : records) {
+            if (record.value.is_put()) {
+                put_records.push_back(&record);
+            }
+        }
+        std::sort(
+            put_records.begin(), put_records.end(),
+            [](const CollapsedRecord* left, const CollapsedRecord* right) {
+                const RowRef left_row = *left->value.row_ref();
+                const RowRef right_row = *right->value.row_ref();
+                return left_row < right_row;
+            });
+
+        std::vector<PartitionedSegmentDescriptor> segment_descriptors;
+        if (!put_records.empty()) {
+            PartitionedSegmentSetBuildSpec segment_spec;
+            segment_spec.manifest = manifest_;
+            segment_spec.kind = PartitionedSegmentKind::Materialized;
+            segment_spec.first_row_ref_segment_id = first_segment_id;
+            segment_spec.creation_epoch = reserved_epoch;
+            PartitionedSegmentSetWriter writer(root_, std::move(segment_spec));
+            const std::uint64_t batch_rows = std::max<std::uint64_t>(
+                1, (8ULL << 20) / manifest_.record_size);
+            for (std::size_t begin = 0; begin != put_records.size();) {
+                const std::size_t count = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(
+                        batch_rows, put_records.size() - begin));
+                const std::uint64_t byte_count = checked_multiply(
+                    count, manifest_.record_size,
+                    "partitioned materialization read batch");
+                if (byte_count > std::numeric_limits<std::size_t>::max()) {
+                    throw StorageError(
+                        "partitioned materialization batch exceeds address "
+                        "space");
+                }
+                std::vector<std::byte> batch(
+                    static_cast<std::size_t>(byte_count));
+                std::vector<PhysicalReadRequest> requests;
+                requests.reserve(count);
+                for (std::size_t offset = 0; offset != count; ++offset) {
+                    requests.push_back(resolve_unlocked(
+                        *put_records[begin + offset]->value.row_ref(),
+                        offset, *source_resources));
+                }
+                physical_reader.execute(
+                    manifest_.record_size, requests, batch);
+                for (std::size_t offset = 0; offset != count; ++offset) {
+                    CollapsedRecord& record =
+                        *put_records[begin + offset];
+                    const RowRef output_row = writer.append(
+                        record.id, record.value.sequence(),
+                        std::span<const std::byte>(batch).subspan(
+                            offset * static_cast<std::size_t>(
+                                manifest_.record_size),
+                            static_cast<std::size_t>(manifest_.record_size)));
+                    record.materialized_value_raw = output_row.raw();
+                }
+                begin += count;
+            }
+            segment_descriptors = writer.finish();
+        }
+        if (segment_descriptors.size() != required_segment_count) {
+            throw StorageError(
+                "partitioned segment writer did not honor reserved range");
+        }
+
+        std::vector<PartitionRunRecord> run_records;
+        run_records.reserve(records.size());
+        for (const CollapsedRecord& record : records) {
+            run_records.push_back(PartitionRunRecord{
+                record.id, record.value.sequence(),
+                record.materialized_value_raw});
+        }
+        PartitionIndexRunBuildSpec run_spec;
+        run_spec.collection_id = manifest_.collection_id;
+        run_spec.schema_id = manifest_.schema_id;
+        run_spec.partition_bits = manifest_.partition_bits;
+        run_spec.hash_seed = manifest_.hash_seed;
+        run_spec.descriptor.run_id = make_uuid();
+        run_spec.descriptor.epoch = reserved_epoch;
+        run_spec.descriptor.kind = PartitionedRunKind::Mutation;
+        run_spec.descriptor.first_sequence =
+            selected_wals.front().first_sequence;
+        run_spec.descriptor.last_sequence =
+            selected_wals.back().last_sequence;
+        const PartitionIndexRunDescriptor run_descriptor =
+            write_partitioned_index_run(root_, run_spec, run_records);
+        sync_directory(partitioned_index_runs_directory(root_));
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::MutationDeltaOutputDurable,
+            NativeCollectionTestOperation::MaterializeFrozenWals,
+            NativeCollectionTestResourceKind::MutationDeltaPair,
+            reservation_generation,
+            0});
+
+        std::vector<std::shared_ptr<PartitionedSegmentReader>>
+            opened_segments;
+        opened_segments.reserve(segment_descriptors.size());
+        for (const PartitionedSegmentDescriptor& descriptor :
+             segment_descriptors) {
+            opened_segments.push_back(
+                std::make_shared<PartitionedSegmentReader>(
+                    root_, manifest_, descriptor, false));
+        }
+        auto opened_run = std::make_shared<PartitionIndexRunReader>(
+            root_, manifest_.collection_id, manifest_.schema_id,
+            manifest_.partition_bits, manifest_.hash_seed,
+            run_descriptor);
+
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        validate_materialization_anchor(
+            selected_wals, indexed_sequence, terminal_wal_id);
+        if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError("partitioned catalog generation is exhausted");
+        }
+
+        PartitionedCatalogV3 next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        next_catalog.indexed_sequence = run_descriptor.last_sequence;
+        next_catalog.indexed_live_count = resulting_indexed_live_count;
+        next_catalog.terminal_wal_id = selected_wals.back().wal_id;
+        next_catalog.segments.insert(
+            next_catalog.segments.end(), segment_descriptors.begin(),
+            segment_descriptors.end());
+        next_catalog.runs.push_back(run_descriptor);
+        next_catalog.wal_entries.erase(
+            next_catalog.wal_entries.begin(),
+            next_catalog.wal_entries.begin()
+                + static_cast<std::ptrdiff_t>(selected_wals.size()));
+
+        auto next_resources = std::make_shared<ResourceSet>();
+        std::vector<decltype(overlay_)::iterator> overlay_erases;
+        overlay_erases.reserve(records.size());
+        {
+            std::shared_lock state(state_mutex_);
+            next_resources->initial_segments = resources_->initial_segments;
+            next_resources->initial_segment_indices =
+                resources_->initial_segment_indices;
+            next_resources->materialized_segments =
+                resources_->materialized_segments;
+            next_resources->materialized_segment_indices =
+                resources_->materialized_segment_indices;
+            next_resources->snapshots = resources_->snapshots;
+            next_resources->runs = resources_->runs;
+            next_resources->sources.assign(
+                resources_->sources.begin()
+                    + static_cast<std::ptrdiff_t>(selected_wals.size()),
+                resources_->sources.end());
+            for (const CollapsedRecord& record : records) {
+                const auto current = overlay_.find(record.id);
+                if (current == overlay_.end()
+                    || !current->second.has_value()
+                    || current->second->sequence()
+                           < record.value.sequence()) {
+                    throw CorruptionError(
+                        "materialized run is newer than the live overlay");
+                }
+                if (current->second->sequence()
+                    == record.value.sequence()) {
+                    overlay_erases.push_back(current);
+                }
+            }
+        }
+        for (std::shared_ptr<PartitionedSegmentReader>& segment :
+             opened_segments) {
+            const std::uint32_t segment_id =
+                segment->descriptor().row_ref_segment_id;
+            const std::size_t index =
+                next_resources->materialized_segments.size();
+            next_resources->materialized_segments.push_back(
+                std::move(segment));
+            if (!next_resources->materialized_segment_indices.emplace(
+                     segment_id, index).second) {
+                throw CorruptionError(
+                    "materialized segment reuses a RowRef segment ID");
+            }
+        }
+        next_resources->runs.push_back(
+            RunView{std::move(opened_run), run_descriptor});
+        next_resources->source_indices.reserve(
+            next_resources->sources.size());
+        for (std::size_t index = 0;
+             index != next_resources->sources.size(); ++index) {
+            if (!next_resources->source_indices.emplace(
+                     next_resources->sources[index]->entry.segment_id,
+                     index).second) {
+                throw CorruptionError(
+                    "retained partitioned WAL segment ID is duplicated");
+            }
+        }
+        if (next_resources->sources.empty()
+            || next_resources->sources.back()->entry.state
+                   != MutationWalState::Active) {
+            throw CorruptionError(
+                "materialization removed the active partitioned WAL");
+        }
+        next_resources->active_index = next_resources->sources.size() - 1;
+
+        try {
+            ScopedAdvisoryLock commit(
+                commit_lock_, FileLockMode::Exclusive);
+            publish_partitioned_catalog(
+                root_, manifest_, next_catalog,
+                NativeCollectionTestOperation::MaterializeFrozenWals);
+            {
+                std::unique_lock state(state_mutex_);
+                for (const auto position : overlay_erases) {
+                    overlay_.erase(position);
+                }
+                resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+                mutation_read_path_active_.store(
+                    true, std::memory_order_release);
+            }
+        } catch (...) {
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+        return mutation_log_stats_locked(
+            false, true,
+            static_cast<std::uint64_t>(selected_wals.size()),
+            selected_input_bytes, false);
+    }
+
+    [[nodiscard]] NativeMutationLogStats fold_partitions(
+        const std::uint64_t max_runs,
+        const std::uint64_t max_input_bytes,
+        const std::uint64_t max_input_entries) {
+        ensure_mutable();
+        if (max_runs < 2 || max_runs > kPartitionedMaximumRuns) {
+            throw InvalidArgumentError(
+                "partition fold max_runs must be between 2 and 4096");
+        }
+        if (max_input_bytes == 0 || max_input_entries == 0) {
+            throw InvalidArgumentError(
+                "partition fold byte and entry budgets must be positive");
+        }
+        std::unique_lock lifecycle(lifecycle_mutex_);
+
+        std::shared_ptr<ResourceSet> source_resources;
+        std::vector<PartitionSnapshotDescriptor> source_snapshots;
+        std::vector<PartitionIndexRunDescriptor> source_runs;
+        std::uint64_t indexed_sequence = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            std::shared_lock state(state_mutex_);
+            source_resources = resources_;
+            source_snapshots = catalog_.snapshots;
+            source_runs = catalog_.runs;
+            indexed_sequence = catalog_.indexed_sequence;
+        }
+
+        const auto run_views_for = [source_resources](
+                                       const std::vector<
+                                           PartitionIndexRunDescriptor>&
+                                           descriptors) {
+            std::vector<PartitionRunView> views;
+            views.reserve(descriptors.size());
+            for (const PartitionIndexRunDescriptor& descriptor :
+                 descriptors) {
+                const auto source = std::find_if(
+                    source_resources->runs.begin(),
+                    source_resources->runs.end(),
+                    [&descriptor](const RunView& run) {
+                        return run.catalog.run_id == descriptor.run_id;
+                    });
+                if (source == source_resources->runs.end()) {
+                    throw CorruptionError(
+                        "partition fold run has no pinned immutable view");
+                }
+                views.push_back(PartitionRunView{
+                    source->file.get(), &descriptor});
+            }
+            return views;
+        };
+
+        std::vector<PartitionIndexRunDescriptor> remaining_runs = source_runs;
+        std::vector<PartitionIndexRunDescriptor> selection_runs = source_runs;
+        std::vector<PartitionFoldCandidate> selected;
+        std::uint64_t remaining_entries = max_input_entries;
+        std::uint64_t remaining_bytes = max_input_bytes;
+        while (!selection_runs.empty()) {
+            const std::vector<PartitionRunView> views =
+                run_views_for(selection_runs);
+            const std::optional<PartitionFoldCandidate> candidate =
+                select_partition_for_fold(
+                    manifest_.partition_bits, source_snapshots, views,
+                    PartitionFoldBudget{
+                        1, max_runs, remaining_entries, remaining_bytes});
+            if (!candidate.has_value()) {
+                break;
+            }
+            const std::uint64_t worst_output_bytes = snapshot_file_size(
+                choose_capacity(candidate->input_entries));
+            const std::uint64_t charged_bytes =
+                std::max(candidate->input_bytes, worst_output_bytes);
+            if (charged_bytes > remaining_bytes) {
+                // This complete partition cannot fit later because the
+                // aggregate budget only decreases. Exclude it from this
+                // selection pass without clearing its catalog-active masks.
+                clear_folded_partition(
+                    selection_runs, manifest_.partition_bits,
+                    candidate->partition_id);
+                continue;
+            }
+            selected.push_back(*candidate);
+            remaining_entries -= candidate->input_entries;
+            remaining_bytes -= charged_bytes;
+            clear_folded_partition(
+                selection_runs, manifest_.partition_bits,
+                candidate->partition_id);
+            clear_folded_partition(
+                remaining_runs, manifest_.partition_bits,
+                candidate->partition_id);
+        }
+        const bool compaction_budget_blocked = !remaining_runs.empty();
+        if (selected.empty()) {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            return mutation_log_stats_locked(
+                false, false, 0, 0, false, false,
+                compaction_budget_blocked);
+        }
+
+        std::uint64_t compacted_run_sections = 0;
+        std::uint64_t run_input_entries = 0;
+        std::uint64_t run_input_bytes = 0;
+        std::uint64_t snapshot_input_entries = 0;
+        std::uint64_t snapshot_input_bytes = 0;
+        for (const PartitionFoldCandidate& candidate : selected) {
+            compacted_run_sections = checked_sum(
+                compacted_run_sections, candidate.active_run_count,
+                "partition fold run sections");
+            run_input_entries = checked_sum(
+                run_input_entries, candidate.run_entries,
+                "partition fold run input entries");
+            run_input_bytes = checked_sum(
+                run_input_bytes, candidate.run_bytes,
+                "partition fold run input bytes");
+            snapshot_input_entries = checked_sum(
+                snapshot_input_entries, candidate.snapshot_entries,
+                "partition fold snapshot input entries");
+            snapshot_input_bytes = checked_sum(
+                snapshot_input_bytes, candidate.snapshot_bytes,
+                "partition fold snapshot input bytes");
+        }
+
+        std::uint64_t reserved_epoch = 0;
+        std::uint64_t reservation_generation = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            validate_fold_anchor(
+                indexed_sequence, source_snapshots, source_runs);
+            if (catalog_.generation
+                > std::numeric_limits<std::uint64_t>::max() - 2) {
+                throw StorageError(
+                    "partitioned catalog lacks two fold generations");
+            }
+            if (catalog_.next_index_epoch
+                == std::numeric_limits<std::uint64_t>::max()) {
+                throw StorageError(
+                    "partitioned index epoch space is exhausted");
+            }
+            reserved_epoch = catalog_.next_index_epoch;
+            PartitionedCatalogV3 reservation = catalog_;
+            reservation.generation = catalog_.generation + 1;
+            reservation.catalog_id = make_uuid();
+            reservation.previous_catalog_id = catalog_.catalog_id;
+            reservation.next_index_epoch = reserved_epoch + 1;
+            reservation_generation = reservation.generation;
+            try {
+                ScopedAdvisoryLock commit(
+                    commit_lock_, FileLockMode::Exclusive);
+                publish_partitioned_catalog(
+                    root_, manifest_, reservation,
+                    NativeCollectionTestOperation::FoldPartitions);
+                invoke_native_collection_test_hook({
+                    NativeCollectionTestHookPoint::
+                        MutationReservationDurable,
+                    NativeCollectionTestOperation::FoldPartitions,
+                    NativeCollectionTestResourceKind::None,
+                    reservation.generation,
+                    0});
+                std::unique_lock state(state_mutex_);
+                std::swap(catalog_, reservation);
+            } catch (...) {
+                poisoned_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+
+        const std::vector<PartitionRunView> source_run_views =
+            run_views_for(source_runs);
+        std::vector<PartitionSnapshotDescriptor> output_descriptors;
+        std::vector<std::shared_ptr<Snapshot>> output_snapshots;
+        output_descriptors.reserve(selected.size());
+        output_snapshots.reserve(selected.size());
+        std::uint64_t output_entries = 0;
+        std::uint64_t output_bytes = 0;
+        for (const PartitionFoldCandidate& candidate : selected) {
+            const PartitionSnapshotDescriptor& source_descriptor =
+                source_snapshots[candidate.partition_id];
+            PartitionSnapshotReader source_snapshot(
+                root_, manifest_.collection_id, manifest_.schema_id,
+                manifest_.partition_bits, manifest_.hash_seed,
+                source_descriptor, true);
+            const std::vector<PartitionRunRecord> records =
+                merge_partition_for_fold(
+                    manifest_.partition_bits, candidate.partition_id,
+                    source_snapshot, source_run_views);
+            const std::uint64_t expected_output_bytes = snapshot_file_size(
+                choose_capacity(static_cast<std::uint64_t>(records.size())));
+            const std::uint64_t worst_output_bytes = snapshot_file_size(
+                choose_capacity(candidate.input_entries));
+            if (expected_output_bytes > worst_output_bytes) {
+                throw CorruptionError(
+                    "partition fold output exceeds its pre-reserved worst "
+                    "case geometry");
+            }
+            PartitionSnapshotBuildSpec spec;
+            spec.collection_id = manifest_.collection_id;
+            spec.schema_id = manifest_.schema_id;
+            spec.snapshot_id = make_uuid();
+            spec.partition_bits = manifest_.partition_bits;
+            spec.partition_id = candidate.partition_id;
+            spec.hash_seed = manifest_.hash_seed;
+            spec.epoch = reserved_epoch;
+            const PartitionSnapshotDescriptor output =
+                write_partition_snapshot(root_, spec, records);
+            output_entries = checked_sum(
+                output_entries, output.entry_count,
+                "partition fold output entries");
+            output_bytes = checked_sum(
+                output_bytes, output.file_size,
+                "partition fold output bytes");
+            output_descriptors.push_back(output);
+        }
+        sync_directory(partitioned_partition_snapshots_directory(root_));
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::MutationDeltaOutputDurable,
+            NativeCollectionTestOperation::FoldPartitions,
+            NativeCollectionTestResourceKind::PartitionSnapshot,
+            reservation_generation,
+            static_cast<std::uint64_t>(output_descriptors.size())});
+        for (const PartitionSnapshotDescriptor& descriptor :
+             output_descriptors) {
+            output_snapshots.push_back(open_snapshot_view(descriptor));
+        }
+
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        validate_fold_anchor(
+            indexed_sequence, source_snapshots, source_runs);
+        if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError("partitioned catalog generation is exhausted");
+        }
+        PartitionedCatalogV3 next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        for (std::size_t index = 0; index != selected.size(); ++index) {
+            const std::uint32_t partition = selected[index].partition_id;
+            next_catalog.snapshots[partition] = output_descriptors[index];
+            clear_folded_partition(
+                next_catalog.runs, manifest_.partition_bits, partition);
+        }
+
+        auto next_resources = std::make_shared<ResourceSet>();
+        {
+            std::shared_lock state(state_mutex_);
+            next_resources->initial_segments = resources_->initial_segments;
+            next_resources->initial_segment_indices =
+                resources_->initial_segment_indices;
+            next_resources->materialized_segments =
+                resources_->materialized_segments;
+            next_resources->materialized_segment_indices =
+                resources_->materialized_segment_indices;
+            next_resources->snapshots = resources_->snapshots;
+            next_resources->sources = resources_->sources;
+            next_resources->source_indices = resources_->source_indices;
+            next_resources->active_index = resources_->active_index;
+            for (std::size_t index = 0;
+                 index != selected.size(); ++index) {
+                next_resources->snapshots[selected[index].partition_id] =
+                    output_snapshots[index];
+            }
+            next_resources->runs.reserve(next_catalog.runs.size());
+            for (const PartitionIndexRunDescriptor& descriptor :
+                 next_catalog.runs) {
+                const auto source = std::find_if(
+                    resources_->runs.begin(), resources_->runs.end(),
+                    [&descriptor](const RunView& run) {
+                        return run.catalog.run_id == descriptor.run_id;
+                    });
+                if (source == resources_->runs.end()) {
+                    throw CorruptionError(
+                        "folded catalog run has no pinned immutable view");
+                }
+                next_resources->runs.push_back(
+                    RunView{source->file, descriptor});
+            }
+        }
+        const bool mutation_path_active =
+            !overlay_.empty() || !next_resources->runs.empty();
+        try {
+            ScopedAdvisoryLock commit(
+                commit_lock_, FileLockMode::Exclusive);
+            publish_partitioned_catalog(
+                root_, manifest_, next_catalog,
+                NativeCollectionTestOperation::FoldPartitions);
+            {
+                std::unique_lock state(state_mutex_);
+                resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+                mutation_read_path_active_.store(
+                    mutation_path_active, std::memory_order_release);
+            }
+        } catch (...) {
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+        return mutation_log_stats_locked(
+            false, false, 0, 0, false, true,
+            compaction_budget_blocked,
+            static_cast<std::uint64_t>(selected.size()),
+            compacted_run_sections, snapshot_input_entries,
+            snapshot_input_bytes, output_entries, output_bytes,
+            run_input_entries, run_input_bytes);
+    }
+
+    [[nodiscard]] NativeSegmentCleaningStats clean_segments(
+        const PhysicalReader& physical_reader,
+        const NativeSegmentCleaningOptions options) {
+        ensure_mutable();
+        if (options.max_candidate_segments == 0
+            || options.max_sidecar_scan_bytes == 0
+            || options.max_source_bytes == 0
+            || options.max_output_bytes == 0
+            || options.max_memory_bytes == 0) {
+            throw InvalidArgumentError(
+                "segment cleaning budgets must be positive");
+        }
+        if (options.min_garbage_rows == 0) {
+            throw InvalidArgumentError(
+                "segment cleaning min_garbage_rows must be positive");
+        }
+        if (options.min_garbage_ratio_ppm > kCleanerRatioScale) {
+            throw InvalidArgumentError(
+                "segment cleaning garbage ratio exceeds 1000000 ppm");
+        }
+        if (options.start_after_segment_id > SegmentId::kMaximum) {
+            throw InvalidArgumentError(
+                "segment cleaning cursor exceeds the RowRef ID space");
+        }
+        std::unique_lock lifecycle(lifecycle_mutex_);
+
+        NativeSegmentCleaningStats stats;
+        stats.dry_run = options.dry_run;
+        std::shared_ptr<ResourceSet> source_resources;
+        std::vector<PartitionedSegmentDescriptor> candidates;
+        std::uint64_t indexed_sequence = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            std::shared_lock state(state_mutex_);
+            source_resources = resources_;
+            candidates = catalog_.segments;
+            indexed_sequence = catalog_.indexed_sequence;
+            stats.generation = catalog_.generation;
+        }
+        std::sort(
+            candidates.begin(), candidates.end(),
+            [](const PartitionedSegmentDescriptor& left,
+               const PartitionedSegmentDescriptor& right) {
+                return left.row_ref_segment_id
+                       < right.row_ref_segment_id;
+            });
+
+        const auto sidecar_for = [&source_resources](
+                                     const PartitionedSegmentDescriptor&
+                                         descriptor)
+            -> std::span<const std::byte> {
+            const auto initial =
+                source_resources->initial_segment_indices.find(
+                    descriptor.row_ref_segment_id);
+            if (initial
+                != source_resources->initial_segment_indices.end()) {
+                const Segment& segment =
+                    *source_resources->initial_segments[initial->second];
+                if (segment.header.descriptor != descriptor) {
+                    throw CorruptionError(
+                        "cleaner initial segment view disagrees with catalog");
+                }
+                return segment.ids_mapping.bytes().subspan(
+                    static_cast<std::size_t>(
+                        segment.ids_header.payload_offset),
+                    static_cast<std::size_t>(
+                        segment.ids_header.payload_size));
+            }
+            const auto derived =
+                source_resources->materialized_segment_indices.find(
+                    descriptor.row_ref_segment_id);
+            if (derived
+                == source_resources->materialized_segment_indices.end()) {
+                throw CorruptionError(
+                    "cleaner candidate has no pinned immutable segment");
+            }
+            const auto& segment =
+                source_resources->materialized_segments[derived->second];
+            if (segment->descriptor() != descriptor) {
+                throw CorruptionError(
+                    "cleaner derived segment view disagrees with catalog");
+            }
+            return segment->sidecar_payload();
+        };
+        const auto fixed_working_memory = [this](const std::uint64_t rows) {
+            const std::uint64_t row_bytes = checked_multiply(
+                rows, kCleanerEstimatedBytesPerRow,
+                "segment cleaner memory estimate");
+            const std::uint64_t partition_bytes = checked_multiply(
+                manifest_.partition_count,
+                kCleanerEstimatedBytesPerPartition,
+                "segment cleaner partition scratch estimate");
+            return checked_sum(
+                checked_sum(
+                    row_bytes, partition_bytes,
+                    "segment cleaner memory estimate"),
+                kCleanerFixedMemoryOverhead,
+                "segment cleaner memory estimate");
+        };
+        const auto required_memory = [this, &fixed_working_memory](
+                                         const std::uint64_t rows) {
+            return checked_sum(
+                fixed_working_memory(rows), manifest_.record_size,
+                "segment cleaner memory estimate");
+        };
+        const auto replacement_bytes = [this](
+                                           const std::uint64_t rows,
+                                           const std::uint64_t segments) {
+            if (rows == 0) {
+                return std::uint64_t{0};
+            }
+            return checked_sum(
+                checked_multiply(
+                    checked_multiply(
+                        segments, 2,
+                        "segment cleaner output header count"),
+                    kPartitionedHeaderSize,
+                    "segment cleaner output headers"),
+                checked_multiply(
+                    rows,
+                    checked_sum(
+                        manifest_.record_size,
+                        kPartitionedSegmentIdEntrySize,
+                        "segment cleaner output row size"),
+                    "segment cleaner output rows"),
+                "segment cleaner output bytes");
+        };
+        const auto ratio_ppm = [](const std::uint64_t garbage,
+                                  const std::uint64_t rows) {
+            return garbage == rows
+                       ? kCleanerRatioScale
+                       : (garbage * kCleanerRatioScale) / rows;
+        };
+        const auto minimum_ratio_rows = [](const std::uint64_t rows,
+                                           const std::uint32_t ppm) {
+            const std::uint64_t whole =
+                (rows / kCleanerRatioScale) * ppm;
+            const std::uint64_t remainder =
+                (rows % kCleanerRatioScale) * ppm;
+            return whole + remainder / kCleanerRatioScale
+                   + (remainder % kCleanerRatioScale == 0 ? 0 : 1);
+        };
+        const auto better_candidate = [](const CleanerCandidate& left,
+                                         const CleanerCandidate& right) {
+            if (left.reclaimable_bytes != right.reclaimable_bytes) {
+                return left.reclaimable_bytes > right.reclaimable_bytes;
+            }
+            if (left.garbage_ratio_ppm != right.garbage_ratio_ppm) {
+                return left.garbage_ratio_ppm > right.garbage_ratio_ppm;
+            }
+            if (left.garbage_rows != right.garbage_rows) {
+                return left.garbage_rows > right.garbage_rows;
+            }
+            return left.descriptor.row_ref_segment_id
+                   < right.descriptor.row_ref_segment_id;
+        };
+
+        std::optional<CleanerCandidate> selected;
+        const auto first = std::upper_bound(
+            candidates.begin(), candidates.end(),
+            options.start_after_segment_id,
+            [](const std::uint32_t cursor,
+               const PartitionedSegmentDescriptor& descriptor) {
+                return cursor < descriptor.row_ref_segment_id;
+            });
+        bool reached_end = first == candidates.end();
+        std::uint64_t considered = 0;
+        std::uint32_t last_considered = options.start_after_segment_id;
+        for (auto position = first; position != candidates.end(); ++position) {
+            if (considered == options.max_candidate_segments) {
+                stats.budget_blocked = true;
+                reached_end = false;
+                break;
+            }
+            const PartitionedSegmentDescriptor& descriptor = *position;
+            const std::uint64_t sidecar_bytes = checked_multiply(
+                descriptor.row_count, kPartitionedSegmentIdEntrySize,
+                "segment cleaner sidecar bytes");
+            if (sidecar_bytes
+                > options.max_sidecar_scan_bytes
+                      - stats.scanned_sidecar_bytes) {
+                stats.budget_blocked = true;
+                if (stats.scanned_sidecar_bytes != 0
+                    && sidecar_bytes <= options.max_sidecar_scan_bytes) {
+                    reached_end = false;
+                    break;
+                }
+                ++stats.skipped_budget_segment_count;
+                ++considered;
+                last_considered = descriptor.row_ref_segment_id;
+                reached_end = std::next(position) == candidates.end();
+                continue;
+            }
+            const std::uint64_t source_bytes = checked_sum(
+                descriptor.data_file_size, descriptor.ids_file_size,
+                "segment cleaner source bytes");
+            if (source_bytes > options.max_source_bytes
+                || required_memory(descriptor.row_count)
+                       > options.max_memory_bytes) {
+                stats.budget_blocked = true;
+                ++stats.skipped_budget_segment_count;
+                ++considered;
+                last_considered = descriptor.row_ref_segment_id;
+                reached_end = std::next(position) == candidates.end();
+                continue;
+            }
+
+            const std::span<const std::byte> sidecar =
+                sidecar_for(descriptor);
+            if (sidecar.size() != sidecar_bytes
+                || crc32c(sidecar) != descriptor.ids_payload_crc32c) {
+                throw CorruptionError(
+                    "segment cleaner IDs payload checksum mismatch");
+            }
+            CleanerCandidate candidate;
+            candidate.descriptor = descriptor;
+            candidate.source_bytes = source_bytes;
+            candidate.records.reserve(
+                static_cast<std::size_t>(descriptor.row_count));
+            std::vector<std::uint64_t> unique_ids;
+            unique_ids.reserve(
+                static_cast<std::size_t>(descriptor.row_count));
+            for (std::uint64_t row_index = 0;
+                 row_index != descriptor.row_count; ++row_index) {
+                const std::size_t offset = static_cast<std::size_t>(
+                    row_index * kPartitionedSegmentIdEntrySize);
+                const std::uint64_t id = get_u64(sidecar, offset);
+                const std::uint64_t source_sequence =
+                    get_u64(sidecar, offset + 8);
+                if (source_sequence < descriptor.minimum_sequence
+                    || source_sequence > descriptor.maximum_sequence
+                    || source_sequence > indexed_sequence
+                    || (descriptor.kind == PartitionedSegmentKind::Initial
+                        && source_sequence != 0)
+                    || (descriptor.kind
+                            == PartitionedSegmentKind::Materialized
+                        && source_sequence == 0)) {
+                    throw CorruptionError(
+                        "segment cleaner sidecar sequence is invalid");
+                }
+                unique_ids.push_back(id);
+                const RowRef source_row = RowRef::create(
+                    descriptor.row_ref_segment_id, row_index);
+                const std::optional<IndexedVersion> winner =
+                    indexed_version(id, *source_resources);
+                const bool exact = winner.has_value()
+                                   && !winner->tombstone()
+                                   && winner->sequence == source_sequence
+                                   && winner->value_raw == source_row.raw();
+                if (exact) {
+                    ++candidate.relocated_rows;
+                    candidate.records.push_back(CleanerPlanRecord{
+                        id, source_sequence, source_row.raw(), true});
+                    continue;
+                }
+                ++candidate.garbage_rows;
+                if (!winner.has_value()) {
+                    candidate.records.push_back(CleanerPlanRecord{
+                        id, source_sequence, 0, false});
+                    continue;
+                }
+                if (winner->sequence < source_sequence
+                    || winner->sequence == source_sequence) {
+                    throw CorruptionError(
+                        "segment cleaner found a conflicting indexed "
+                        "version for a source row");
+                }
+                candidate.records.push_back(CleanerPlanRecord{
+                    id, winner->sequence, winner->value_raw, false});
+            }
+            std::sort(unique_ids.begin(), unique_ids.end());
+            if (std::adjacent_find(unique_ids.begin(), unique_ids.end())
+                != unique_ids.end()) {
+                throw CorruptionError(
+                    "segment cleaner source sidecar contains duplicate IDs");
+            }
+
+            ++considered;
+            ++stats.scanned_segment_count;
+            stats.scanned_row_count = checked_sum(
+                stats.scanned_row_count, descriptor.row_count,
+                "segment cleaner scanned rows");
+            stats.scanned_sidecar_bytes = checked_sum(
+                stats.scanned_sidecar_bytes, sidecar_bytes,
+                "segment cleaner scanned sidecar bytes");
+            last_considered = descriptor.row_ref_segment_id;
+            reached_end = std::next(position) == candidates.end();
+
+            const std::uint64_t required_garbage = std::max(
+                options.min_garbage_rows,
+                minimum_ratio_rows(
+                    descriptor.row_count,
+                    options.min_garbage_ratio_ppm));
+            if (candidate.garbage_rows < required_garbage) {
+                continue;
+            }
+            const std::uint64_t segment_capacity =
+                partitioned_segment_row_capacity(manifest_);
+            candidate.output_segment_count =
+                candidate.relocated_rows / segment_capacity
+                + (candidate.relocated_rows % segment_capacity == 0
+                       ? 0
+                       : 1);
+            candidate.output_segment_bytes = replacement_bytes(
+                candidate.relocated_rows,
+                candidate.output_segment_count);
+            candidate.output_run_bytes =
+                partitioned_index_run_file_size(
+                    manifest_.partition_bits, descriptor.row_count);
+            const std::uint64_t output_bytes = checked_sum(
+                candidate.output_segment_bytes,
+                candidate.output_run_bytes,
+                "segment cleaner total output bytes");
+            if (output_bytes > options.max_output_bytes
+                || (output_bytes >= candidate.source_bytes
+                    && options.min_reclaimable_bytes != 0)) {
+                stats.budget_blocked = true;
+                ++stats.skipped_budget_segment_count;
+                continue;
+            }
+            candidate.reclaimable_bytes =
+                output_bytes < candidate.source_bytes
+                    ? candidate.source_bytes - output_bytes
+                    : 0;
+            if (candidate.reclaimable_bytes
+                < options.min_reclaimable_bytes) {
+                continue;
+            }
+            candidate.garbage_ratio_ppm = ratio_ppm(
+                candidate.garbage_rows, descriptor.row_count);
+            if (!selected.has_value()
+                || better_candidate(candidate, *selected)) {
+                selected = std::move(candidate);
+            }
+        }
+        stats.cycle_complete = reached_end;
+        stats.next_start_after_segment_id =
+            reached_end ? 0 : last_considered;
+        if (!selected.has_value()) {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            stats.generation = catalog_.generation;
+            return stats;
+        }
+
+        CleanerCandidate& candidate = *selected;
+        stats.candidate_found = true;
+        stats.candidate_segment_id =
+            candidate.descriptor.row_ref_segment_id;
+        stats.source_rows = candidate.descriptor.row_count;
+        stats.relocated_rows = candidate.relocated_rows;
+        stats.garbage_rows = candidate.garbage_rows;
+        stats.source_bytes = candidate.source_bytes;
+        stats.output_segment_count = candidate.output_segment_count;
+        stats.output_segment_bytes = candidate.output_segment_bytes;
+        stats.output_run_bytes = candidate.output_run_bytes;
+        stats.reclaimable_bytes = candidate.reclaimable_bytes;
+        if (options.dry_run) {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            stats.generation = catalog_.generation;
+            return stats;
+        }
+
+        std::uint32_t first_segment_id = 0;
+        std::uint64_t reserved_epoch = 0;
+        std::uint64_t reservation_generation = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            const auto source = std::find(
+                catalog_.segments.begin(), catalog_.segments.end(),
+                candidate.descriptor);
+            if (source == catalog_.segments.end()
+                || catalog_.indexed_sequence != indexed_sequence) {
+                throw StorageError(
+                    "segment cleaner indexed source changed before "
+                    "reservation");
+            }
+            if (catalog_.generation
+                > std::numeric_limits<std::uint64_t>::max() - 2) {
+                throw StorageError(
+                    "partitioned catalog lacks two cleaner generations");
+            }
+            if (catalog_.runs.size() >= kPartitionedMaximumRuns) {
+                throw StorageError(
+                    "partitioned index run limit is exhausted");
+            }
+            if (candidate.output_segment_count
+                > kPartitionedMaximumResourceEntries
+                      - (catalog_.segments.size() - 1)) {
+                throw StorageError(
+                    "partitioned segment catalog limit is exhausted");
+            }
+            if (catalog_.next_index_epoch
+                == std::numeric_limits<std::uint64_t>::max()) {
+                throw StorageError(
+                    "partitioned index epoch space is exhausted");
+            }
+            if (candidate.output_segment_count
+                > static_cast<std::uint64_t>(SegmentId::kMaximum)
+                      - catalog_.next_segment_id) {
+                throw StorageError(
+                    "partitioned cleaner segment ID space is exhausted");
+            }
+            first_segment_id = catalog_.next_segment_id;
+            reserved_epoch = catalog_.next_index_epoch;
+            PartitionedCatalogV3 reservation = catalog_;
+            reservation.generation = catalog_.generation + 1;
+            reservation.catalog_id = make_uuid();
+            reservation.previous_catalog_id = catalog_.catalog_id;
+            reservation.next_index_epoch = reserved_epoch + 1;
+            if (candidate.output_segment_count != 0) {
+                reservation.next_segment_id = static_cast<std::uint32_t>(
+                    static_cast<std::uint64_t>(first_segment_id)
+                    + candidate.output_segment_count);
+            }
+            reservation_generation = reservation.generation;
+            try {
+                ScopedAdvisoryLock commit(
+                    commit_lock_, FileLockMode::Exclusive);
+                publish_partitioned_catalog(
+                    root_, manifest_, reservation,
+                    NativeCollectionTestOperation::CleanSegment);
+                invoke_native_collection_test_hook({
+                    NativeCollectionTestHookPoint::MutationReservationDurable,
+                    NativeCollectionTestOperation::CleanSegment,
+                    NativeCollectionTestResourceKind::None,
+                    reservation.generation,
+                    0});
+                std::unique_lock state(state_mutex_);
+                std::swap(catalog_, reservation);
+            } catch (...) {
+                poisoned_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+
+        std::unique_ptr<PartitionedSegmentSetWriter> segment_writer;
+        if (candidate.relocated_rows != 0) {
+            PartitionedSegmentSetBuildSpec spec;
+            spec.manifest = manifest_;
+            spec.kind = PartitionedSegmentKind::Cleaner;
+            spec.first_row_ref_segment_id = first_segment_id;
+            spec.creation_epoch = reserved_epoch;
+            segment_writer = std::make_unique<PartitionedSegmentSetWriter>(
+                root_, std::move(spec));
+        }
+        const std::uint64_t fixed_memory =
+            fixed_working_memory(candidate.descriptor.row_count);
+        const std::uint64_t batch_byte_budget = std::min(
+            kCleanerReadBatchBytes,
+            options.max_memory_bytes - fixed_memory);
+        const std::uint64_t batch_rows = std::max<std::uint64_t>(
+            1, batch_byte_budget / manifest_.record_size);
+        Crc32c source_crc;
+        for (std::uint64_t begin = 0;
+             begin != candidate.descriptor.row_count;) {
+            const std::uint64_t count = std::min(
+                batch_rows, candidate.descriptor.row_count - begin);
+            const std::uint64_t byte_count = checked_multiply(
+                count, manifest_.record_size,
+                "segment cleaner read batch");
+            if (byte_count > std::numeric_limits<std::size_t>::max()) {
+                throw StorageError(
+                    "segment cleaner read batch exceeds address space");
+            }
+            std::vector<std::byte> batch(
+                static_cast<std::size_t>(byte_count));
+            std::vector<PhysicalReadRequest> requests;
+            requests.reserve(static_cast<std::size_t>(count));
+            for (std::uint64_t local = 0; local != count; ++local) {
+                requests.push_back(resolve_unlocked(
+                    RowRef::create(
+                        candidate.descriptor.row_ref_segment_id,
+                        begin + local),
+                    local, *source_resources));
+            }
+            physical_reader.execute(
+                manifest_.record_size, requests, batch);
+            source_crc.update(batch);
+            if (segment_writer != nullptr) {
+                for (std::uint64_t local = 0; local != count; ++local) {
+                    CleanerPlanRecord& record = candidate.records[
+                        static_cast<std::size_t>(begin + local)];
+                    if (!record.relocate) {
+                        continue;
+                    }
+                    const RowRef output = segment_writer->append(
+                        record.id, record.sequence,
+                        std::span<const std::byte>(batch).subspan(
+                            static_cast<std::size_t>(
+                                local * manifest_.record_size),
+                            static_cast<std::size_t>(
+                                manifest_.record_size)));
+                    record.value_raw = output.raw();
+                }
+            }
+            begin += count;
+        }
+        if (source_crc.value()
+            != candidate.descriptor.data_payload_crc32c) {
+            throw CorruptionError(
+                "segment cleaner data payload checksum mismatch");
+        }
+
+        std::vector<PartitionedSegmentDescriptor> output_segments;
+        if (segment_writer != nullptr) {
+            output_segments = segment_writer->finish();
+        }
+        if (output_segments.size() != stats.output_segment_count) {
+            throw StorageError(
+                "segment cleaner writer violated reserved geometry");
+        }
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::CleanerSegmentOutputDurable,
+            NativeCollectionTestOperation::CleanSegment,
+            NativeCollectionTestResourceKind::PartitionedSegmentPair,
+            reservation_generation,
+            static_cast<std::uint64_t>(output_segments.size())});
+
+        std::vector<PartitionRunRecord> run_records;
+        run_records.reserve(candidate.records.size());
+        std::uint64_t first_sequence =
+            std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t last_sequence = 0;
+        for (const CleanerPlanRecord& record : candidate.records) {
+            first_sequence = std::min(first_sequence, record.sequence);
+            last_sequence = std::max(last_sequence, record.sequence);
+            run_records.push_back(PartitionRunRecord{
+                record.id, record.sequence, record.value_raw});
+        }
+        PartitionIndexRunBuildSpec run_spec;
+        run_spec.collection_id = manifest_.collection_id;
+        run_spec.schema_id = manifest_.schema_id;
+        run_spec.partition_bits = manifest_.partition_bits;
+        run_spec.hash_seed = manifest_.hash_seed;
+        run_spec.descriptor.run_id = make_uuid();
+        run_spec.descriptor.epoch = reserved_epoch;
+        run_spec.descriptor.kind = PartitionedRunKind::Cleaner;
+        run_spec.descriptor.first_sequence = first_sequence;
+        run_spec.descriptor.last_sequence = last_sequence;
+        run_spec.descriptor.retired_row_ref_segment_id =
+            candidate.descriptor.row_ref_segment_id;
+        run_spec.descriptor.retired_segment_id =
+            candidate.descriptor.segment_id;
+        run_spec.descriptor.retired_row_count =
+            candidate.descriptor.row_count;
+        run_spec.descriptor.retired_ids_payload_crc32c =
+            candidate.descriptor.ids_payload_crc32c;
+        const PartitionIndexRunDescriptor output_run =
+            write_partitioned_index_run(root_, run_spec, run_records);
+        sync_directory(partitioned_index_runs_directory(root_));
+        if (output_run.file_size != stats.output_run_bytes) {
+            throw StorageError(
+                "segment cleaner run violated predicted geometry");
+        }
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::CleanerRunOutputDurable,
+            NativeCollectionTestOperation::CleanSegment,
+            NativeCollectionTestResourceKind::PartitionIndexRun,
+            reservation_generation,
+            1});
+
+        std::vector<std::shared_ptr<PartitionedSegmentReader>>
+            opened_segments;
+        for (const PartitionedSegmentDescriptor& descriptor :
+             output_segments) {
+            opened_segments.push_back(
+                std::make_shared<PartitionedSegmentReader>(
+                    root_, manifest_, descriptor, false));
+        }
+        auto opened_run = std::make_shared<PartitionIndexRunReader>(
+            root_, manifest_.collection_id, manifest_.schema_id,
+            manifest_.partition_bits, manifest_.hash_seed, output_run);
+
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        const auto source = std::find(
+            catalog_.segments.begin(), catalog_.segments.end(),
+            candidate.descriptor);
+        if (source == catalog_.segments.end()
+            || catalog_.indexed_sequence != indexed_sequence
+            || catalog_.next_index_epoch != reserved_epoch + 1
+            || static_cast<std::uint64_t>(catalog_.next_segment_id)
+                   < static_cast<std::uint64_t>(first_segment_id)
+                         + output_segments.size()) {
+            throw StorageError(
+                "segment cleaner source changed during immutable build");
+        }
+        if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError(
+                "partitioned catalog generation is exhausted");
+        }
+        PartitionedCatalogV3 next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        next_catalog.segments.erase(
+            next_catalog.segments.begin()
+            + std::distance(catalog_.segments.begin(), source));
+        next_catalog.segments.insert(
+            next_catalog.segments.end(), output_segments.begin(),
+            output_segments.end());
+        next_catalog.runs.push_back(output_run);
+
+        auto next_resources = std::make_shared<ResourceSet>();
+        {
+            std::shared_lock state(state_mutex_);
+            next_resources->snapshots = resources_->snapshots;
+            next_resources->runs = resources_->runs;
+            next_resources->sources = resources_->sources;
+            next_resources->source_indices = resources_->source_indices;
+            next_resources->active_index = resources_->active_index;
+            for (const auto& segment : resources_->initial_segments) {
+                if (segment->header.descriptor.row_ref_segment_id
+                    != candidate.descriptor.row_ref_segment_id) {
+                    next_resources->initial_segments.push_back(segment);
+                }
+            }
+            for (std::size_t index = 0;
+                 index != next_resources->initial_segments.size(); ++index) {
+                const std::uint32_t id = next_resources
+                                             ->initial_segments[index]
+                                             ->header.descriptor
+                                             .row_ref_segment_id;
+                if (!next_resources->initial_segment_indices.emplace(
+                         id, index).second) {
+                    throw CorruptionError(
+                        "segment cleaner rebuilt duplicate initial IDs");
+                }
+            }
+            for (const auto& segment : resources_->materialized_segments) {
+                if (segment->descriptor().row_ref_segment_id
+                    != candidate.descriptor.row_ref_segment_id) {
+                    next_resources->materialized_segments.push_back(segment);
+                }
+            }
+        }
+        for (auto& segment : opened_segments) {
+            next_resources->materialized_segments.push_back(
+                std::move(segment));
+        }
+        for (std::size_t index = 0;
+             index != next_resources->materialized_segments.size(); ++index) {
+            const std::uint32_t id = next_resources
+                                         ->materialized_segments[index]
+                                         ->descriptor()
+                                         .row_ref_segment_id;
+            if (!next_resources->materialized_segment_indices.emplace(
+                     id, index).second) {
+                throw CorruptionError(
+                    "segment cleaner rebuilt duplicate derived IDs");
+            }
+        }
+        next_resources->runs.push_back(
+            RunView{std::move(opened_run), output_run});
+        try {
+            ScopedAdvisoryLock commit(
+                commit_lock_, FileLockMode::Exclusive);
+            publish_partitioned_catalog(
+                root_, manifest_, next_catalog,
+                NativeCollectionTestOperation::CleanSegment);
+            {
+                std::unique_lock state(state_mutex_);
+                resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+                mutation_read_path_active_.store(
+                    true, std::memory_order_release);
+            }
+        } catch (...) {
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+        stats.generation = catalog_.generation;
+        stats.cleaned = true;
+        stats.reclamation_complete = false;
+        return stats;
     }
 
     [[nodiscard]] std::uint64_t count() const {
@@ -1386,11 +2928,14 @@ public:
         if (owned_by_current_process()) {
             return;
         }
-        for (Segment& segment : segments_) {
-            segment.fd.reset();
-        }
-        if (wal_resources_ != nullptr) {
-            for (const auto& source : wal_resources_->sources) {
+        if (resources_ != nullptr) {
+            for (const auto& segment : resources_->initial_segments) {
+                segment->fd.reset();
+            }
+            for (const auto& segment : resources_->materialized_segments) {
+                segment->abandon_after_fork();
+            }
+            for (const auto& source : resources_->sources) {
                 source->fd.reset();
             }
         }
@@ -1421,10 +2966,55 @@ private:
         std::uint64_t valid_end{kWalFileHeaderSize};
         std::uint64_t next_sequence{1};
     };
-    struct WalResourceSet {
+    struct RunView {
+        std::shared_ptr<PartitionIndexRunReader> file;
+        PartitionIndexRunDescriptor catalog;
+    };
+    struct ResourceSet {
+        std::vector<std::shared_ptr<Segment>> initial_segments;
+        std::unordered_map<std::uint32_t, std::size_t>
+            initial_segment_indices;
+        std::vector<std::shared_ptr<PartitionedSegmentReader>>
+            materialized_segments;
+        std::unordered_map<std::uint32_t, std::size_t>
+            materialized_segment_indices;
+        std::vector<std::shared_ptr<Snapshot>> snapshots;
+        std::vector<RunView> runs;
         std::vector<std::shared_ptr<WalSource>> sources;
         std::unordered_map<std::uint32_t, std::size_t> source_indices;
         std::size_t active_index{0};
+    };
+    struct IndexedVersion {
+        std::uint64_t sequence{0};
+        std::uint64_t value_raw{0};
+        std::uint64_t source_epoch{0};
+
+        [[nodiscard]] bool tombstone() const noexcept {
+            return value_raw == 0;
+        }
+        [[nodiscard]] std::optional<RowRef> row_ref() const {
+            return tombstone()
+                       ? std::nullopt
+                       : std::optional<RowRef>(RowRef::decode(value_raw));
+        }
+    };
+    struct CleanerPlanRecord {
+        std::uint64_t id{0};
+        std::uint64_t sequence{0};
+        std::uint64_t value_raw{0};
+        bool relocate{false};
+    };
+    struct CleanerCandidate {
+        PartitionedSegmentDescriptor descriptor;
+        std::vector<CleanerPlanRecord> records;
+        std::uint64_t relocated_rows{0};
+        std::uint64_t garbage_rows{0};
+        std::uint64_t source_bytes{0};
+        std::uint64_t output_segment_count{0};
+        std::uint64_t output_segment_bytes{0};
+        std::uint64_t output_run_bytes{0};
+        std::uint64_t reclaimable_bytes{0};
+        std::uint64_t garbage_ratio_ppm{0};
     };
     using OverlayValue = std::optional<VersionedMutationValue>;
 
@@ -1477,65 +3067,100 @@ private:
             || catalog_.generation != current.generation
             || catalog_.catalog_id != current.catalog_id
             || catalog_.partition_bits != manifest_.partition_bits
-            || catalog_.hash_seed != manifest_.hash_seed
-            || catalog_.indexed_live_count != manifest_.initial_record_count) {
+            || catalog_.hash_seed != manifest_.hash_seed) {
             throw CorruptionError(
                 "partitioned catalog does not match manifest or CURRENT");
         }
-        if (!catalog_.runs.empty()
-            || catalog_.indexed_sequence != 0
-            || !catalog_.terminal_wal_id.empty()
-            || catalog_.next_index_epoch != 1
-            || (manifest_.required_feature_bits
-                & kNativeRequiredFeatureDeltaV1) != 0) {
-            throw CorruptionError(
-                "format-7 WAL slice cannot interpret immutable index runs");
-        }
         std::uint64_t initial_rows = 0;
-        for (std::size_t index = 0; index != catalog_.segments.size(); ++index) {
-            const PartitionedSegmentDescriptor& descriptor =
-                catalog_.segments[index];
-            if (descriptor.kind != PartitionedSegmentKind::Initial
-                || descriptor.minimum_sequence != 0
-                || descriptor.maximum_sequence != 0
-                || descriptor.creation_epoch != 0
-                || descriptor.row_ref_segment_id != index + 1) {
+        const std::uint32_t initial_segment_count =
+            manifest_.initial_active_wal_segment_id - 1;
+        const std::uint64_t rows_per_segment =
+            partitioned_segment_row_capacity(manifest_);
+        const std::uint64_t expected_initial_segment_count =
+            manifest_.initial_record_count / rows_per_segment
+            + (manifest_.initial_record_count % rows_per_segment == 0
+                   ? 0
+                   : 1);
+        if (expected_initial_segment_count != initial_segment_count) {
+            throw CorruptionError(
+                "format-7 manifest initial segment geometry is invalid");
+        }
+        std::unordered_set<std::uint32_t> saw_initial;
+        saw_initial.reserve(std::min<std::size_t>(
+            catalog_.segments.size(), initial_segment_count));
+        for (const PartitionedSegmentDescriptor& descriptor :
+             catalog_.segments) {
+            if (descriptor.kind != PartitionedSegmentKind::Initial) {
+                if (descriptor.row_ref_segment_id
+                    < manifest_.initial_next_segment_id) {
+                    throw CorruptionError(
+                        "format-7 derived segment reuses the initial ID "
+                        "range");
+                }
+                continue;
+            }
+            if (descriptor.row_ref_segment_id == 0
+                || descriptor.row_ref_segment_id > initial_segment_count
+                || !saw_initial.insert(
+                        descriptor.row_ref_segment_id).second) {
                 throw CorruptionError(
-                    "format-7 initial catalog contains a non-initial segment");
+                    "format-7 initial segment topology disagrees with manifest");
+            }
+            const std::uint64_t first_row = checked_multiply(
+                descriptor.row_ref_segment_id - 1, rows_per_segment,
+                "format-7 initial segment first row");
+            const std::uint64_t expected_rows = std::min(
+                rows_per_segment,
+                manifest_.initial_record_count - first_row);
+            const std::uint64_t expected_data_size = checked_sum(
+                kPartitionedHeaderSize,
+                checked_multiply(
+                    expected_rows, manifest_.record_size,
+                    "format-7 initial data geometry"),
+                "format-7 initial data geometry");
+            const std::uint64_t expected_ids_size = checked_sum(
+                kPartitionedHeaderSize,
+                checked_multiply(
+                    expected_rows, kPartitionedSegmentIdEntrySize,
+                    "format-7 initial sidecar geometry"),
+                "format-7 initial sidecar geometry");
+            if (descriptor.row_count != expected_rows
+                || descriptor.data_file_size != expected_data_size
+                || descriptor.ids_file_size != expected_ids_size) {
+                throw CorruptionError(
+                    "format-7 active initial segment has unexpected "
+                    "original geometry");
             }
             initial_rows = checked_sum(
                 initial_rows, descriptor.row_count,
                 "format-7 initial segment rows");
         }
-        for (const PartitionSnapshotDescriptor& descriptor :
-             catalog_.snapshots) {
-            if (descriptor.epoch != 0) {
-                throw CorruptionError(
-                    "format-7 initial catalog contains a folded snapshot");
-            }
-        }
-        if (catalog_.wal_entries.empty()) {
-            throw CorruptionError("format-7 catalog has no active WAL");
-        }
-        const MutationWalEntry& entry = catalog_.wal_entries.front();
-        if (initial_rows != manifest_.initial_record_count
-            || entry.wal_id != manifest_.initial_active_wal_id
-            || !entry.predecessor_wal_id.empty()
-            || entry.segment_id != manifest_.initial_active_wal_segment_id
-            || entry.previous_sequence != 0 || entry.first_sequence != 1
+        if (initial_rows > manifest_.initial_record_count
+            || saw_initial.size() > initial_segment_count
             || catalog_.next_segment_id < manifest_.initial_next_segment_id) {
             throw CorruptionError(
-                "format-7 initial catalog lineage does not match manifest");
+                "format-7 initial segment set does not match manifest");
+        }
+        if (catalog_.indexed_sequence == 0) {
+            const MutationWalEntry& entry = catalog_.wal_entries.front();
+            if (entry.wal_id != manifest_.initial_active_wal_id
+                || !entry.predecessor_wal_id.empty()
+                || entry.segment_id
+                       != manifest_.initial_active_wal_segment_id
+                || entry.previous_sequence != 0 || entry.first_sequence != 1) {
+                throw CorruptionError(
+                    "format-7 unmaterialized WAL lineage disagrees with "
+                    "manifest");
+            }
         }
     }
 
     void open_and_replay_wals() {
         const auto started = SteadyClock::now();
         live_count_.store(
-            manifest_.initial_record_count, std::memory_order_relaxed);
-        wal_resources_ = std::make_shared<WalResourceSet>();
-        wal_resources_->sources.reserve(catalog_.wal_entries.size());
-        wal_resources_->source_indices.reserve(catalog_.wal_entries.size());
+            catalog_.indexed_live_count, std::memory_order_relaxed);
+        resources_->sources.reserve(catalog_.wal_entries.size());
+        resources_->source_indices.reserve(catalog_.wal_entries.size());
         overlay_.reserve(catalog_.wal_entries.size());
 
         for (const MutationWalEntry& entry : catalog_.wal_entries) {
@@ -1574,33 +3199,53 @@ private:
                 sync_file(source->fd.get(), source->path);
             }
             const std::size_t source_index =
-                wal_resources_->sources.size();
-            wal_resources_->sources.push_back(std::move(source));
-            if (!wal_resources_->source_indices.emplace(
+                resources_->sources.size();
+            resources_->sources.push_back(std::move(source));
+            if (!resources_->source_indices.emplace(
                      entry.segment_id, source_index).second) {
                 throw CorruptionError(
                     "partitioned WAL segment ID is duplicated");
             }
         }
-        if (wal_resources_->sources.empty()
-            || wal_resources_->sources.back()->entry.state
+        if (resources_->sources.empty()
+            || resources_->sources.back()->entry.state
                    != MutationWalState::Active) {
             throw CorruptionError(
                 "partitioned WAL chain lacks a final active WAL");
         }
-        wal_resources_->active_index = wal_resources_->sources.size() - 1;
+        resources_->active_index = resources_->sources.size() - 1;
         append_offset_ = active_wal().valid_end;
         next_sequence_ = active_wal().next_sequence;
         mutation_read_path_active_.store(
-            !overlay_.empty(), std::memory_order_relaxed);
+            !overlay_.empty() || !resources_->runs.empty(),
+            std::memory_order_relaxed);
         open_stats_.wal_replay_seconds = elapsed_seconds(started);
     }
 
     void pin_segments(const bool retain_ids_for_verification) {
         const auto started = SteadyClock::now();
-        segments_.reserve(catalog_.segments.size());
+        resources_->initial_segments.reserve(catalog_.segments.size());
+        resources_->materialized_segments.reserve(catalog_.segments.size());
+        resources_->initial_segment_indices.reserve(catalog_.segments.size());
+        resources_->materialized_segment_indices.reserve(
+            catalog_.segments.size());
         for (const PartitionedSegmentDescriptor& descriptor :
              catalog_.segments) {
+            if (descriptor.kind != PartitionedSegmentKind::Initial) {
+                const std::size_t index =
+                    resources_->materialized_segments.size();
+                auto reader = std::make_shared<PartitionedSegmentReader>(
+                    root_, manifest_, descriptor,
+                    retain_ids_for_verification);
+                resources_->materialized_segments.push_back(
+                    std::move(reader));
+                if (!resources_->materialized_segment_indices.emplace(
+                         descriptor.row_ref_segment_id, index).second) {
+                    throw CorruptionError(
+                        "partitioned materialized segment ID is duplicated");
+                }
+                continue;
+            }
             const std::filesystem::path data_path =
                 segment_data_path(root_, descriptor.segment_id);
             FileDescriptor data_fd = open_regular(data_path);
@@ -1635,61 +3280,95 @@ private:
                 throw CorruptionError(
                     "partitioned IDs segment does not match catalog");
             }
-            if (!segment_indices_.emplace(
-                    descriptor.row_ref_segment_id, segments_.size()).second) {
+            if (!resources_->initial_segment_indices.emplace(
+                    descriptor.row_ref_segment_id,
+                    resources_->initial_segments.size()).second) {
                 throw CorruptionError("partitioned segment ID is duplicated");
             }
-            ReadOnlyMapping ids_mapping;
-            if (retain_ids_for_verification) {
-                ids_mapping = ReadOnlyMapping(
-                    ids_fd.get(), descriptor.ids_file_size, ids_path);
-            }
-            segments_.push_back(Segment{
+            ReadOnlyMapping ids_mapping(
+                ids_fd.get(), descriptor.ids_file_size, ids_path);
+            resources_->initial_segments.push_back(std::make_shared<Segment>(Segment{
                 data_header,
                 std::move(data_fd),
                 data_path,
                 ids_header,
                 std::move(ids_mapping),
-                ids_path});
+                ids_path}));
         }
         open_stats_.base_segments_seconds = elapsed_seconds(started);
     }
 
+    [[nodiscard]] std::shared_ptr<Snapshot> open_snapshot_view(
+        const PartitionSnapshotDescriptor& descriptor) const {
+        const std::filesystem::path path = snapshot_path(root_, descriptor);
+        FileDescriptor fd = open_regular(path);
+        if (file_size(fd.get(), path) != descriptor.file_size) {
+            throw CorruptionError("partition snapshot size changed");
+        }
+        ReadOnlyMapping mapping(fd.get(), descriptor.file_size, path);
+        // The mapping pins this exact immutable inode, keeping descriptor
+        // usage independent of partition count and catalog generations.
+        fd.reset();
+        const std::span<const std::byte> bytes = mapping.bytes();
+        const PartitionSnapshotHeaderV1 header =
+            decode_partition_snapshot_header_v1(
+                bytes.first(static_cast<std::size_t>(
+                    kPartitionedHeaderSize)));
+        if (header.collection_id != manifest_.collection_id
+            || header.schema_id != manifest_.schema_id
+            || header.descriptor != descriptor
+            || header.partition_bits != manifest_.partition_bits
+            || header.hash_seed != manifest_.hash_seed) {
+            throw CorruptionError(
+                "partition snapshot does not match catalog");
+        }
+        return std::make_shared<Snapshot>(
+            Snapshot{header, std::move(mapping)});
+    }
+
     void pin_snapshots() {
-        snapshots_.reserve(catalog_.snapshots.size());
+        resources_->snapshots.reserve(catalog_.snapshots.size());
         for (const PartitionSnapshotDescriptor& descriptor :
              catalog_.snapshots) {
-            const std::filesystem::path path = snapshot_path(root_, descriptor);
-            FileDescriptor fd = open_regular(path);
-            if (file_size(fd.get(), path) != descriptor.file_size) {
-                throw CorruptionError("partition snapshot size changed");
-            }
-            ReadOnlyMapping mapping(fd.get(), descriptor.file_size, path);
-            // Close immediately: the mapping pins this exact immutable inode,
-            // keeping descriptor usage independent of partition count.
-            fd.reset();
-            const std::span<const std::byte> bytes = mapping.bytes();
-            const PartitionSnapshotHeaderV1 header =
-                decode_partition_snapshot_header_v1(
-                    bytes.first(static_cast<std::size_t>(
-                        kPartitionedHeaderSize)));
-            if (header.collection_id != manifest_.collection_id
-                || header.schema_id != manifest_.schema_id
-                || header.descriptor != descriptor
-                || header.partition_bits != manifest_.partition_bits
-                || header.hash_seed != manifest_.hash_seed) {
-                throw CorruptionError(
-                    "partition snapshot does not match catalog");
-            }
             open_stats_.index_file_bytes = checked_sum(
                 open_stats_.index_file_bytes, descriptor.file_size,
                 "partition snapshot bytes");
-            snapshots_.push_back(Snapshot{header, std::move(mapping)});
+            resources_->snapshots.push_back(open_snapshot_view(descriptor));
+        }
+    }
+
+    void pin_runs() {
+        resources_->runs.reserve(catalog_.runs.size());
+        for (const PartitionIndexRunDescriptor& descriptor : catalog_.runs) {
+            if (descriptor.kind == PartitionedRunKind::LegacyDeltaV1) {
+                throw CorruptionError(
+                    "format-7 reader does not support legacy delta runs");
+            }
+            for (std::uint32_t partition = 0;
+                 partition != manifest_.partition_count; ++partition) {
+                if (partition_bitmap_contains(
+                        descriptor.active_partitions, partition)
+                    && descriptor.epoch
+                           <= catalog_.snapshots[partition].epoch) {
+                    throw CorruptionError(
+                        "active partition run is not newer than its "
+                        "snapshot");
+                }
+            }
+            auto run = std::make_shared<PartitionIndexRunReader>(
+                root_, manifest_.collection_id, manifest_.schema_id,
+                manifest_.partition_bits, manifest_.hash_seed, descriptor);
+            open_stats_.index_file_bytes = checked_sum(
+                open_stats_.index_file_bytes, descriptor.file_size,
+                "partition index run bytes");
+            resources_->runs.push_back(RunView{
+                std::move(run), descriptor});
         }
     }
 
     void verify_segment_payloads() const {
-        for (const Segment& segment : segments_) {
+        for (const auto& segment_pointer : resources_->initial_segments) {
+            const Segment& segment = *segment_pointer;
             if (segment.ids_mapping.bytes().empty()) {
                 throw CorruptionError(
                     "partitioned IDs sidecar was not pinned for verification");
@@ -1744,7 +3423,8 @@ private:
     }
 
     void verify_snapshot_checksums() const {
-        for (const Snapshot& snapshot : snapshots_) {
+        for (const auto& snapshot_pointer : resources_->snapshots) {
+            const Snapshot& snapshot = *snapshot_pointer;
             if (crc32c(snapshot.mapping.bytes().subspan(
                     static_cast<std::size_t>(kPartitionedHeaderSize)))
                 != snapshot.header.descriptor.body_crc32c) {
@@ -1754,18 +3434,9 @@ private:
     }
 
     void validate_snapshot_structure() {
-        std::vector<std::vector<std::uint8_t>> seen_rows;
-        seen_rows.reserve(segments_.size());
-        for (const Segment& segment : segments_) {
-            const std::uint64_t bytes =
-                (segment.header.descriptor.row_count + 7) / 8;
-            if (bytes > std::numeric_limits<std::size_t>::max()) {
-                throw CorruptionError("segment RowRef bitmap does not fit memory");
-            }
-            seen_rows.emplace_back(static_cast<std::size_t>(bytes));
-        }
         std::uint64_t occupied_total = 0;
-        for (const Snapshot& snapshot : snapshots_) {
+        for (const auto& snapshot_pointer : resources_->snapshots) {
+            const Snapshot& snapshot = *snapshot_pointer;
             const std::uint64_t capacity = snapshot.header.descriptor.capacity;
             const std::uint64_t mask = capacity - 1;
             std::uint64_t occupied = 0;
@@ -1787,9 +3458,9 @@ private:
                 }
                 ++occupied;
                 ++occupied_total;
-                if (sequence != 0) {
+                if (sequence > catalog_.indexed_sequence) {
                     throw CorruptionError(
-                        "initial partition snapshot contains mutation sequence");
+                        "partition snapshot sequence exceeds indexed state");
                 }
                 const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
                 if (partition_for_hash(hash, manifest_.partition_bits)
@@ -1797,45 +3468,7 @@ private:
                     throw CorruptionError(
                         "partition snapshot contains an ID in the wrong partition");
                 }
-                const RowRef row = RowRef::decode(raw);
-                const auto segment_position = segment_indices_.find(
-                    row.segment_id().value());
-                if (segment_position == segment_indices_.end()) {
-                    throw CorruptionError(
-                        "partition snapshot RowRef has no segment");
-                }
-                const std::size_t segment_index = segment_position->second;
-                const Segment& source_segment = segments_[segment_index];
-                if (row.row_index()
-                    >= source_segment.header.descriptor.row_count) {
-                    throw CorruptionError(
-                        "partition snapshot RowRef exceeds its segment");
-                }
-                if (source_segment.ids_mapping.bytes().empty()) {
-                    throw CorruptionError(
-                        "full verification lacks a pinned IDs sidecar");
-                }
-                const std::size_t ids_offset = static_cast<std::size_t>(
-                    source_segment.ids_header.payload_offset
-                    + static_cast<std::uint64_t>(row.row_index())
-                          * kPartitionedSegmentIdEntrySize);
-                if (get_u64(
-                        source_segment.ids_mapping.bytes(), ids_offset) != id
-                    || get_u64(
-                           source_segment.ids_mapping.bytes(), ids_offset + 8)
-                           != sequence) {
-                    throw CorruptionError(
-                        "partition snapshot entry disagrees with its IDs sidecar");
-                }
-                std::vector<std::uint8_t>& bitmap = seen_rows[segment_index];
-                const std::size_t byte = row.row_index() / 8;
-                const std::uint8_t bit = static_cast<std::uint8_t>(
-                    std::uint32_t{1} << (row.row_index() % 8));
-                if ((bitmap[byte] & bit) != 0) {
-                    throw CorruptionError(
-                        "partition snapshot duplicates a physical RowRef");
-                }
-                bitmap[byte] |= bit;
+                static_cast<void>(RowRef::decode(raw));
 
                 std::uint64_t probe = hash & mask;
                 bool reached = false;
@@ -1860,75 +3493,241 @@ private:
                     "partition snapshot occupancy does not match catalog");
             }
         }
-        if (occupied_total != catalog_.indexed_live_count
-            || occupied_total != manifest_.initial_record_count) {
-            throw CorruptionError(
-                "partitioned index occupancy does not match collection count");
+        std::uint64_t described_snapshot_rows = 0;
+        for (const PartitionSnapshotDescriptor& descriptor :
+             catalog_.snapshots) {
+            described_snapshot_rows = checked_sum(
+                described_snapshot_rows, descriptor.entry_count,
+                "partition snapshot entry count");
         }
-        for (std::size_t segment_index = 0;
-             segment_index != segments_.size(); ++segment_index) {
-            const std::uint64_t rows =
-                segments_[segment_index].header.descriptor.row_count;
-            for (std::uint64_t row = 0; row != rows; ++row) {
-                if ((seen_rows[segment_index][static_cast<std::size_t>(row / 8)]
-                     & static_cast<std::uint8_t>(
-                         std::uint32_t{1} << (row % 8))) == 0) {
-                    throw CorruptionError(
-                        "partitioned index does not reference every base row");
+        if (occupied_total != described_snapshot_rows) {
+            throw CorruptionError(
+                "partition snapshot occupancy disagrees with catalog");
+        }
+
+        std::uint64_t authoritative_live = 0;
+        const auto audit_candidate = [this, &authoritative_live](
+                                         const std::uint64_t id,
+                                         const std::uint64_t sequence,
+                                         const std::uint64_t value_raw,
+                                         const std::uint64_t source_epoch) {
+            const std::optional<IndexedVersion> winner =
+                indexed_version(id, *resources_);
+            if (!winner.has_value()) {
+                throw CorruptionError(
+                    "partitioned index candidate has no authoritative winner");
+            }
+            if (winner->source_epoch != source_epoch) {
+                return;
+            }
+            if (winner->sequence != sequence
+                || winner->value_raw != value_raw) {
+                throw CorruptionError(
+                    "partitioned index winner disagrees with its source");
+            }
+            if (winner->tombstone()) {
+                return;
+            }
+            validate_authoritative_row(id, *winner);
+            authoritative_live = checked_sum(
+                authoritative_live, 1,
+                "partitioned authoritative live count");
+        };
+        for (const auto& snapshot_pointer : resources_->snapshots) {
+            const Snapshot& snapshot = *snapshot_pointer;
+            for (std::uint64_t slot = 0;
+                 slot != snapshot.header.descriptor.capacity; ++slot) {
+                if (control(snapshot, slot) == 1) {
+                    audit_candidate(
+                        slot_id(snapshot, slot), slot_sequence(snapshot, slot),
+                        slot_value(snapshot, slot),
+                        snapshot.header.descriptor.epoch);
                 }
             }
         }
-        // Full verification no longer needs the sidecar inode pins. Releasing
-        // the mappings here also guarantees that verification does not leave
-        // one extra descriptor or mapping per data segment for handle life.
-        for (Segment& segment : segments_) {
-            segment.ids_mapping = ReadOnlyMapping{};
+        for (const RunView& run : resources_->runs) {
+            for (std::uint32_t partition = 0;
+                 partition != manifest_.partition_count; ++partition) {
+                if (!partition_bitmap_contains(
+                        run.catalog.active_partitions, partition)) {
+                    continue;
+                }
+                const PartitionRunTocEntry section =
+                    run.file->partition_records(partition);
+                for (std::uint64_t offset = 0;
+                     offset != section.record_count; ++offset) {
+                    const PartitionRunRecord record = run.file->record_at(
+                        section.first_record + offset);
+                    audit_candidate(
+                        record.id, record.sequence, record.value_raw,
+                        run.catalog.epoch);
+                }
+            }
+        }
+        if (authoritative_live != catalog_.indexed_live_count) {
+            throw CorruptionError(
+                "authoritative partitioned index live count disagrees with "
+                "catalog");
+        }
+    }
+
+    void validate_authoritative_row(
+        const std::uint64_t id,
+        const IndexedVersion& winner) const {
+        const RowRef row = *winner.row_ref();
+        const auto initial = resources_->initial_segment_indices.find(
+            row.segment_id().value());
+        if (initial != resources_->initial_segment_indices.end()) {
+            const Segment& segment =
+                *resources_->initial_segments[initial->second];
+            if (row.row_index() >= segment.header.descriptor.row_count) {
+                throw CorruptionError(
+                    "authoritative RowRef exceeds its initial segment");
+            }
+            const std::size_t offset = static_cast<std::size_t>(
+                segment.ids_header.payload_offset
+                + static_cast<std::uint64_t>(row.row_index())
+                      * kPartitionedSegmentIdEntrySize);
+            if (get_u64(segment.ids_mapping.bytes(), offset) != id
+                || get_u64(segment.ids_mapping.bytes(), offset + 8)
+                       != winner.sequence) {
+                throw CorruptionError(
+                    "authoritative index winner disagrees with initial "
+                    "sidecar");
+            }
+            return;
+        }
+        const auto derived = resources_->materialized_segment_indices.find(
+            row.segment_id().value());
+        if (derived == resources_->materialized_segment_indices.end()) {
+            throw CorruptionError(
+                "authoritative RowRef has no active immutable segment");
+        }
+        const PartitionedSegmentIdEntry sidecar =
+            resources_->materialized_segments[derived->second]->sidecar_at(
+                row.row_index());
+        if (sidecar.id != id || sidecar.sequence != winner.sequence) {
+            throw CorruptionError(
+                "authoritative index winner disagrees with materialized "
+                "sidecar");
         }
     }
 
     [[nodiscard]] WalSource& active_wal() {
-        return *wal_resources_->sources.at(wal_resources_->active_index);
+        return *resources_->sources.at(resources_->active_index);
     }
 
     [[nodiscard]] const WalSource& active_wal() const {
-        return *wal_resources_->sources.at(wal_resources_->active_index);
+        return *resources_->sources.at(resources_->active_index);
     }
 
-    [[nodiscard]] std::optional<RowRef> snapshot_lookup(
-        const std::uint64_t id) const {
+    [[nodiscard]] std::optional<IndexedVersion> snapshot_version(
+        const std::uint64_t id,
+        const ResourceSet& resources) const {
         const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
         const std::uint64_t partition = partition_for_hash(
             hash, manifest_.partition_bits);
         const Snapshot& snapshot =
-            snapshots_[static_cast<std::size_t>(partition)];
+            *resources.snapshots[static_cast<std::size_t>(partition)];
         const std::uint64_t mask = snapshot.header.descriptor.capacity - 1;
         std::uint64_t slot = hash & mask;
-        while (control(snapshot, slot) != 0) {
+        for (std::uint64_t probes = 0;
+             probes != snapshot.header.descriptor.capacity; ++probes) {
+            if (control(snapshot, slot) == 0) {
+                return std::nullopt;
+            }
             if (slot_id(snapshot, slot) == id) {
-                return RowRef::decode(slot_value(snapshot, slot));
+                return IndexedVersion{
+                    slot_sequence(snapshot, slot), slot_value(snapshot, slot),
+                    snapshot.header.descriptor.epoch};
             }
             slot = (slot + 1) & mask;
         }
-        return std::nullopt;
+        throw CorruptionError("partition snapshot lookup has no empty slot");
+    }
+
+    [[nodiscard]] std::optional<IndexedVersion> indexed_version(
+        const std::uint64_t id,
+        const ResourceSet& resources) const {
+        std::optional<IndexedVersion> winner = snapshot_version(id, resources);
+        const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
+        const auto partition = static_cast<std::uint32_t>(partition_for_hash(
+            hash, manifest_.partition_bits));
+        for (const RunView& run : resources.runs) {
+            if (!partition_bitmap_contains(
+                    run.catalog.active_partitions, partition)) {
+                continue;
+            }
+            if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
+                || run.catalog.epoch
+                       <= resources.snapshots[partition]
+                              ->header.descriptor.epoch) {
+                throw CorruptionError(
+                    "active partition run is incompatible with its "
+                    "authoritative snapshot");
+            }
+            const std::optional<PartitionRunRecord> record =
+                run.file->lookup(partition, id);
+            if (!record.has_value()) {
+                continue;
+            }
+            const PartitionIndexRunDescriptor& descriptor = run.catalog;
+            const IndexedVersion candidate{
+                record->sequence, record->value_raw, descriptor.epoch};
+            if (!winner.has_value()
+                || candidate.sequence > winner->sequence) {
+                winner = candidate;
+                continue;
+            }
+            if (candidate.sequence < winner->sequence) {
+                continue;
+            }
+            if (candidate.value_raw == winner->value_raw) {
+                winner->source_epoch = std::max(
+                    winner->source_epoch, candidate.source_epoch);
+                continue;
+            }
+            bool valid_cleaner_relocation = false;
+            if (descriptor.kind == PartitionedRunKind::Cleaner
+                && descriptor.epoch > winner->source_epoch
+                && candidate.value_raw != 0 && winner->value_raw != 0) {
+                const RowRef previous = RowRef::decode(winner->value_raw);
+                valid_cleaner_relocation =
+                    previous.segment_id().value()
+                    == descriptor.retired_row_ref_segment_id;
+            }
+            if (!valid_cleaner_relocation) {
+                throw CorruptionError(
+                    "partitioned index has conflicting values at one "
+                    "sequence");
+            }
+            winner = candidate;
+        }
+        return winner;
     }
 
     [[nodiscard]] std::optional<RowRef> logical_lookup_unlocked(
-        const std::uint64_t id) const {
+        const std::uint64_t id,
+        const ResourceSet& resources) const {
         const auto position = overlay_.find(id);
         if (position != overlay_.end() && position->second.has_value()) {
             return position->second->row_ref();
         }
-        return snapshot_lookup(id);
+        const std::optional<IndexedVersion> indexed =
+            indexed_version(id, resources);
+        return indexed.has_value() ? indexed->row_ref() : std::nullopt;
     }
 
     [[nodiscard]] PhysicalReadRequest resolve_base(
         const RowRef row,
-        const std::uint64_t output_index) const {
-        const auto position = segment_indices_.find(row.segment_id().value());
-        if (position == segment_indices_.end()) {
+        const std::uint64_t output_index,
+        const ResourceSet& resources) const {
+        const auto position = resources.initial_segment_indices.find(
+            row.segment_id().value());
+        if (position == resources.initial_segment_indices.end()) {
             throw CorruptionError("partition RowRef has no pinned segment");
         }
-        const Segment& segment = segments_[position->second];
+        const Segment& segment = *resources.initial_segments[position->second];
         if (row.row_index() >= segment.header.descriptor.row_count) {
             throw CorruptionError("partition RowRef exceeds pinned segment");
         }
@@ -1943,9 +3742,16 @@ private:
     [[nodiscard]] PhysicalReadRequest resolve_unlocked(
         const RowRef row,
         const std::uint64_t output_index,
-        const WalResourceSet& resources) const {
-        if (segment_indices_.contains(row.segment_id().value())) {
-            return resolve_base(row, output_index);
+        const ResourceSet& resources) const {
+        if (resources.initial_segment_indices.contains(
+                row.segment_id().value())) {
+            return resolve_base(row, output_index, resources);
+        }
+        const auto materialized = resources.materialized_segment_indices.find(
+            row.segment_id().value());
+        if (materialized != resources.materialized_segment_indices.end()) {
+            return resources.materialized_segments[materialized->second]
+                ->resolve(row, output_index);
         }
         const auto source_position = resources.source_indices.find(
             row.segment_id().value());
@@ -1978,7 +3784,12 @@ private:
             const bool existed =
                 prior != overlay_.end() && prior->second.has_value()
                     ? prior->second->is_put()
-                    : snapshot_lookup(operation.id).has_value();
+                    : [&] {
+                          const auto indexed = indexed_version(
+                              operation.id, *resources_);
+                          return indexed.has_value()
+                                 && !indexed->tombstone();
+                      }();
             if (operation.kind == WalOperationKind::Put) {
                 if (operation.payload_size != manifest_.record_size) {
                     throw CorruptionError(
@@ -2112,18 +3923,89 @@ private:
         }
     }
 
+    void validate_materialization_anchor(
+        const std::span<const MutationWalEntry> selected_wals,
+        const std::uint64_t indexed_sequence,
+        const Uuid128 terminal_wal_id) const {
+        if (selected_wals.empty()
+            || catalog_.indexed_sequence != indexed_sequence
+            || catalog_.terminal_wal_id != terminal_wal_id
+            || catalog_.wal_entries.size() <= selected_wals.size()) {
+            throw StorageError(
+                "partitioned catalog changed incompatibly during "
+                "materialization");
+        }
+        for (std::size_t index = 0; index != selected_wals.size(); ++index) {
+            if (catalog_.wal_entries[index] != selected_wals[index]) {
+                throw StorageError(
+                    "partitioned frozen WAL prefix changed during "
+                    "materialization");
+            }
+        }
+    }
+
+    void validate_fold_anchor(
+        const std::uint64_t indexed_sequence,
+        const std::vector<PartitionSnapshotDescriptor>& snapshots,
+        const std::vector<PartitionIndexRunDescriptor>& runs) const {
+        if (catalog_.indexed_sequence != indexed_sequence
+            || catalog_.snapshots != snapshots || catalog_.runs != runs) {
+            throw StorageError(
+                "partitioned indexed view changed during selective fold");
+        }
+    }
+
     [[nodiscard]] NativeMutationLogStats mutation_log_stats_locked(
-        const bool rotated) const {
+        const bool rotated,
+        const bool materialized = false,
+        const std::uint64_t materialized_wal_count = 0,
+        const std::uint64_t materialized_wal_input_bytes = 0,
+        const bool materialization_budget_blocked = false,
+        const bool compacted = false,
+        const bool compaction_budget_blocked = false,
+        const std::uint64_t compacted_partition_count = 0,
+        const std::uint64_t compacted_run_section_count = 0,
+        const std::uint64_t compacted_snapshot_input_entries = 0,
+        const std::uint64_t compacted_snapshot_input_bytes = 0,
+        const std::uint64_t compacted_output_entries = 0,
+        const std::uint64_t compacted_output_bytes = 0,
+        const std::uint64_t compacted_delta_input_entries = 0,
+        const std::uint64_t compacted_delta_input_bytes = 0) const {
         NativeMutationLogStats stats;
         stats.catalog_managed = true;
-        stats.delta_managed = false;
+        stats.delta_managed = true;
         stats.generation = catalog_.generation;
         stats.committed_sequence = next_sequence_ - 1;
         stats.materialized_sequence = catalog_.indexed_sequence;
         stats.active_wal_bytes = append_offset_;
         stats.active_wal_put_rows = active_wal().payload_offsets.size();
+        stats.active_wal_transaction_count =
+            next_sequence_ - active_wal().header.first_sequence;
         stats.rotated = rotated;
-        for (const auto& source : wal_resources_->sources) {
+        stats.materialized = materialized;
+        stats.materialized_wal_count = materialized_wal_count;
+        stats.materialized_wal_input_bytes =
+            materialized_wal_input_bytes;
+        stats.materialization_budget_blocked =
+            materialization_budget_blocked;
+        stats.compacted = compacted;
+        stats.compaction_budget_blocked = compaction_budget_blocked;
+        stats.compacted_partition_count = compacted_partition_count;
+        stats.compacted_run_section_count = compacted_run_section_count;
+        stats.compacted_snapshot_input_entries =
+            compacted_snapshot_input_entries;
+        stats.compacted_snapshot_input_bytes =
+            compacted_snapshot_input_bytes;
+        stats.compacted_output_entries = compacted_output_entries;
+        stats.compacted_output_bytes = compacted_output_bytes;
+        stats.compacted_delta_input_entries =
+            compacted_delta_input_entries;
+        stats.compacted_delta_input_bytes = compacted_delta_input_bytes;
+        // Materialization intentionally leaves selected WAL pathnames for the
+        // orphan collector. Readers already hold exact inode pins, so unlink
+        // and namespace reclamation are a separate lifecycle transaction.
+        stats.reclamation_complete = !materialized && !compacted;
+        for (const auto& source : resources_->sources) {
             if (source->entry.state == MutationWalState::Frozen) {
                 ++stats.frozen_wal_count;
             }
@@ -2131,6 +4013,32 @@ private:
                 stats.total_wal_bytes, source->valid_end,
                 "partitioned WAL total bytes");
         }
+        for (const RunView& run : resources_->runs) {
+            ++stats.delta_run_count;
+            stats.delta_entry_count = checked_sum(
+                stats.delta_entry_count, run.catalog.entry_count,
+                "partitioned run entries");
+            stats.total_delta_run_bytes = checked_sum(
+                stats.total_delta_run_bytes, run.catalog.file_size,
+                "partitioned run bytes");
+        }
+        for (const auto& segment : resources_->materialized_segments) {
+            const PartitionedSegmentDescriptor& descriptor =
+                segment->descriptor();
+            stats.delta_put_rows = checked_sum(
+                stats.delta_put_rows, descriptor.row_count,
+                "partitioned materialized rows");
+            const std::uint64_t bytes = checked_sum(
+                descriptor.data_file_size, descriptor.ids_file_size,
+                "partitioned materialized segment bytes");
+            stats.total_delta_segment_bytes = checked_sum(
+                stats.total_delta_segment_bytes, bytes,
+                "partitioned materialized segment bytes");
+        }
+        stats.total_delta_bytes = checked_sum(
+            stats.total_delta_run_bytes,
+            stats.total_delta_segment_bytes,
+            "partitioned mutation resource bytes");
         return stats;
     }
 
@@ -2201,12 +4109,21 @@ private:
             successor_source->valid_end = kWalFileHeaderSize;
             successor_source->next_sequence = successor.first_sequence;
 
-            auto next_resources = std::make_shared<WalResourceSet>();
+            auto next_resources = std::make_shared<ResourceSet>();
             {
                 std::shared_lock state(state_mutex_);
-                next_resources->sources = wal_resources_->sources;
+                next_resources->initial_segments = resources_->initial_segments;
+                next_resources->initial_segment_indices =
+                    resources_->initial_segment_indices;
+                next_resources->materialized_segments =
+                    resources_->materialized_segments;
+                next_resources->materialized_segment_indices =
+                    resources_->materialized_segment_indices;
+                next_resources->snapshots = resources_->snapshots;
+                next_resources->runs = resources_->runs;
+                next_resources->sources = resources_->sources;
                 next_resources->source_indices =
-                    wal_resources_->source_indices;
+                    resources_->source_indices;
             }
             next_resources->sources.push_back(std::move(successor_source));
             if (!next_resources->source_indices.emplace(
@@ -2221,7 +4138,7 @@ private:
             {
                 std::unique_lock state(state_mutex_);
                 old_active.entry = frozen;
-                wal_resources_.swap(next_resources);
+                resources_.swap(next_resources);
                 std::swap(catalog_, next_catalog);
                 append_offset_ = kWalFileHeaderSize;
                 active_wal().valid_end = append_offset_;
@@ -2241,10 +4158,7 @@ private:
     AdvisoryLockFile writer_lock_;
     AdvisoryLockFile commit_lock_;
     AdvisoryLockFile view_lock_;
-    std::vector<Segment> segments_;
-    std::unordered_map<std::uint32_t, std::size_t> segment_indices_;
-    std::vector<Snapshot> snapshots_;
-    std::shared_ptr<WalResourceSet> wal_resources_;
+    std::shared_ptr<ResourceSet> resources_;
     mutable std::shared_mutex state_mutex_;
     std::unordered_map<std::uint64_t, OverlayValue> overlay_;
     std::atomic<bool> mutation_read_path_active_{false};
@@ -2252,6 +4166,10 @@ private:
     std::uint64_t append_offset_{kWalFileHeaderSize};
     std::uint64_t next_sequence_{1};
     mutable std::mutex mutation_mutex_;
+    // Serializes every future index lifecycle transaction (materialization,
+    // selective fold, and cleaner publication) while still allowing ordinary
+    // WAL commits and rotations during long immutable-output builds.
+    std::mutex lifecycle_mutex_;
     std::atomic<bool> poisoned_{false};
     bool writable_{false};
     const pid_t owner_pid_{::getpid()};
@@ -2327,6 +4245,32 @@ NativeMutationLogStats PartitionedIndexReader::mutation_log_stats() const {
 }
 NativeMutationLogStats PartitionedIndexReader::rotate_wal() {
     return impl_->rotate_wal();
+}
+NativeMutationLogStats PartitionedIndexReader::materialize_frozen_wals(
+    const PhysicalReader& physical_reader,
+    const std::uint64_t max_wals,
+    const std::uint64_t max_input_bytes) {
+    return impl_->materialize_frozen_wals(
+        physical_reader, max_wals, max_input_bytes);
+}
+NativeMutationLogStats PartitionedIndexReader::fold_partitions(
+    const std::uint64_t max_runs,
+    const std::uint64_t max_input_bytes,
+    const std::uint64_t max_input_entries) {
+    return impl_->fold_partitions(
+        max_runs, max_input_bytes, max_input_entries);
+}
+NativeSegmentCleaningStats PartitionedIndexReader::clean_segments(
+    const PhysicalReader& physical_reader,
+    const NativeSegmentCleaningOptions options) {
+    return impl_->clean_segments(physical_reader, options);
+}
+PartitionedResourceInventory PartitionedIndexReader::collect_orphans() {
+    return impl_->collect_orphans();
+}
+PartitionedOrphanCollectionResult PartitionedIndexReader::reclaim_orphans(
+    const PartitionedOrphanCollectionOptions options) {
+    return impl_->reclaim_orphans(options);
 }
 std::uint64_t PartitionedIndexReader::count() const { return impl_->count(); }
 std::uint32_t PartitionedIndexReader::dimension() const {

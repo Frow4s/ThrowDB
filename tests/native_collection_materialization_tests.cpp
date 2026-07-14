@@ -131,6 +131,7 @@ void build_store(
     const std::uint32_t dimension,
     const std::uint64_t segment_size_bytes = 1ULL << 20) {
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = segment_size_bytes;

@@ -20,6 +20,8 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
     AfterOrphanUnlink = 9,
     BeforeOrphanDirectorySync = 10,
     AfterOrphanDirectorySync = 11,
+    CleanerSegmentOutputDurable = 12,
+    CleanerRunOutputDurable = 13,
 };
 
 enum class NativeCollectionTestOperation : std::uint8_t {
@@ -27,6 +29,8 @@ enum class NativeCollectionTestOperation : std::uint8_t {
     MaterializeFrozenWals = 1,
     CompactDeltaRuns = 2,
     CollectOrphans = 3,
+    FoldPartitions = 4,
+    CleanSegment = 5,
 };
 
 enum class NativeCollectionTestResourceKind : std::uint8_t {
@@ -37,6 +41,9 @@ enum class NativeCollectionTestResourceKind : std::uint8_t {
     MutationDeltaIndex = 4,
     OrphanFile = 5,
     OrphanDirectory = 6,
+    PartitionSnapshot = 7,
+    PartitionedSegmentPair = 8,
+    PartitionIndexRun = 9,
 };
 
 // Keep the callback payload a plain value so fork-based crash tests can

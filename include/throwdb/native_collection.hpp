@@ -19,9 +19,9 @@ struct NativeBuilderOptions {
     // Target payload bytes per immutable base segment. Headers/ID sidecars are
     // additional. The builder also caps every segment at 2^32 rows.
     std::uint64_t segment_size_bytes = 16ULL << 30;
-    // Format 6 remains the stable default. Format 7 is an explicit opt-in to
-    // the partitioned RowRef layout while its mutation lifecycle is built out.
-    std::uint32_t format_version = 6;
+    // Format 7 is the stable local-storage format. Format 6 remains readable
+    // and writable for existing collections.
+    std::uint32_t format_version = 7;
     // Format-7 builders use 4096 authoritative partitions by default. Kept at
     // the end to preserve aggregate initialization of the stable v6 fields.
     std::uint32_t partition_bits = 12;
@@ -90,7 +90,8 @@ struct NativeReadStats {
     bool zero_delta_fast_path = false;
 };
 
-// A deterministic, bounded sample from the immutable base index. Sampling
+// A deterministic, bounded sample from the currently authoritative ID sources.
+// Format 7 includes active snapshots, run sections, and WAL overlays. Sampling
 // never scans more than inspected_slots and complete is true only when the
 // requested number of currently-live IDs was collected.
 struct NativeIdSample {
@@ -130,6 +131,64 @@ struct NativeMutationLogStats {
     bool materialization_budget_blocked = false;
     bool compacted = false;
     bool reclamation_complete = true;
+    // New diagnostics are appended to preserve the layout of the original
+    // format-6 stats prefix for native callers.
+    std::uint64_t total_delta_run_bytes = 0;
+    std::uint64_t total_delta_segment_bytes = 0;
+    std::uint64_t compacted_partition_count = 0;
+    std::uint64_t compacted_run_section_count = 0;
+    std::uint64_t compacted_snapshot_input_entries = 0;
+    std::uint64_t compacted_snapshot_input_bytes = 0;
+    std::uint64_t compacted_output_entries = 0;
+    std::uint64_t compacted_output_bytes = 0;
+    // Committed transaction records in the active WAL. Unlike put_rows, this
+    // is non-zero for a delete-only transaction stream.
+    std::uint64_t active_wal_transaction_count = 0;
+    bool compaction_budget_blocked = false;
+};
+
+// One bounded, deterministic selective-segment cleaning pass. The cleaner
+// scans complete immutable sidecars only and retires at most one segment per
+// call. start_after_segment_id is a performance cursor, not correctness
+// state: callers may persist the returned next_start_after_segment_id, while
+// losing it merely causes an earlier segment to be inspected again.
+struct NativeSegmentCleaningOptions {
+    bool dry_run = true;
+    std::uint64_t max_candidate_segments = 8;
+    std::uint64_t max_sidecar_scan_bytes = 1ULL << 30;
+    std::uint64_t max_source_bytes = 32ULL << 30;
+    std::uint64_t max_output_bytes = 32ULL << 30;
+    std::uint64_t max_memory_bytes = 2ULL << 30;
+    std::uint64_t min_garbage_rows = 1;
+    std::uint64_t min_reclaimable_bytes = 512ULL << 20;
+    // Integer parts per million avoids an architecture-dependent floating
+    // point decision at the catalog publication boundary.
+    std::uint32_t min_garbage_ratio_ppm = 300'000;
+    std::uint32_t start_after_segment_id = 0;
+};
+
+struct NativeSegmentCleaningStats {
+    std::uint64_t generation = 0;
+    std::uint64_t scanned_segment_count = 0;
+    std::uint64_t scanned_row_count = 0;
+    std::uint64_t scanned_sidecar_bytes = 0;
+    std::uint64_t skipped_budget_segment_count = 0;
+    std::uint32_t next_start_after_segment_id = 0;
+    std::uint32_t candidate_segment_id = 0;
+    std::uint64_t source_rows = 0;
+    std::uint64_t relocated_rows = 0;
+    std::uint64_t garbage_rows = 0;
+    std::uint64_t source_bytes = 0;
+    std::uint64_t output_segment_count = 0;
+    std::uint64_t output_segment_bytes = 0;
+    std::uint64_t output_run_bytes = 0;
+    std::uint64_t reclaimable_bytes = 0;
+    bool dry_run = true;
+    bool candidate_found = false;
+    bool cleaned = false;
+    bool budget_blocked = false;
+    bool cycle_complete = false;
+    bool reclamation_complete = true;
 };
 
 // Read-only classification of files in the mutable-resource namespaces. The
@@ -143,6 +202,12 @@ enum class NativeOrphanClass : std::uint8_t {
     CompleteUnreferencedDeltaPair,
     PartialUnreferencedDeltaPair,
     UnknownDoNotTouch,
+    // Format-7 values are append-only so existing numeric values remain
+    // stable for native callers that persist diagnostics.
+    CompleteUnreferencedSegmentPair,
+    PartialUnreferencedSegmentPair,
+    UnreferencedSnapshot,
+    UnreferencedRun,
 };
 
 struct NativeOrphanEntry {
@@ -156,6 +221,11 @@ struct NativeOrphanEntry {
     // Negative pre-epoch timestamps are retained rather than silently
     // clamped so policy code can conservatively reject them.
     std::int64_t modified_unix_ns = 0;
+    // True when this storage format's destructive collector may consider the
+    // class after its own fresh locked scan, age/budget checks, and no-follow
+    // identity revalidation. This remains diagnostic, not unlink authority.
+    // Kept append-only so the layout of the pre-existing fields stays stable.
+    bool candidate = false;
 };
 
 struct NativeOrphanInventory {
@@ -336,13 +406,21 @@ public:
             std::numeric_limits<std::uint64_t>::max(),
         std::uint64_t max_input_bytes =
             std::numeric_limits<std::uint64_t>::max());
-    // Merge the oldest contiguous DeltaV1 prefix when at least two complete
-    // runs fit every budget. Original sequences and tombstones are retained;
-    // base segments and newer delta/WAL resources are never rewritten.
+    // Format 6 merges the oldest contiguous DeltaV1 prefix. Format 7 folds
+    // complete active run sections into selected authoritative partitions.
+    // Embedding segments and newer WAL resources are never rewritten here.
+    // The no-argument overload uses the format-aware complete bound: 8 runs
+    // for format 6 and all 4096 possible active runs for format 7.
+    [[nodiscard]] NativeMutationLogStats compact_delta_runs();
     [[nodiscard]] NativeMutationLogStats compact_delta_runs(
-        std::uint64_t max_runs = 8,
+        std::uint64_t max_runs,
         std::uint64_t max_input_bytes = 8ULL << 30,
         std::uint64_t max_input_entries = 1'000'000);
+    // Selectively retire one garbage-heavy immutable segment in format 7.
+    // The source pathname is deliberately left for the orphan collector so
+    // readers that pinned the old inode remain isolated from publication.
+    [[nodiscard]] NativeSegmentCleaningStats clean_segments(
+        NativeSegmentCleaningOptions options = {});
     // Build the same read-only inventory through an already-open writable
     // handle. A writable handle is required because its lifetime writer lease
     // excludes unpublished materialization/compaction output.

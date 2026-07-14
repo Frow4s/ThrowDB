@@ -13,6 +13,7 @@
 #include "native_collection_test_hooks.hpp"
 #include "partitioned_index_format.hpp"
 #include "partitioned_index_storage.hpp"
+#include "partitioned_resource_inventory.hpp"
 #include "physical_reader.hpp"
 #include "wal_file.hpp"
 
@@ -137,6 +138,18 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
     throw StorageError("mutation inventory contains an unknown class");
 }
 
+[[nodiscard]] bool public_orphan_candidate(
+    const detail::MutationInventoryClass classification) noexcept {
+    return classification == detail::MutationInventoryClass::TempPublication
+        || classification == detail::MutationInventoryClass::UnreferencedWal
+        || classification
+               == detail::MutationInventoryClass::
+                   CompleteUnreferencedDeltaPair
+        || classification
+               == detail::MutationInventoryClass::
+                   PartialUnreferencedDeltaPair;
+}
+
 [[nodiscard]] NativeOrphanInventory public_orphan_inventory(
     detail::MutationResourceInventory inventory) {
     NativeOrphanInventory result;
@@ -145,11 +158,79 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
         uuid_filename_token(inventory.current_catalog_id);
     result.entries.reserve(inventory.entries.size());
     for (detail::MutationInventoryEntry& entry : inventory.entries) {
-        result.entries.push_back(NativeOrphanEntry{
-            std::move(entry.relative_path),
-            public_orphan_class(entry.classification),
-            entry.bytes,
-            entry.modified_unix_ns});
+        NativeOrphanEntry converted;
+        converted.path = std::move(entry.relative_path);
+        converted.classification = public_orphan_class(entry.classification);
+        converted.bytes = entry.bytes;
+        converted.modified_unix_ns = entry.modified_unix_ns;
+        converted.candidate = public_orphan_candidate(entry.classification);
+        result.entries.push_back(std::move(converted));
+    }
+    return result;
+}
+
+[[nodiscard]] NativeOrphanClass public_orphan_class(
+    const detail::PartitionedInventoryClass classification) {
+    switch (classification) {
+        case detail::PartitionedInventoryClass::Reachable:
+            return NativeOrphanClass::Reachable;
+        case detail::PartitionedInventoryClass::SupersededCatalog:
+            return NativeOrphanClass::SupersededCatalog;
+        case detail::PartitionedInventoryClass::TempPublication:
+            return NativeOrphanClass::TempPublication;
+        case detail::PartitionedInventoryClass::UnreferencedWal:
+            return NativeOrphanClass::UnreferencedWal;
+        case detail::PartitionedInventoryClass::
+            CompleteUnreferencedSegmentPair:
+            return NativeOrphanClass::CompleteUnreferencedSegmentPair;
+        case detail::PartitionedInventoryClass::
+            PartialUnreferencedSegmentPair:
+            return NativeOrphanClass::PartialUnreferencedSegmentPair;
+        case detail::PartitionedInventoryClass::UnreferencedSnapshot:
+            return NativeOrphanClass::UnreferencedSnapshot;
+        case detail::PartitionedInventoryClass::UnreferencedRun:
+            return NativeOrphanClass::UnreferencedRun;
+        case detail::PartitionedInventoryClass::UnknownDoNotTouch:
+            return NativeOrphanClass::UnknownDoNotTouch;
+    }
+    throw StorageError("format-7 inventory contains an unknown class");
+}
+
+[[nodiscard]] bool public_orphan_candidate(
+    const detail::PartitionedInventoryClass classification) noexcept {
+    return classification
+               == detail::PartitionedInventoryClass::SupersededCatalog
+        || classification
+               == detail::PartitionedInventoryClass::TempPublication
+        || classification
+               == detail::PartitionedInventoryClass::UnreferencedWal
+        || classification
+               == detail::PartitionedInventoryClass::
+                   CompleteUnreferencedSegmentPair
+        || classification
+               == detail::PartitionedInventoryClass::
+                   PartialUnreferencedSegmentPair
+        || classification
+               == detail::PartitionedInventoryClass::UnreferencedSnapshot
+        || classification
+               == detail::PartitionedInventoryClass::UnreferencedRun;
+}
+
+[[nodiscard]] NativeOrphanInventory public_orphan_inventory(
+    detail::PartitionedResourceInventory inventory) {
+    NativeOrphanInventory result;
+    result.current_generation = inventory.current_generation;
+    result.current_catalog_id =
+        uuid_filename_token(inventory.current_catalog_id);
+    result.entries.reserve(inventory.entries.size());
+    for (detail::PartitionedInventoryEntry& entry : inventory.entries) {
+        NativeOrphanEntry converted;
+        converted.path = std::move(entry.relative_path);
+        converted.classification = public_orphan_class(entry.classification);
+        converted.bytes = entry.bytes;
+        converted.modified_unix_ns = entry.modified_unix_ns;
+        converted.candidate = public_orphan_candidate(entry.classification);
+        result.entries.push_back(std::move(converted));
     }
     return result;
 }
@@ -177,6 +258,31 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
             return NativeOrphanDisposition::UnlinkFailed;
     }
     throw StorageError("orphan collector contains an unknown disposition");
+}
+
+[[nodiscard]] NativeOrphanDisposition public_orphan_disposition(
+    const detail::PartitionedOrphanDisposition disposition) {
+    switch (disposition) {
+        case detail::PartitionedOrphanDisposition::NotCandidate:
+            return NativeOrphanDisposition::NotCandidate;
+        case detail::PartitionedOrphanDisposition::InvalidModificationTime:
+            return NativeOrphanDisposition::InvalidModificationTime;
+        case detail::PartitionedOrphanDisposition::MinimumAgeNotReached:
+            return NativeOrphanDisposition::MinimumAgeNotReached;
+        case detail::PartitionedOrphanDisposition::MaximumFilesReached:
+            return NativeOrphanDisposition::MaximumFilesReached;
+        case detail::PartitionedOrphanDisposition::MaximumBytesReached:
+            return NativeOrphanDisposition::MaximumBytesReached;
+        case detail::PartitionedOrphanDisposition::Removed:
+            return NativeOrphanDisposition::Removed;
+        case detail::PartitionedOrphanDisposition::NoLongerPresent:
+            return NativeOrphanDisposition::NoLongerPresent;
+        case detail::PartitionedOrphanDisposition::IdentityChanged:
+            return NativeOrphanDisposition::IdentityChanged;
+        case detail::PartitionedOrphanDisposition::UnlinkFailed:
+            return NativeOrphanDisposition::UnlinkFailed;
+    }
+    throw StorageError("format-7 orphan collector contains an unknown disposition");
 }
 
 [[nodiscard]] std::string orphan_area_name(
@@ -216,6 +322,66 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
         converted.file.path = std::move(entry.file.relative_path);
         converted.file.classification =
             public_orphan_class(entry.file.classification);
+        converted.file.candidate =
+            public_orphan_candidate(entry.file.classification);
+        converted.file.bytes = entry.file.bytes;
+        converted.file.modified_unix_ns = entry.file.modified_unix_ns;
+        converted.disposition =
+            public_orphan_disposition(entry.disposition);
+        converted.eligible = entry.eligible;
+        converted.selected = entry.selected;
+        converted.removed = entry.removed;
+        converted.durable = entry.durable;
+        converted.error = std::move(entry.error);
+        result.entries.push_back(std::move(converted));
+    }
+    return result;
+}
+
+[[nodiscard]] std::string orphan_area_name(
+    const detail::PartitionedInventoryArea area) {
+    switch (area) {
+        case detail::PartitionedInventoryArea::Root:
+            return ".";
+        case detail::PartitionedInventoryArea::Catalogs:
+            return "catalogs";
+        case detail::PartitionedInventoryArea::Segments:
+            return "segments";
+        case detail::PartitionedInventoryArea::Partitions:
+            return "index/partitions";
+        case detail::PartitionedInventoryArea::Runs:
+            return "index/runs";
+        case detail::PartitionedInventoryArea::Wal:
+            return "wal";
+    }
+    throw StorageError("format-7 orphan collector contains an unknown area");
+}
+
+[[nodiscard]] NativeOrphanCollectionResult public_orphan_result(
+    detail::PartitionedOrphanCollectionResult collected) {
+    NativeOrphanCollectionResult result;
+    result.current_generation = collected.current_generation;
+    result.current_catalog_id =
+        uuid_filename_token(collected.current_catalog_id);
+    result.snapshot_unix_ns = collected.options.snapshot_unix_ns;
+    result.min_age_ns = collected.options.min_age_ns;
+    result.max_files = collected.options.max_files;
+    result.max_bytes = collected.options.max_bytes;
+    result.durability_complete = collected.durability_complete;
+    result.synced_directories.reserve(collected.synced_directories.size());
+    for (const detail::PartitionedInventoryArea area :
+         collected.synced_directories) {
+        result.synced_directories.push_back(orphan_area_name(area));
+    }
+    result.entries.reserve(collected.entries.size());
+    for (detail::PartitionedOrphanCollectionEntry& entry :
+         collected.entries) {
+        NativeOrphanCollectionEntry converted;
+        converted.file.path = std::move(entry.file.relative_path);
+        converted.file.classification =
+            public_orphan_class(entry.file.classification);
+        converted.file.candidate =
+            public_orphan_candidate(entry.file.classification);
         converted.file.bytes = entry.file.bytes;
         converted.file.modified_unix_ns = entry.file.modified_unix_ns;
         converted.disposition =
@@ -260,6 +426,11 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
     // for WAL commits and through CURRENT publication, unlink, and directory
     // sync. Never replace it while the collection exists.
     return path / "locks" / "commit.lock";
+}
+
+[[nodiscard]] std::filesystem::path view_lock_path(
+    const std::filesystem::path& path) {
+    return path / "locks" / "view.lock";
 }
 
 [[nodiscard]] detail::AdvisoryLockFile create_native_store_directories(
@@ -1052,8 +1223,8 @@ public:
 
     [[nodiscard]] NativeOrphanInventory collect_orphans() {
         if (partitioned_reader_ != nullptr) {
-            throw InvalidArgumentError(
-                "orphan collection is not implemented for format-7 yet");
+            return public_orphan_inventory(
+                partitioned_reader_->collect_orphans());
         }
         // A writable handle owns writer.lock for its complete lifetime. The
         // remaining lock order matches lifecycle publishers and yields one
@@ -1083,8 +1254,14 @@ public:
     [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
         NativeOrphanCollectionOptions options) {
         if (partitioned_reader_ != nullptr) {
-            throw InvalidArgumentError(
-                "orphan collection is not implemented for format-7 yet");
+            options = normalized_orphan_options(options);
+            return public_orphan_result(
+                partitioned_reader_->reclaim_orphans(
+                    detail::PartitionedOrphanCollectionOptions{
+                        options.snapshot_unix_ns,
+                        options.min_age_ns,
+                        options.max_files,
+                        options.max_bytes}));
         }
         ensure_mutable();
         std::unique_lock lifecycle(materialization_mutex_);
@@ -1135,8 +1312,8 @@ public:
         const std::uint64_t max_wals,
         const std::uint64_t max_input_bytes) {
         if (partitioned_reader_ != nullptr) {
-            throw InvalidArgumentError(
-                "WAL materialization is not implemented for format-7 yet");
+            return partitioned_reader_->materialize_frozen_wals(
+                physical_reader_, max_wals, max_input_bytes);
         }
         ensure_mutable();
         if (max_wals == 0 || max_input_bytes == 0) {
@@ -1517,8 +1694,8 @@ public:
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
         if (partitioned_reader_ != nullptr) {
-            throw InvalidArgumentError(
-                "index-run compaction is not implemented for format-7 yet");
+            return partitioned_reader_->fold_partitions(
+                max_runs, max_input_bytes, max_input_entries);
         }
         ensure_mutable();
         if (max_runs < 2) {
@@ -1987,6 +2164,16 @@ public:
         stats.reclaimed_delta_bytes = reclaimed_delta_bytes;
         stats.reclamation_complete = reclamation_complete;
         return stats;
+    }
+
+    [[nodiscard]] NativeSegmentCleaningStats clean_segments(
+        const NativeSegmentCleaningOptions options) {
+        if (partitioned_reader_ == nullptr) {
+            throw InvalidArgumentError(
+                "selective segment cleaning requires a format-7 collection");
+        }
+        return partitioned_reader_->clean_segments(
+            physical_reader_, options);
     }
 
     [[nodiscard]] std::uint64_t count() const {
@@ -2558,6 +2745,8 @@ private:
             catalog_managed_ ? catalog_.materialized_sequence : 0;
         stats.active_wal_bytes = append_offset_;
         stats.active_wal_put_rows = active_wal().payload_offsets.size();
+        stats.active_wal_transaction_count =
+            next_sequence_ - active_wal().header.first_sequence;
         stats.rotated = rotated;
         stats.materialized = materialized;
         stats.reclaimed_wal_count = reclaimed_wal_count;
@@ -2600,6 +2789,12 @@ private:
             const std::uint64_t bytes =
                 source->descriptor.data_file_size
                 + source->descriptor.index_file_size;
+            if (stats.total_delta_run_bytes
+                > std::numeric_limits<std::uint64_t>::max() - bytes) {
+                throw CorruptionError(
+                    "mutation delta run byte count overflows uint64");
+            }
+            stats.total_delta_run_bytes += bytes;
             if (stats.total_delta_bytes
                 > std::numeric_limits<std::uint64_t>::max() - bytes) {
                 throw CorruptionError(
@@ -3051,6 +3246,21 @@ NativeOrphanInventory NativeCollection::inspect_orphans(
     detail::ScopedAdvisoryLock writer_lease(
         writer, detail::FileLockMode::Exclusive, true);
 
+    if (detail::is_partitioned_index_store(path)) {
+        detail::AdvisoryLockFile commit =
+            detail::AdvisoryLockFile::open_existing(
+                commit_lock_path(path), true);
+        detail::ScopedAdvisoryLock stable(
+            commit, detail::FileLockMode::Exclusive);
+        detail::AdvisoryLockFile view =
+            detail::AdvisoryLockFile::open_existing(
+                view_lock_path(path), true);
+        detail::ScopedAdvisoryLock unlinked_view_barrier(
+            view, detail::FileLockMode::Exclusive);
+        return public_orphan_inventory(
+            detail::inspect_partitioned_resources(path));
+    }
+
     // Read all authoritative metadata only after excluding a builder, writer,
     // materializer, or compactor. Nothing below loads the flat base index,
     // opens base segments, or replays mutations.
@@ -3084,6 +3294,26 @@ NativeOrphanCollectionResult NativeCollection::reclaim_orphans(
             writer_lock_path(path), true);
     detail::ScopedAdvisoryLock writer_lease(
         writer, detail::FileLockMode::Exclusive, true);
+    if (detail::is_partitioned_index_store(path)) {
+        detail::AdvisoryLockFile commit =
+            detail::AdvisoryLockFile::open_existing(
+                commit_lock_path(path), true);
+        detail::ScopedAdvisoryLock stable(
+            commit, detail::FileLockMode::Exclusive);
+        detail::AdvisoryLockFile view =
+            detail::AdvisoryLockFile::open_existing(
+                view_lock_path(path), true);
+        detail::ScopedAdvisoryLock unlinked_view_barrier(
+            view, detail::FileLockMode::Exclusive);
+        options = normalized_orphan_options(options);
+        return public_orphan_result(detail::collect_partitioned_orphans(
+            path,
+            detail::PartitionedOrphanCollectionOptions{
+                options.snapshot_unix_ns,
+                options.min_age_ns,
+                options.max_files,
+                options.max_bytes}));
+    }
     const detail::NativeManifest manifest =
         detail::read_native_manifest(path);
     if (!detail::mutation_catalog_managed(manifest)) {
@@ -3226,12 +3456,25 @@ NativeMutationLogStats NativeCollection::materialize_frozen_wals(
     const std::uint64_t max_input_bytes) {
     return impl_->materialize_frozen_wals(max_wals, max_input_bytes);
 }
+NativeMutationLogStats NativeCollection::compact_delta_runs() {
+    constexpr std::uint64_t format6_default_max_runs = 8;
+    constexpr std::uint64_t format7_default_max_runs = 4096;
+    return impl_->compact_delta_runs(
+        impl_->format_version() == detail::kPartitionedPublicFormatVersion
+            ? format7_default_max_runs
+            : format6_default_max_runs,
+        8ULL << 30, 1'000'000);
+}
 NativeMutationLogStats NativeCollection::compact_delta_runs(
     const std::uint64_t max_runs,
     const std::uint64_t max_input_bytes,
     const std::uint64_t max_input_entries) {
     return impl_->compact_delta_runs(
         max_runs, max_input_bytes, max_input_entries);
+}
+NativeSegmentCleaningStats NativeCollection::clean_segments(
+    const NativeSegmentCleaningOptions options) {
+    return impl_->clean_segments(options);
 }
 NativeOrphanInventory NativeCollection::collect_orphans() {
     return impl_->collect_orphans();

@@ -19,19 +19,25 @@ from .collection import Collection, CollectionSchema, _normalize_numeric_ids
 
 DEFAULT_SHARD_SIZE_GIB = 16
 DEFAULT_BATCH_ROWS = 32_768
-DEFAULT_DELTA_COMPACTION_MAX_RUNS = 8
-MAX_DELTA_COMPACTION_RUNS = 64
+MAX_PARTITIONED_FOLD_RUNS = 4096
 DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB = 8
 DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES = 1_000_000
+DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS = 8
+DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES = 1 << 30
+DEFAULT_CLEAN_MAX_SOURCE_BYTES = 32 << 30
+DEFAULT_CLEAN_MAX_OUTPUT_BYTES = 32 << 30
+DEFAULT_CLEAN_MAX_MEMORY_BYTES = 2 << 30
+DEFAULT_CLEAN_MIN_GARBAGE_ROWS = 1
+DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES = 512 << 20
+DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM = 300_000
 DEFAULT_ORPHAN_MIN_AGE_SECONDS = 3_600.0
 DEFAULT_ORPHAN_MAX_FILES = 1_024
 DEFAULT_ORPHAN_MAX_BYTES = 8 << 30
 DEFAULT_MAINTAIN_MAX_SECONDS = 300.0
-DEFAULT_MAINTAIN_MAX_ACTIONS = 4
+DEFAULT_MAINTAIN_MAX_ACTIONS = 5
 DEFAULT_MAINTAIN_ROTATE_WAL_BYTES = 1 << 30
 DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS = 8
 DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES = 8 << 30
-DEFAULT_MAINTAIN_COMPACT_MIN_RUNS = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
 MAX_IO_URING_WORKERS = 64
 MAX_IO_URING_QUEUE_DEPTH = 4096
@@ -147,9 +153,18 @@ def _io_uring_workers(value: str) -> int:
 
 def _delta_compaction_runs(value: str) -> int:
     parsed = int(value)
-    if parsed < 2 or parsed > MAX_DELTA_COMPACTION_RUNS:
+    if parsed < 2 or parsed > MAX_PARTITIONED_FOLD_RUNS:
         raise argparse.ArgumentTypeError(
-            f"value must be between 2 and {MAX_DELTA_COMPACTION_RUNS}"
+            f"value must be between 2 and {MAX_PARTITIONED_FOLD_RUNS}"
+        )
+    return parsed
+
+
+def _partitioned_compaction_min_runs(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > MAX_PARTITIONED_FOLD_RUNS:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 1 and {MAX_PARTITIONED_FOLD_RUNS}"
         )
     return parsed
 
@@ -278,6 +293,23 @@ def _compact_deltas(args: argparse.Namespace) -> None:
         )
 
 
+def _clean_segments(args: argparse.Namespace) -> None:
+    with Collection.open(args.storage, mode="r+") as collection:
+        report = collection.clean_segments(
+            dry_run=not args.execute,
+            max_candidate_segments=args.max_candidate_segments,
+            max_sidecar_scan_bytes=args.max_sidecar_scan_bytes,
+            max_source_bytes=args.max_source_bytes,
+            max_output_bytes=args.max_output_bytes,
+            max_memory_bytes=args.max_memory_bytes,
+            min_garbage_rows=args.min_garbage_rows,
+            min_reclaimable_bytes=args.min_reclaimable_bytes,
+            min_garbage_ratio_ppm=args.min_garbage_ratio_ppm,
+            start_after_segment_id=args.start_after_segment_id,
+        )
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+
+
 def _collect_orphans(args: argparse.Namespace) -> None:
     if args.dry_run:
         report = Collection.inspect_orphans(
@@ -314,6 +346,15 @@ def _maintain(args: argparse.Namespace) -> None:
             compact_max_runs=args.compact_max_runs,
             compact_max_input_bytes=args.compact_max_input_bytes,
             compact_max_input_entries=args.compact_max_input_entries,
+            clean_max_candidate_segments=args.clean_max_candidate_segments,
+            clean_max_sidecar_scan_bytes=args.clean_max_sidecar_scan_bytes,
+            clean_max_source_bytes=args.clean_max_source_bytes,
+            clean_max_output_bytes=args.clean_max_output_bytes,
+            clean_max_memory_bytes=args.clean_max_memory_bytes,
+            clean_min_garbage_rows=args.clean_min_garbage_rows,
+            clean_min_reclaimable_bytes=args.clean_min_reclaimable_bytes,
+            clean_min_garbage_ratio_ppm=args.clean_min_garbage_ratio_ppm,
+            clean_start_after_segment_id=args.clean_start_after_segment_id,
             orphan_min_age_seconds=args.orphan_min_age_seconds,
             orphan_max_files=args.orphan_max_files,
             orphan_max_bytes=args.orphan_max_bytes,
@@ -557,8 +598,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--format-version",
         type=int,
         choices=(6, 7),
-        default=6,
-        help="on-disk collection format (default: 6; 7 is explicit opt-in)",
+        default=7,
+        help="on-disk collection format (default: 7; 6 remains supported)",
     )
     create.add_argument(
         "--shard-size-gib", type=_positive_int, default=DEFAULT_SHARD_SIZE_GIB
@@ -597,7 +638,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     materialize = subparsers.add_parser(
         "materialize",
-        help="replace the frozen WAL prefix with an immutable delta run",
+        help="materialize a frozen WAL prefix into immutable indexed storage",
     )
     materialize.add_argument("--storage", type=Path, required=True)
     materialize.add_argument(
@@ -616,14 +657,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     compact_deltas = subparsers.add_parser(
         "compact-deltas",
-        help="compact a bounded oldest prefix of immutable delta runs",
+        help="compact bounded immutable index state",
     )
     compact_deltas.add_argument("--storage", type=Path, required=True)
     compact_deltas.add_argument(
         "--max-runs",
         type=_delta_compaction_runs,
-        default=DEFAULT_DELTA_COMPACTION_MAX_RUNS,
-        help="maximum input delta runs (default: 8)",
+        default=None,
+        help="maximum input runs (default: 8 for format 6, 4096 for format 7)",
     )
     compact_deltas.add_argument(
         "--max-input-gib",
@@ -639,9 +680,62 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     compact_deltas.set_defaults(handler=_compact_deltas)
 
+    clean_segments = subparsers.add_parser(
+        "clean-segments",
+        help="plan or execute one bounded format-7 selective segment rewrite",
+    )
+    clean_segments.add_argument("--storage", type=Path, required=True)
+    clean_mode = clean_segments.add_mutually_exclusive_group(required=True)
+    clean_mode.add_argument(
+        "--dry-run", action="store_true",
+        help="scan and report the deterministic candidate without publishing",
+    )
+    clean_mode.add_argument(
+        "--execute", action="store_true",
+        help="publish Cleaner resources and retire at most one source segment",
+    )
+    clean_segments.add_argument(
+        "--max-candidate-segments", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS,
+    )
+    clean_segments.add_argument(
+        "--max-sidecar-scan-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES,
+    )
+    clean_segments.add_argument(
+        "--max-source-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_SOURCE_BYTES,
+    )
+    clean_segments.add_argument(
+        "--max-output-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_OUTPUT_BYTES,
+    )
+    clean_segments.add_argument(
+        "--max-memory-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_MEMORY_BYTES,
+    )
+    clean_segments.add_argument(
+        "--min-garbage-rows", type=_positive_int,
+        default=DEFAULT_CLEAN_MIN_GARBAGE_ROWS,
+    )
+    clean_segments.add_argument(
+        "--min-reclaimable-bytes", type=_nonnegative_int,
+        default=DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES,
+    )
+    clean_segments.add_argument(
+        "--min-garbage-ratio-ppm", type=_nonnegative_int,
+        default=DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM,
+    )
+    clean_segments.add_argument(
+        "--start-after-segment-id", type=_nonnegative_int,
+        default=None,
+        help="optional scan cursor; omitted uses this handle's cursor",
+    )
+    clean_segments.set_defaults(handler=_clean_segments)
+
     collect_orphans = subparsers.add_parser(
         "collect-orphans",
-        help="plan or execute bounded orphan mutation-file collection",
+        help="plan or execute bounded orphan storage-resource collection",
     )
     collect_orphans.add_argument("--storage", type=Path, required=True)
     orphan_mode = collect_orphans.add_mutually_exclusive_group(required=True)
@@ -704,12 +798,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES,
     )
     maintain.add_argument(
-        "--compact-min-runs", type=_delta_compaction_runs,
-        default=DEFAULT_MAINTAIN_COMPACT_MIN_RUNS,
+        "--compact-min-runs", type=_partitioned_compaction_min_runs,
+        default=None,
     )
     maintain.add_argument(
         "--compact-max-runs", type=_delta_compaction_runs,
-        default=DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+        default=None,
     )
     maintain.add_argument(
         "--compact-max-input-bytes", type=_positive_int,
@@ -718,6 +812,43 @@ def _build_parser() -> argparse.ArgumentParser:
     maintain.add_argument(
         "--compact-max-input-entries", type=_positive_int,
         default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+    )
+    maintain.add_argument(
+        "--clean-max-candidate-segments", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS,
+    )
+    maintain.add_argument(
+        "--clean-max-sidecar-scan-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES,
+    )
+    maintain.add_argument(
+        "--clean-max-source-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_SOURCE_BYTES,
+    )
+    maintain.add_argument(
+        "--clean-max-output-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_OUTPUT_BYTES,
+    )
+    maintain.add_argument(
+        "--clean-max-memory-bytes", type=_positive_int,
+        default=DEFAULT_CLEAN_MAX_MEMORY_BYTES,
+    )
+    maintain.add_argument(
+        "--clean-min-garbage-rows", type=_positive_int,
+        default=DEFAULT_CLEAN_MIN_GARBAGE_ROWS,
+    )
+    maintain.add_argument(
+        "--clean-min-reclaimable-bytes", type=_nonnegative_int,
+        default=DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES,
+    )
+    maintain.add_argument(
+        "--clean-min-garbage-ratio-ppm", type=_nonnegative_int,
+        default=DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM,
+    )
+    maintain.add_argument(
+        "--clean-start-after-segment-id", type=_nonnegative_int,
+        default=None,
+        help="optional cleaner scan cursor from a previous report",
     )
     maintain.add_argument(
         "--orphan-min-age-seconds", type=_nonnegative_float,
@@ -824,5 +955,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         args.handler(args)
-    except (CalibrationError, TuningRegistryError, TypeError, ValueError) as error:
+    except (
+        CalibrationError,
+        TuningRegistryError,
+        NotImplementedError,
+        TypeError,
+        ValueError,
+    ) as error:
         parser.error(str(error))

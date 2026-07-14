@@ -35,6 +35,12 @@ jobs:
           cache: pip
       - name: Build sdist
         run: python -m pip install build && python -m build --sdist
+      - name: Test installed sdist in an isolated environment
+        run: |
+          python -m venv "${RUNNER_TEMP}/throwdb-sdist-smoke"
+          "${RUNNER_TEMP}/throwdb-sdist-smoke/bin/python" -m pip install --upgrade pip
+          "${RUNNER_TEMP}/throwdb-sdist-smoke/bin/python" -m pip install dist/*.tar.gz
+          "${RUNNER_TEMP}/throwdb-sdist-smoke/bin/python" tools/wheel_smoke.py
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
         with:

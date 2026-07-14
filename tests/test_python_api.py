@@ -256,9 +256,9 @@ def test_internal_io_worker_options_preserve_repeated_cross_shard_reads(
         )
         _assert_same_float16_bits(storage.get(query), vectors[positions])
 
-    # Cover the adaptive partition boundaries, including the observable result
-    # of the one-range direct fast path. The implementation does not expose
-    # executor scheduling details through the public API.
+    # Cover adaptive scheduling boundaries, including a single-range request.
+    # The implementation does not expose coordinator details through the
+    # public API.
     for query_rows in (1, 2, 7, 8, 9, 16, 17):
         small_positions = positions[: min(query_rows, positions.size)]
         if query_rows > positions.size:

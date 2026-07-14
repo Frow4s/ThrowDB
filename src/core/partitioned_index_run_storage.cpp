@@ -312,6 +312,14 @@ struct SortableRecord {
 
 }  // namespace
 
+std::uint64_t partitioned_index_run_file_size(
+    const std::uint32_t partition_bits,
+    const std::uint64_t entry_count) {
+    return run_geometry<InvalidArgumentError>(
+               partition_bits, entry_count)
+        .file_size;
+}
+
 std::filesystem::path partitioned_index_runs_directory(
     const std::filesystem::path& store_path) {
     return store_path / "index" / "runs";

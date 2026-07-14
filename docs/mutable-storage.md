@@ -1,40 +1,49 @@
 # Mutable local storage architecture
 
-This document defines the target selective-cleaning mutation layer for a
+This document defines the implemented selective-cleaning mutation layer for a
 logical ThrowDB collection. It deliberately does **not** require periodically
-copying the whole base collection. New writes eventually become smaller
-immutable resources, and background cleaning rewrites only selected segments
-whose live-data ratio justifies the work.
+copying the whole collection. New writes become bounded immutable resources,
+and an explicit cleaner pass rewrites at most one selected segment whose
+garbage and reclaimable-byte thresholds justify the work. No background thread
+invokes lifecycle maintenance.
 
 The fresh native numeric MVP now implements:
 
 - checked `SegmentId`, `RowRef`, tombstone, and partition-routing types;
 - CRC32C-protected native headers and WAL frames;
-- immutable base segments plus ID sidecars and a flat `ID -> RowRef` index;
+- immutable embedding segments plus `{id, sequence}` sidecars;
 - one writer lease, a commit lock, RAM overlay, public batch CRUD, and strict
   active/frozen WAL recovery;
 - checksummed `CURRENT`, immutable catalog generations, UUID-named WAL chains,
   and manual plus hard-limit WAL rotation;
-- DeltaV1 materialization of a frozen WAL prefix into immutable data/index
-  pairs, with durable segment-ID reservation and an atomic catalog switch;
-- bounded compaction of an oldest contiguous DeltaV1-run prefix, preserving
-  original commit sequences and tombstones while reclaiming only replaced
-  delta files;
-- generic physical reads spanning base segments, mutation deltas, and multiple
-  WAL payloads,
+- format-6 DeltaV1 materialization and prefix compaction for compatibility;
+- format-7 frozen-WAL materialization into immutable segments and one
+  partitioned mutation run;
+- an authoritative format-7 index made of one immutable snapshot per partition
+  plus small active run sections;
+- bounded selective folding of complete partition state without copying
+  embedding payloads;
+- bounded segment cleaning with same-sequence RowRef relocation and a cleaner
+  run that fences every row of the retired source;
+- format-aware orphan planning and fail-closed deletion for WALs, delta pairs,
+  segment pairs, snapshots, runs, and temporary publications;
+- generic physical reads spanning immutable segments and multiple WAL payloads,
   with one shared resource-set pin retained through physical I/O.
 
-The current format-6 collection can retain immutable mutation-delta runs,
-multiple frozen WALs, and exactly one active WAL. Manual materialization removes
-a frozen WAL prefix from the current catalog without rewriting the base, and
-manual delta compaction can replace several oldest runs with one bounded run;
-format 5 remains catalog/WAL-only and rejects both operations. Partitioned
-index runs and base-segment selective cleaning remain later integration slices.
-Public orphan planning/deletion and explicit bounded maintenance are available
-today. Materialization and delta compaction reduce retained resources
-and replay work, but all surviving delta version metadata is still rebuilt into
-a RAM overlay on open. The exact shipped MVP layout and limits are in
-`native-format-v3.md`.
+Format 7 retains multiple frozen WALs, exactly one active WAL, immutable
+materialized segments, partition snapshots, and partitioned mutation/cleaner
+runs. Materialization, folding, and cleaning publish a new catalog but do not
+unlink retired resources. They become unreachable only after the catalog
+switch and are reclaimed by a later fresh, locked orphan pass. This separates
+logical publication from namespace reclamation and preserves readers that
+pinned the previous view. Format 6 keeps its flat-index/DeltaV1 lifecycle, and
+format 5 remains catalog/WAL-only. The historical formats 3 through 6 are
+specified in `native-format-v3.md`.
+
+One writable handle serializes materialization, folding, cleaning, and orphan
+passes through its lifecycle mutex. Ordinary commits and compatible WAL
+rotations may continue during long data-build portions; each operation
+revalidates its indexed/catalog anchor before final publication.
 
 ## Logical view and resource layout
 
@@ -45,23 +54,25 @@ CollectionView
   collection/schema identity
   visible commit sequence
   segment catalog
-  immutable delta and active/frozen WAL resolvers
-  RAM overlay captured for this view
+  authoritative partition snapshots and active run sections
+  active/frozen WAL resolvers and current RAM overlay
 ```
 
-The current format-6 directory layout extends the fresh native base:
+The format-7 layout is:
 
 ```text
 collection/
-  manifest.bin, index/, data/, ids/ # fresh immutable native base
+  manifest.bin
   CURRENT                           # points to exactly one immutable catalog
   catalogs/
-  wal/
-  deltas/                           # immutable delta-UUID.dat/.idx pairs
+  segments/                         # segment-UUID.dat + segment-UUID.ids
+  index/partitions/                 # one authoritative snapshot per partition
+  index/runs/                       # immutable mutation and cleaner runs
+  wal/                              # frozen prefix + exactly one active WAL
+  locks/writer.lock
+  locks/commit.lock
+  locks/view.lock
 ```
-
-Future partitioned index and cleaner resources will extend this layout without
-changing `CURRENT` as the only selected-view pointer.
 
 `CURRENT` is the sole metadata publication point. It names a catalog by an
 immutable generation and UUID and records its expected size/checksums. Open
@@ -77,21 +88,18 @@ Publication order is:
 5. Atomically rename it to `CURRENT` and sync the collection directory.
 6. Publish the equivalent in-memory view.
 
-`locks/commit.lock` is also the mutation reader-open barrier. A reader holds it
-shared from immediately before reading `CURRENT` until the complete referenced
-catalog, delta indexes, WAL offsets, and data/WAL file descriptors are pinned.
-A publisher or reclaimer holds it exclusively across the durable `CURRENT`
-switch, in-memory view swap, retired-resource unlink, and directory sync. Thus
-an opener either finishes pinning the old view before unlink or waits and opens
-the new view. POSIX keeps unlinked inodes alive until older readers release the
-final open descriptor.
+`locks/commit.lock` serializes mutation publication. Format 7 additionally uses
+`locks/view.lock` as the reader-open/reclamation barrier. A reader holds it
+shared until every selected segment FD, snapshot mmap, run mmap, and WAL FD is
+pinned, then releases the pathname lease. An orphan reclaimer holds both locks
+exclusively during its fresh scan, no-follow identity check, unlink, and
+directory sync. Thus an opener pins the old view before unlink or waits and
+opens the new view. POSIX keeps an unlinked inode alive until the last older
+reader releases it.
 
 The global order is `writer.lock -> lifecycle mutex -> mutation mutex ->
-commit.lock -> state mutex`. The collector follows the same order, so it cannot
-mistake an unlocked in-progress delta build for an orphan. The current barrier
-protects mutation resources only. Future
-base generations require a separate base-view barrier so loading a large base
-index does not stall every WAL commit.
+commit.lock -> view.lock -> state mutex`. The collector follows the same order,
+so it cannot mistake an in-progress lifecycle output for an orphan.
 
 Segment IDs are durably reserved before a long delta build and are never reused,
 which protects against segment-ID ABA. Network filesystem and object-store
@@ -100,14 +108,12 @@ semantics are not yet part of this contract.
 ## Current lifecycle safety slice
 
 The native tests have private lifecycle checkpoints at the reader-open barrier
-and at important materialization/compaction transitions: an immutable catalog
-is durable before `CURRENT`, `CURRENT` is durable, an output segment ID is
-reserved, a delta output pair is durable, and a selected source is immediately
-before or after a successful unlink. Checkpoint context identifies the
-operation, catalog generation, resource kind, and source ordinal. These hooks
-are internal test seams, not an installed header, public failpoint facility, or
-supported runtime configuration. With no test callback installed they do not
-change the storage state machine.
+and at important reservation, resource-output, catalog-publication, and orphan
+unlink transitions. Checkpoint context identifies the operation, catalog
+generation, resource kind, and source ordinal. These hooks are internal test
+seams, not an installed header, public failpoint facility, or supported runtime
+configuration. With no test callback installed they do not change the storage
+state machine.
 
 Fork-based tests terminate a child with `_exit` at those checkpoints. That
 models an abrupt **process crash**: destructors do not run, while completed
@@ -115,24 +121,27 @@ kernel calls and previously synced files remain visible to the surviving
 system. It is not a complete **power-loss** simulation. In particular, an
 after-unlink checkpoint occurs after a successful unlink syscall but before the
 later directory `fsync`; it does not claim that the pathname removal has reached
-stable media. The catalog-before-`CURRENT`, durable-`CURRENT`, and durable-delta
-checkpoints are placed after their documented file and directory sync barriers.
+stable media. The catalog-before-`CURRENT`, durable-`CURRENT`, and durable
+resource-output checkpoints are placed after their documented file and
+directory sync barriers.
 Power-loss guarantees still require fault testing on the target local
 filesystem and storage stack.
 
 A strict read-only inventory validates `CURRENT` and exactly the immutable
-catalog it selects, then inspects entries in the `CURRENT`-like root,
-`catalogs/`, `wal/`, and `deltas/` namespaces. Its categories are:
+catalog it selects, then inspects only product-owned namespaces. The format-7
+categories are:
 
 - reachable files in the currently selected operational view;
 - superseded catalogs;
 - temporary publications;
 - unreferenced WALs;
-- complete or partial unreferenced delta pairs; and
+- complete or partial unreferenced segment pairs;
+- unreferenced partition snapshots and index runs; and
 - unknown/do-not-touch entries.
 
 Operational reachability is deliberately **CURRENT-only**. The selected
-catalog, its named WALs, and its named delta pairs are reachable. A
+catalog and every segment, partition snapshot, run, and WAL it names are
+reachable. A
 `previous_catalog_id` records lineage but does not make its predecessor a
 runtime snapshot, so older catalog files may be reported as superseded. Exact
 lowercase UUID filename grammar is required for orphan classification;
@@ -146,10 +155,14 @@ An already-open mutable handle may call
 `collection.collect_orphans(dry_run=True, min_age_seconds=...)`. The CLI
 requires exactly one of `--dry-run` and `--execute`.
 
-Only temporary publications, unreferenced WALs, and complete or partial
-unreferenced delta pairs are candidates. The age threshold separates eligible
-from deferred candidates. Reachable files, superseded catalogs retained by
-policy, and unknown/do-not-touch entries are never candidates.
+Superseded catalogs, temporary publications, unreferenced WALs, complete
+unreferenced segment pairs, partial unreferenced segment singletons, and
+unreferenced snapshots/runs are format-7 candidates. A complete pair is
+selected and prevalidated as one budget unit. A partial singleton lets a later
+pass converge after an earlier pair deletion stopped between its two unlinks;
+if either half is still named by CURRENT it classifies as reachable instead.
+The age threshold separates eligible from deferred candidates. Reachable files
+and unknown/do-not-touch entries are never candidates.
 
 An inventory result is diagnostic data, not an authorization token. Execute
 mode never consumes it: while holding the writer lease and `commit.lock`
@@ -157,25 +170,29 @@ exclusively it performs a fresh scan, deterministically selects within hard
 file/byte budgets, and compares no-follow `{device,inode,mode,size,mtime,ctime}`
 identity immediately before `unlinkat`. Missing or changed entries are skipped;
 successful unlinks are followed by an `fsync` of every affected namespace.
+`max_files` and `max_bytes` bound selection and unlink work, not the validated
+catalog itself. The local MVP therefore has a separate fail-closed inventory
+guard: a scan may contain the path count implied by the active catalog plus at
+most 65,536 uncataloged entries. Exceeding that bound aborts before any unlink.
+This prevents an unexpectedly polluted namespace from driving unbounded scan
+memory or lock time; a resumable streaming/cursor collector is a later
+extension.
 The contract assumes a trusted local POSIX collection directory: POSIX has no
 conditional unlink-by-inode primitive that could defeat a hostile process
 renaming pathnames outside ThrowDB's locks.
 
 `maintain(dry_run=...)` is an explicit deterministic pass, not a background
-thread. In order it may rotate a non-empty active WAL at the configured byte
-threshold, materialize a bounded oldest frozen prefix, compact a bounded oldest
-delta prefix, and collect bounded orphans. Each action is attempted at most
-once. `max_actions` is hard; `max_seconds` is cooperative and is checked only
-between durable primitives. Publication failures remain fail-fast, while
-individual orphan unlink/fsync failures are represented in the report.
-Superseded catalogs remain retained by policy.
+thread. Format 7 considers, in order, rotation of a non-empty active WAL,
+bounded materialization of the oldest frozen prefix, selective partition
+folding, cleaning of at most one segment, and bounded orphan collection. Each
+action is attempted at most once. Format 6 uses the older four-action sequence
+without cleaning. `max_actions` is hard; `max_seconds` is cooperative and is
+checked only between durable primitives. Publication failures remain fail-fast,
+while individual orphan unlink/fsync failures are represented in the report.
 
-The version-1 defaults are: 300 cooperative seconds, four attempted actions,
-a 1 GiB active-WAL rotation threshold, at most 8 frozen WALs / 8 GiB input for
-materialization, delta compaction when 8 runs are present with the existing
-8-run / 8-GiB / 1,000,000-entry limits, and orphan age/file/byte limits of
-3600 seconds / 1024 files / 8 GiB. Each normalized value is repeated in the
-maintenance report so a run is reproducible.
+The normalized thresholds and budgets are repeated in every maintenance report
+so a pass is reproducible. The wall-clock limit is not a cancellation deadline:
+an already-started durable action always runs to a safe terminal state.
 
 ## Row references and tombstones
 
@@ -215,36 +232,54 @@ row_index  = n % R
 Older immutable collections are rebuilt from their source NumPy arrays rather
 than adapted with a global-ordinal compatibility layer.
 
-## Index transition and steady state
+## Index modes and format-7 steady state
 
-Two explicit modes avoid pretending that selective cleaning works before its
-prerequisites exist.
+Format 6 is the compatibility mode: a versioned RAM overlay rebuilt from
+DeltaV1 runs and retained WALs shadows one flat base index. It supports CRUD,
+rotation, frozen-prefix materialization, and bounded oldest-prefix DeltaV1
+compaction, but it cannot safely retire base segments.
 
-### Current DeltaV1 catalog-overlay mode
+Format 7 makes the durable partitioned index authoritative. It maps every live
+logical ID to `{sequence, RowRef}`; a tombstone may appear in a run, while
+absence from an authoritative snapshot after all active run sections have been
+consulted is the final missing answer. Partitioning uses configurable high bits
+of the seeded ID hash. The number of partitions is persisted collection
+geometry, not a process-local tuning choice.
 
-The versioned RAM overlay rebuilt from catalog delta runs followed by the
-retained WAL chain shadows the fresh flat base index. Delta `.idx` records are
-applied oldest run first; retained frozen/active WAL commits then win by commit
-sequence. Both layers return `RowRef`, and reads, CRUD, catalog publication, WAL
-rotation, frozen-prefix materialization, and bounded oldest-prefix delta
-compaction are implemented. The delta index
-body contains durable sorted version metadata and reverse `{id, sequence}` rows,
-but those records are still loaded into RAM on open. Selective base cleaning is
-disabled because no authoritative partition-level index publication exists yet.
+Commits do not rebuild a partition. Recent entries live in the RAM/WAL overlay
+and then in small immutable per-partition run sections. A selective fold reads
+one complete partition snapshot and all of that partition's active sections,
+retains the greatest original sequence per ID, and writes one replacement
+snapshot. Other partitions in the same run stay active. This matters for a
+workload that randomly updates 1% of 600 million IDs: materialization writes
+only changed rows, and folding touches bounded index partitions rather than
+copying a 1.5-TB payload.
 
-### Authoritative partitioned-RowRef mode
+### Format-7 catalog invariants
 
-The durable index maps every logical ID to `{sequence, PUT/DELETE, RowRef}`.
-Partitioning uses configurable high bits of the existing seeded ID hash; the
-local hash table can use disjoint low bits. A starting profile such as 4096
-partitions is configuration, not a storage-format constant.
+The public format-7 manifest requires both `SegmentCatalogV1` and
+`PartitionedRowRefV1`. Its immutable catalog records the generation and UUID,
+next monotonic segment ID and index epoch, indexed sequence/live count,
+partition geometry, every selected segment/snapshot/run descriptor, terminal
+materialized WAL identity, and the remaining WAL chain.
 
-Commits do not rebuild a whole partition. Recent entries live in the RAM/WAL
-overlay and then small immutable per-partition runs. Runs are folded into a
-larger partition only when their count, lookup cost, or garbage ratio crosses a
-budget. This matters for a workload that randomly updates 1% of 600 million
-IDs: it touches almost every partition, but should write only the changed
-entries rather than thousands of complete hash tables.
+- segment descriptors have unique nonzero file UUIDs and RowRef segment IDs;
+  initial rows use sequence zero and derived sidecars remain within the
+  descriptor's sequence interval;
+- exactly one snapshot descriptor exists for every partition, in partition
+  order;
+- run epochs are strictly increasing, and each catalog `active_partitions`
+  bitmap is a nonempty subset of the immutable file's `covered_partitions`;
+- an active run section is newer than the selected snapshot for that partition;
+  a section cleared by a fold can no longer participate in lookup;
+- a cleaner run additionally binds the exact retired segment UUID, RowRef
+  segment ID, row count, and IDs-payload CRC;
+- the retained WAL chain begins immediately after `indexed_sequence`, has exact
+  predecessor/sequence continuity, and ends in exactly one active WAL.
+
+Open validates these invariants, the `CURRENT` binding, resource identities,
+file geometry, and index checksums before exposing a view. It never scans the
+directory for a plausible newer generation.
 
 ## Mutation commit path
 
@@ -459,8 +494,9 @@ short catalog publications around an unlocked data build:
    selected WAL prefix and adding the delta descriptor. Switch the in-memory
    view after the durable pointer change.
 6. Best-effort unlink the replaced WAL pathnames. Failure leaves harmless
-   unreferenced files for a future sweeper; it does not roll back the selected
-   catalog. Already-open POSIX descriptors remain valid for older reads.
+   unreferenced files for the explicit orphan collector; it does not roll back
+   the selected catalog. Already-open POSIX descriptors remain valid for older
+   reads.
 
 Thus materialization is not a base compaction: it bounds the selected mutation
 history without copying any base embedding or flat-index entry.
@@ -494,14 +530,15 @@ publication. The entry budget bounds retained version metadata; the current
 writer still holds bounded input/output vectors rather than implementing a
 fully streaming external merge.
 
-This compaction reduces run/file count, duplicated delta payload, and reopen
+Format-6 compaction reduces run/file count, duplicated delta payload, and reopen
 work without reading or copying the immutable base. It deliberately cannot
-discard tombstones while the flat base index remains a fallback. Reclaiming
-garbage inside base segments still requires an authoritative partitioned
-RowRef index in a later format. Explicit `maintain()` supplies deterministic
-size/age triggers; there is intentionally no background invocation yet.
+discard tombstones while the flat base index remains a fallback and therefore
+cannot reclaim garbage inside base segments. Format 7, described below,
+provides the authoritative partitioned RowRef index and selective cleaner.
+Explicit `maintain()` supplies deterministic triggers; there is intentionally
+no background invocation.
 
-### Current DeltaV1 limits
+### Format-6 DeltaV1 limits
 
 - Delta version records still populate the full mutation overlay in RAM when a
   collection opens; `.idx` is durable metadata, not yet an on-demand or
@@ -514,32 +551,67 @@ size/age triggers; there is intentionally no background invocation yet.
   complete `.dat` embedding payload to verify its stored CRC; no public payload
   scrub operation exists yet.
 - Delta compaction is prefix-only. Explicit `maintain()` applies its bounded
-  trigger policy, but no background worker invokes it. Base segments are not
-  compacted.
+  trigger policy, but no background worker invokes it. Format-6 base segments
+  are not compacted.
 - Publication, old-view safety, and post-switch WAL unlink currently rely on
   local POSIX `rename`, `fsync`, open-descriptor, and unlink semantics. CephFS,
   other network filesystems, and object storage require a separately validated
   backend protocol.
 
+## Format-7 materialization and selective folding
+
+Format 7 uses the same active/frozen WAL protocol but a different immutable
+destination. `materialize_frozen_wals()` selects the oldest contiguous frozen
+prefix fitting its WAL-count and input-byte budgets. It collapses each ID to
+the greatest sequence in that prefix, orders winning PUT payload reads by their
+source `RowRef`, and streams the bit-exact rows into one or more
+`segment-<uuid>.dat/.ids` pairs. The sidecar stores `{id, original sequence}`
+for every dense row. A single immutable mutation run stores ID-sorted
+`{id, sequence, PUT RowRef/DELETE}` records grouped by partition.
+
+The operation first reserves the necessary monotonic segment IDs and index
+epoch in a durable metadata-only catalog generation. The long read/copy/write
+phase does not hold the mutation mutex, so commits and rotation may continue.
+Final publication validates the frozen prefix and indexed anchor, rebases on
+the latest WAL chain, then atomically advances `indexed_sequence` and removes
+only the selected WAL references. The retired WAL pathnames remain on disk as
+unreferenced files for a later orphan pass.
+
+`compact_deltas()` performs a selective fold in format 7. A candidate budget
+charges the complete current partition snapshot plus every active run section
+for that partition; a partial fold is forbidden. The merge keeps the greatest
+sequence, validates equal-sequence cleaner relocations, and omits tombstones
+because the new snapshot is authoritative. It writes and syncs a complete
+replacement snapshot before atomically clearing the folded partition's active
+bits. A partially consumed run remains referenced with its remaining bitmap; a
+fully consumed run is removed from the catalog and later collected as an
+orphan. Embedding segments are never read by index folding.
+
 ## Selective segment cleaner
 
-The cleaner runs only after the partitioned RowRef index is authoritative. It
-chooses old segments using measured garbage ratio, age, read heat, and available
-I/O/space budgets. For a stable view at sequence `C`, each candidate row is
-copied only if the index at `C` still contains exactly the same ID, original
-sequence, and old `RowRef`. Newer commits stay in a higher overlay and shadow
-any row copied by the cleaner.
+`clean_segments()` is available only when the format-7 partitioned RowRef index
+is authoritative. One call scans complete immutable sidecars within hard
+candidate-count, sidecar-byte, source-byte, output-byte, and memory budgets. It
+selects at most one candidate satisfying minimum garbage rows, garbage ratio,
+and reclaimable bytes. Selection is deterministic: greater reclaimable bytes,
+then greater garbage ratio/count, then lower segment ID.
 
-The cleaner writes replacement segments and copy-on-write index resources,
-then switches them together in one catalog generation. Before publication it
-acquires the metadata lock (or performs an equivalent generation CAS), rebases
-on the latest catalog, and preserves all WALs/runs committed after `C`. An index
-mapping is relocated only if the latest mapping still equals the candidate's
-old `{sequence, RowRef}`; a newer mapping is left untouched. If candidate
-resource identities changed, that cleaning attempt is discarded or rebuilt.
-An all-garbage segment is simply omitted. Unselected segments are untouched.
-There is no normal operation that copies every embedding in a 1.5 TB
-collection.
+For the indexed view at sequence `C`, a candidate row is copied only when the
+index still contains exactly the same ID, original sequence, and source
+`RowRef`. A newer indexed winner is recorded as a fence; authoritative absence
+becomes a tombstone fence at the source sequence. Commits newer than `C` stay in
+the WAL overlay and shadow the cleaner output.
+
+Execution reserves replacement segment IDs and one index epoch, copies live
+rows in bounded source-order batches, verifies the complete source payload CRC,
+and writes a cleaner run with exactly one record per source row. Its descriptor
+binds the retired segment UUID, RowRef segment ID, row count, and sidecar CRC;
+this is what permits a same-sequence mapping to move to a replacement RowRef
+without accepting an arbitrary conflict. Final publication removes the source
+descriptor, adds zero or more replacement segments, and adds the cleaner run in
+one catalog switch. An all-garbage segment therefore needs no replacement data
+segment. Unselected segments are untouched. There is no normal operation that
+copies every embedding in a 1.5-TB collection.
 
 Every fresh base segment already has an ID-by-row sidecar because its data
 payload contains only embeddings. For 600 million numeric IDs all sidecars are
@@ -551,7 +623,7 @@ A complete collection rewrite remains an explicit administrative operation for
 schema/layout migration or major workload reorganization, not routine garbage
 collection.
 
-Tombstone reclamation follows the lookup mode. In the current overlay mode a
+Tombstone reclamation follows the lookup mode. In format-6 overlay mode a
 DELETE must remain until every older source that could contain the ID is
 removed or durably shadowed; dropping it early would resurrect a base row. In
 authoritative partitioned mode, partition absence is itself the final
@@ -560,10 +632,22 @@ can be folded into that absence only when the new authoritative partition is
 published atomically and no catalog reachable by the new view can reintroduce
 an older mapping.
 
+The dry-run path performs the same bounded scan and reports its candidate
+without publishing resources. Each result includes
+`next_start_after_segment_id`; reusing it avoids restarting every call at the
+lowest segment ID. It is a performance cursor only, not durable correctness
+state, and losing it merely repeats earlier scans. An executing `maintain()`
+remembers scan progress on its live `Collection` handle even when no candidate
+was found. Separate CLI processes can pass the reported cursor back through
+`--clean-start-after-segment-id`. Logical publication does not
+unlink the retired source. The later orphan collector performs that work under
+the view barrier after the configured minimum age.
+
 ## Adaptive policy boundary
 
 Correctness does not depend on cleaner thresholds, segment size, partition
 count, WAL rotation size, read backend, or queue depth. Those are observable,
-bounded policies. Initial defaults should be deterministic; later calibration
-and workload logs may tune them per local NVMe, network storage, and request
-shape without changing the persisted state machine.
+bounded policies. The current reader uses saved device/runtime/layout profiles
+for backend topology and deterministic request-level fairness inside the chosen
+backend. Cleaner and maintenance thresholds remain explicit. Later workload
+logs may tune them without changing the persisted state machine.

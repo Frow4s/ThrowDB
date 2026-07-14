@@ -140,6 +140,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
     const std::vector<std::byte> base = rows(base_ids.size(), record_size, 3);
 
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 2 * record_size;
@@ -258,6 +259,7 @@ void test_open_stats_fast_forced_and_legacy_validation() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     const std::array<std::uint64_t, 2> ids{7, 11};
@@ -313,6 +315,7 @@ void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
     constexpr std::uint64_t record_size = dimension * 4;
 
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float32;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
@@ -381,6 +384,7 @@ void test_zero_delta_read_path_transitions_on_first_commit() {
     const std::vector<std::byte> updated = rows(row_count, record_size, 149);
 
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.segment_size_bytes = 64 * record_size;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
@@ -453,6 +457,7 @@ void test_empty_collection_and_empty_batches() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     builder->append({}, {});
@@ -471,6 +476,7 @@ void test_read_only_open_does_not_require_writable_lock_metadata() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     builder->finish();
@@ -520,6 +526,7 @@ void test_forked_builder_and_writer_handles_are_rejected() {
 
     const auto builder_store = temporary.path() / "builder";
     throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 6;
     builder_options.dimension = dimension;
     auto builder = throwdb::NativeCollectionBuilder::create(
         builder_store, builder_options);
@@ -686,10 +693,20 @@ void test_native_open_rejects_big_endian_hosts() {
     }
 }
 
+void test_builder_options_default_and_explicit_legacy_format_versions() {
+    throwdb::NativeBuilderOptions options;
+    require(options.format_version == 7,
+            "native builder options do not default to format 7");
+    options.format_version = 6;
+    require(options.format_version == 6,
+            "native builder options do not retain explicit format 6");
+}
+
 void test_lightweight_metadata_inspection() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 7;
     options.dtype = throwdb::DType::Float32;
     options.segment_size_bytes = 32 * 1024;
@@ -732,6 +749,7 @@ void test_reader_trials_and_bounded_id_sampling() {
         rows(ids.size(), record_size, 23);
 
     throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 6;
     builder_options.dimension = dimension;
     builder_options.segment_size_bytes = 7 * record_size;
     auto builder = throwdb::NativeCollectionBuilder::create(
@@ -812,6 +830,7 @@ void test_calibration_handle_owns_exclusive_read_only_lease() {
     const auto store = temporary.path() / "store";
     constexpr std::uint64_t record_size = 4;
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     const std::array<std::uint64_t, 1> ids{7};
@@ -894,6 +913,9 @@ int main() {
         TestCase{
             "native_open_rejects_big_endian_hosts",
             test_native_open_rejects_big_endian_hosts},
+        TestCase{
+            "builder_options_default_and_explicit_legacy_format_versions",
+            test_builder_options_default_and_explicit_legacy_format_versions},
         TestCase{
             "lightweight_metadata_inspection",
             test_lightweight_metadata_inspection},

@@ -56,6 +56,7 @@ def _create_collection(
         path,
         schema=schema,
         shard_size_bytes=shard_size_bytes,
+        format_version=6,
     ) as collection:
         collection.add(ids, vectors)
 
@@ -219,6 +220,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         path,
         schema=schema,
         shard_size_bytes=3 * schema.dimension * np.dtype(np.float16).itemsize,
+        format_version=6,
     ) as builder:
         assert builder.mode == "write"
         assert builder.schema is schema
@@ -273,7 +275,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     _assert_same_bits(output, vectors[order])
 
 
-def test_collection_create_forwards_default_and_opt_in_format_versions(
+def test_collection_create_forwards_default_and_explicit_legacy_format_versions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -302,17 +304,17 @@ def test_collection_create_forwards_default_and_opt_in_format_versions(
         FakeNativeCollectionBuilder,
     )
 
-    stable = throwdb.Collection.create(tmp_path / "stable")
-    opt_in = throwdb.Collection.create(
-        tmp_path / "partitioned",
-        format_version=7,
+    default = throwdb.Collection.create(tmp_path / "default")
+    legacy = throwdb.Collection.create(
+        tmp_path / "legacy",
+        format_version=6,
     )
 
-    assert calls == [6, 7]
-    assert stable.format_version == 6
-    assert opt_in.format_version == 7
-    stable.abort()
-    opt_in.abort()
+    assert calls == [7, 6]
+    assert default.format_version == 7
+    assert legacy.format_version == 6
+    default.abort()
+    legacy.abort()
 
 
 @pytest.mark.parametrize(
@@ -370,6 +372,7 @@ def test_add_normalizes_layout_but_never_silently_casts_embedding_dtype(
     builder = throwdb.Collection.create(
         tmp_path / "wrong-dtype",
         schema=throwdb.CollectionSchema(dimension=dimension),
+        format_version=6,
     )
     with pytest.raises(TypeError, match="float16.*float32"):
         builder.add(ids, expected.astype(np.float32))
@@ -504,6 +507,7 @@ def test_builder_context_aborts_on_exception(tmp_path: Path) -> None:
         with throwdb.Collection.create(
             path,
             schema=throwdb.CollectionSchema(dimension=3),
+            format_version=6,
         ) as builder:
             builder.add(ids, _vectors(ids.size, 3))
             raise RuntimeError("stop build")
@@ -520,6 +524,7 @@ def test_explicit_finish_and_abort_are_idempotent_and_close_the_builder(
     finished = throwdb.Collection.create(
         finished_path,
         schema=throwdb.CollectionSchema(dimension=3),
+        format_version=6,
     )
     finished.add(ids, vectors)
     finished.finish()
@@ -535,6 +540,7 @@ def test_explicit_finish_and_abort_are_idempotent_and_close_the_builder(
     aborted = throwdb.Collection.create(
         aborted_path,
         schema=throwdb.CollectionSchema(dimension=3),
+        format_version=6,
     )
     aborted.add(ids, vectors)
     aborted.abort()
@@ -553,6 +559,7 @@ def test_collection_operations_reject_the_wrong_mode(tmp_path: Path) -> None:
     builder = throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=2),
+        format_version=6,
     )
 
     with pytest.raises(RuntimeError, match="opened collection reader"):

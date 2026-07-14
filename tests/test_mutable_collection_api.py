@@ -47,6 +47,7 @@ def _build(
         path,
         schema=schema,
         shard_size_bytes=shard_size_bytes,
+        format_version=6,
     ) as builder:
         builder.add(ids, embeddings)
 
@@ -125,24 +126,26 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
         reopened.get([20])
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
 def test_format7_python_read_write_crud_rotation_and_reopen(
     tmp_path: Path,
+    dtype: str,
 ) -> None:
-    path = tmp_path / "partitioned"
+    path = tmp_path / f"partitioned-{dtype}"
     maximum_id = (1 << 64) - 1
-    base = _vectors(3, 5, "float16", salt=7)
-    schema = throwdb.CollectionSchema(dimension=5, dtype="float16")
+    base = _vectors(3, 5, dtype, salt=7)
+    schema = throwdb.CollectionSchema(dimension=5, dtype=dtype)
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=20,
+        shard_size_bytes=base[0].nbytes,
         format_version=7,
     ) as builder:
         builder.add([0, maximum_id, 7], base)
 
     old_reader = throwdb.Collection.open(path)
-    inserted = _vectors(1, 5, "float16", salt=107)
-    updated = _vectors(2, 5, "float16", salt=207)
+    inserted = _vectors(1, 5, dtype, salt=107)
+    updated = _vectors(2, 5, dtype, salt=207)
     with throwdb.Collection.open(path, mode="r+") as writer:
         assert writer.format_version == 7
         assert writer.mode == "read_write"
@@ -154,9 +157,34 @@ def test_format7_python_read_write_crud_rotation_and_reopen(
         assert stats["rotated"] is True
         assert stats["generation"] == 2
         assert stats["frozen_wal_count"] == 1
+        materialized = writer.materialize_frozen_wals()
+        assert materialized["materialized"] is True
+        assert materialized["generation"] == 4
+        assert materialized["materialized_sequence"] == 4
+        assert materialized["frozen_wal_count"] == 0
+        assert materialized["delta_run_count"] == 1
+        assert materialized["delta_entry_count"] == 4
+        assert materialized["delta_put_rows"] == 4
+        assert materialized["total_delta_run_bytes"] > 0
+        assert materialized["total_delta_segment_bytes"] > 0
+        assert materialized["reclamation_complete"] is False
+        folded = writer.compact_deltas()
+        assert folded["compacted"] is True
+        assert folded["generation"] == 6
+        assert folded["compacted_partition_count"] >= 1
+        assert (
+            folded["compacted_run_section_count"]
+            == folded["compacted_partition_count"]
+        )
+        assert folded["compacted_snapshot_input_entries"] == 3
+        assert folded["compacted_delta_input_entries"] == 4
+        assert folded["compacted_output_entries"] == 4
+        assert folded["delta_run_count"] == 0
+        assert folded["compaction_budget_blocked"] is False
+        assert folded["reclamation_complete"] is False
         expected = np.stack([updated[0], updated[1], inserted[0], inserted[0]])
         _assert_same_bits(writer.get([0, maximum_id, 7, 9]), expected)
-        prefix = np.empty((4, 2), dtype=np.float16)
+        prefix = np.empty((4, 2), dtype=np.dtype(dtype))
         writer.get_into(
             [0, maximum_id, 7, 9], prefix, prefix_dimensions=2
         )
@@ -302,6 +330,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert initial["frozen_wal_count"] == 0
         assert initial["active_wal_bytes"] == 4096
         assert initial["active_wal_put_rows"] == 0
+        assert initial["active_wal_transaction_count"] == 0
 
         empty = collection.rotate_wal()
         assert empty["rotated"] is False
@@ -312,6 +341,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert before is not None
         assert before["committed_sequence"] == 1
         assert before["active_wal_put_rows"] == 2
+        assert before["active_wal_transaction_count"] == 1
 
         rotated = collection.rotate_wal()
         assert rotated["rotated"] is True
@@ -320,6 +350,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert rotated["frozen_wal_count"] == 1
         assert rotated["active_wal_bytes"] == 4096
         assert rotated["active_wal_put_rows"] == 0
+        assert rotated["active_wal_transaction_count"] == 0
         assert rotated["total_wal_bytes"] > 8192
 
         np.testing.assert_array_equal(collection.delete([maximum_id]), [True])
@@ -651,6 +682,7 @@ def test_read_only_and_builder_reject_crud_and_context_closes_handles(
     builder = throwdb.Collection.create(
         tmp_path / "builder",
         schema=throwdb.CollectionSchema(dimension=3),
+        format_version=6,
     )
     for operation in (builder.insert, builder.update, builder.upsert):
         with pytest.raises(RuntimeError, match="opened collection"):

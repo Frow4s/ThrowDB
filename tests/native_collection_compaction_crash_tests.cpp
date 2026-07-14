@@ -115,6 +115,7 @@ void build_store(
     const std::span<const std::byte> embeddings,
     const std::uint32_t dimension) {
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 1ULL << 20;

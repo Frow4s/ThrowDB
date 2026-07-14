@@ -665,6 +665,13 @@ void validate_catalog(const PartitionedCatalogV3& catalog) {
         }
         for (std::uint64_t partition = 0;
              partition != partition_count; ++partition) {
+            if (bitmap_contains(descriptor.active_partitions, partition)) {
+                require<Error>(
+                    catalog.snapshots[static_cast<std::size_t>(partition)]
+                            .epoch
+                        < descriptor.epoch,
+                    "active run partition is not newer than its snapshot");
+            }
             if (bitmap_contains(descriptor.covered_partitions, partition)
                 && !bitmap_contains(descriptor.active_partitions, partition)) {
                 require<Error>(

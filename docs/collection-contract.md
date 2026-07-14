@@ -3,12 +3,14 @@
 This document fixes the contract for the first user-facing ThrowDB product.
 The fresh native numeric subset is implemented through the Python `Collection`
 API: safe uint64 normalization, float16/float32 rows, arbitrary fixed
-dimensions, semantic prefix reads, and durable batch CRUD. The public format
-version produced by new builders is 6. WAL rotation, frozen-WAL-prefix
-materialization, and bounded oldest-prefix DeltaV1 compaction are implemented;
-UTF-8 IDs and selective base cleaning remain later local-library slices. Format
-5 remains a readable and writable catalog/WAL-only format, but it rejects both
-materialization and delta compaction.
+dimensions, semantic prefix reads, and durable batch CRUD. Format 7 is the
+current creation default. Format 6 remains an explicit legacy-compatibility
+choice. Format 7 provides
+an authoritative partitioned RowRef index, WAL-to-segment materialization,
+selective partition folding, selective segment cleaning, and deferred orphan
+reclamation. UTF-8 IDs are deliberately postponed. Format 5 remains a readable
+and writable catalog/WAL-only format, but it rejects materialization and
+compaction.
 
 ## Product boundary
 
@@ -43,7 +45,7 @@ The following fields are immutable for the lifetime of a snapshot:
 
 | Field | Initial contract |
 | --- | --- |
-| ID domain | unsigned integer (canonical `uint64`) or byte-exact UTF-8 |
+| ID domain | unsigned integer (canonical `uint64`) |
 | Embedding dtype | `float16` or `float32` |
 | Dimension | Positive fixed integer per collection |
 | Row layout | Dense row-major embedding values |
@@ -79,11 +81,10 @@ remains strict and zero-copy so performance-sensitive callers can avoid hidden
 allocation. If negative IDs become a real requirement, `int64` will be added as
 a distinct logical ID domain rather than reinterpreting signed bits as uint64.
 
-String IDs are UTF-8 byte sequences with no hidden normalization, case folding,
-or locale rules. Applications that need Unicode normalization must apply it
-before writing and querying. A string index may use fingerprints internally,
-but every match must be verified against the stored bytes; hash collisions must
-never return the wrong embedding.
+UTF-8 IDs are not accepted by the current API. Their eventual contract remains
+byte-exact storage with no hidden normalization, case folding, or locale rules;
+that string arena and collision-verified index are a later extension of the
+stable numeric lifecycle, not an implicit coercion in the numeric API.
 
 Duplicate build IDs are an error. Query IDs may repeat and must repeat the
 corresponding output rows in the original query order.
@@ -135,14 +136,15 @@ schema = throwdb.CollectionSchema(
 with throwdb.Collection.create(
     path,
     schema=schema,
-    format_version=6,  # stable default; pass 7 only as an explicit opt-in
 ) as collection:
     collection.add(ids, embeddings)
 ```
 
 The creation boundary accepts only native format versions 6 and 7. Omitting
-`format_version` preserves the stable version-6 layout; selecting version 7 is
-always explicit and is reflected by `collection.format_version`.
+`format_version` selects version 7; existing version-6 collections continue to
+open normally, and new legacy-compatible stores can request
+`format_version=6` explicitly. The selected version is reflected by
+`collection.format_version`.
 
 Writers accept bounded batches and may spill build metadata to disk. Successful
 context-manager exit calls `finish()`; exceptional exit must not publish the
@@ -157,8 +159,10 @@ collection.update(ids, embeddings)   # every ID must exist
 collection.upsert(ids, embeddings)   # explicit insert-or-replace
 deleted = collection.delete(ids)     # boolean result per requested ID
 collection.rotate_wal()              # freeze a non-empty active WAL
-collection.materialize_frozen_wals() # replace frozen prefix with DeltaV1
-collection.compact_deltas()           # merge a bounded oldest delta prefix
+collection.materialize_frozen_wals() # replace a bounded frozen-WAL prefix
+collection.compact_deltas()           # format 7: fold selected partitions
+cleaner_plan = collection.clean_segments(dry_run=True)
+cleaned = collection.clean_segments(dry_run=False)
 plan = collection.collect_orphans(    # advisory report
     dry_run=True,
     min_age_seconds=3600,
@@ -193,17 +197,18 @@ resolves all IDs against one state, so it cannot mix rows across a commit.
 ## Mutation and segment-cleaning model
 
 ```text
-immutable base snapshot
-          +
-committed PUT/DELETE delta segments
-          =
-logical collection view
+immutable embedding segment catalog
+          + authoritative index state
+          + committed WAL overlay
+          = logical collection view
 ```
 
-Lookup checks the newest committed delta state first. A delete is a tombstone;
-otherwise lookup falls back to the base index. Mutation batches receive a
-monotonic commit sequence and are protected by checksummed WAL framing and a
-commit marker. Recovery ignores incomplete/uncommitted tails.
+Mutation batches receive a monotonic commit sequence and are protected by
+checksummed WAL framing and a commit marker. Recovery ignores
+incomplete/uncommitted tails. Format 6 checks the newest mutation state before
+falling back to its flat base index. Format 7 checks the current WAL overlay,
+then active immutable run sections, then an authoritative partition snapshot;
+absence from all three is final and never falls through to a retired segment.
 
 In format 6, `materialize_frozen_wals()` collapses the currently selected
 frozen WAL prefix into one immutable DeltaV1 `.dat/.idx` pair. It first
@@ -220,24 +225,57 @@ records are loaded into the RAM overlay on open. Normal open verifies the whole
 delta-index body but does not stream the complete embedding payload to recompute
 its stored CRC during ordinary open.
 
-`compact_deltas(max_runs=8, max_input_bytes=8 GiB,
-max_input_entries=1_000_000)` merges only the oldest contiguous prefix when at
-least two complete runs fit all budgets. It verifies the selected data payload
+In format 6, `compact_deltas()` defaults to at most eight runs and merges only
+the oldest contiguous prefix when at least two complete runs fit all budgets.
+It verifies the selected data payload
 CRCs before publication, keeps the newest original sequence per ID (including
 tombstones), reserves a fresh segment ID, atomically replaces the exact prefix,
 verifies the replacement payload, and then reclaims only those source pairs
 best-effort. The base and every newer
-delta/WAL resource remain unchanged. A public standalone payload scrub and base
-compaction are not yet implemented. Publication and old-reader behavior rely
-on local POSIX filesystem semantics; network filesystems are outside the
-supported durability contract.
+delta/WAL resource remain unchanged. Format 6 has no selective base cleaner; a
+public standalone payload scrub is also not implemented. Publication and
+old-reader behavior rely on local POSIX filesystem semantics; network
+filesystems are outside the supported durability contract.
 
-For local POSIX storage, `locks/commit.lock` closes the race between opening an
-old snapshot and unlinking its files. Readers hold a shared lease until every
-mutation resource in the selected catalog is open; publication and reclamation
-hold the exclusive lease through `CURRENT`, unlink, and directory sync. This
-barrier currently covers WAL/delta resources, not future replaceable base
-generations.
+In format 7, `materialize_frozen_wals()` selects a bounded oldest frozen-WAL
+prefix and collapses each ID to its newest state in that prefix. Winning PUT
+payloads are read in source-offset order and streamed bit-exactly into one or
+more immutable `segments/*.dat` plus matching `{id, sequence}` sidecars. One
+immutable mutation run stores the resulting per-partition PUT/DELETE mappings.
+The final catalog publication advances `indexed_sequence`, removes only the
+selected WAL references, and preserves every newer WAL. Commits and rotations
+may proceed during the long build; only durable reservation and final rebase
+are short serialized metadata transactions.
+
+For format 7, `compact_deltas()` means selective index folding rather than
+embedding compaction. Its format-aware default admits up to all 4096 active
+runs so a partition cannot become permanently ineligible merely because more
+than eight runs accumulated; callers may set a smaller explicit bound. A
+partition is eligible only when its complete current
+snapshot and every active run section for that partition fit the run, byte, and
+entry budgets. The merge keeps the greatest original sequence for each ID,
+omits authoritative tombstones, publishes a new complete partition snapshot,
+and clears only that partition's active bits in its input runs. A run that
+still covers another partition remains reachable; a run with no active section
+is removed from the catalog and becomes eligible for deferred orphan
+collection. No embedding segment is copied by a fold.
+
+`clean_segments()` is the separate format-7 payload reclamation operation. It
+scans bounded immutable sidecars at the catalog's indexed sequence, chooses at
+most one segment, and copies only rows whose `{id, sequence, RowRef}` is still
+authoritative. One cleaner run relocates those rows and fences every discarded
+source row, while WAL changes newer than the indexed sequence remain above it.
+The source descriptor and replacement descriptors switch atomically. The
+cursor returned by a call is only a performance hint for continuing a bounded
+scan; losing it cannot change correctness.
+
+For local POSIX storage, `locks/commit.lock` closes publication races and the
+format-7 `locks/view.lock` closes the race between opening a selected view and
+unlinking retired immutable resources. Readers hold the view lease until every
+selected segment descriptor, snapshot mmap, run mmap, and WAL descriptor is
+pinned. The orphan collector takes both locks exclusively for a fresh scan,
+identity revalidation, unlink, and directory sync. Existing readers continue
+through pinned inodes after a catalog switch.
 
 `Collection.inspect_orphans(path, min_age_seconds=3600)` provides the same
 read-only plan without first opening the collection or loading its base index.
@@ -247,21 +285,30 @@ catalog, and the mutation namespaces. An existing `r+` handle can instead call
 lease. `dry_run=False` executes only from an `r+` handle and always performs a
 fresh scan; it never consumes the earlier plan. The CLI requires exactly one of
 `--dry-run` and `--execute`; its execute path remains lightweight and does not
-load the flat base index.
+load the format-6 flat index or format-7 partition snapshots.
 
-Temporary publications, unreferenced WALs, and complete or partial
-unreferenced delta pairs are candidates; the minimum age only decides whether
-a candidate is currently eligible. Reachable files, superseded catalogs
-retained by policy, and unknown/do-not-touch entries are never candidates. The
-report is a potentially stale diagnostic snapshot, not an authorization token
-for deletion. Execute mode revalidates identity without following symlinks,
-unlinks only within hard file/byte budgets, and fsyncs affected directories.
-Its report separates durability of performed unlinks from completeness of the
-bounded policy pass. Superseded catalogs remain retained.
+The inventory recognizes temporary publications and unreferenced WALs. Format
+6 additionally recognizes complete or partial delta pairs and retains
+superseded catalogs. Format 7 recognizes superseded catalogs, complete or
+partial segment resources, partition snapshots, and index runs. A complete
+segment pair is one atomic budget unit; an unreferenced partial singleton is a
+candidate so a later pass can finish interrupted pair cleanup. Any remaining
+half named by CURRENT is reachable and never a candidate. Symlinks and
+unknown/do-not-touch entries are also never deleted. The minimum age controls
+eligibility. A report is a potentially stale diagnostic snapshot, not an
+authorization token. Execute mode performs a fresh locked scan, revalidates
+identity without following symlinks, unlinks only within hard file/byte
+budgets, and fsyncs affected directories. Independently, format 7 fails before
+unlink if scanned entries exceed the active catalog's reachable-path count by
+more than 65,536. This is the local MVP's hard scan-memory/lock-time guard;
+resumable streaming with an opaque performance cursor remains a later
+extension.
 
-`maintain(dry_run=True)` explains one deterministic pass; explicit
-`dry_run=False` may rotate, bounded-materialize, bounded-compact, then collect
-orphans. No background thread invokes it. `max_actions` is hard and
+`maintain(dry_run=True)` explains one deterministic pass. For format 7,
+explicit execution considers, in order: WAL rotation, bounded materialization,
+selective partition folding, one selective segment clean, and orphan
+collection. Format 6 omits cleaning and keeps oldest-prefix DeltaV1 compaction.
+No background thread invokes maintenance. `max_actions` is hard and
 `max_seconds` is cooperative between complete durable actions.
 
 `max_input_bytes` bounds the selected source-file footprint, not aggregate
@@ -269,13 +316,11 @@ physical I/O: integrity scans, copying winning rows, and replacement readback
 are additional reads. `max_input_entries` is the explicit in-memory metadata
 bound for this first implementation.
 
-After a partitioned `ID -> RowRef` index becomes authoritative, the cleaner
-selects segments with enough garbage, copies only rows that are still live in a
-stable view, and atomically publishes the replacement segments and affected
-index partitions. Untouched base and mutation segments remain in place. Old
-files are reclaimed only after no reader retains the old view. A complete
-snapshot rewrite is reserved for explicit schema/layout migration rather than
-normal CRUD maintenance. The detailed contract is in `mutable-storage.md`.
+Untouched format-7 segments and partitions remain in place throughout this
+lifecycle. Retired pathnames are reclaimed by the later orphan action rather
+than by materialization, folding, or cleaning itself. A complete collection
+rewrite is reserved for explicit schema/layout migration rather than normal
+CRUD maintenance. The detailed contract is in `mutable-storage.md`.
 
 ## Compatibility policy
 
@@ -285,14 +330,15 @@ Format version is a storage contract, not a package version.
 - the legacy low-level reader remains available for existing benchmarks, but
   the new `Collection` path need not open format-v1/v2 collections during the
   experimental MVP;
-- source NumPy arrays are the supported migration path into the current
-  DeltaV1 native format 6; the reader retains strict paths for catalog/WAL-only
+- source NumPy arrays are the supported migration path into an explicitly
+  selected format 6 or 7; the reader retains strict paths for catalog/WAL-only
   format 5 and legacy native formats 3 and 4;
 - migration creates a new collection and never rewrites the source arrays;
 - reserved fields and feature flags must be validated rather than silently
   interpreted.
 
-The native mutable layout is documented in `native-format-v3.md`.
+Formats 3 through 6 are documented in `native-format-v3.md`; format 7 and its
+selective lifecycle are documented in `mutable-storage.md`.
 
 ## Tuning contract
 
@@ -303,8 +349,9 @@ select:
 Collection.open(path, tuning="auto")
 Collection.open(path, tuning="persisted")
 Collection.open(path, tuning="conservative")
-Collection.open(path, tuning={"backend": "io_uring", "workers": 2,
-                              "queue_depth": 32})
+Collection.open(path, tuning={"io_backend": "io_uring",
+                              "io_uring_workers": 2,
+                              "io_uring_queue_depth": 32})
 ```
 
 Automatic tuning must be observable, bounded, and overrideable. The product
@@ -327,7 +374,7 @@ report = Collection.tune(
 ```
 
 It holds the lifecycle writer lease on one read-only snapshot, samples live
-base IDs without a population scan, compares bit-exact temporary readers that
+IDs from the active index/WAL view without a population scan, compares bit-exact temporary readers that
 share the already-loaded index, and publishes only after rechecking the
 media/runtime/layout identity, root inode, mutation snapshot, registry salt,
 and registry generation. Failure, interruption, instability, a cooperative

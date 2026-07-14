@@ -50,6 +50,12 @@ container policy must be changed before an io_uring backend can be tested.
 | Multi-ring io_uring | One and two workers with total queue depths 2, 3, and 4 | A single request is split across rings without changing bits or row order |
 | Multi-ring concurrency | Simultaneous callers share two ring-owner workers | Calls complete without cross-request corruption or deadlock |
 | io_uring error | Truncate a shard after open, then issue a healthy request | EOF reaches the caller and the ring remains reusable |
+| Mixed-size fairness | A small call arrives behind a multi-unit large call | The small call completes before the large call drains; both make progress |
+| One-range fairness | Concurrent one-range calls use an enabled parallel backend | Calls pass through the shared coordinator rather than bypassing its credits |
+| Format-7 materialization | Commits and rotation continue while a frozen prefix is built | Final catalog keeps newer WALs and reads remain bit-exact after reopen |
+| Selective fold | One partition is active in runs that also cover other partitions | Only that partition is replaced; remaining active sections stay reachable |
+| Segment cleaner | Live, stale, deleted, and newer-WAL rows share one source segment | At most one segment is retired; every logical result and old reader view remains correct |
+| Format-7 orphan GC | Retired resources, interrupted partial pairs, CURRENT-referenced halves, symlinks, and unknown files coexist | Fresh locked cleanup removes eligible superseded catalogs and unreferenced resources, retries safe partial singletons, and preserves every reachable or unknown entry |
 
 Floating-point comparisons are deliberately inappropriate here. The storage
 engine does not calculate with embeddings: it preserves the original 16-bit
@@ -131,12 +137,11 @@ shared executor. Reports record both axes as `io_workers` and
 `io_ranges_per_task` records the maximum number of physical ranges a worker
 processes after one queue dispatch.
 
-There is one deliberate exception to the shared bound. If planning produces
-exactly one physical range, the calling thread performs a synchronous direct
-read without submitting to the executor. One-range calls from concurrent
-callers therefore bypass the executor and queue and are not included in the
-global concurrency bound that applies to multi-range work. Interpret batch-1
-concurrency results with this fast path in mind.
+With workers enabled, every request becomes a scheduler job, including a plan
+containing exactly one physical range. Bounded FIFO admission prevents new
+callers from repeatedly bypassing waiters, and deficit round robin interleaves
+the task units of mixed-size jobs. Only the zero-worker sequential baseline
+uses synchronous direct reads without the coordinator.
 
 Zero internal workers is the synchronous `pread` baseline. With workers enabled,
 `--io-queue-capacity 0` selects an automatic bound of twice the worker count; an
@@ -209,19 +214,17 @@ derived throttled-period/time ratios. These are per-scenario deltas rather than
 container-lifetime totals, so CPU-quota stalls can be separated from ThrowDB
 queue latency.
 
-## Multi-ring io_uring experiment
+## Multi-ring io_uring qualification
 
-The raw-ABI baseline uses one mutex-protected ring per `Storage`. The next
-experiment adds dedicated ring-owner workers. One large request is cost-balanced
-across all rings, concurrent batches enter every per-worker FIFO in the same
-order, and the caller waits for every lane before temporary buffers can expire.
-Queue depth is a total: two workers with depth 32 create two depth-16 rings.
-Admission is bounded to `2 * io_uring_workers` active/queued batches and is
-strictly FIFO between callers. It is recorded as
-`io_uring_admission_capacity` and `io_uring_admission_policy` in the benchmark
-report. The storage
-section also records `/proc/self/task` counts immediately before and after open,
-which isolates the dedicated user-space ring workers.
+The raw-ABI backend uses persistent ring lanes. One worker is caller-driven;
+two or more workers have one dedicated owner thread per lane. Queue depth is an
+aggregate: two workers with depth 32 create two depth-16 rings. The shared
+coordinator converts every call into bounded range/byte work units, applies DRR
+between concurrent jobs, and never exceeds aggregate dispatch, range, and byte
+credits. Admission waiters enter in ticket order. The caller does not return
+until every already-issued lane operation has drained, so temporary plan/output
+buffers remain valid. The storage section records `/proc/self/task` counts
+before and after open to isolate user-space ring workers.
 
 Compare the known single-ring QD32 baseline with two rings at the same aggregate
 depth:
@@ -247,9 +250,9 @@ done
 The two-ring success gate is bit-exact correctness, cold single-client
 throughput at least 95% of the single-ring QD32 result, higher warm concurrent
 throughput, and no return of cgroup throttling. Compare p50/p99, CPU time,
-context switches, diskstats, and `/proc/self/task` count. Whole-batch FIFO can
-still cause head-of-line blocking between very different batch sizes; a fair
-quantum scheduler is intentionally deferred until measurements justify it.
+context switches, diskstats, and `/proc/self/task` count. Add an intentionally
+mixed small/large-call scenario: the small call must complete before the large
+job drains while the large job continues to make bounded progress.
 
 ## Fixed v4 reader A/B profile
 
@@ -306,8 +309,10 @@ By default the preflight also requires
 `telemetry.zero_delta_fast_path: true`. A mutation smoke leaves entries in the
 active WAL even after restoring their logical values, so use a freshly built
 collection with no committed WAL mutations for the empty mutable-read
-regression gate. Selective compaction will later be another way to restore that
-state. To intentionally measure a collection with mutation overlay state, opt
+regression gate. On format 7, materializing every WAL and folding all active run
+sections into partition snapshots can restore an authoritative snapshot-only
+state; retired run files are reclaimed separately. To intentionally measure a
+collection with mutation overlay state, opt
 out explicitly:
 
 ```bash

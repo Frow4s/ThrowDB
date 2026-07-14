@@ -106,6 +106,10 @@ public:
     [[nodiscard]] std::uint64_t row_count() const;
     [[nodiscard]] PartitionedSegmentIdEntry sidecar_at(
         std::uint64_t row_index) const;
+    // Exact immutable IDs payload, excluding the 4096-byte resource header.
+    // The span is valid for the lifetime of this reader and allows bounded
+    // maintenance scans to verify the catalog checksum without copying it.
+    [[nodiscard]] std::span<const std::byte> sidecar_payload() const;
     [[nodiscard]] PhysicalReadRequest resolve(
         RowRef row_ref,
         std::uint64_t output_index) const;

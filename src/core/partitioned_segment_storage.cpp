@@ -891,6 +891,14 @@ public:
         return result;
     }
 
+    [[nodiscard]] std::span<const std::byte> sidecar_payload() const {
+        ensure_owner();
+        return ids_mapping_.bytes().subspan(
+            static_cast<std::size_t>(kPartitionedHeaderSize),
+            static_cast<std::size_t>(
+                descriptor_.ids_file_size - kPartitionedHeaderSize));
+    }
+
     [[nodiscard]] PhysicalReadRequest resolve(
         const RowRef row_ref,
         const std::uint64_t output_index) const {
@@ -972,6 +980,10 @@ std::uint64_t PartitionedSegmentReader::row_count() const {
 PartitionedSegmentIdEntry PartitionedSegmentReader::sidecar_at(
     const std::uint64_t row_index) const {
     return impl_->sidecar_at(row_index);
+}
+
+std::span<const std::byte> PartitionedSegmentReader::sidecar_payload() const {
+    return impl_->sidecar_payload();
 }
 
 PhysicalReadRequest PartitionedSegmentReader::resolve(

@@ -2,8 +2,10 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
@@ -11,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -27,7 +30,12 @@
 #include "throwdb/native_collection.hpp"
 #include "../src/core/crc32c.hpp"
 #include "../src/core/internal.hpp"
+#include "../src/core/native_collection_test_hooks.hpp"
+#include "../src/core/partition_snapshot_storage.hpp"
 #include "../src/core/partitioned_index_format.hpp"
+#include "../src/core/partitioned_index_merge.hpp"
+#include "../src/core/partitioned_index_run_storage.hpp"
+#include "../src/core/partitioned_segment_storage.hpp"
 
 namespace {
 
@@ -232,10 +240,88 @@ void write_file(
         / ("catalog-" + uuid_token(current.catalog_id) + ".bin")));
 }
 
+[[nodiscard]] throwdb::detail::PartitionedManifestV2 current_manifest(
+    const std::filesystem::path& root) {
+    return throwdb::detail::decode_partitioned_manifest_v2(
+        read_file(root / "manifest.bin"));
+}
+
+void publish_test_catalog(
+    const std::filesystem::path& root,
+    const throwdb::detail::PartitionedManifestV2& manifest,
+    const throwdb::detail::PartitionedCatalogV3& catalog) {
+    using namespace throwdb::detail;
+    const std::vector<std::byte> catalog_bytes =
+        encode_partitioned_catalog_v3(catalog);
+    write_file(
+        root / "catalogs"
+            / ("catalog-" + uuid_token(catalog.catalog_id) + ".bin"),
+        catalog_bytes);
+    PartitionedCurrentV1 current;
+    current.collection_id = manifest.collection_id;
+    current.schema_id = manifest.schema_id;
+    current.generation = catalog.generation;
+    current.catalog_id = catalog.catalog_id;
+    current.catalog_file_size = catalog_bytes.size();
+    current.catalog_crc32c = crc32c(catalog_bytes);
+    write_file(root / "CURRENT", encode_partitioned_current_v1(manifest, current));
+}
+
 [[nodiscard]] std::filesystem::path test_wal_path(
     const std::filesystem::path& root,
     const throwdb::detail::Uuid128 wal_id) {
     return root / "wal" / ("wal-" + uuid_token(wal_id) + ".wal");
+}
+
+std::atomic<bool> materialization_output_entered{false};
+std::atomic<bool> release_materialization_output{false};
+
+void blocking_materialization_hook(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    using namespace throwdb::detail;
+    if (context.operation
+            != NativeCollectionTestOperation::MaterializeFrozenWals
+        || context.point
+               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+        return;
+    }
+    materialization_output_entered.store(true, std::memory_order_release);
+    while (!release_materialization_output.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+std::atomic<bool> fold_output_entered{false};
+std::atomic<bool> release_fold_output{false};
+
+void blocking_fold_hook(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    using namespace throwdb::detail;
+    if (context.operation != NativeCollectionTestOperation::FoldPartitions
+        || context.point
+               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+        return;
+    }
+    fold_output_entered.store(true, std::memory_order_release);
+    while (!release_fold_output.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+throwdb::detail::NativeCollectionTestHookPoint crash_target_point =
+    throwdb::detail::NativeCollectionTestHookPoint::
+        MutationReservationDurable;
+std::uint64_t crash_target_generation = 0;
+throwdb::detail::NativeCollectionTestOperation crash_target_operation =
+    throwdb::detail::NativeCollectionTestOperation::MaterializeFrozenWals;
+
+void crashing_materialization_hook(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    if (context.operation == crash_target_operation
+        && context.point == crash_target_point
+        && context.generation == crash_target_generation) {
+        ::_exit(73);
+    }
 }
 
 void test_float16_end_to_end_and_read_surface() {
@@ -325,7 +411,7 @@ void test_float16_end_to_end_and_read_surface() {
         writable->rotate_wal();
     require(
         !clean_stats.rotated && clean_stats.catalog_managed
-            && !clean_stats.delta_managed && clean_stats.generation == 1,
+            && clean_stats.delta_managed && clean_stats.generation == 1,
         "empty format-7 WAL rotation was not a clean no-op");
     writable.reset();
     auto calibration = throwdb::NativeCollection::open(
@@ -461,14 +547,16 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
     require(
         before_rotation.committed_sequence == 5
             && before_rotation.frozen_wal_count == 0
-            && before_rotation.active_wal_put_rows == 7,
+            && before_rotation.active_wal_put_rows == 7
+            && before_rotation.active_wal_transaction_count == 5,
         "format-7 active WAL stats changed before rotation");
     const throwdb::NativeMutationLogStats rotated = writer->rotate_wal();
     require(
         rotated.rotated && rotated.generation == 2
             && rotated.frozen_wal_count == 1
             && rotated.committed_sequence == 5
-            && rotated.active_wal_put_rows == 0,
+            && rotated.active_wal_put_rows == 0
+            && rotated.active_wal_transaction_count == 0,
         "format-7 WAL rotation did not publish its successor");
 
     auto middle_reader = throwdb::NativeCollection::open(temporary.path());
@@ -516,9 +604,29 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
         std::set<std::uint64_t>(sample.ids.begin(), sample.ids.end())
             == std::set<std::uint64_t>({0, maximum, 7, 42, 9, 10, 11}),
         "format-7 mutation-aware sample was not authoritative");
-    require_throws<throwdb::InvalidArgumentError>(
-        [&] { static_cast<void>(writer->materialize_frozen_wals()); },
-        "format-7 materialization did not fail explicitly");
+    const throwdb::NativeMutationLogStats materialized =
+        writer->materialize_frozen_wals();
+    require(
+        materialized.materialized && materialized.generation == 4
+            && materialized.materialized_sequence == 5
+            && materialized.materialized_wal_count == 1
+            && materialized.frozen_wal_count == 0
+            && materialized.delta_run_count == 1
+            && materialized.delta_entry_count == 6
+            && materialized.delta_put_rows == 6
+            && materialized.total_delta_run_bytes != 0
+            && materialized.total_delta_segment_bytes != 0
+            && !materialized.reclamation_complete,
+        "format-7 materialization stats changed");
+    require(
+        writer->get_bytes(std::array<std::uint64_t, 1>{0})
+            == zero_reinserted,
+        "format-7 materialization hid a newer active-WAL value");
+    require(
+        middle_reader->get_bytes(std::array<std::uint64_t, 1>{0})
+            == std::vector<std::byte>(
+                updated_extremes.begin(), updated_extremes.begin() + 4),
+        "format-7 materialization changed an older reader view");
 
     writer.reset();
     auto reopened = throwdb::NativeCollection::open(temporary.path());
@@ -534,9 +642,11 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
     const throwdb::NativeMutationLogStats replayed =
         reopened->mutation_log_stats();
     require(
-        replayed.generation == 2 && replayed.committed_sequence == 7
-            && replayed.frozen_wal_count == 1
-            && replayed.active_wal_put_rows == 1,
+        replayed.generation == 4 && replayed.committed_sequence == 7
+            && replayed.materialized_sequence == 5
+            && replayed.frozen_wal_count == 0
+            && replayed.active_wal_put_rows == 1
+            && replayed.delta_run_count == 1,
         "format-7 reopen mutation stats changed");
 }
 
@@ -631,6 +741,784 @@ void test_active_wal_tail_recovery_and_frozen_corruption() {
     }
 }
 
+void test_materialization_budget_and_tombstone_only_run() {
+    TemporaryDirectory temporary("materialize-tombstone");
+    const std::array<std::uint64_t, 2> ids{17, 29};
+    const std::vector<std::byte> embeddings = rows(ids.size(), 4);
+    build_collection(
+        temporary.path(), ids, embeddings, throwdb::DType::Float16,
+        2, 4, 1);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    require(
+        writer->erase(std::array<std::uint64_t, 1>{17})
+            == std::vector<std::uint8_t>({1}),
+        "format-7 tombstone setup failed");
+    static_cast<void>(writer->rotate_wal());
+    const throwdb::detail::PartitionedCatalogV3 before =
+        current_catalog(temporary.path());
+    const std::uint64_t sealed = before.wal_entries.front().sealed_file_size;
+    const throwdb::NativeMutationLogStats blocked =
+        writer->materialize_frozen_wals(1, sealed - 1);
+    require(
+        !blocked.materialized && blocked.materialization_budget_blocked
+            && blocked.generation == before.generation
+            && blocked.frozen_wal_count == 1,
+        "format-7 materialization did not honor its input-byte budget");
+
+    const throwdb::NativeMutationLogStats materialized =
+        writer->materialize_frozen_wals(1, sealed);
+    require(
+        materialized.materialized
+            && !materialized.materialization_budget_blocked
+            && materialized.materialized_sequence == 1
+            && materialized.delta_run_count == 1
+            && materialized.delta_entry_count == 1
+            && materialized.delta_put_rows == 0
+            && materialized.total_delta_segment_bytes == 0
+            && materialized.total_delta_run_bytes != 0,
+        "format-7 tombstone-only materialization stats changed");
+    require(writer->count() == 1, "tombstone materialization changed count");
+    require_throws<throwdb::MissingIdError>(
+        [&] {
+            static_cast<void>(writer->get_bytes(
+                std::array<std::uint64_t, 1>{17}));
+        },
+        "materialized tombstone fell through to the initial snapshot");
+    require(
+        writer->get_bytes(std::array<std::uint64_t, 1>{29})
+            == expected_rows(
+                ids, embeddings, 4,
+                std::array<std::uint64_t, 1>{29}),
+        "tombstone-only run changed an unrelated ID");
+    writer.reset();
+
+    throwdb::ReaderOptions verified_options;
+    verified_options.verify_native_index = true;
+    auto reopened = throwdb::NativeCollection::open(
+        temporary.path(), verified_options);
+    require(reopened->count() == 1, "tombstone run reopen changed count");
+    require_throws<throwdb::MissingIdError>(
+        [&] {
+            static_cast<void>(reopened->get_bytes(
+                std::array<std::uint64_t, 1>{17}));
+        },
+        "verified reopen lost the authoritative tombstone");
+    reopened.reset();
+    const std::filesystem::path run_file = first_file_with_extension(
+        temporary.path() / "index" / "runs", ".idx");
+    flip_byte(run_file, std::filesystem::file_size(run_file) - 1);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(
+                throwdb::NativeCollection::open(temporary.path()));
+        },
+        "ordinary reopen accepted a corrupt partitioned run body");
+}
+
+void test_materialization_rebases_over_newer_rotation() {
+    TemporaryDirectory temporary("materialize-rebase");
+    const std::array<std::uint64_t, 1> ids{41};
+    const std::vector<std::byte> base = rows(1, 4);
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, 1);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    const std::vector<std::byte> first{
+        std::byte{0x11}, std::byte{0x12}, std::byte{0x13}, std::byte{0x14}};
+    const std::vector<std::byte> second{
+        std::byte{0x21}, std::byte{0x22}, std::byte{0x23}, std::byte{0x24}};
+    writer->update(ids, first);
+    static_cast<void>(writer->rotate_wal());
+    auto middle_reader = throwdb::NativeCollection::open(temporary.path());
+
+    materialization_output_entered.store(false, std::memory_order_release);
+    release_materialization_output.store(false, std::memory_order_release);
+    throwdb::detail::set_native_collection_test_hook(
+        blocking_materialization_hook);
+    std::exception_ptr background_error;
+    throwdb::NativeMutationLogStats first_stats;
+    std::thread background([&] {
+        try {
+            first_stats = writer->materialize_frozen_wals();
+        } catch (...) {
+            background_error = std::current_exception();
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds(10);
+    while (!materialization_output_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!materialization_output_entered.load(std::memory_order_acquire)) {
+        release_materialization_output.store(true, std::memory_order_release);
+        background.join();
+        throwdb::detail::set_native_collection_test_hook(nullptr);
+        fail("format-7 materialization did not reach its output barrier");
+    }
+
+    writer->update(ids, second);
+    const throwdb::NativeMutationLogStats concurrent_rotation =
+        writer->rotate_wal();
+    require(
+        concurrent_rotation.rotated
+            && concurrent_rotation.frozen_wal_count == 2,
+        "concurrent format-7 rotation did not preserve both WALs");
+    release_materialization_output.store(true, std::memory_order_release);
+    background.join();
+    throwdb::detail::set_native_collection_test_hook(nullptr);
+    if (background_error != nullptr) {
+        std::rethrow_exception(background_error);
+    }
+    require(
+        first_stats.materialized && first_stats.materialized_wal_count == 1
+            && first_stats.materialized_sequence == 1
+            && first_stats.committed_sequence == 2
+            && first_stats.frozen_wal_count == 1,
+        "format-7 final rebase lost a concurrent frozen WAL");
+    require(
+        writer->get_bytes(ids) == second,
+        "materialization overrode a newer retained WAL version");
+    require(
+        middle_reader->get_bytes(ids) == first,
+        "materialization changed a pre-existing reader resource set");
+
+    const throwdb::NativeMutationLogStats second_stats =
+        writer->materialize_frozen_wals();
+    require(
+        second_stats.materialized && second_stats.delta_run_count == 2
+            && second_stats.materialized_sequence == 2
+            && second_stats.frozen_wal_count == 0,
+        "second format-7 materialization did not advance run precedence");
+    require(writer->get_bytes(ids) == second, "second run changed newest row");
+    writer.reset();
+
+    throwdb::ReaderOptions verified_options;
+    verified_options.verify_native_index = true;
+    auto reopened = throwdb::NativeCollection::open(
+        temporary.path(), verified_options);
+    require(
+        reopened->get_bytes(ids) == second,
+        "verified reopen did not choose the newest materialized run");
+}
+
+void test_catalog_mask_subset_and_cleaner_relocation() {
+    TemporaryDirectory temporary("cleaner-relocation");
+    using namespace throwdb::detail;
+    std::array<std::uint64_t, 2> ids{};
+    std::array<bool, 2> found{};
+    for (std::uint64_t candidate = 1;
+         candidate != 10000 && (!found[0] || !found[1]); ++candidate) {
+        const std::size_t partition = static_cast<std::size_t>(
+            hash_id(candidate, kHashSeed) >> 63);
+        if (!found[partition]) {
+            ids[partition] = candidate;
+            found[partition] = true;
+        }
+    }
+    require(found[0] && found[1], "test could not find IDs in both partitions");
+    const std::vector<std::byte> base = rows(ids.size(), 4);
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, 1);
+    const std::vector<std::byte> replacement{
+        std::byte{0x31}, std::byte{0x32}, std::byte{0x33}, std::byte{0x34},
+        std::byte{0x41}, std::byte{0x42}, std::byte{0x43}, std::byte{0x44}};
+    {
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(ids, replacement);
+        static_cast<void>(writer->rotate_wal());
+        static_cast<void>(writer->materialize_frozen_wals());
+    }
+
+    const PartitionedManifestV2 manifest = current_manifest(temporary.path());
+    PartitionedCatalogV3 catalog = current_catalog(temporary.path());
+    require(
+        catalog.runs.size() == 1
+            && std::to_integer<std::uint8_t>(
+                   catalog.runs.front().covered_partitions.front())
+                   == 0x03
+            && catalog.runs.front().active_partitions
+                   == catalog.runs.front().covered_partitions,
+        "materialized fixture did not cover both partitions");
+    PartitionIndexRunReader mutation_run(
+        temporary.path(), manifest.collection_id, manifest.schema_id,
+        manifest.partition_bits, manifest.hash_seed, catalog.runs.front());
+    const PartitionRunRecord partition_zero = *mutation_run.lookup(0, ids[0]);
+    const PartitionRunRecord partition_one = *mutation_run.lookup(1, ids[1]);
+
+    PartitionSnapshotBuildSpec snapshot_spec;
+    snapshot_spec.collection_id = manifest.collection_id;
+    snapshot_spec.schema_id = manifest.schema_id;
+    snapshot_spec.snapshot_id = Uuid128{0xa001, 0xa002};
+    snapshot_spec.partition_bits = manifest.partition_bits;
+    snapshot_spec.partition_id = 0;
+    snapshot_spec.hash_seed = manifest.hash_seed;
+    snapshot_spec.epoch = catalog.runs.front().epoch;
+    const std::array<PartitionRunRecord, 1> folded_records{partition_zero};
+    const PartitionSnapshotDescriptor folded = write_partition_snapshot(
+        temporary.path(), snapshot_spec, folded_records);
+    sync_directory(partitioned_partition_snapshots_directory(temporary.path()));
+    catalog.generation += 1;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = Uuid128{0xa003, 0xa004};
+    catalog.snapshots[0] = folded;
+    clear_folded_partition(catalog.runs, manifest.partition_bits, 0);
+    require(
+        catalog.runs.size() == 1
+            && std::to_integer<std::uint8_t>(
+                   catalog.runs.front().covered_partitions.front())
+                   == 0x03
+            && std::to_integer<std::uint8_t>(
+                   catalog.runs.front().active_partitions.front())
+                   == 0x02,
+        "fold did not preserve a covered-but-inactive run partition");
+    publish_test_catalog(temporary.path(), manifest, catalog);
+    {
+        auto folded_reader = throwdb::NativeCollection::open(temporary.path());
+        require(
+            folded_reader->get_bytes(ids) == replacement,
+            "catalog-active mask subset changed online lookup");
+    }
+
+    catalog = current_catalog(temporary.path());
+    const RowRef retired_row = RowRef::decode(partition_one.value_raw);
+    const auto retired_position = std::find_if(
+        catalog.segments.begin(), catalog.segments.end(),
+        [retired_row](const PartitionedSegmentDescriptor& descriptor) {
+            return descriptor.row_ref_segment_id
+                   == retired_row.segment_id().value();
+        });
+    require(
+        retired_position != catalog.segments.end(),
+        "cleaner fixture could not find its retired segment");
+    const PartitionedSegmentDescriptor retired = *retired_position;
+
+    PartitionedSegmentSetBuildSpec segment_spec;
+    segment_spec.manifest = manifest;
+    segment_spec.kind = PartitionedSegmentKind::Cleaner;
+    segment_spec.first_row_ref_segment_id = catalog.next_segment_id;
+    segment_spec.creation_epoch = catalog.next_index_epoch;
+    PartitionedSegmentSetWriter cleaner_writer(
+        temporary.path(), std::move(segment_spec));
+    const RowRef relocated = cleaner_writer.append(
+        ids[1], partition_one.sequence,
+        std::span<const std::byte>(replacement).subspan(4, 4));
+    const std::vector<PartitionedSegmentDescriptor> cleaner_segments =
+        cleaner_writer.finish();
+    require(cleaner_segments.size() == 1, "cleaner emitted extra segments");
+
+    PartitionIndexRunBuildSpec cleaner_spec;
+    cleaner_spec.collection_id = manifest.collection_id;
+    cleaner_spec.schema_id = manifest.schema_id;
+    cleaner_spec.partition_bits = manifest.partition_bits;
+    cleaner_spec.hash_seed = manifest.hash_seed;
+    cleaner_spec.descriptor.run_id = Uuid128{0xb001, 0xb002};
+    cleaner_spec.descriptor.epoch = catalog.next_index_epoch;
+    cleaner_spec.descriptor.kind = PartitionedRunKind::Cleaner;
+    cleaner_spec.descriptor.first_sequence = partition_one.sequence;
+    cleaner_spec.descriptor.last_sequence = partition_one.sequence;
+    cleaner_spec.descriptor.retired_row_ref_segment_id =
+        retired.row_ref_segment_id;
+    cleaner_spec.descriptor.retired_segment_id = retired.segment_id;
+    cleaner_spec.descriptor.retired_row_count = retired.row_count;
+    cleaner_spec.descriptor.retired_ids_payload_crc32c =
+        retired.ids_payload_crc32c;
+    const std::array<PartitionRunRecord, 1> cleaner_records{
+        PartitionRunRecord{ids[1], partition_one.sequence, relocated.raw()}};
+    const PartitionIndexRunDescriptor cleaner_run =
+        write_partitioned_index_run(
+            temporary.path(), cleaner_spec, cleaner_records);
+    sync_directory(partitioned_index_runs_directory(temporary.path()));
+
+    catalog.generation += 1;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = Uuid128{0xb003, 0xb004};
+    catalog.next_segment_id += 1;
+    catalog.next_index_epoch += 1;
+    catalog.segments.erase(retired_position);
+    catalog.segments.push_back(cleaner_segments.front());
+    catalog.runs.push_back(cleaner_run);
+    publish_test_catalog(temporary.path(), manifest, catalog);
+
+    auto relocated_reader = throwdb::NativeCollection::open(temporary.path());
+    require(
+        relocated_reader->get_bytes(ids) == replacement,
+        "online reducer rejected a valid cleaner relocation");
+    throwdb::ReaderOptions verified_options;
+    verified_options.verify_native_index = true;
+    auto verified = throwdb::NativeCollection::open(
+        temporary.path(), verified_options);
+    require(
+        verified->get_bytes(ids) == replacement,
+        "full verification rejected a valid cleaner relocation");
+}
+
+void test_materialization_crash_checkpoints_reopen() {
+    using HookPoint =
+        throwdb::detail::NativeCollectionTestHookPoint;
+    struct CrashCase {
+        HookPoint point;
+        std::uint64_t generation;
+        bool final_current_visible;
+    };
+    const std::array<CrashCase, 4> cases{{
+        {HookPoint::MutationReservationDurable, 3, false},
+        {HookPoint::MutationDeltaOutputDurable, 3, false},
+        {HookPoint::MutationCatalogDurableBeforeCurrent, 4, false},
+        {HookPoint::MutationCurrentDurable, 4, true},
+    }};
+    crash_target_operation =
+        throwdb::detail::NativeCollectionTestOperation::
+            MaterializeFrozenWals;
+    for (std::size_t case_index = 0; case_index != cases.size(); ++case_index) {
+        TemporaryDirectory temporary(
+            "materialize-crash-" + std::to_string(case_index));
+        const std::array<std::uint64_t, 1> ids{71};
+        const std::vector<std::byte> base = rows(1, 4);
+        const std::vector<std::byte> replacement{
+            std::byte{0x51}, std::byte{0x52},
+            std::byte{0x53}, std::byte{0x54}};
+        build_collection(
+            temporary.path(), ids, base, throwdb::DType::Float16,
+            2, 4, 1);
+        {
+            auto writer = throwdb::NativeCollection::open(
+                temporary.path(), {}, true);
+            writer->update(ids, replacement);
+            static_cast<void>(writer->rotate_wal());
+        }
+
+        crash_target_point = cases[case_index].point;
+        crash_target_generation = cases[case_index].generation;
+        const pid_t child = ::fork();
+        require(child >= 0, "fork failed for materialization crash test");
+        if (child == 0) {
+            throwdb::detail::set_native_collection_test_hook(
+                crashing_materialization_hook);
+            try {
+                auto writer = throwdb::NativeCollection::open(
+                    temporary.path(), {}, true);
+                static_cast<void>(writer->materialize_frozen_wals());
+            } catch (...) {
+                ::_exit(74);
+            }
+            ::_exit(75);
+        }
+        int status = 0;
+        pid_t waited = -1;
+        do {
+            waited = ::waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        require(
+            waited == child && WIFEXITED(status)
+                && WEXITSTATUS(status) == 73,
+            "materialization crash hook did not terminate at its checkpoint");
+
+        throwdb::ReaderOptions verified_options;
+        verified_options.verify_native_index = true;
+        auto reopened = throwdb::NativeCollection::open(
+            temporary.path(), verified_options);
+        require(
+            reopened->get_bytes(ids) == replacement,
+            "crash checkpoint lost the committed logical value");
+        const throwdb::NativeMutationLogStats stats =
+            reopened->mutation_log_stats();
+        if (cases[case_index].final_current_visible) {
+            require(
+                stats.materialized_sequence == 1
+                    && stats.frozen_wal_count == 0
+                    && stats.delta_run_count == 1,
+                "durable final CURRENT did not expose materialized state");
+        } else {
+            require(
+                stats.materialized_sequence == 0
+                    && stats.frozen_wal_count == 1
+                    && stats.delta_run_count == 0,
+                "pre-CURRENT crash exposed unpublished materialization");
+        }
+    }
+}
+
+void test_fully_folded_materialized_snapshot_uses_fast_path() {
+    TemporaryDirectory temporary("folded-fast-path");
+    using namespace throwdb::detail;
+    const std::array<std::uint64_t, 1> ids{83};
+    const std::vector<std::byte> base = rows(1, 4);
+    const std::vector<std::byte> replacement{
+        std::byte{0x61}, std::byte{0x62},
+        std::byte{0x63}, std::byte{0x64}};
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, 0);
+    {
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(ids, replacement);
+        static_cast<void>(writer->rotate_wal());
+        static_cast<void>(writer->materialize_frozen_wals());
+    }
+    const PartitionedManifestV2 manifest = current_manifest(temporary.path());
+    PartitionedCatalogV3 catalog = current_catalog(temporary.path());
+    PartitionIndexRunReader run(
+        temporary.path(), manifest.collection_id, manifest.schema_id,
+        manifest.partition_bits, manifest.hash_seed, catalog.runs.front());
+    const PartitionRunRecord winner = *run.lookup(0, ids.front());
+    PartitionSnapshotBuildSpec snapshot_spec;
+    snapshot_spec.collection_id = manifest.collection_id;
+    snapshot_spec.schema_id = manifest.schema_id;
+    snapshot_spec.snapshot_id = Uuid128{0xc001, 0xc002};
+    snapshot_spec.partition_bits = manifest.partition_bits;
+    snapshot_spec.partition_id = 0;
+    snapshot_spec.hash_seed = manifest.hash_seed;
+    snapshot_spec.epoch = catalog.runs.front().epoch;
+    const std::array<PartitionRunRecord, 1> records{winner};
+    catalog.snapshots[0] = write_partition_snapshot(
+        temporary.path(), snapshot_spec, records);
+    sync_directory(partitioned_partition_snapshots_directory(temporary.path()));
+    clear_folded_partition(catalog.runs, manifest.partition_bits, 0);
+    require(catalog.runs.empty(), "full fold retained an inactive run");
+    catalog.generation += 1;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = Uuid128{0xc003, 0xc004};
+    publish_test_catalog(temporary.path(), manifest, catalog);
+
+    auto reader = throwdb::NativeCollection::open(temporary.path());
+    std::vector<std::byte> output(4);
+    const throwdb::NativeReadStats profile =
+        reader->get_into_profiled(ids, output);
+    require(
+        output == replacement && profile.zero_delta_fast_path
+            && profile.base_rows == 0 && profile.mutation_rows == 1,
+        "fully folded materialized snapshot missed the direct fast path");
+}
+
+void test_selective_fold_is_bounded_and_rebases_newer_wal() {
+    TemporaryDirectory temporary("selective-fold");
+    constexpr std::uint32_t partition_bits = 2;
+    std::array<std::uint64_t, 4> ids{};
+    std::array<bool, 4> found{};
+    for (std::uint64_t candidate = 1;
+         candidate != 100000
+         && std::find(found.begin(), found.end(), false) != found.end();
+         ++candidate) {
+        const std::size_t partition = static_cast<std::size_t>(
+            throwdb::detail::hash_id(candidate, throwdb::detail::kHashSeed)
+            >> (64 - partition_bits));
+        if (!found[partition]) {
+            ids[partition] = candidate;
+            found[partition] = true;
+        }
+    }
+    require(
+        std::find(found.begin(), found.end(), false) == found.end(),
+        "test could not route one ID to every partition");
+    const auto tagged_rows = [](const std::uint8_t tag,
+                                const std::size_t count) {
+        std::vector<std::byte> result(count * 4);
+        for (std::size_t index = 0; index != result.size(); ++index) {
+            result[index] = static_cast<std::byte>(tag + index);
+        }
+        return result;
+    };
+    const std::vector<std::byte> base = tagged_rows(1, ids.size());
+    const std::vector<std::byte> first = tagged_rows(31, ids.size());
+    const std::vector<std::byte> second = tagged_rows(61, ids.size());
+    const std::vector<std::byte> third = tagged_rows(91, 1);
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, partition_bits);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    const throwdb::NativeMutationLogStats fresh =
+        writer->compact_delta_runs();
+    require(
+        !fresh.compacted && !fresh.compaction_budget_blocked
+            && fresh.generation == 1,
+        "selective fold fresh-store no-op changed");
+
+    writer->update(ids, first);
+    static_cast<void>(writer->rotate_wal());
+    static_cast<void>(writer->materialize_frozen_wals());
+    writer->update(ids, second);
+    static_cast<void>(writer->rotate_wal());
+    static_cast<void>(writer->materialize_frozen_wals());
+    auto old_reader = throwdb::NativeCollection::open(temporary.path());
+
+    const throwdb::NativeMutationLogStats before =
+        writer->mutation_log_stats();
+    const throwdb::NativeMutationLogStats blocked =
+        writer->compact_delta_runs(
+            2, 1, std::numeric_limits<std::uint64_t>::max());
+    require(
+        !blocked.compacted && blocked.compaction_budget_blocked
+            && blocked.generation == before.generation,
+        "selective fold did not report a budget-blocked no-op");
+
+    fold_output_entered.store(false, std::memory_order_release);
+    release_fold_output.store(false, std::memory_order_release);
+    throwdb::detail::set_native_collection_test_hook(blocking_fold_hook);
+    std::exception_ptr background_error;
+    throwdb::NativeMutationLogStats first_fold;
+    std::thread background([&] {
+        try {
+            first_fold = writer->compact_delta_runs(
+                2, std::numeric_limits<std::uint64_t>::max(), 6);
+        } catch (...) {
+            background_error = std::current_exception();
+        }
+    });
+    const auto deadline = std::chrono::steady_clock::now()
+                          + std::chrono::seconds(10);
+    while (!fold_output_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!fold_output_entered.load(std::memory_order_acquire)) {
+        release_fold_output.store(true, std::memory_order_release);
+        background.join();
+        throwdb::detail::set_native_collection_test_hook(nullptr);
+        fail("selective fold did not reach its output barrier");
+    }
+    writer->update(
+        std::array<std::uint64_t, 1>{ids[0]}, third);
+    const throwdb::NativeMutationLogStats concurrent_rotation =
+        writer->rotate_wal();
+    require(
+        concurrent_rotation.rotated
+            && concurrent_rotation.frozen_wal_count == 1,
+        "selective fold blocked a concurrent WAL rotation");
+    release_fold_output.store(true, std::memory_order_release);
+    background.join();
+    throwdb::detail::set_native_collection_test_hook(nullptr);
+    if (background_error != nullptr) {
+        std::rethrow_exception(background_error);
+    }
+
+    require(
+        first_fold.compacted && first_fold.generation == 10
+            && first_fold.committed_sequence == 3
+            && first_fold.compacted_partition_count == 2
+            && first_fold.compacted_run_section_count == 4
+            && first_fold.compacted_snapshot_input_entries == 2
+            && first_fold.compacted_delta_input_entries == 4
+            && first_fold.compacted_delta_input_bytes
+                   == 4 * throwdb::detail::kPartitionRunRecordSize
+            && first_fold.compacted_output_entries == 2
+            && first_fold.compacted_snapshot_input_bytes != 0
+            && first_fold.compacted_output_bytes != 0
+            && first_fold.compaction_budget_blocked
+            && !first_fold.reclamation_complete
+            && first_fold.delta_run_count == 2
+            && first_fold.frozen_wal_count == 1,
+        "bounded selective fold diagnostics changed");
+    std::vector<std::byte> expected = second;
+    std::copy(third.begin(), third.end(), expected.begin());
+    require(
+        writer->get_bytes(ids) == expected,
+        "selective fold overrode a newer WAL value");
+    require(
+        old_reader->get_bytes(ids) == second,
+        "selective fold changed an already-open reader view");
+
+    const throwdb::NativeMutationLogStats second_fold =
+        writer->compact_delta_runs(
+            2, std::numeric_limits<std::uint64_t>::max(),
+            std::numeric_limits<std::uint64_t>::max());
+    require(
+        second_fold.compacted && second_fold.generation == 12
+            && second_fold.compacted_partition_count == 2
+            && second_fold.compacted_run_section_count == 4
+            && !second_fold.compaction_budget_blocked
+            && second_fold.delta_run_count == 0,
+        "second selective fold did not clear all active run sections");
+    require(writer->get_bytes(ids) == expected, "second fold changed output");
+    writer.reset();
+
+    throwdb::ReaderOptions verified_options;
+    verified_options.verify_native_index = true;
+    auto reopened = throwdb::NativeCollection::open(
+        temporary.path(), verified_options);
+    require(
+        reopened->get_bytes(ids) == expected,
+        "verified reopen changed selectively folded state");
+    require(
+        old_reader->get_bytes(ids) == second,
+        "old reader pins did not survive all selective folds");
+}
+
+void test_format_aware_default_fold_covers_all_active_runs() {
+    TemporaryDirectory temporary("format-aware-default-fold");
+    const std::array<std::uint64_t, 1> ids{17};
+    const std::vector<std::byte> base{
+        std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, 0);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+
+    std::vector<std::byte> expected(4);
+    for (std::uint8_t round = 0; round != 9; ++round) {
+        for (std::size_t index = 0; index != expected.size(); ++index) {
+            expected[index] = static_cast<std::byte>(31 + round + index);
+        }
+        writer->update(ids, expected);
+        require(writer->rotate_wal().rotated,
+                "default-fold fixture did not rotate");
+        require(writer->materialize_frozen_wals().materialized,
+                "default-fold fixture did not materialize");
+    }
+    require(writer->mutation_log_stats().delta_run_count == 9,
+            "default-fold fixture did not create nine active runs");
+
+    const throwdb::NativeMutationLogStats folded =
+        writer->compact_delta_runs();
+    require(
+        folded.compacted && folded.compacted_partition_count == 1
+            && folded.compacted_run_section_count == 9
+            && folded.delta_run_count == 0
+            && !folded.compaction_budget_blocked,
+        "format-7 native default did not fold every active run section");
+    require(writer->get_bytes(ids) == expected,
+            "format-aware default fold changed the newest value");
+}
+
+void test_fold_budget_charges_worst_case_output_geometry() {
+    TemporaryDirectory temporary("fold-output-budget");
+    build_collection(
+        temporary.path(), {}, {}, throwdb::DType::Float16,
+        2, 4, 0);
+    constexpr std::size_t row_count = 1000;
+    std::vector<std::uint64_t> ids(row_count);
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        ids[index] = static_cast<std::uint64_t>(index + 1);
+    }
+    const std::vector<std::byte> embeddings = rows(row_count, 4);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    writer->insert(ids, embeddings);
+    static_cast<void>(writer->rotate_wal());
+    static_cast<void>(writer->materialize_frozen_wals());
+    const throwdb::detail::PartitionedCatalogV3 catalog =
+        current_catalog(temporary.path());
+    require(
+        catalog.runs.size() == 1
+            && catalog.runs.front().entry_count == row_count
+            && catalog.snapshots.front().entry_count == 0,
+        "worst-case fold fixture geometry changed");
+    const std::uint64_t raw_input_bytes =
+        catalog.snapshots.front().file_size
+        + catalog.runs.front().entry_count
+              * throwdb::detail::kPartitionRunRecordSize;
+    const throwdb::NativeMutationLogStats blocked =
+        writer->compact_delta_runs(2, raw_input_bytes, row_count);
+    require(
+        !blocked.compacted && blocked.compaction_budget_blocked
+            && blocked.generation == catalog.generation,
+        "fold admitted output growth that exceeded the byte budget");
+
+    const throwdb::NativeMutationLogStats folded =
+        writer->compact_delta_runs(2, 100000, row_count);
+    require(
+        folded.compacted && !folded.compaction_budget_blocked
+            && folded.compacted_partition_count == 1
+            && folded.compacted_run_section_count == 1
+            && folded.compacted_delta_input_entries == row_count
+            && folded.compacted_snapshot_input_entries == 0
+            && folded.compacted_output_entries == row_count
+            && folded.compacted_output_bytes <= 100000
+            && folded.delta_run_count == 0,
+        "fold did not honor its bounded worst-case output geometry");
+    require(
+        writer->get_bytes(ids) == embeddings,
+        "worst-case geometry fold changed stored rows");
+}
+
+void test_selective_fold_crash_checkpoints_reopen() {
+    using HookPoint =
+        throwdb::detail::NativeCollectionTestHookPoint;
+    struct CrashCase {
+        HookPoint point;
+        std::uint64_t generation;
+        bool final_current_visible;
+    };
+    const std::array<CrashCase, 4> cases{{
+        {HookPoint::MutationReservationDurable, 5, false},
+        {HookPoint::MutationDeltaOutputDurable, 5, false},
+        {HookPoint::MutationCatalogDurableBeforeCurrent, 6, false},
+        {HookPoint::MutationCurrentDurable, 6, true},
+    }};
+    crash_target_operation =
+        throwdb::detail::NativeCollectionTestOperation::FoldPartitions;
+    for (std::size_t case_index = 0; case_index != cases.size(); ++case_index) {
+        TemporaryDirectory temporary(
+            "fold-crash-" + std::to_string(case_index));
+        const std::array<std::uint64_t, 1> ids{101};
+        const std::vector<std::byte> base = rows(1, 4);
+        const std::vector<std::byte> replacement{
+            std::byte{0x71}, std::byte{0x72},
+            std::byte{0x73}, std::byte{0x74}};
+        build_collection(
+            temporary.path(), ids, base, throwdb::DType::Float16,
+            2, 4, 0);
+        {
+            auto writer = throwdb::NativeCollection::open(
+                temporary.path(), {}, true);
+            writer->update(ids, replacement);
+            static_cast<void>(writer->rotate_wal());
+            static_cast<void>(writer->materialize_frozen_wals());
+        }
+        crash_target_point = cases[case_index].point;
+        crash_target_generation = cases[case_index].generation;
+        const pid_t child = ::fork();
+        require(child >= 0, "fork failed for selective-fold crash test");
+        if (child == 0) {
+            throwdb::detail::set_native_collection_test_hook(
+                crashing_materialization_hook);
+            try {
+                auto writer = throwdb::NativeCollection::open(
+                    temporary.path(), {}, true);
+                static_cast<void>(writer->compact_delta_runs(
+                    2, std::numeric_limits<std::uint64_t>::max(),
+                    std::numeric_limits<std::uint64_t>::max()));
+            } catch (...) {
+                ::_exit(76);
+            }
+            ::_exit(77);
+        }
+        int status = 0;
+        pid_t waited = -1;
+        do {
+            waited = ::waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        require(
+            waited == child && WIFEXITED(status)
+                && WEXITSTATUS(status) == 73,
+            "selective-fold crash hook missed its checkpoint");
+
+        throwdb::ReaderOptions verified_options;
+        verified_options.verify_native_index = true;
+        auto reopened = throwdb::NativeCollection::open(
+            temporary.path(), verified_options);
+        require(
+            reopened->get_bytes(ids) == replacement,
+            "selective-fold crash changed the logical value");
+        const throwdb::detail::PartitionedCatalogV3 catalog =
+            current_catalog(temporary.path());
+        require(
+            catalog.runs.empty()
+                == cases[case_index].final_current_visible,
+            "selective-fold crash exposed the wrong catalog generation");
+    }
+    crash_target_operation =
+        throwdb::detail::NativeCollectionTestOperation::
+            MaterializeFrozenWals;
+}
+
 void test_duplicate_and_abandoned_build_are_not_published() {
     {
         TemporaryDirectory temporary("duplicate");
@@ -675,6 +1563,69 @@ void test_duplicate_and_abandoned_build_are_not_published() {
             },
             "abandoned build could be opened");
     }
+}
+
+void test_selective_fold_rejects_checksum_valid_snapshot_corruption() {
+    using namespace throwdb::detail;
+    TemporaryDirectory temporary("fold-structural-corruption");
+    const std::array<std::uint64_t, 1> ids{701};
+    const std::vector<std::byte> base = rows(1, 4);
+    const std::vector<std::byte> replacement{
+        std::byte{0x61}, std::byte{0x62},
+        std::byte{0x63}, std::byte{0x64}};
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 8, 0);
+    {
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(ids, replacement);
+        require(writer->rotate_wal().rotated,
+                "structural-corruption fixture did not rotate");
+        require(writer->materialize_frozen_wals().materialized,
+                "structural-corruption fixture did not materialize");
+    }
+
+    const PartitionedManifestV2 manifest = current_manifest(temporary.path());
+    PartitionedCatalogV3 catalog = current_catalog(temporary.path());
+    require(catalog.runs.size() == 1,
+            "structural-corruption fixture lacks an active run");
+    PartitionSnapshotDescriptor descriptor = catalog.snapshots.front();
+    const std::filesystem::path snapshot_path =
+        partitioned_partition_snapshot_path(temporary.path(), descriptor);
+    std::vector<std::byte> snapshot = read_file(snapshot_path);
+    PartitionSnapshotHeaderV1 header =
+        decode_partition_snapshot_header_v1(
+            std::span<const std::byte>(snapshot).first(
+                static_cast<std::size_t>(kPartitionedHeaderSize)));
+    const std::uint64_t controls_end =
+        kPartitionedHeaderSize + descriptor.capacity;
+    require(controls_end < header.lookup_slots_offset,
+            "snapshot fixture has no alignment padding to corrupt");
+    snapshot[static_cast<std::size_t>(controls_end)] = std::byte{1};
+    descriptor.body_crc32c = crc32c(
+        std::span<const std::byte>(snapshot).subspan(
+            static_cast<std::size_t>(kPartitionedHeaderSize)));
+    header.descriptor = descriptor;
+    const auto encoded_header = encode_partition_snapshot_header_v1(header);
+    std::copy(
+        encoded_header.begin(), encoded_header.end(), snapshot.begin());
+    write_file(snapshot_path, snapshot);
+
+    catalog.generation += 1;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = Uuid128{0xf001, 0xf002};
+    catalog.snapshots.front() = descriptor;
+    publish_test_catalog(temporary.path(), manifest, catalog);
+
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(
+                writer->compact_delta_runs(2, 1ULL << 20, 100));
+        },
+        "selective fold normalized checksum-valid snapshot corruption");
 }
 
 void test_snapshot_and_current_corruption_and_symlink_rejected() {
@@ -1028,12 +1979,12 @@ void test_checksummed_post_initial_catalog_fails_closed() {
         encode_partitioned_current_v1(manifest, current);
     write_file(temporary.path() / "CURRENT", current_bytes);
 
-    require_throws<throwdb::CorruptionError>(
+    require_throws<throwdb::StorageError>(
         [&] {
             static_cast<void>(
                 throwdb::NativeCollection::open(temporary.path()));
         },
-        "read-only slice accepted a checksummed post-initial run catalog");
+        "format-7 reader accepted a catalog whose run resource is missing");
 }
 
 struct TestCase {
@@ -1044,7 +1995,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 11> tests{{
+    const std::array<TestCase, 21> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
@@ -1052,6 +2003,26 @@ int main() {
          test_writable_crud_reopen_rotation_and_snapshot_isolation},
         {"active_wal_tail_recovery_and_frozen_corruption",
          test_active_wal_tail_recovery_and_frozen_corruption},
+        {"materialization_budget_and_tombstone_only_run",
+         test_materialization_budget_and_tombstone_only_run},
+        {"materialization_rebases_over_newer_rotation",
+         test_materialization_rebases_over_newer_rotation},
+        {"catalog_mask_subset_and_cleaner_relocation",
+         test_catalog_mask_subset_and_cleaner_relocation},
+        {"materialization_crash_checkpoints_reopen",
+         test_materialization_crash_checkpoints_reopen},
+        {"fully_folded_materialized_snapshot_uses_fast_path",
+         test_fully_folded_materialized_snapshot_uses_fast_path},
+        {"selective_fold_is_bounded_and_rebases_newer_wal",
+         test_selective_fold_is_bounded_and_rebases_newer_wal},
+        {"format_aware_default_fold_covers_all_active_runs",
+         test_format_aware_default_fold_covers_all_active_runs},
+        {"fold_budget_charges_worst_case_output_geometry",
+         test_fold_budget_charges_worst_case_output_geometry},
+        {"selective_fold_crash_checkpoints_reopen",
+         test_selective_fold_crash_checkpoints_reopen},
+        {"selective_fold_rejects_checksum_valid_snapshot_corruption",
+         test_selective_fold_rejects_checksum_valid_snapshot_corruption},
         {"duplicate_and_abandoned_build_are_not_published",
          test_duplicate_and_abandoned_build_are_not_published},
         {"snapshot_and_current_corruption_and_symlink_rejected",

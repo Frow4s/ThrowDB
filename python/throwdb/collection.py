@@ -38,31 +38,33 @@ from ._tuning import (
 
 
 _UINT32_MAX: Final = (1 << 32) - 1
+_ROW_REF_SEGMENT_ID_MAX: Final = _UINT32_MAX - 1
 _UINT64_MAX: Final = (1 << 64) - 1
 _DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
 _ID_SCAN_CHUNK_ROWS: Final = 1 << 20
 _DEFAULT_DELTA_COMPACTION_MAX_RUNS: Final = 8
 _MAX_DELTA_COMPACTION_RUNS: Final = 64
+_MAX_PARTITIONED_FOLD_RUNS: Final = 4096
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES: Final = 1_000_000
+_DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS: Final = 8
+_DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES: Final = 1 << 30
+_DEFAULT_CLEAN_MAX_SOURCE_BYTES: Final = 32 << 30
+_DEFAULT_CLEAN_MAX_OUTPUT_BYTES: Final = 32 << 30
+_DEFAULT_CLEAN_MAX_MEMORY_BYTES: Final = 2 << 30
+_DEFAULT_CLEAN_MIN_GARBAGE_ROWS: Final = 1
+_DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES: Final = 512 << 20
+_DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM: Final = 300_000
 _DEFAULT_ORPHAN_MIN_AGE_SECONDS: Final = 3_600.0
 _DEFAULT_ORPHAN_MAX_FILES: Final = 1_024
 _DEFAULT_ORPHAN_MAX_BYTES: Final = 8 << 30
 _DEFAULT_MAINTAIN_MAX_SECONDS: Final = 300.0
-_DEFAULT_MAINTAIN_MAX_ACTIONS: Final = 4
+_DEFAULT_MAINTAIN_MAX_ACTIONS: Final = 5
 _DEFAULT_MAINTAIN_ROTATE_WAL_BYTES: Final = 1 << 30
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS: Final = 8
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS: Final = 8
 
-_ORPHAN_CANDIDATE_CLASSES: Final = frozenset(
-    {
-        "temp_publication",
-        "unreferenced_wal",
-        "complete_unreferenced_delta_pair",
-        "partial_unreferenced_delta_pair",
-    }
-)
 _ORPHAN_INVENTORY_CLASS_NAMES: Final = (
     "reachable",
     "superseded_catalog",
@@ -71,6 +73,10 @@ _ORPHAN_INVENTORY_CLASS_NAMES: Final = (
     "complete_unreferenced_delta_pair",
     "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
+    "complete_unreferenced_segment_pair",
+    "partial_unreferenced_segment_pair",
+    "unreferenced_snapshot",
+    "unreferenced_run",
 )
 _ORPHAN_INVENTORY_CLASSES: Final = frozenset(
     _ORPHAN_INVENTORY_CLASS_NAMES
@@ -87,6 +93,10 @@ OrphanClassification: TypeAlias = Literal[
     "complete_unreferenced_delta_pair",
     "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
+    "complete_unreferenced_segment_pair",
+    "partial_unreferenced_segment_pair",
+    "unreferenced_snapshot",
+    "unreferenced_run",
 ]
 
 
@@ -164,6 +174,30 @@ class MaintenanceReport(TypedDict):
     deadline_reached: bool
     action_budget_reached: bool
     work_performed: bool
+
+
+class SegmentCleaningReport(TypedDict):
+    generation: int
+    scanned_segment_count: int
+    scanned_row_count: int
+    scanned_sidecar_bytes: int
+    skipped_budget_segment_count: int
+    next_start_after_segment_id: int
+    candidate_segment_id: int
+    source_rows: int
+    relocated_rows: int
+    garbage_rows: int
+    source_bytes: int
+    output_segment_count: int
+    output_segment_bytes: int
+    output_run_bytes: int
+    reclaimable_bytes: int
+    dry_run: bool
+    candidate_found: bool
+    cleaned: bool
+    budget_blocked: bool
+    cycle_complete: bool
+    reclamation_complete: bool
 
 
 def _storage_match_level(probe: StorageProbeResult) -> str:
@@ -554,11 +588,57 @@ def _orphan_report(
     }
     previous_path: str | None = None
 
+    # A format-7 segment is published and reclaimed as one .dat/.ids unit.
+    # Mirror the native executor's group-age policy in dry-run reports so a
+    # young or invalid half defers both files and an execution report cannot
+    # disagree with its reconstructed plan.
+    complete_segment_pair_states: dict[str, dict[str, int]] = {}
+    for raw_entry in raw_entries:
+        if (
+            isinstance(raw_entry, dict)
+            and raw_entry.get("classification")
+            == "complete_unreferenced_segment_pair"
+        ):
+            path = raw_entry.get("path")
+            modified_unix_ns = raw_entry.get("modified_unix_ns")
+            if (
+                isinstance(path, str)
+                and path.startswith("segments/segment-")
+                and (path.endswith(".dat") or path.endswith(".ids"))
+                and isinstance(modified_unix_ns, int)
+                and not isinstance(modified_unix_ns, bool)
+            ):
+                stem = path[:-4]
+                if not 0 <= modified_unix_ns <= snapshot_unix_ns:
+                    state = 0
+                elif snapshot_unix_ns - modified_unix_ns < minimum_age_ns:
+                    state = 1
+                else:
+                    state = 2
+                parts = complete_segment_pair_states.setdefault(stem, {})
+                suffix = path[-4:]
+                if suffix in parts:
+                    raise RuntimeError(
+                        "native orphan inventory contains a duplicate complete "
+                        "segment pair member"
+                    )
+                parts[suffix] = state
+
+    complete_segment_pair_state: dict[str, int] = {}
+    for stem, states in complete_segment_pair_states.items():
+        if set(states) != {".dat", ".ids"}:
+            raise RuntimeError(
+                "native orphan inventory contains an incomplete complete "
+                "segment pair"
+            )
+        complete_segment_pair_state[stem] = min(states.values())
+
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict):
             raise RuntimeError("native orphan inventory contains an invalid entry")
         path = raw_entry.get("path")
         classification = raw_entry.get("classification")
+        native_candidate = raw_entry.get("candidate")
         byte_count = raw_entry.get("bytes")
         modified_unix_ns = raw_entry.get("modified_unix_ns")
         if not isinstance(path, str) or not path:
@@ -576,6 +656,10 @@ def _orphan_report(
                 "native orphan inventory contains an invalid classification"
             )
         classification = cast(OrphanClassification, classification)
+        if not isinstance(native_candidate, bool):
+            raise RuntimeError(
+                "native orphan inventory contains an invalid candidate policy"
+            )
         if (
             not isinstance(byte_count, int)
             or isinstance(byte_count, bool)
@@ -591,15 +675,26 @@ def _orphan_report(
                 "native orphan inventory contains an invalid modification time"
             )
 
-        candidate = classification in _ORPHAN_CANDIDATE_CLASSES
-        valid_modification_time = (
-            0 <= modified_unix_ns <= snapshot_unix_ns
-        )
+        # Candidate policy is format-specific. In particular, format 7 can
+        # safely retire superseded catalogs and unreferenced segment
+        # singletons under view.lock, while the format-6 catalog policy stays
+        # conservative. Never infer this destructive policy from a class name.
+        candidate = native_candidate
+        valid_modification_time = 0 <= modified_unix_ns <= snapshot_unix_ns
         eligible = (
             candidate
             and valid_modification_time
             and snapshot_unix_ns - modified_unix_ns >= minimum_age_ns
         )
+        if classification == "complete_unreferenced_segment_pair":
+            state = complete_segment_pair_state.get(path[:-4])
+            if state is None:
+                raise RuntimeError(
+                    "native orphan inventory contains an invalid complete "
+                    "segment pair path"
+                )
+            valid_modification_time = state != 0
+            eligible = state == 2
         total_bytes += byte_count
         classification_counts[classification] += 1
         classification_bytes[classification] += byte_count
@@ -618,9 +713,15 @@ def _orphan_report(
             reason = "reachable_from_current"
         elif classification == "superseded_catalog":
             reason = "retained_by_policy"
-        else:
+        elif classification == "partial_unreferenced_segment_pair":
+            reason = "incomplete_pair_do_not_touch"
+        elif classification == "unknown_do_not_touch":
             unknown_file_count += 1
             reason = "unknown_do_not_touch"
+        else:
+            raise RuntimeError(
+                "native orphan inventory class has no collection policy"
+            )
 
         entries.append(
             {
@@ -691,6 +792,7 @@ def _orphan_execution_report(
             {
                 "path": entry.get("path"),
                 "classification": entry.get("classification"),
+                "candidate": entry.get("candidate"),
                 "bytes": entry.get("bytes"),
                 "modified_unix_ns": entry.get("modified_unix_ns"),
             }
@@ -795,7 +897,15 @@ def _orphan_execution_report(
         or not all(isinstance(value, str) for value in synced_directories)
         or len(synced_directories) != len(set(synced_directories))
         or any(
-            value not in {".", "catalogs", "wal", "deltas"}
+            value not in {
+                ".",
+                "catalogs",
+                "wal",
+                "deltas",
+                "segments",
+                "index/partitions",
+                "index/runs",
+            }
             for value in synced_directories
         )
     ):
@@ -1211,6 +1321,7 @@ class Collection:
             assert native is not None
             self._count = 0
             self._format_version = native.format_version
+        self._cleaning_cursor = 0
         self._tuning = dict(tuning_profile) if tuning_profile is not None else None
 
     @classmethod
@@ -1220,7 +1331,7 @@ class Collection:
         *,
         schema: CollectionSchema | None = None,
         shard_size_bytes: int = _DEFAULT_SHARD_SIZE_BYTES,
-        format_version: int = 6,
+        format_version: int = 7,
     ) -> Collection:
         if schema is None:
             schema = CollectionSchema()
@@ -2359,22 +2470,34 @@ class Collection:
     def compact_deltas(
         self,
         *,
-        max_runs: int = _DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+        max_runs: int | None = None,
         max_input_bytes: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES,
         max_input_entries: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
     ) -> dict[str, object]:
-        """Compact a bounded oldest prefix of immutable delta runs.
+        """Compact bounded immutable index state.
 
-        At least two complete runs must fit all three limits; otherwise this
-        is a successful no-op. The operation never rewrites base segments.
+        Format 6 merges a complete oldest delta-run prefix. Format 7 folds
+        complete per-partition run sections into authoritative snapshots.
+        The operation never rewrites embedding segments.
         """
 
         native = self._ensure_mutable("compact immutable mutation deltas")
+        maximum_runs = (
+            _MAX_PARTITIONED_FOLD_RUNS
+            if self._format_version == 7
+            else _MAX_DELTA_COMPACTION_RUNS
+        )
         validated_max_runs = _validate_delta_compaction_limit(
-            max_runs,
+            (
+                _MAX_PARTITIONED_FOLD_RUNS
+                if self._format_version == 7
+                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
+            )
+            if max_runs is None
+            else max_runs,
             name="max_runs",
             minimum=2,
-            maximum=_MAX_DELTA_COMPACTION_RUNS,
+            maximum=maximum_runs,
         )
         validated_max_input_bytes = _validate_delta_compaction_limit(
             max_input_bytes,
@@ -2403,7 +2526,7 @@ class Collection:
         max_files: int = _DEFAULT_ORPHAN_MAX_FILES,
         max_bytes: int = _DEFAULT_ORPHAN_MAX_BYTES,
     ) -> OrphanCollectionReport | OrphanCollectionExecutionReport:
-        """Plan or execute bounded orphan mutation-resource collection.
+        """Plan or execute bounded orphan storage-resource collection.
 
         Execute mode never consumes a previous plan. It performs a fresh scan,
         no-follow identity revalidation, unlink, and directory sync while this
@@ -2448,14 +2571,31 @@ class Collection:
         materialize_max_input_bytes: int = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES
         ),
-        compact_min_runs: int = _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS,
-        compact_max_runs: int = _DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+        compact_min_runs: int | None = None,
+        compact_max_runs: int | None = None,
         compact_max_input_bytes: int = (
             _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES
         ),
         compact_max_input_entries: int = (
             _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES
         ),
+        clean_max_candidate_segments: int = (
+            _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS
+        ),
+        clean_max_sidecar_scan_bytes: int = (
+            _DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES
+        ),
+        clean_max_source_bytes: int = _DEFAULT_CLEAN_MAX_SOURCE_BYTES,
+        clean_max_output_bytes: int = _DEFAULT_CLEAN_MAX_OUTPUT_BYTES,
+        clean_max_memory_bytes: int = _DEFAULT_CLEAN_MAX_MEMORY_BYTES,
+        clean_min_garbage_rows: int = _DEFAULT_CLEAN_MIN_GARBAGE_ROWS,
+        clean_min_reclaimable_bytes: int = (
+            _DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES
+        ),
+        clean_min_garbage_ratio_ppm: int = (
+            _DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM
+        ),
+        clean_start_after_segment_id: int | None = None,
         orphan_min_age_seconds: float = _DEFAULT_ORPHAN_MIN_AGE_SECONDS,
         orphan_max_files: int = _DEFAULT_ORPHAN_MAX_FILES,
         orphan_max_bytes: int = _DEFAULT_ORPHAN_MAX_BYTES,
@@ -2477,7 +2617,7 @@ class Collection:
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("max_seconds must be finite and zero or greater")
         validated_max_actions = _validate_delta_compaction_limit(
-            max_actions, name="max_actions", maximum=4
+            max_actions, name="max_actions", maximum=5
         )
         validated_rotate_bytes = _validate_delta_compaction_limit(
             rotate_wal_bytes, name="rotate_wal_bytes"
@@ -2490,16 +2630,36 @@ class Collection:
             name="materialize_max_input_bytes",
         )
         validated_compact_min_runs = _validate_delta_compaction_limit(
-            compact_min_runs,
+            (
+                1
+                if self._format_version == 7
+                else _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS
+            )
+            if compact_min_runs is None
+            else compact_min_runs,
             name="compact_min_runs",
-            minimum=2,
-            maximum=_MAX_DELTA_COMPACTION_RUNS,
+            minimum=1 if self._format_version == 7 else 2,
+            maximum=(
+                _MAX_PARTITIONED_FOLD_RUNS
+                if self._format_version == 7
+                else _MAX_DELTA_COMPACTION_RUNS
+            ),
         )
         validated_compact_max_runs = _validate_delta_compaction_limit(
-            compact_max_runs,
+            (
+                _MAX_PARTITIONED_FOLD_RUNS
+                if self._format_version == 7
+                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
+            )
+            if compact_max_runs is None
+            else compact_max_runs,
             name="compact_max_runs",
             minimum=2,
-            maximum=_MAX_DELTA_COMPACTION_RUNS,
+            maximum=(
+                _MAX_PARTITIONED_FOLD_RUNS
+                if self._format_version == 7
+                else _MAX_DELTA_COMPACTION_RUNS
+            ),
         )
         if validated_compact_max_runs < validated_compact_min_runs:
             raise ValueError("compact_max_runs must be >= compact_min_runs")
@@ -2508,6 +2668,39 @@ class Collection:
         )
         validated_compact_entries = _validate_delta_compaction_limit(
             compact_max_input_entries, name="compact_max_input_entries"
+        )
+        clean_limits = {
+            "clean_max_candidate_segments": clean_max_candidate_segments,
+            "clean_max_sidecar_scan_bytes": clean_max_sidecar_scan_bytes,
+            "clean_max_source_bytes": clean_max_source_bytes,
+            "clean_max_output_bytes": clean_max_output_bytes,
+            "clean_max_memory_bytes": clean_max_memory_bytes,
+            "clean_min_garbage_rows": clean_min_garbage_rows,
+        }
+        validated_clean = {
+            name: _validate_delta_compaction_limit(value, name=name)
+            for name, value in clean_limits.items()
+        }
+        validated_clean_reclaimable = _validate_delta_compaction_limit(
+            clean_min_reclaimable_bytes,
+            name="clean_min_reclaimable_bytes",
+            minimum=0,
+        )
+        validated_clean_ratio = _validate_delta_compaction_limit(
+            clean_min_garbage_ratio_ppm,
+            name="clean_min_garbage_ratio_ppm",
+            minimum=0,
+            maximum=1_000_000,
+        )
+        validated_clean_cursor = (
+            self._cleaning_cursor
+            if clean_start_after_segment_id is None
+            else _validate_delta_compaction_limit(
+                clean_start_after_segment_id,
+                name="clean_start_after_segment_id",
+                minimum=0,
+                maximum=_ROW_REF_SEGMENT_ID_MAX,
+            )
         )
         orphan_age, validated_orphan_files, validated_orphan_bytes = (
             _validate_orphan_options(
@@ -2527,6 +2720,12 @@ class Collection:
             "compact_max_runs": validated_compact_max_runs,
             "compact_max_input_bytes": validated_compact_bytes,
             "compact_max_input_entries": validated_compact_entries,
+            **validated_clean,
+            "clean_min_reclaimable_bytes": validated_clean_reclaimable,
+            "clean_min_garbage_ratio_ppm": validated_clean_ratio,
+            # Record the effective cursor rather than the caller's optional
+            # value so the report fully describes the bounded scan it ran.
+            "clean_start_after_segment_id": validated_clean_cursor,
             "orphan_min_age_seconds": orphan_age,
             "orphan_max_files": validated_orphan_files,
             "orphan_max_bytes": validated_orphan_bytes,
@@ -2579,7 +2778,7 @@ class Collection:
             )
 
         rotate_planned = (
-            stat_int(current, "active_wal_put_rows") > 0
+            stat_int(current, "active_wal_transaction_count") > 0
             and stat_int(current, "active_wal_bytes") >= validated_rotate_bytes
         )
         if dry_run:
@@ -2636,7 +2835,8 @@ class Collection:
                             "after": dict(current), "result": result})
 
         compact_planned = (
-            stat_int(current, "delta_run_count") >= validated_compact_min_runs
+            stat_int(current, "delta_run_count")
+            >= validated_compact_min_runs
         )
         if dry_run:
             record_skipped(
@@ -2662,9 +2862,104 @@ class Collection:
                             "attempted": True, "performed": performed,
                             "reason": (
                                 "completed" if performed
-                                else "input_exceeds_budget"
+                                else (
+                                    "input_exceeds_budget"
+                                    if result.get("compaction_budget_blocked")
+                                    else "no_eligible_partition"
+                                )
                             ), "before": action_before,
                             "after": dict(current), "result": result})
+
+        if self._format_version == 7:
+            clean_kwargs = {
+                "max_candidate_segments": validated_clean[
+                    "clean_max_candidate_segments"
+                ],
+                "max_sidecar_scan_bytes": validated_clean[
+                    "clean_max_sidecar_scan_bytes"
+                ],
+                "max_source_bytes": validated_clean[
+                    "clean_max_source_bytes"
+                ],
+                "max_output_bytes": validated_clean[
+                    "clean_max_output_bytes"
+                ],
+                "max_memory_bytes": validated_clean[
+                    "clean_max_memory_bytes"
+                ],
+                "min_garbage_rows": validated_clean[
+                    "clean_min_garbage_rows"
+                ],
+                "min_reclaimable_bytes": validated_clean_reclaimable,
+                "min_garbage_ratio_ppm": validated_clean_ratio,
+                "start_after_segment_id": validated_clean_cursor,
+            }
+            if dry_run:
+                clean_plan = self.clean_segments(dry_run=True, **clean_kwargs)
+                clean_planned = clean_plan["candidate_found"]
+                actions.append(
+                    {
+                        "name": "clean_segments",
+                        "planned": clean_planned,
+                        "attempted": False,
+                        "performed": False,
+                        "reason": (
+                            "candidate_found"
+                            if clean_planned
+                            else (
+                                "budget_blocked"
+                                if clean_plan["budget_blocked"]
+                                else "no_candidate"
+                            )
+                        ),
+                        "before": dict(current),
+                        "after": dict(current),
+                        "result": clean_plan,
+                    }
+                )
+            elif actions_attempted >= validated_max_actions:
+                action_budget_reached = True
+                record_skipped(
+                    "clean_segments", True, "maintenance_budget_reached"
+                )
+            elif time.monotonic() - started >= seconds:
+                deadline_reached = True
+                record_skipped(
+                    "clean_segments", True, "maintenance_budget_reached"
+                )
+            else:
+                # Execute performs its own bounded selection while holding the
+                # native lifecycle locks. A separate dry-run here would scan
+                # every candidate sidecar twice and could consume twice the
+                # advertised scan budget in one maintenance pass.
+                actions_attempted += 1
+                action_before = dict(current)
+                clean_result = self.clean_segments(
+                    dry_run=False, **clean_kwargs
+                )
+                performed = clean_result["cleaned"]
+                actions_performed += int(performed)
+                current = stats_snapshot()
+                actions.append(
+                    {
+                        "name": "clean_segments",
+                        "planned": clean_result["candidate_found"],
+                        "attempted": True,
+                        "performed": performed,
+                        "reason": (
+                            "completed"
+                            if performed
+                            else (
+                                "budget_blocked"
+                                if clean_result["budget_blocked"]
+                                else "no_candidate"
+                            )
+                        ),
+                        "before": action_before,
+                        "after": dict(current),
+                        "result": clean_result,
+                    }
+                )
 
         if dry_run:
             orphan_result = self.collect_orphans(
@@ -2701,7 +2996,7 @@ class Collection:
         finished_unix_ns = time.time_ns()
         return {
             "format": "throwdb-maintenance-report",
-            "version": 1,
+            "version": 2 if self._format_version == 7 else 1,
             "dry_run": dry_run,
             "started_unix_ns": started_unix_ns,
             "finished_unix_ns": finished_unix_ns,
@@ -2781,6 +3076,97 @@ class Collection:
             raise RuntimeError("native profiled read returned invalid diagnostics")
         return dict(stats)
 
+    def clean_segments(
+        self,
+        *,
+        dry_run: bool = True,
+        max_candidate_segments: int = _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS,
+        max_sidecar_scan_bytes: int = _DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES,
+        max_source_bytes: int = _DEFAULT_CLEAN_MAX_SOURCE_BYTES,
+        max_output_bytes: int = _DEFAULT_CLEAN_MAX_OUTPUT_BYTES,
+        max_memory_bytes: int = _DEFAULT_CLEAN_MAX_MEMORY_BYTES,
+        min_garbage_rows: int = _DEFAULT_CLEAN_MIN_GARBAGE_ROWS,
+        min_reclaimable_bytes: int = _DEFAULT_CLEAN_MIN_RECLAIMABLE_BYTES,
+        min_garbage_ratio_ppm: int = _DEFAULT_CLEAN_MIN_GARBAGE_RATIO_PPM,
+        start_after_segment_id: int | None = None,
+    ) -> SegmentCleaningReport:
+        """Plan or execute one bounded selective segment rewrite.
+
+        Only format-7 collections support the authoritative Cleaner run used
+        by this operation. A call retires at most one immutable segment and
+        deliberately leaves its pathnames for :meth:`collect_orphans`.
+        Dry runs never advance this handle's in-memory scan cursor.
+        """
+
+        if not isinstance(dry_run, bool):
+            raise TypeError("dry_run must be a bool")
+        if self._format_version != 7:
+            raise NotImplementedError(
+                "selective segment cleaning requires a format-7 collection"
+            )
+        limits = {
+            "max_candidate_segments": max_candidate_segments,
+            "max_sidecar_scan_bytes": max_sidecar_scan_bytes,
+            "max_source_bytes": max_source_bytes,
+            "max_output_bytes": max_output_bytes,
+            "max_memory_bytes": max_memory_bytes,
+            "min_garbage_rows": min_garbage_rows,
+        }
+        validated = {
+            name: _validate_delta_compaction_limit(value, name=name)
+            for name, value in limits.items()
+        }
+        validated_reclaimable = _validate_delta_compaction_limit(
+            min_reclaimable_bytes,
+            name="min_reclaimable_bytes",
+            minimum=0,
+        )
+        validated_ratio = _validate_delta_compaction_limit(
+            min_garbage_ratio_ppm,
+            name="min_garbage_ratio_ppm",
+            minimum=0,
+            maximum=1_000_000,
+        )
+        cursor = (
+            self._cleaning_cursor
+            if start_after_segment_id is None
+            else _validate_delta_compaction_limit(
+                start_after_segment_id,
+                name="start_after_segment_id",
+                minimum=0,
+                maximum=_ROW_REF_SEGMENT_ID_MAX,
+            )
+        )
+        native = self._ensure_mutable("clean immutable segments")
+        raw = native.clean_segments(
+            dry_run=dry_run,
+            max_candidate_segments=validated["max_candidate_segments"],
+            max_sidecar_scan_bytes=validated["max_sidecar_scan_bytes"],
+            max_source_bytes=validated["max_source_bytes"],
+            max_output_bytes=validated["max_output_bytes"],
+            max_memory_bytes=validated["max_memory_bytes"],
+            min_garbage_rows=validated["min_garbage_rows"],
+            min_reclaimable_bytes=validated_reclaimable,
+            min_garbage_ratio_ppm=validated_ratio,
+            start_after_segment_id=cursor,
+        )
+        if not isinstance(raw, dict):
+            raise RuntimeError(
+                "native segment cleaner returned invalid diagnostics"
+            )
+        next_cursor = raw.get("next_start_after_segment_id")
+        if (
+            not isinstance(next_cursor, int)
+            or isinstance(next_cursor, bool)
+            or not 0 <= next_cursor <= _ROW_REF_SEGMENT_ID_MAX
+        ):
+            raise RuntimeError(
+                "native segment cleaner returned an invalid scan cursor"
+            )
+        if not dry_run:
+            self._cleaning_cursor = next_cursor
+        return cast(SegmentCleaningReport, dict(raw))
+
     def __enter__(self) -> Collection:
         if self._builder is not None:
             self._ensure_builder_open()
@@ -2814,4 +3200,5 @@ __all__ = [
     "OrphanCollectionExecutionReport",
     "OrphanCollectionReport",
     "OrphanInventoryEntry",
+    "SegmentCleaningReport",
 ]

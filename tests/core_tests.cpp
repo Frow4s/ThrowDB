@@ -943,9 +943,9 @@ void test_parallel_read_error_is_propagated_and_executor_survives() {
     }
     require(rejected, "parallel shard read error was not propagated");
 
-    // Two rows in different healthy shards cannot coalesce and therefore
-    // force the recovery read through the executor instead of the one-range
-    // direct fast path.
+    // Two rows in different healthy shards cannot coalesce, so the recovery
+    // read verifies that the coordinator can issue multiple healthy ranges
+    // after a task error.
     const std::array<std::uint64_t, 2> healthy_query{ids[0], ids[2]};
     const auto healthy = storage->get(healthy_query);
     std::vector<std::uint16_t> healthy_expected;

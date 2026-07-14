@@ -109,6 +109,7 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
         path,
         schema=schema,
         shard_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
+        format_version=6,
     ) as builder:
         assert builder.dtype == "float32"
         assert builder.format_version == 6
@@ -161,6 +162,7 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
     with throwdb.Collection.create(
         foreign_path,
         schema=throwdb.CollectionSchema(dimension=4, dtype="float32"),
+        format_version=6,
     ) as builder:
         builder.add([1, 2, 3], foreign)
     _assert_same_float32_bits(
@@ -195,6 +197,8 @@ def test_cli_preserves_float32_dtype_and_bits(
             str(vectors_path),
             "--batch-rows",
             "2",
+            "--format-version",
+            "6",
         ]
     )
     cli_main(

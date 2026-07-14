@@ -130,6 +130,7 @@ void build_store(
     const std::uint32_t dimension,
     const std::uint64_t segment_size_bytes = 1ULL << 20) {
     throwdb::NativeBuilderOptions options;
+    options.format_version = 6;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = segment_size_bytes;
@@ -259,6 +260,10 @@ void test_builder_stats_empty_and_delete_only_rotation() {
                   "delete did not advance the commit sequence");
     require_equal(before_rotation.active_wal_put_rows, std::uint64_t{0},
                   "delete consumed a WAL PUT row");
+    require_equal(
+        before_rotation.active_wal_transaction_count,
+        std::uint64_t{1},
+        "delete-only WAL did not report its transaction");
     require(
         before_rotation.active_wal_bytes
             > throwdb::detail::kWalFileHeaderSize,
@@ -278,6 +283,10 @@ void test_builder_stats_empty_and_delete_only_rotation() {
         "successor WAL is not header-only");
     require_equal(rotated.active_wal_put_rows, std::uint64_t{0},
                   "successor WAL inherited PUT rows");
+    require_equal(
+        rotated.active_wal_transaction_count,
+        std::uint64_t{0},
+        "successor WAL inherited a transaction count");
     require_equal(
         rotated.total_wal_bytes,
         before_rotation.active_wal_bytes

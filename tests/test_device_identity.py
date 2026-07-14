@@ -279,6 +279,86 @@ def test_default_discovery_probes_base_delta_and_wal_payloads() -> None:
     )
 
 
+def test_format7_segment_discovery_detects_a_separate_payload_mount() -> None:
+    source = FakeProbeSource()
+    root = "/collection"
+    segments = f"{root}/segments"
+    token = "1" * 32
+    data_path = f"{segments}/segment-{token}.dat"
+    ids_path = f"{segments}/segment-{token}.ids"
+    source.directories.add(segments)
+    source.glob_values[f"{segments}/segment-*.dat"] = (data_path,)
+    source.stats[root] = stat_device(0, 42)
+    source.stats[segments] = stat_device(0, 43)
+    source.stats[data_path] = stat_device(0, 43)
+    source.stats[ids_path] = stat_device(0, 43)
+    source.statvfs_values[root] = statvfs_with_fsid(42)
+    source.statvfs_values[segments] = statvfs_with_fsid(43)
+    source.statvfs_values[data_path] = statvfs_with_fsid(43)
+    source.statvfs_values[ids_path] = statvfs_with_fsid(43)
+    source.texts["/proc/self/mountinfo"] = "\n".join(
+        (
+            mount_line(
+                21, 0, 42, "/", root, "ceph", "client@cluster-a.fs=/"
+            ),
+            mount_line(
+                22,
+                0,
+                43,
+                "/",
+                segments,
+                "ceph",
+                "client@cluster-b.fs=/",
+            ),
+            mount_line(
+                23, 0, 28, "/", "/sys/fs/cgroup", "cgroup2", "cgroup"
+            ),
+        )
+    )
+    add_runtime_files(source)
+
+    result = probe_collection_storage(
+        root,
+        collection_salt=SALT,
+        source=source,
+    )
+
+    assert result.used_root_fallback is False
+    assert result.probed_path_count == 3
+    assert result.media.kind == "heterogeneous"
+    assert result.media.component_count == 2
+    assert result.media.reuse_scope == "durable"
+    assert source.stat_calls[segments] == 1
+    assert source.stat_calls[data_path] == 1
+    # Sidecars do not serve embedding bytes and must not add discovery work.
+    assert source.stat_calls[ids_path] == 0
+
+
+def test_inaccessible_format7_segment_discovery_fails_closed() -> None:
+    complete_source = local_partition_source()
+    incomplete_source = local_partition_source()
+    incomplete_source.glob_errors[
+        "/collection/segments/segment-*.dat"
+    ] = PermissionError("not allowed")
+
+    complete = probe_collection_storage(
+        "/collection",
+        collection_salt=SALT,
+        source=complete_source,
+    )
+    incomplete = probe_collection_storage(
+        "/collection",
+        collection_salt=SALT,
+        source=incomplete_source,
+    )
+
+    assert complete.media.reuse_scope == "durable"
+    assert incomplete.media.reuse_scope == "none"
+    assert incomplete.media.confidence == "low"
+    assert "discovery_incomplete" in incomplete.media.evidence
+    assert incomplete.media.fingerprint != complete.media.fingerprint
+
+
 def test_incomplete_payload_discovery_fails_closed() -> None:
     complete_source = local_partition_source()
     incomplete_source = local_partition_source()
