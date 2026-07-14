@@ -24,6 +24,7 @@ add_library(throwdb_core STATIC
     src/core/native_collection_test_hooks.cpp
     src/core/native_format.cpp
     src/core/physical_reader.cpp
+    src/core/read_scheduler.cpp
     src/core/storage_reader.cpp
     src/core/storage_writer.cpp
     src/core/wal_file.cpp
@@ -124,6 +125,17 @@ if(THROWDB_BUILD_TESTS)
     target_compile_features(throwdb_physical_reader_tests PRIVATE cxx_std_20)
     throwdb_enable_warnings(throwdb_physical_reader_tests)
     add_test(NAME throwdb_physical_reader_tests COMMAND throwdb_physical_reader_tests)
+
+    add_executable(
+        throwdb_read_scheduler_tests tests/read_scheduler_tests.cpp)
+    target_link_libraries(
+        throwdb_read_scheduler_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_read_scheduler_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_read_scheduler_tests)
+    add_test(
+        NAME throwdb_read_scheduler_tests
+        COMMAND throwdb_read_scheduler_tests)
 
     add_executable(throwdb_native_format_tests tests/native_format_tests.cpp)
     target_link_libraries(throwdb_native_format_tests PRIVATE throwdb::core)
