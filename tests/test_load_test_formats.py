@@ -27,6 +27,7 @@ BENCHMARK = _load_benchmark_module()
     [
         (b"THROWDBM", "legacy_immutable"),
         (b"TDBNMNF1", "native_mutable"),
+        (b"TDBNMNF2", "native_mutable"),
     ],
 )
 def test_store_format_is_detected_from_manifest_magic(
@@ -51,7 +52,11 @@ def test_unknown_and_truncated_manifest_magic_are_rejected(tmp_path: Path) -> No
 
 @pytest.mark.parametrize(
     ("magic", "expected_api"),
-    [(b"TDBNMNF1", "collection"), (b"THROWDBM", "storage")],
+    [
+        (b"TDBNMNF1", "collection"),
+        (b"TDBNMNF2", "collection"),
+        (b"THROWDBM", "storage"),
+    ],
 )
 def test_storage_open_is_routed_with_identical_reader_tuning(
     tmp_path: Path,
@@ -212,6 +217,37 @@ def test_cache_eviction_includes_base_segments_and_active_wal(
     assert result["advised_file_count"] == 3
     assert result["advised_bytes"] == 43
     assert len(advised) == 3
+
+
+def test_cache_eviction_includes_partitioned_format7_segments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    wal = tmp_path / "wal"
+    wal.mkdir()
+    (segments / f"segment-{'1' * 32}.dat").write_bytes(bytes(29))
+    (segments / f"segment-{'1' * 32}.ids").write_bytes(bytes(31))
+    (wal / f"wal-{'2' * 32}.wal").write_bytes(bytes(37))
+    advised: list[tuple[int, int, int, int]] = []
+    monkeypatch.setattr(BENCHMARK.os, "POSIX_FADV_DONTNEED", 4, raising=False)
+    monkeypatch.setattr(
+        BENCHMARK.os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: advised.append(
+            (fd, offset, length, advice)
+        ),
+        raising=False,
+    )
+
+    result = BENCHMARK.evict_data_cache(tmp_path)
+
+    assert result["data_file_count"] == 1
+    assert result["wal_file_count"] == 1
+    assert result["advised_file_count"] == 2
+    assert result["advised_bytes"] == 66
+    assert len(advised) == 2
 
 
 def test_sequential_warm_only_replays_measured_queries_before_metrics(

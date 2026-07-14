@@ -74,7 +74,7 @@ MAX_IO_URING_QUEUE_DEPTH = 4096
 ID_VALIDATION_CHUNK_ROWS = 1 << 20
 
 LEGACY_MANIFEST_MAGIC = b"THROWDBM"
-NATIVE_MANIFEST_MAGIC = b"TDBNMNF1"
+NATIVE_MANIFEST_MAGICS = frozenset({b"TDBNMNF1", b"TDBNMNF2"})
 LEGACY_STORE_FORMAT = "legacy_immutable"
 NATIVE_STORE_FORMAT = "native_mutable"
 
@@ -321,7 +321,7 @@ def detect_store_format(store_path: Path) -> str:
         ) from error
     if magic == LEGACY_MANIFEST_MAGIC:
         return LEGACY_STORE_FORMAT
-    if magic == NATIVE_MANIFEST_MAGIC:
+    if magic in NATIVE_MANIFEST_MAGICS:
         return NATIVE_STORE_FORMAT
     if len(magic) != 8:
         raise ValueError(
@@ -811,13 +811,15 @@ def evict_data_cache(store_path: Path) -> dict[str, int | float]:
             "cold cache mode requires os.posix_fadvise and POSIX_FADV_DONTNEED"
         )
     data_directory = store_path / "data"
+    partitioned_segments_directory = store_path / "segments"
     data_paths = sorted(
         set(data_directory.glob("shard-*.dat"))
         | set(data_directory.glob("segment-*.dat"))
+        | set(partitioned_segments_directory.glob("segment-*.dat"))
     )
     wal_paths = sorted((store_path / "wal").glob("*.wal"))
     if not data_paths:
-        raise RuntimeError(f"no data files found under {data_directory}")
+        raise RuntimeError(f"no embedding data files found under {store_path}")
     payload_paths = data_paths + wal_paths
     started = time.perf_counter()
     total_bytes = 0
