@@ -146,7 +146,7 @@ void create_garbage(
 
 [[nodiscard]] std::string uuid_token(
     const throwdb::detail::Uuid128 value) {
-    constexpr char hex[] = "0123456789abcdef";
+    static constexpr char hex[] = "0123456789abcdef";
     std::array<char, 32> result{};
     const auto put = [&result](const std::uint64_t word,
                                const std::size_t begin) {

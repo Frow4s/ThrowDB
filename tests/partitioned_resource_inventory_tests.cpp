@@ -85,7 +85,7 @@ private:
 }
 
 [[nodiscard]] std::string uuid_token(const Uuid128 value) {
-    constexpr char hex[] = "0123456789abcdef";
+    static constexpr char hex[] = "0123456789abcdef";
     std::array<char, 32> token{};
     const auto put = [&token](const std::uint64_t word, const std::size_t at) {
         for (std::size_t index = 0; index != 16; ++index) {

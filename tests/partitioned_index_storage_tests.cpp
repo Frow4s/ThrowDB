@@ -214,7 +214,7 @@ void write_file(
 
 [[nodiscard]] std::string uuid_token(
     const throwdb::detail::Uuid128 value) {
-    constexpr char hex[] = "0123456789abcdef";
+    static constexpr char hex[] = "0123456789abcdef";
     std::array<char, 32> token{};
     const auto put_word = [&token](const std::uint64_t word,
                                    const std::size_t begin) {

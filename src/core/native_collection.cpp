@@ -99,7 +99,7 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
 
 [[nodiscard]] std::string uuid_filename_token(
     const detail::Uuid128 value) {
-    constexpr char hex[] = "0123456789abcdef";
+    static constexpr char hex[] = "0123456789abcdef";
     std::array<char, 32> token{};
     std::size_t output = 0;
     const auto append_word = [&token, &output](const std::uint64_t word) {
