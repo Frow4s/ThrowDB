@@ -45,6 +45,7 @@ enum class IndexKind : std::uint32_t {
     Invalid = 0,
     UInt64Flat = 1,
     Utf8FingerprintFlat = 2,
+    UInt64PartitionedRowRef = 3,
 };
 
 enum class HashAlgorithm : std::uint32_t {
@@ -113,6 +114,8 @@ struct CollectionSchema {
     RowLayout row_layout{RowLayout::Invalid};
     IndexKind index_kind{IndexKind::Invalid};
     HashAlgorithm hash_algorithm{HashAlgorithm::Invalid};
+
+    bool operator==(const CollectionSchema&) const = default;
 };
 
 struct Manifest {

@@ -23,6 +23,7 @@ add_library(throwdb_core STATIC
     src/core/native_collection.cpp
     src/core/native_collection_test_hooks.cpp
     src/core/native_format.cpp
+    src/core/partitioned_index_format.cpp
     src/core/physical_reader.cpp
     src/core/read_scheduler.cpp
     src/core/storage_reader.cpp
@@ -82,6 +83,18 @@ if(THROWDB_BUILD_TESTS)
     target_compile_features(throwdb_mutation_types_tests PRIVATE cxx_std_20)
     throwdb_enable_warnings(throwdb_mutation_types_tests)
     add_test(NAME throwdb_mutation_types_tests COMMAND throwdb_mutation_types_tests)
+
+    add_executable(
+        throwdb_partitioned_index_format_tests
+        tests/partitioned_index_format_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_index_format_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_index_format_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_index_format_tests)
+    add_test(
+        NAME throwdb_partitioned_index_format_tests
+        COMMAND throwdb_partitioned_index_format_tests)
 
     add_executable(throwdb_mutation_wal_tests tests/mutation_wal_tests.cpp)
     target_link_libraries(throwdb_mutation_wal_tests PRIVATE throwdb::core)
