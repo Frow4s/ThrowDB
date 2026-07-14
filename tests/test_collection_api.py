@@ -694,3 +694,132 @@ def test_low_level_native_verify_flag_requires_a_python_bool(
     reader = NativeCollection.open(path, verify_native_index=True)
     assert reader.open_stats["index_validation"] == "checksum_and_full"
     reader.close()
+
+
+def test_low_level_native_metadata_and_range_options(
+    tmp_path: Path,
+) -> None:
+    from throwdb._throwdb import NativeCollection
+
+    path = tmp_path / "store"
+    dimension = 7
+    segment_size_bytes = 1 << 20
+    ids = np.array([11, 22, 33], dtype=np.uint64)
+    vectors = _vectors(ids.size, dimension)
+    _create_collection(
+        path,
+        ids,
+        vectors,
+        shard_size_bytes=segment_size_bytes,
+    )
+
+    metadata = NativeCollection.inspect_metadata(path)
+    assert metadata == {
+        "format_version": 6,
+        "dimension": dimension,
+        "dtype": "float16",
+        "record_size": dimension * np.dtype(np.float16).itemsize,
+        "segment_size_bytes": (
+            segment_size_bytes
+            // (dimension * np.dtype(np.float16).itemsize)
+            * (dimension * np.dtype(np.float16).itemsize)
+        ),
+        "layout": "uint64_dense_row_major_flat_v1",
+        "feature_discriminator": "catalog_v1+delta_v1",
+        "required_feature_bits": 3,
+        "optional_feature_bits": 0,
+    }
+
+    reader = NativeCollection.open(
+        path,
+        max_read_range_bytes=metadata["record_size"],
+        max_gap_bytes=(1 << 64) - 1,
+    )
+    _assert_same_bits(reader.get(ids[::-1].copy()), vectors[::-1])
+    reader.close()
+
+    with pytest.raises(ValueError, match="max_read_range_bytes.*greater than zero"):
+        NativeCollection.open(path, max_read_range_bytes=0)
+    with pytest.raises(
+        RuntimeError, match="max_read_range_bytes.*at least one record"
+    ):
+        NativeCollection.open(
+            path,
+            max_read_range_bytes=int(metadata["record_size"]) - 1,
+        )
+    with pytest.raises(ValueError, match="max_gap_bytes.*2\\*\\*64-1"):
+        NativeCollection.open(path, max_gap_bytes=-1)
+
+
+def test_low_level_reader_capability_probe_is_bounded_and_observable() -> None:
+    from throwdb._throwdb import NativeCollection
+
+    capabilities = NativeCollection.reader_capabilities()
+    assert set(capabilities) == {
+        "io_uring_available",
+        "io_uring_probe_queue_depth",
+        "io_uring_probe_workers",
+        "io_uring_reason",
+    }
+    assert isinstance(capabilities["io_uring_available"], bool)
+    assert capabilities["io_uring_probe_queue_depth"] == 32
+    assert capabilities["io_uring_probe_workers"] == 1
+    reason = capabilities["io_uring_reason"]
+    assert reason is None or isinstance(reason, str)
+    if capabilities["io_uring_available"]:
+        assert reason is None
+    else:
+        assert reason
+
+    exact = NativeCollection.reader_capabilities(
+        io_uring_queue_depth=8,
+        io_uring_workers=2,
+    )
+    assert exact["io_uring_probe_queue_depth"] == 8
+    assert exact["io_uring_probe_workers"] == 2
+    with pytest.raises(ValueError, match="at least io_uring_workers"):
+        NativeCollection.reader_capabilities(
+            io_uring_queue_depth=1,
+            io_uring_workers=2,
+        )
+
+
+def test_low_level_calibration_snapshot_reuses_index_for_reader_trials(
+    tmp_path: Path,
+) -> None:
+    from throwdb._throwdb import NativeCollection
+
+    path = tmp_path / "store"
+    ids = np.array([11, 29, 47, 83], dtype=np.uint64)
+    vectors = _vectors(ids.size, 6)
+    _create_collection(path, ids, vectors)
+
+    calibration = NativeCollection.open(path, calibration=True)
+    sampled = calibration.sample_ids(
+        requested_count=ids.size,
+        seed=123,
+        max_inspected_slots=128,
+    )
+    assert sampled["complete"] is True
+    assert sampled["requested_count"] == ids.size
+    assert sampled["inspected_slots"] <= 128
+    sampled_ids = sampled["ids"]
+    assert isinstance(sampled_ids, np.ndarray)
+    assert sampled_ids.dtype == np.dtype(np.uint64)
+    assert set(sampled_ids.tolist()) == set(ids.tolist())
+
+    trial = calibration.reader_trial(io_workers=2, io_queue_capacity=4)
+    output = np.empty_like(vectors)
+    stats = trial.get_into_profiled(ids, output)
+    _assert_same_bits(output, vectors)
+    assert stats["requested_rows"] == ids.size
+    assert stats["planned_read_bytes"] <= vectors.nbytes
+    trial.close()
+    with pytest.raises(RuntimeError, match="trial is closed"):
+        trial.get_into(ids, output)
+    calibration.close()
+
+    with pytest.raises(TypeError, match="calibration must be a bool"):
+        NativeCollection.open(path, calibration=1)
+    with pytest.raises(ValueError, match="must be read-only"):
+        NativeCollection.open(path, mode="r+", calibration=True)

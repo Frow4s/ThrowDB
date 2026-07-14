@@ -199,6 +199,13 @@ public:
                 + std::to_string(first_error.user_index));
         }
         if (first_error.kind == ErrorKind::System) {
+            if (first_error.error_number == EOPNOTSUPP
+                || first_error.error_number == ENOSYS) {
+                throw ReaderBackendError(
+                    system_error(
+                        "io_uring reads are unsupported by the storage target",
+                        first_error.error_number));
+            }
             throw StorageError(
                 system_error(
                     "io_uring read operation "

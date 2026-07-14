@@ -550,6 +550,18 @@ void test_forked_builder_and_writer_handles_are_rejected() {
     require(
         waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "forked builder was not rejected or did not tear down safely");
+    bool parent_builder_lease_preserved = false;
+    try {
+        static_cast<void>(
+            throwdb::NativeCollection::inspect_orphans(builder_store));
+    } catch (const throwdb::StorageError& error) {
+        parent_builder_lease_preserved =
+            std::string(error.what()).find("another writer")
+            != std::string::npos;
+    }
+    require(
+        parent_builder_lease_preserved,
+        "forked child teardown released the parent builder lease");
     builder->append(builder_id, builder_row);
     builder->finish();
 
@@ -674,6 +686,182 @@ void test_native_open_rejects_big_endian_hosts() {
     }
 }
 
+void test_lightweight_metadata_inspection() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 7;
+    options.dtype = throwdb::DType::Float32;
+    options.segment_size_bytes = 32 * 1024;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->finish();
+
+    const throwdb::NativeCollectionMetadata metadata =
+        throwdb::NativeCollection::inspect_metadata(store);
+    require(metadata.format_version == 6, "metadata format version is wrong");
+    require(metadata.dimension == options.dimension,
+            "metadata dimension is wrong");
+    require(metadata.dtype == options.dtype, "metadata dtype is wrong");
+    require(metadata.record_size == 7 * sizeof(float),
+            "metadata record size is wrong");
+    require(metadata.segment_size_bytes
+                == (options.segment_size_bytes / metadata.record_size)
+                       * metadata.record_size,
+            "metadata segment size is wrong");
+    require(metadata.layout == "uint64_dense_row_major_flat_v1",
+            "metadata layout discriminator is wrong");
+    require(metadata.feature_discriminator == "catalog_v1+delta_v1",
+            "metadata feature discriminator is wrong");
+    require(metadata.required_feature_bits == 3,
+            "metadata required features are wrong");
+    require(metadata.optional_feature_bits == 0,
+            "metadata optional features are wrong");
+}
+
+void test_reader_trials_and_bounded_id_sampling() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::uint64_t record_size = dimension * 2;
+    std::vector<std::uint64_t> ids;
+    ids.reserve(32);
+    for (std::uint64_t index = 0; index != 32; ++index) {
+        ids.push_back(1000 + index * 17);
+    }
+    const std::vector<std::byte> embeddings =
+        rows(ids.size(), record_size, 23);
+
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.dimension = dimension;
+    builder_options.segment_size_bytes = 7 * record_size;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store, {}, true);
+    throwdb::ReaderOptions trial_options;
+    trial_options.io_workers = 2;
+    trial_options.io_queue_capacity = 4;
+    auto trial = collection->create_reader_trial(trial_options);
+    const std::array<std::uint64_t, 6> query{
+        ids[17], ids[2], ids[29], ids[2], ids[0], ids[11]};
+    const std::vector<std::byte> expected = collection->get_bytes(query);
+    std::vector<std::byte> actual(expected.size());
+    collection->get_into_with_reader(*trial, query, actual);
+    require_equal(actual, expected, "reader trial is not bit exact");
+    std::fill(actual.begin(), actual.end(), std::byte{0});
+    const throwdb::NativeReadStats stats =
+        collection->get_into_with_reader_profiled(*trial, query, actual);
+    require_equal(actual, expected, "profiled reader trial is not bit exact");
+    require(stats.requested_rows == query.size(),
+            "reader trial profiled the wrong row count");
+    require(stats.base_rows == query.size(),
+            "reader trial did not resolve base rows");
+
+    throwdb::ReaderOptions invalid_options;
+    invalid_options.max_read_range_bytes = record_size - 1;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                collection->create_reader_trial(invalid_options));
+        },
+        "reader trial accepted a range smaller than one row");
+
+    const throwdb::NativeIdSample first =
+        collection->sample_ids(12, 0x12345678ULL, 128);
+    const throwdb::NativeIdSample repeated =
+        collection->sample_ids(12, 0x12345678ULL, 128);
+    require(first.complete, "bounded sample did not collect requested IDs");
+    require(first.ids == repeated.ids,
+            "bounded sample is not deterministic");
+    require(first.inspected_slots == repeated.inspected_slots,
+            "bounded sample inspection count is not deterministic");
+    require(first.inspected_slots <= 128,
+            "bounded sample exceeded its inspection limit");
+
+    const throwdb::NativeIdSample capped =
+        collection->sample_ids(12, 0x12345678ULL, 3);
+    require(capped.inspected_slots == 3,
+            "incomplete sample did not honor its hard slot cap");
+    require(!capped.complete,
+            "slot-capped sample unexpectedly reported completion");
+    require(capped.ids.size() <= capped.inspected_slots,
+            "sample returned more IDs than inspected slots");
+    const throwdb::NativeIdSample empty =
+        collection->sample_ids(0, 0x12345678ULL, 0);
+    require(empty.complete && empty.ids.empty()
+                && empty.inspected_slots == 0,
+            "zero-sized sample has incorrect semantics");
+
+    const std::array<std::uint64_t, 1> deleted_id{first.ids.front()};
+    require(collection->erase(deleted_id) == std::vector<std::uint8_t>{1},
+            "sample fixture delete failed");
+    const throwdb::NativeIdSample after_delete =
+        collection->sample_ids(12, 0x12345678ULL, 128);
+    require(after_delete.complete,
+            "sample did not replace a deleted base ID");
+    require(std::find(
+                after_delete.ids.begin(), after_delete.ids.end(),
+                deleted_id.front()) == after_delete.ids.end(),
+            "sample returned a logically deleted base ID");
+}
+
+void test_calibration_handle_owns_exclusive_read_only_lease() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint64_t record_size = 4;
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    const std::array<std::uint64_t, 1> ids{7};
+    const std::vector<std::byte> embeddings = rows(1, record_size, 5);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, true, true));
+        },
+        "writable calibration handle was accepted");
+
+    auto calibration = throwdb::NativeCollection::open(
+        store, {}, false, true);
+    require(!calibration->writable(),
+            "calibration handle unexpectedly permits writes");
+    require_equal(
+        calibration->get_bytes(ids), embeddings,
+        "calibration snapshot cannot read base data");
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] { calibration->upsert(ids, embeddings); },
+        "calibration snapshot accepted a mutation");
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(
+                throwdb::NativeCollection::open(store, {}, true));
+        },
+        "writer opened during calibration");
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, true));
+        },
+        "second calibrator opened during calibration");
+
+    // Ordinary immutable snapshots do not participate in the lifecycle
+    // lease and remain available while tuning is in progress.
+    auto reader = throwdb::NativeCollection::open(store);
+    require_equal(reader->get_bytes(ids), embeddings,
+                  "ordinary reader was disrupted by calibration");
+    reader.reset();
+    calibration.reset();
+
+    auto writer = throwdb::NativeCollection::open(store, {}, true);
+    require(writer->writable(),
+            "calibration did not release its writer lease");
+}
+
 }  // namespace
 
 int main() {
@@ -706,6 +894,15 @@ int main() {
         TestCase{
             "native_open_rejects_big_endian_hosts",
             test_native_open_rejects_big_endian_hosts},
+        TestCase{
+            "lightweight_metadata_inspection",
+            test_lightweight_metadata_inspection},
+        TestCase{
+            "reader_trials_and_bounded_id_sampling",
+            test_reader_trials_and_bounded_id_sampling},
+        TestCase{
+            "calibration_handle_owns_exclusive_read_only_lease",
+            test_calibration_handle_owns_exclusive_read_only_lease},
     };
 
     std::size_t passed = 0;

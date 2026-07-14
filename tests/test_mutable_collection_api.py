@@ -362,8 +362,74 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
             read_only.get([maximum_id, 0, boundary_id]),
             np.stack([second[1], first[0], second[0]]),
         )
-        with pytest.raises(RuntimeError, match=r"mode='r\+'"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"mode='r\+'",
+        ):
             read_only.materialize_frozen_wals()
+
+
+def test_delta_compaction_public_api_is_bounded_and_reopenable(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "compacted"
+    base = _vectors(2, 6, "float16", salt=41)
+    first = _vectors(1, 6, "float16", salt=241)
+    second = _vectors(1, 6, "float16", salt=441)
+    _build(path, [1, 2], base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        no_op = collection.compact_deltas()
+        assert no_op["compacted"] is False
+        assert no_op["delta_run_count"] == 0
+
+        collection.update([1], first)
+        collection.rotate_wal()
+        collection.materialize_frozen_wals()
+        collection.update([1], second)
+        collection.rotate_wal()
+        collection.materialize_frozen_wals()
+        assert collection.mutation_log_stats["delta_run_count"] == 2
+
+        compacted = collection.compact_deltas(
+            max_runs=np.uint8(2),
+            max_input_bytes=np.uint64(1 << 20),
+            max_input_entries=np.int64(16),
+        )
+        assert compacted["compacted"] is True
+        assert compacted["compacted_delta_run_count"] == 2
+        assert compacted["compacted_delta_input_entries"] == 2
+        assert compacted["compacted_delta_input_bytes"] > 0
+        assert compacted["delta_run_count"] == 1
+        assert compacted["delta_entry_count"] == 1
+        assert compacted["reclaimed_delta_run_count"] == 2
+        assert compacted["reclaimed_delta_bytes"] > 0
+        assert compacted["reclamation_complete"] is True
+        _assert_same_bits(
+            collection.get([1, 2]),
+            np.stack([second[0], base[1]]),
+        )
+
+        with pytest.raises(TypeError, match="max_runs.*bool"):
+            collection.compact_deltas(max_runs=True)
+        with pytest.raises(ValueError, match="max_runs.*between 2 and 64"):
+            collection.compact_deltas(max_runs=1)
+        with pytest.raises(ValueError, match="max_input_bytes.*between"):
+            collection.compact_deltas(max_input_bytes=0)
+        with pytest.raises(TypeError, match="max_input_entries.*integer"):
+            collection.compact_deltas(max_input_entries=1.5)
+
+    with throwdb.Collection.open(path) as reopened:
+        assert reopened.mutation_log_stats["delta_run_count"] == 1
+        _assert_same_bits(
+            reopened.get([1, 2]),
+            np.stack([second[0], base[1]]),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"mode='r\+'",
+        ):
+            reopened.compact_deltas()
 
 
 def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(

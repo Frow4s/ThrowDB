@@ -64,7 +64,19 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     deleted = collection.delete([200, 999])  # [True, False]
     lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
     materialized = collection.materialize_frozen_wals()
+    compacted = collection.compact_deltas()   # bounded oldest-prefix merge
+    orphan_plan = collection.collect_orphans(
+        dry_run=True,
+        min_age_seconds=3600,
+    )
 ```
+
+For diagnostics that do not otherwise need an open collection, use
+`Collection.inspect_orphans("/data/example", min_age_seconds=3600)`. This
+lightweight path validates the selected catalog and scans mutation namespaces
+without loading the base index. Both APIs only produce an advisory dry-run
+report: they do not delete files, and the report is not authorization for a
+later unlink.
 
 `Collection.create()` now builds the checksummed native numeric format reported
 as `collection.format_version == 6`. Version 6 adds the required `DeltaV1`
@@ -77,9 +89,61 @@ checksum-free fallback. UTF-8 IDs remain reserved for the next string index
 slice.
 Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
-The initial `"auto"` tuning profile deliberately selects the conservative
-thread-pool baseline without running a calibration benchmark; the effective
-selection and reason are visible through `collection.tuning`.
+`"auto"` never runs a calibration benchmark while opening. It selects the
+strongest persisted media/runtime/layout match: `exact` when the storage target
+is identifiable, `compatible` when its physical backing is opaque but its
+visible performance class is reproducible, and the conservative thread-pool
+`fallback` otherwise. The effective `profile_reuse_level`, selection, and
+reason are visible through `collection.tuning`. See
+[Reader tuning profiles](docs/tuning-profiles.md) for the matching and safety
+contract.
+
+Run calibration explicitly after placing or copying a collection onto its
+target storage:
+
+```python
+report = throwdb.Collection.tune(
+    "/data/example",
+    max_seconds=300,
+    max_read_bytes=8 << 30,
+    max_memory_bytes=512 << 20,
+)
+print(report["status"], report["selection"])
+```
+
+The bounded calibrator loads the index once, samples IDs internally, verifies
+every candidate bit-for-bit, runs one charged but unmeasured warm-up pass, and
+saves only a stable winner. It does not need the original NumPy ID file. Pass
+`dry_run=True` (or CLI `--dry-run`) to measure without saving. A stable
+OverlayFS access path is reusable at the `compatible` level even though its
+local or network backing is hidden. Its report contains
+`target.profile_reusable=true`,
+`target.profile_reuse_level="compatible"`, and an `identity_warning` describing
+that limitation. Visible local-block and CephFS targets use separate exact
+identities. Only an incomplete or unclassifiable target remains `fallback` and
+requires dry-run because its profile cannot be published.
+
+The MVP performance target is a local SSD/NVMe. Network-filesystem identities
+remain isolated from local profiles for correctness and observability, but the
+current random-row reader makes no CephFS performance guarantee; a later server
+can expose the collection over the network while keeping its payload on local
+NVMe.
+
+Compare the same bounded matrix across two or more local storage targets
+without publishing any profile:
+
+```bash
+python benchmarks/run_storage_matrix.py \
+  --target nvme-a=/data/nvme-a/example \
+  --target nvme-b=/data/nvme-b/example \
+  --results benchmark-results/storage-matrix
+```
+
+Targets run sequentially with the same seed. Time, read, and memory limits are
+applied independently to each target. The result directory contains each raw
+tuning report, optional system-monitor logs, and an aggregate `report.json`.
+Each target summary includes `profile_reuse_level`, so an opaque-overlay
+compatible result is distinguishable from an exact local identity.
 
 Normal format-6 open verifies the CRC32C persisted for the complete flat-index
 body and for every immutable delta-index body. It validates delta version and
@@ -95,12 +159,16 @@ scrubbing is a separate future operation and is not implied by this flag.
 
 `collection.mutation_log_stats` reports the selected catalog generation,
 committed/materialized sequence, frozen-WAL count, delta-run count, and
-active/total WAL and delta bytes. Calling `rotate_wal()` seals a non-empty
+active/total WAL and delta bytes. Lifecycle results additionally report the
+selected/reclaimed resources and bytes. Calling `rotate_wal()` seals a non-empty
 active WAL and atomically publishes its successor. Calling
 `materialize_frozen_wals()` collapses the currently frozen WAL prefix into one
 immutable DeltaV1 run, atomically switches `CURRENT`, and then best-effort
-unlinks the replaced WAL pathnames. Neither operation rewrites base embeddings.
-An empty frozen prefix is a successful no-op.
+unlinks the replaced WAL pathnames. Calling `compact_deltas()` verifies and
+merges a bounded oldest contiguous DeltaV1 prefix while preserving original
+sequences and tombstones, then best-effort unlinks only the replaced delta
+pairs. None of these operations rewrites base embeddings. An empty frozen
+prefix or fewer than two eligible delta runs is a successful no-op.
 
 `Writer` and `Storage` remain the legacy immutable low-level API used by the
 existing benchmark suite. They require native, aligned, C-contiguous `uint64`
@@ -118,8 +186,9 @@ db = throwdb.Storage.open("/data/example-low-level")
 result = db.get(np.array([42, 100], dtype=np.uint64))
 ```
 
-The sequential `pread` baseline remains the default. Enable the bounded,
-per-storage parallel backend explicitly:
+The sequential `pread` baseline remains the conservative fallback. A saved
+profile may select another backend automatically; pass an explicit mapping to
+override it for one open:
 
 ```python
 db = throwdb.Collection.open(
@@ -219,10 +288,36 @@ throwdb get \
 
 throwdb inspect --storage /data/example
 
+throwdb tuning show --storage /data/example
+
+throwdb tune \
+  --storage /data/example \
+  --max-seconds 300 \
+  --max-read-gib 8 \
+  --max-memory-mib 512 \
+  --output tune-report.json
+
 throwdb rotate-wal --storage /data/example
 
 throwdb materialize --storage /data/example
+
+throwdb compact-deltas \
+  --storage /data/example \
+  --max-runs 8 \
+  --max-input-gib 8 \
+  --max-input-entries 1000000
+
+throwdb collect-orphans \
+  --storage /data/example \
+  --dry-run \
+  --min-age-seconds 3600
 ```
+
+`collect-orphans` requires the explicit `--dry-run` acknowledgement. It marks
+old temporary publications, unreferenced WALs, and complete or partial
+unreferenced delta pairs as eligible candidates after the age threshold.
+Reachable files, superseded catalogs retained by policy, and unknown entries
+are never candidates. The command does not remove anything.
 
 `ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
 dtype whose values are all non-negative. `embeddings.npy` must use `float16` or
@@ -265,11 +360,17 @@ can interrupt cleanup.
   pairs. The build permits concurrent writes, pauses them for the two short
   catalog publications, preserves newer/active WAL precedence, and never
   rewrites the immutable base;
-- no delta-run merge, base compaction/selective cleaning, UTF-8 IDs, delta
-  payload scrub command, or network service yet. Delta version metadata is
-  still loaded into the RAM overlay on open. The lifecycle currently relies on
-  local POSIX rename, `fsync`, open-file, and unlink semantics; network
-  filesystems are outside this contract.
+- manual bounded oldest-prefix DeltaV1 compaction with source-payload
+  verification, newest-version collapse, tombstone preservation, atomic
+  publication, and best-effort source reclamation;
+- public lightweight orphan inspection and a writer-held dry-run collection
+  plan with age-based eligibility, but no orphan deletion or automatic
+  `maintain()` policy yet;
+- no base compaction/selective cleaning, UTF-8 IDs, delta payload scrub command,
+  or network service yet. Delta version metadata is still loaded into the RAM
+  overlay on open. The lifecycle currently relies on local POSIX rename,
+  `fsync`, open-file, and unlink semantics; network filesystems are outside
+  this contract.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and

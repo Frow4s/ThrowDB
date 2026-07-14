@@ -4,10 +4,11 @@ This document fixes the contract for the first user-facing ThrowDB product.
 The fresh native numeric subset is implemented through the Python `Collection`
 API: safe uint64 normalization, float16/float32 rows, arbitrary fixed
 dimensions, semantic prefix reads, and durable batch CRUD. The public format
-version produced by new builders is 6. WAL rotation and frozen-WAL-prefix
-materialization are implemented; UTF-8 IDs, delta merging, and selective base
-cleaning remain later local-library slices. Format 5 remains a readable and
-writable catalog/WAL-only format, but it rejects materialization.
+version produced by new builders is 6. WAL rotation, frozen-WAL-prefix
+materialization, and bounded oldest-prefix DeltaV1 compaction are implemented;
+UTF-8 IDs and selective base cleaning remain later local-library slices. Format
+5 remains a readable and writable catalog/WAL-only format, but it rejects both
+materialization and delta compaction.
 
 ## Product boundary
 
@@ -149,6 +150,11 @@ collection.upsert(ids, embeddings)   # explicit insert-or-replace
 deleted = collection.delete(ids)     # boolean result per requested ID
 collection.rotate_wal()              # freeze a non-empty active WAL
 collection.materialize_frozen_wals() # replace frozen prefix with DeltaV1
+collection.compact_deltas()           # merge a bounded oldest delta prefix
+plan = collection.collect_orphans(    # advisory report; no deletion
+    dry_run=True,
+    min_age_seconds=3600,
+)
 ```
 
 Mutation rules:
@@ -197,10 +203,48 @@ The delta index stores version metadata sorted by numeric ID plus reverse
 `{id, original commit sequence}` metadata for every dense PUT row. Today these
 records are loaded into the RAM overlay on open. Normal open verifies the whole
 delta-index body but does not stream the complete embedding payload to recompute
-its stored CRC. Delta-run merge, base compaction, and a public payload scrub are
-not yet implemented. The publication and old-reader behavior currently rely on
-local POSIX filesystem semantics; network filesystems are outside the supported
-durability contract.
+its stored CRC during ordinary open.
+
+`compact_deltas(max_runs=8, max_input_bytes=8 GiB,
+max_input_entries=1_000_000)` merges only the oldest contiguous prefix when at
+least two complete runs fit all budgets. It verifies the selected data payload
+CRCs before publication, keeps the newest original sequence per ID (including
+tombstones), reserves a fresh segment ID, atomically replaces the exact prefix,
+verifies the replacement payload, and then reclaims only those source pairs
+best-effort. The base and every newer
+delta/WAL resource remain unchanged. A public standalone payload scrub and base
+compaction are not yet implemented. Publication and old-reader behavior rely
+on local POSIX filesystem semantics; network filesystems are outside the
+supported durability contract.
+
+For local POSIX storage, `locks/commit.lock` closes the race between opening an
+old snapshot and unlinking its files. Readers hold a shared lease until every
+mutation resource in the selected catalog is open; publication and reclamation
+hold the exclusive lease through `CURRENT`, unlink, and directory sync. This
+barrier currently covers WAL/delta resources, not future replaceable base
+generations.
+
+`Collection.inspect_orphans(path, min_age_seconds=3600)` provides the same
+read-only plan without first opening the collection or loading its base index.
+It briefly acquires the writer lease while validating `CURRENT`, its selected
+catalog, and the mutation namespaces. An existing `r+` handle can instead call
+`collect_orphans(dry_run=True, min_age_seconds=...)` while retaining its writer
+lease. `dry_run=False` is deliberately unsupported. The CLI equivalent is
+`throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`, and
+the `--dry-run` flag is mandatory.
+
+Temporary publications, unreferenced WALs, and complete or partial
+unreferenced delta pairs are candidates; the minimum age only decides whether
+a candidate is currently eligible. Reachable files, superseded catalogs
+retained by policy, and unknown/do-not-touch entries are never candidates. The
+report is a potentially stale diagnostic snapshot, not an authorization token
+for deletion. There is no public deletion executor or automatic `maintain()`
+operation yet.
+
+`max_input_bytes` bounds the selected source-file footprint, not aggregate
+physical I/O: integrity scans, copying winning rows, and replacement readback
+are additional reads. `max_input_entries` is the explicit in-memory metadata
+bound for this first implementation.
 
 After a partitioned `ID -> RowRef` index becomes authoritative, the cleaner
 selects segments with enough garbage, copies only rows that are still live in a
@@ -234,11 +278,34 @@ select:
 
 ```python
 Collection.open(path, tuning="auto")
+Collection.open(path, tuning="persisted")
+Collection.open(path, tuning="conservative")
 Collection.open(path, tuning={"backend": "io_uring", "workers": 2,
                               "queue_depth": 32})
 ```
 
 Automatic tuning must be observable, bounded, and overrideable. The product
-will expose the selected profile and the reason for request-level decisions.
-Opening a collection must not unexpectedly run a destructive or long cold-cache
-benchmark.
+exposes the selected source and compatibility reason through
+`collection.tuning`. Exact media/runtime/layout profiles are optional advisory
+metadata inside the collection; a corrupt registry falls back in `"auto"` and
+is an error in `"persisted"`. Opening a collection never unexpectedly runs a
+destructive or long cold-cache benchmark.
+
+Calibration is an explicit bounded operation:
+
+```python
+report = Collection.tune(
+    path,
+    max_seconds=300,
+    max_read_bytes=8 << 30,
+    max_memory_bytes=512 << 20,
+    dry_run=False,
+)
+```
+
+It holds the lifecycle writer lease on one read-only snapshot, samples live
+base IDs without a population scan, compares bit-exact temporary readers that
+share the already-loaded index, and publishes only after rechecking the
+media/runtime/layout identity, root inode, mutation snapshot, registry salt,
+and registry generation. Failure, interruption, instability, a cooperative
+deadline, or `dry_run=True` leaves the registry unchanged.

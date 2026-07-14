@@ -21,6 +21,15 @@ public:
     using StorageError::StorageError;
 };
 
+// Resource/runtime-policy failure while constructing a reader backend, or a
+// backend operation unsupported by the current storage target. Collection
+// metadata, ordinary I/O failures, and data corruption use distinct exception
+// types so an advisory policy may safely try a conservative backend.
+class ReaderBackendError : public StorageError {
+public:
+    using StorageError::StorageError;
+};
+
 class MissingIdError : public std::out_of_range {
 public:
     explicit MissingIdError(std::uint64_t id);

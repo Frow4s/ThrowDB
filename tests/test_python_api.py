@@ -318,3 +318,61 @@ def test_internal_io_worker_options_preserve_repeated_cross_shard_reads(
             io_backend="io_uring",
             io_workers=1,
         )
+
+
+def test_low_level_storage_exposes_physical_range_options(
+    tmp_path: Path,
+) -> None:
+    dimension = 8
+    record_size = dimension * np.dtype(np.float16).itemsize
+    ids = np.array([1, 2, 3], dtype=np.uint64)
+    vectors = _vectors(ids.size, dimension)
+    store_path = tmp_path / "store"
+    _create_store(store_path, ids, vectors)
+
+    storage = throwdb.Storage.open(
+        store_path,
+        max_read_range_bytes=record_size,
+        max_gap_bytes=(1 << 64) - 1,
+    )
+    _assert_same_float16_bits(storage.get(ids[::-1].copy()), vectors[::-1])
+
+    with pytest.raises(
+        RuntimeError, match="max_read_range_bytes.*at least one record"
+    ):
+        throwdb.Storage.open(
+            store_path,
+            max_read_range_bytes=record_size - 1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "error", "message"),
+    [
+        ("max_read_range_bytes", False, TypeError, "not bool"),
+        ("max_read_range_bytes", 1.5, TypeError, "must be an integer"),
+        ("max_read_range_bytes", -1, ValueError, "between 0 and 2\\*\\*64-1"),
+        ("max_read_range_bytes", 0, ValueError, "greater than zero"),
+        ("max_read_range_bytes", 1 << 64, ValueError, "2\\*\\*64-1"),
+        ("max_gap_bytes", True, TypeError, "not bool"),
+        ("max_gap_bytes", 1.5, TypeError, "must be an integer"),
+        ("max_gap_bytes", -1, ValueError, "between 0 and 2\\*\\*64-1"),
+        ("max_gap_bytes", 1 << 64, ValueError, "2\\*\\*64-1"),
+    ],
+)
+def test_low_level_storage_range_options_validate_uint64(
+    tmp_path: Path,
+    option: str,
+    value: object,
+    error: type[Exception],
+    message: str,
+) -> None:
+    store_path = tmp_path / "store"
+    _create_store(
+        store_path,
+        np.array([1], dtype=np.uint64),
+        _vectors(1, 2),
+    )
+
+    with pytest.raises(error, match=message):
+        throwdb.Storage.open(store_path, **{option: value})

@@ -17,18 +17,23 @@ The fresh native numeric MVP now implements:
   and manual plus hard-limit WAL rotation;
 - DeltaV1 materialization of a frozen WAL prefix into immutable data/index
   pairs, with durable segment-ID reservation and an atomic catalog switch;
+- bounded compaction of an oldest contiguous DeltaV1-run prefix, preserving
+  original commit sequences and tombstones while reclaiming only replaced
+  delta files;
 - generic physical reads spanning base segments, mutation deltas, and multiple
   WAL payloads,
   with one shared resource-set pin retained through physical I/O.
 
 The current format-6 collection can retain immutable mutation-delta runs,
 multiple frozen WALs, and exactly one active WAL. Manual materialization removes
-a frozen WAL prefix from the current catalog without rewriting the base;
-format 5 remains catalog/WAL-only and rejects that operation. Partitioned index
-runs, delta merging, base-segment selective cleaning, and a general orphan
-collector remain later integration slices. Materialization reduces retained WAL
-replay and descriptors, but all delta version metadata is still rebuilt into a
-RAM overlay on open. The exact shipped MVP layout and limits are in
+a frozen WAL prefix from the current catalog without rewriting the base, and
+manual delta compaction can replace several oldest runs with one bounded run;
+format 5 remains catalog/WAL-only and rejects both operations. Partitioned
+index runs, base-segment selective cleaning, orphan deletion, and automatic
+maintenance remain later integration slices. A public orphan dry-run plan is
+available today. Materialization and delta compaction reduce retained resources
+and replay work, but all surviving delta version metadata is still rebuilt into
+a RAM overlay on open. The exact shipped MVP layout and limits are in
 `native-format-v3.md`.
 
 ## Logical view and resource layout
@@ -72,12 +77,89 @@ Publication order is:
 5. Atomically rename it to `CURRENT` and sync the collection directory.
 6. Publish the equivalent in-memory view.
 
-Readers own a shared reference to their view and its open files. Materialization
-may unlink replaced WAL pathnames only after the new catalog is durable; POSIX
-keeps their inodes alive until older readers release the final open descriptor.
+`locks/commit.lock` is also the mutation reader-open barrier. A reader holds it
+shared from immediately before reading `CURRENT` until the complete referenced
+catalog, delta indexes, WAL offsets, and data/WAL file descriptors are pinned.
+A publisher or reclaimer holds it exclusively across the durable `CURRENT`
+switch, in-memory view swap, retired-resource unlink, and directory sync. Thus
+an opener either finishes pinning the old view before unlink or waits and opens
+the new view. POSIX keeps unlinked inodes alive until older readers release the
+final open descriptor.
+
+The global order is `writer.lock -> lifecycle mutex -> mutation mutex ->
+commit.lock -> state mutex`. A future collector must own the writer lease before
+the commit lock; otherwise it could mistake an unlocked in-progress delta build
+for an orphan. The current barrier protects mutation resources only. Future
+base generations require a separate base-view barrier so loading a large base
+index does not stall every WAL commit.
+
 Segment IDs are durably reserved before a long delta build and are never reused,
 which protects against segment-ID ABA. Network filesystem and object-store
 semantics are not yet part of this contract.
+
+## Current lifecycle safety slice
+
+The native tests have private lifecycle checkpoints at the reader-open barrier
+and at important materialization/compaction transitions: an immutable catalog
+is durable before `CURRENT`, `CURRENT` is durable, an output segment ID is
+reserved, a delta output pair is durable, and a selected source is immediately
+before or after a successful unlink. Checkpoint context identifies the
+operation, catalog generation, resource kind, and source ordinal. These hooks
+are internal test seams, not an installed header, public failpoint facility, or
+supported runtime configuration. With no test callback installed they do not
+change the storage state machine.
+
+Fork-based tests terminate a child with `_exit` at those checkpoints. That
+models an abrupt **process crash**: destructors do not run, while completed
+kernel calls and previously synced files remain visible to the surviving
+system. It is not a complete **power-loss** simulation. In particular, an
+after-unlink checkpoint occurs after a successful unlink syscall but before the
+later directory `fsync`; it does not claim that the pathname removal has reached
+stable media. The catalog-before-`CURRENT`, durable-`CURRENT`, and durable-delta
+checkpoints are placed after their documented file and directory sync barriers.
+Power-loss guarantees still require fault testing on the target local
+filesystem and storage stack.
+
+A strict read-only inventory validates `CURRENT` and exactly the immutable
+catalog it selects, then inspects entries in the `CURRENT`-like root,
+`catalogs/`, `wal/`, and `deltas/` namespaces. Its categories are:
+
+- reachable files in the currently selected operational view;
+- superseded catalogs;
+- temporary publications;
+- unreferenced WALs;
+- complete or partial unreferenced delta pairs; and
+- unknown/do-not-touch entries.
+
+Operational reachability is deliberately **CURRENT-only**. The selected
+catalog, its named WALs, and its named delta pairs are reachable. A
+`previous_catalog_id` records lineage but does not make its predecessor a
+runtime snapshot, so older catalog files may be reported as superseded. Exact
+lowercase UUID filename grammar is required for orphan classification;
+malformed names, symlinks, and non-regular entries fail safe to
+unknown/do-not-touch.
+
+The inventory powers two public dry-run surfaces. The class method
+`Collection.inspect_orphans(path, min_age_seconds=3600)` briefly takes the
+writer lease and performs the lightweight scan without loading the base index.
+An already-open mutable handle may call
+`collection.collect_orphans(dry_run=True, min_age_seconds=...)`. The CLI form
+is `throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`;
+`--dry-run` is required.
+
+Only temporary publications, unreferenced WALs, and complete or partial
+unreferenced delta pairs are candidates. The age threshold separates eligible
+from deferred candidates. Reachable files, superseded catalogs retained by
+policy, and unknown/do-not-touch entries are never candidates.
+
+An inventory result is diagnostic data, not an authorization token. It can be
+stale, and a path can change after inspection. Any future deleter must hold the
+writer lease and `commit.lock` exclusively, repeat no-follow type and identity
+checks immediately before each unlink, apply age/durability policy, and sync the
+affected directory. The current public slice performs no deletion. A deletion
+executor and automatic `maintain()` operation are still not implemented;
+materialization and delta compaction only reclaim the exact source resources
+replaced by their own publication.
 
 ## Row references and tombstones
 
@@ -128,7 +210,8 @@ The versioned RAM overlay rebuilt from catalog delta runs followed by the
 retained WAL chain shadows the fresh flat base index. Delta `.idx` records are
 applied oldest run first; retained frozen/active WAL commits then win by commit
 sequence. Both layers return `RowRef`, and reads, CRUD, catalog publication, WAL
-rotation, and frozen-prefix materialization are implemented. The delta index
+rotation, frozen-prefix materialization, and bounded oldest-prefix delta
+compaction are implemented. The delta index
 body contains durable sorted version metadata and reverse `{id, sequence}` rows,
 but those records are still loaded into RAM on open. Selective base cleaning is
 disabled because no authoritative partition-level index publication exists yet.
@@ -364,11 +447,37 @@ short catalog publications around an unlocked data build:
    catalog. Already-open POSIX descriptors remain valid for older reads.
 
 Thus materialization is not a base compaction: it bounds the selected mutation
-history without copying any base embedding or flat-index entry. A later delta
-merge and selective cleaner can use the persisted original sequence and
-reverse metadata to prove whether each physical row is still authoritative.
-There is currently no automatic size/age policy, delta-run merge, or rewrite of
-garbage inside base segments.
+history without copying any base embedding or flat-index entry.
+
+Format 6 also exposes `compact_deltas()` (CLI: `throwdb compact-deltas`). It
+selects the oldest contiguous prefix of at least two DeltaV1 runs subject to
+explicit run-count, input-byte, and input-entry budgets. Before reserving an
+output segment, it verifies every selected source payload CRC. It then performs
+a bounded k-way merge of the ID-sorted indexes, retaining the greatest original
+commit sequence for each ID and retaining tombstones. PUT payload rows are
+copied bit-exactly into one new immutable DeltaV1 pair. A metadata-only catalog
+generation reserves the output segment ID; a second generation atomically
+replaces exactly the selected prefix after revalidation and a complete output
+payload checksum pass. Newer unselected
+deltas and every retained WAL remain in place and continue to shadow the merged
+run. Only after the durable `CURRENT` switch are the selected source pairs
+unlinked best-effort. A process that crashes before the switch leaves an orphan
+or an unused segment-ID gap; after the switch, recovery selects the compacted
+view.
+
+The byte budget is the catalog footprint of selected source files, not a bound
+on total physical I/O. Source payloads are scanned for integrity, winning PUT
+rows are read again for the copy, and the output payload is read back before
+publication. The entry budget bounds retained version metadata; the current
+writer still holds bounded input/output vectors rather than implementing a
+fully streaming external merge.
+
+This compaction reduces run/file count, duplicated delta payload, and reopen
+work without reading or copying the immutable base. It deliberately cannot
+discard tombstones while the flat base index remains a fallback. Reclaiming
+garbage inside base segments still requires an authoritative partitioned
+RowRef index in a later format. There is currently no automatic size/age policy
+for invoking lifecycle operations.
 
 ### Current DeltaV1 limits
 
@@ -382,9 +491,9 @@ garbage inside base segments.
   rows, and the complete `.idx` body CRC. It intentionally does not stream the
   complete `.dat` embedding payload to verify its stored CRC; no public payload
   scrub operation exists yet.
-- Delta runs are not merged, and base segments are not compacted. Repeated
-  materializations can therefore accumulate delta files and their in-RAM
-  metadata.
+- Delta compaction is explicit and prefix-only. Its budgets bound one operation,
+  but no automatic policy currently prevents repeated materializations from
+  accumulating runs between calls. Base segments are not compacted.
 - Publication, old-view safety, and post-switch WAL unlink currently rely on
   local POSIX `rename`, `fsync`, open-descriptor, and unlink semantics. CephFS,
   other network filesystems, and object storage require a separately validated

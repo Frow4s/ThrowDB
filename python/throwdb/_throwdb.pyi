@@ -9,6 +9,10 @@ import numpy.typing as npt
 
 __version__: str
 
+
+class ReaderBackendError(RuntimeError): ...
+
+
 _DTypeName: TypeAlias = Literal["float16", "float32"]
 _EmbeddingArray: TypeAlias = (
     npt.NDArray[np.float16] | npt.NDArray[np.float32]
@@ -66,6 +70,8 @@ class Storage:
         io_backend: str = "thread_pool",
         io_uring_queue_depth: int = 32,
         io_uring_workers: int = 1,
+        max_read_range_bytes: int = 1_048_576,
+        max_gap_bytes: int = 0,
     ) -> Storage: ...
 
     @property
@@ -121,7 +127,39 @@ class NativeCollectionBuilder:
     def abort(self) -> None: ...
 
 
+class NativeReaderTrial:
+    def get_into(
+        self,
+        ids: npt.NDArray[np.uint64],
+        output: _EmbeddingArray,
+    ) -> None: ...
+
+    def get_into_profiled(
+        self,
+        ids: npt.NDArray[np.uint64],
+        output: _EmbeddingArray,
+    ) -> dict[str, object]: ...
+
+    def close(self) -> None: ...
+
+
 class NativeCollection:
+    @staticmethod
+    def reader_capabilities(
+        io_uring_queue_depth: int = 32,
+        io_uring_workers: int = 1,
+    ) -> dict[str, object]: ...
+
+    @staticmethod
+    def inspect_metadata(
+        path: str | bytes | PathLike[str] | PathLike[bytes],
+    ) -> dict[str, object]: ...
+
+    @staticmethod
+    def inspect_orphans(
+        path: str | PathLike[str],
+    ) -> dict[str, object]: ...
+
     @staticmethod
     def open(
         path: str | bytes | PathLike[str] | PathLike[bytes],
@@ -133,6 +171,9 @@ class NativeCollection:
         io_uring_queue_depth: int = 32,
         io_uring_workers: int = 1,
         verify_native_index: bool = False,
+        max_read_range_bytes: int = 1_048_576,
+        max_gap_bytes: int = 0,
+        calibration: bool = False,
     ) -> NativeCollection: ...
 
     @property
@@ -153,6 +194,8 @@ class NativeCollection:
     @property
     def mutation_log_stats(self) -> dict[str, object]: ...
 
+    def collect_orphans(self) -> dict[str, object]: ...
+
     def get(self, ids: npt.NDArray[np.uint64]) -> _EmbeddingArray: ...
 
     def get_into(
@@ -165,6 +208,25 @@ class NativeCollection:
         self,
         ids: npt.NDArray[np.uint64],
         output: _EmbeddingArray,
+    ) -> dict[str, object]: ...
+
+    def reader_trial(
+        self,
+        io_workers: int = 0,
+        io_queue_capacity: int = 0,
+        io_ranges_per_task: int = 8,
+        io_backend: str = "thread_pool",
+        io_uring_queue_depth: int = 32,
+        io_uring_workers: int = 1,
+        max_read_range_bytes: int = 1_048_576,
+        max_gap_bytes: int = 0,
+    ) -> NativeReaderTrial: ...
+
+    def sample_ids(
+        self,
+        requested_count: int,
+        seed: int,
+        max_inspected_slots: int,
     ) -> dict[str, object]: ...
 
     def insert(
@@ -192,5 +254,11 @@ class NativeCollection:
 
     def rotate_wal(self) -> dict[str, object]: ...
     def materialize_frozen_wals(self) -> dict[str, object]: ...
+    def compact_delta_runs(
+        self,
+        max_runs: int = 8,
+        max_input_bytes: int = 8_589_934_592,
+        max_input_entries: int = 1_000_000,
+    ) -> dict[str, object]: ...
 
     def close(self) -> None: ...

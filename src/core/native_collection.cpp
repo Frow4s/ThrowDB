@@ -2,11 +2,15 @@
 
 #include "file_lock.hpp"
 #include "internal.hpp"
+#include "io_uring_engine.hpp"
+#include "io_uring_pool.hpp"
 #include "mutation_catalog.hpp"
 #include "mutation_delta.hpp"
+#include "mutation_inventory.hpp"
 #include "mutation_types.hpp"
 #include "mutation_wal.hpp"
 #include "native_format.hpp"
+#include "native_collection_test_hooks.hpp"
 #include "physical_reader.hpp"
 #include "wal_file.hpp"
 
@@ -17,7 +21,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
+#include <fcntl.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -40,6 +46,7 @@ constexpr std::uint32_t kDeltaPublicNativeFormatVersion = 6;
 constexpr std::uint32_t kCatalogPublicNativeFormatVersion = 5;
 constexpr std::uint32_t kCurrentPublicNativeFormatVersion = 4;
 constexpr std::uint32_t kLegacyPublicNativeFormatVersion = 3;
+constexpr std::uint64_t kMaximumDeltaCompactionRuns = 64;
 using SteadyClock = std::chrono::steady_clock;
 
 [[nodiscard]] double elapsed_seconds(
@@ -85,6 +92,64 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
     return detail::Uuid128{value.low, value.high};
 }
 
+[[nodiscard]] std::string uuid_filename_token(
+    const detail::Uuid128 value) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::array<char, 32> token{};
+    std::size_t output = 0;
+    const auto append_word = [&token, &output](const std::uint64_t word) {
+        for (std::uint32_t shift = 60;; shift -= 4) {
+            token[output++] = hex[(word >> shift) & 0xfU];
+            if (shift == 0) {
+                break;
+            }
+        }
+    };
+    append_word(value.high);
+    append_word(value.low);
+    return std::string(token.data(), token.size());
+}
+
+[[nodiscard]] NativeOrphanClass public_orphan_class(
+    const detail::MutationInventoryClass classification) {
+    switch (classification) {
+        case detail::MutationInventoryClass::Reachable:
+            return NativeOrphanClass::Reachable;
+        case detail::MutationInventoryClass::SupersededCatalog:
+            return NativeOrphanClass::SupersededCatalog;
+        case detail::MutationInventoryClass::TempPublication:
+            return NativeOrphanClass::TempPublication;
+        case detail::MutationInventoryClass::UnreferencedWal:
+            return NativeOrphanClass::UnreferencedWal;
+        case detail::MutationInventoryClass::
+            CompleteUnreferencedDeltaPair:
+            return NativeOrphanClass::CompleteUnreferencedDeltaPair;
+        case detail::MutationInventoryClass::
+            PartialUnreferencedDeltaPair:
+            return NativeOrphanClass::PartialUnreferencedDeltaPair;
+        case detail::MutationInventoryClass::UnknownDoNotTouch:
+            return NativeOrphanClass::UnknownDoNotTouch;
+    }
+    throw StorageError("mutation inventory contains an unknown class");
+}
+
+[[nodiscard]] NativeOrphanInventory public_orphan_inventory(
+    detail::MutationResourceInventory inventory) {
+    NativeOrphanInventory result;
+    result.current_generation = inventory.current_generation;
+    result.current_catalog_id =
+        uuid_filename_token(inventory.current_catalog_id);
+    result.entries.reserve(inventory.entries.size());
+    for (detail::MutationInventoryEntry& entry : inventory.entries) {
+        result.entries.push_back(NativeOrphanEntry{
+            std::move(entry.relative_path),
+            public_orphan_class(entry.classification),
+            entry.bytes,
+            entry.modified_unix_ns});
+    }
+    return result;
+}
+
 [[nodiscard]] std::uint64_t current_unix_time_ns() noexcept {
     const auto raw = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -98,10 +163,15 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
 
 [[nodiscard]] std::filesystem::path commit_lock_path(
     const std::filesystem::path& path) {
+    // This inode is broader than its historical name: readers hold SH while
+    // selecting CURRENT and pinning every mutation resource; writers hold EX
+    // for WAL commits and through CURRENT publication, unlink, and directory
+    // sync. Never replace it while the collection exists.
     return path / "locks" / "commit.lock";
 }
 
-void create_native_store_directories(const std::filesystem::path& path) {
+[[nodiscard]] detail::AdvisoryLockFile create_native_store_directories(
+    const std::filesystem::path& path) {
     std::error_code error;
     const bool exists = std::filesystem::exists(path, error);
     if (error) {
@@ -131,14 +201,18 @@ void create_native_store_directories(const std::filesystem::path& path) {
 
     // Publish the lock inodes before the manifest. Read-only opens therefore
     // never need to create metadata inside an otherwise immutable collection.
-    {
-        auto writer = detail::AdvisoryLockFile::create(writer_lock_path(path));
-        auto commit = detail::AdvisoryLockFile::create(commit_lock_path(path));
-        static_cast<void>(writer);
-        static_cast<void>(commit);
-    }
+    // Keep the writer inode's first open-file description and lease for the
+    // builder lifetime. Lock immediately after creation; if a filesystem
+    // observer wins the tiny create-to-flock race, waiting here lets its
+    // incomplete-store probe fail and release instead of abandoning this
+    // otherwise uniquely-created store.
+    auto writer = detail::AdvisoryLockFile::create(writer_lock_path(path));
+    writer.lock(detail::FileLockMode::Exclusive);
+    auto commit = detail::AdvisoryLockFile::create(commit_lock_path(path));
+    static_cast<void>(commit);
     detail::sync_directory(path / "locks");
     detail::sync_directory(path);
+    return writer;
 }
 
 void validate_embedding_batch(
@@ -204,9 +278,8 @@ public:
               records_per_segment_, record_size_, "segment payload capacity")),
           collection_id_(make_uuid()),
           schema_id_(make_uuid()),
-          wal_id_(make_uuid()) {
-        create_native_store_directories(path_);
-    }
+          wal_id_(make_uuid()),
+          writer_lock_(create_native_store_directories(path_)) {}
 
     void append(
         const std::span<const std::uint64_t> ids,
@@ -305,6 +378,7 @@ public:
             // This is the only initial publication point. Everything it names
             // has already reached stable storage.
             detail::write_native_manifest_atomic(path_, manifest);
+            writer_lock_.unlock();
             finished_ = true;
         } catch (...) {
             poisoned_ = true;
@@ -347,6 +421,7 @@ public:
         }
         active_data_fd_.reset();
         active_ids_fd_.reset();
+        writer_lock_.abandon_after_fork();
     }
 
 private:
@@ -448,6 +523,7 @@ private:
     detail::Uuid128 collection_id_;
     detail::Uuid128 schema_id_;
     detail::Uuid128 wal_id_;
+    detail::AdvisoryLockFile writer_lock_;
 
     detail::FileDescriptor active_data_fd_;
     detail::FileDescriptor active_ids_fd_;
@@ -461,27 +537,56 @@ private:
     const pid_t owner_pid_{::getpid()};
 };
 
+class NativeReaderTrial::Impl {
+public:
+    explicit Impl(const ReaderOptions& reader_options)
+        : physical_reader_(reader_options) {}
+
+    [[nodiscard]] const detail::PhysicalReader& physical_reader() const {
+        return physical_reader_;
+    }
+
+    [[nodiscard]] bool owned_by_current_process() const noexcept {
+        return owner_pid_ == ::getpid();
+    }
+
+    void abandon_after_fork() noexcept {
+        physical_reader_.abandon_after_fork();
+    }
+
+private:
+    detail::PhysicalReader physical_reader_;
+    const pid_t owner_pid_{::getpid()};
+};
+
 class NativeCollection::Impl {
 public:
     Impl(
         std::filesystem::path path,
         const ReaderOptions& reader_options,
         const bool writable,
+        const bool calibration,
         const SteadyClock::time_point open_started)
         : path_(std::move(path)),
           manifest_(read_manifest_timed(path_, open_stats_)),
           physical_reader_(reader_options),
           writer_lock_(detail::AdvisoryLockFile::open_existing(
-              writer_lock_path(path_), writable)),
+              writer_lock_path(path_), writable || calibration)),
           commit_lock_(detail::AdvisoryLockFile::open_existing(
               commit_lock_path(path_), writable)),
           writable_(writable),
           catalog_managed_(detail::mutation_catalog_managed(manifest_)),
           delta_managed_(detail::mutation_delta_managed(manifest_)),
           live_count_(manifest_.base_record_count) {
-        if (writable_) {
-            // Fail a competing writer before loading a potentially very large
-            // base index into a second process.
+        if (reader_options.max_read_range_bytes < manifest_.record_size) {
+            throw InvalidArgumentError(
+                "max_read_range_bytes must fit at least one record");
+        }
+        if (writable_ || calibration) {
+            // Fail a competing writer/calibrator before loading a potentially
+            // very large base index into a second process. A calibration
+            // handle remains read-only but owns the same exclusive lifecycle
+            // lease for the duration of its stable snapshot.
             writer_lock_.lock(detail::FileLockMode::Exclusive, true);
         }
         detail::NativeIndexReadStats index_stats;
@@ -513,9 +618,17 @@ public:
         open_stats_.base_segments_seconds = elapsed_seconds(phase_started);
 
         phase_started = SteadyClock::now();
+        // Mutation snapshot-open barrier. A publisher/reclaimer uses EX
+        // through publication and unlink, so this handle either pins the old
+        // resource set completely or waits and opens the new CURRENT.
         detail::ScopedAdvisoryLock stable(
             commit_lock_, writable_ ? detail::FileLockMode::Exclusive
                                     : detail::FileLockMode::Shared);
+        if (!writable_) {
+            detail::invoke_native_collection_test_hook(
+                {detail::NativeCollectionTestHookPoint::
+                     ReaderOpenCommitLockAcquired});
+        }
         open_mutation_logs();
         // This flag is monotonic for the lifetime of the current collection
         // implementation. A clean collection can therefore plan reads from
@@ -540,15 +653,91 @@ public:
     void get_into(
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
-        get_into_impl<false>(ids, output, nullptr);
+        get_into_impl<false>(physical_reader_, ids, output, nullptr);
     }
 
     [[nodiscard]] NativeReadStats get_into_profiled(
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
         NativeReadStats stats;
-        get_into_impl<true>(ids, output, &stats);
+        get_into_impl<true>(physical_reader_, ids, output, &stats);
         return stats;
+    }
+
+    void validate_reader_trial_options(
+        const ReaderOptions& reader_options) const {
+        ensure_healthy();
+        if (reader_options.max_read_range_bytes < manifest_.record_size) {
+            throw InvalidArgumentError(
+                "max_read_range_bytes must fit at least one record");
+        }
+    }
+
+    void get_into_with_reader(
+        const detail::PhysicalReader& physical_reader,
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output) const {
+        get_into_impl<false>(physical_reader, ids, output, nullptr);
+    }
+
+    [[nodiscard]] NativeReadStats get_into_with_reader_profiled(
+        const detail::PhysicalReader& physical_reader,
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output) const {
+        NativeReadStats stats;
+        get_into_impl<true>(physical_reader, ids, output, &stats);
+        return stats;
+    }
+
+    [[nodiscard]] NativeIdSample sample_ids(
+        const std::uint64_t requested,
+        const std::uint64_t seed,
+        const std::uint64_t max_inspected_slots) const {
+        ensure_healthy();
+        NativeIdSample sample;
+        if (requested == 0) {
+            sample.complete = true;
+            return sample;
+        }
+        if (max_inspected_slots == 0 || index_.capacity == 0) {
+            return sample;
+        }
+
+        const std::uint64_t inspection_limit =
+            std::min(max_inspected_slots, index_.capacity);
+        const std::uint64_t mask = index_.capacity - 1;
+        std::uint64_t position = detail::hash_id(
+            seed, 0x9e3779b97f4a7c15ULL) & mask;
+        // Every odd step visits each slot exactly once because native index
+        // capacity is a power of two.
+        const std::uint64_t step =
+            (detail::hash_id(seed, 0xd1b54a32d192ed03ULL) | 1ULL) & mask;
+        const std::uint64_t reserve_count = std::min(
+            {requested, inspection_limit, index_.count,
+             static_cast<std::uint64_t>(
+                 std::numeric_limits<std::size_t>::max())});
+        sample.ids.reserve(static_cast<std::size_t>(reserve_count));
+
+        const bool mutation_path =
+            mutation_read_path_active_.load(std::memory_order_acquire);
+        std::shared_lock state(state_mutex_, std::defer_lock);
+        if (mutation_path) {
+            state.lock();
+        }
+        while (sample.inspected_slots != inspection_limit
+               && sample.ids.size() != requested) {
+            const std::size_t slot = static_cast<std::size_t>(position);
+            ++sample.inspected_slots;
+            if (index_.controls[slot] != 0) {
+                const std::uint64_t id = index_.slots[slot].id;
+                if (!mutation_path || logical_lookup_unlocked(id).has_value()) {
+                    sample.ids.push_back(id);
+                }
+            }
+            position = (position + step) & mask;
+        }
+        sample.complete = sample.ids.size() == requested;
+        return sample;
     }
 
     [[nodiscard]] std::vector<std::byte> get_bytes(
@@ -674,6 +863,32 @@ public:
         return mutation_log_stats_locked(false);
     }
 
+    [[nodiscard]] NativeOrphanInventory collect_orphans() {
+        // A writable handle owns writer.lock for its complete lifetime. The
+        // remaining lock order matches lifecycle publishers and yields one
+        // authoritative CURRENT plus a filesystem scan in the same stable
+        // mutation-resource snapshot.
+        ensure_mutable();
+        std::unique_lock lifecycle(materialization_mutex_);
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        if (!catalog_managed_) {
+            throw InvalidArgumentError(
+                "orphan inventory requires a catalog-managed collection");
+        }
+        detail::ScopedAdvisoryLock commit(
+            commit_lock_, detail::FileLockMode::Exclusive);
+        detail::MutationResourceInventory inventory =
+            detail::inspect_mutation_resources(path_, manifest_);
+        if (inventory.current_generation != catalog_.generation
+            || inventory.current_catalog_id != catalog_.catalog_id) {
+            throw StorageError(
+                "orphan inventory CURRENT differs from the open writer "
+                "snapshot; reopen the collection");
+        }
+        return public_orphan_inventory(std::move(inventory));
+    }
+
     [[nodiscard]] NativeMutationLogStats rotate_wal() {
         ensure_mutable();
         std::lock_guard mutation(mutation_mutex_);
@@ -693,6 +908,7 @@ public:
         std::shared_ptr<WalResourceSet> source_resources;
         std::vector<detail::MutationWalEntry> selected_wals;
         detail::MutationDeltaBuildSpec build_spec;
+        std::uint64_t reservation_generation = 0;
         {
             std::lock_guard mutation(mutation_mutex_);
             ensure_healthy();
@@ -748,11 +964,22 @@ public:
             reservation.catalog_id = make_uuid();
             reservation.previous_catalog_id = catalog_.catalog_id;
             reservation.next_segment_id = build_spec.segment_id + 1;
+            reservation_generation = reservation.generation;
             try {
                 detail::ScopedAdvisoryLock commit(
                     commit_lock_, detail::FileLockMode::Exclusive);
                 static_cast<void>(detail::publish_mutation_catalog(
-                    path_, manifest_, reservation));
+                    path_, manifest_, reservation,
+                    detail::NativeCollectionTestOperation::
+                        MaterializeFrozenWals));
+                detail::invoke_native_collection_test_hook({
+                    detail::NativeCollectionTestHookPoint::
+                        MutationReservationDurable,
+                    detail::NativeCollectionTestOperation::
+                        MaterializeFrozenWals,
+                    detail::NativeCollectionTestResourceKind::None,
+                    reservation.generation,
+                    0});
                 std::swap(catalog_, reservation);
             } catch (...) {
                 poisoned_.store(true, std::memory_order_release);
@@ -836,6 +1063,13 @@ public:
                     physical_reader_.execute(
                         manifest_.record_size, requests, destination);
                 });
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::
+                MutationDeltaOutputDurable,
+            detail::NativeCollectionTestOperation::MaterializeFrozenWals,
+            detail::NativeCollectionTestResourceKind::MutationDeltaPair,
+            reservation_generation,
+            0});
         detail::OpenMutationDelta opened = detail::open_mutation_delta(
             path_, manifest_, descriptor);
 
@@ -949,7 +1183,9 @@ public:
             detail::ScopedAdvisoryLock commit(
                 commit_lock_, detail::FileLockMode::Exclusive);
             static_cast<void>(detail::publish_mutation_catalog(
-                path_, manifest_, next_catalog));
+                path_, manifest_, next_catalog,
+                detail::NativeCollectionTestOperation::
+                    MaterializeFrozenWals));
             {
                 std::unique_lock state(state_mutex_);
                 for (const OverlayPatch& patch : overlay_patches) {
@@ -959,10 +1195,36 @@ public:
                 std::swap(catalog_, next_catalog);
             }
 
-            for (const detail::MutationWalEntry& entry : selected_wals) {
+            for (std::size_t ordinal = 0;
+                 ordinal != selected_wals.size(); ++ordinal) {
+                const detail::MutationWalEntry& entry =
+                    selected_wals[ordinal];
+                const auto context =
+                    detail::NativeCollectionTestHookContext{
+                        detail::NativeCollectionTestHookPoint::
+                            BeforeSourceUnlink,
+                        detail::NativeCollectionTestOperation::
+                            MaterializeFrozenWals,
+                        detail::NativeCollectionTestResourceKind::
+                            MutationWal,
+                        catalog_.generation,
+                        ordinal};
+                detail::invoke_native_collection_test_hook(context);
                 std::error_code error;
                 const bool removed = std::filesystem::remove(
                     detail::mutation_wal_path(path_, entry.wal_id), error);
+                if (!error && removed) {
+                    // This is a process-crash checkpoint after the pathname
+                    // disappeared. Directory durability is established only
+                    // by the sync after the complete reclamation loop.
+                    detail::invoke_native_collection_test_hook({
+                        detail::NativeCollectionTestHookPoint::
+                            AfterSourceUnlink,
+                        context.operation,
+                        context.resource_kind,
+                        context.generation,
+                        context.ordinal});
+                }
                 if (error) {
                     reclamation_complete = false;
                 } else if (removed) {
@@ -992,6 +1254,479 @@ public:
         return mutation_log_stats_locked(
             false, true, reclaimed_wal_count, reclaimed_wal_bytes,
             reclamation_complete);
+    }
+
+    [[nodiscard]] NativeMutationLogStats compact_delta_runs(
+        const std::uint64_t max_runs,
+        const std::uint64_t max_input_bytes,
+        const std::uint64_t max_input_entries) {
+        ensure_mutable();
+        if (max_runs < 2) {
+            throw InvalidArgumentError(
+                "delta compaction max_runs must be at least 2");
+        }
+        if (max_runs > kMaximumDeltaCompactionRuns) {
+            throw InvalidArgumentError(
+                "delta compaction max_runs must not exceed 64");
+        }
+        if (max_input_bytes == 0 || max_input_entries == 0) {
+            throw InvalidArgumentError(
+                "delta compaction byte and entry budgets must be positive");
+        }
+        std::unique_lock lifecycle(materialization_mutex_);
+
+        std::vector<detail::MutationDeltaDescriptor> selected_deltas;
+        std::uint64_t selected_input_bytes = 0;
+        std::uint64_t selected_input_entries = 0;
+        std::uint64_t selected_source_wals = 0;
+        std::uint64_t reservation_generation = 0;
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            if (!delta_managed_) {
+                throw InvalidArgumentError(
+                    "delta compaction requires a delta-managed "
+                    "format-6 collection");
+            }
+
+            const std::uint64_t candidate_count = std::min<std::uint64_t>(
+                max_runs, catalog_.delta_entries.size());
+            selected_deltas.reserve(
+                static_cast<std::size_t>(candidate_count));
+            for (std::uint64_t index = 0; index != candidate_count; ++index) {
+                const detail::MutationDeltaDescriptor& descriptor =
+                    catalog_.delta_entries[static_cast<std::size_t>(index)];
+                if (descriptor.data_file_size
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - descriptor.index_file_size) {
+                    throw CorruptionError(
+                        "delta compaction input byte count overflows uint64");
+                }
+                const std::uint64_t bytes =
+                    descriptor.data_file_size + descriptor.index_file_size;
+                if (bytes > max_input_bytes - selected_input_bytes
+                    || descriptor.entry_count
+                           > max_input_entries - selected_input_entries) {
+                    break;
+                }
+                if (descriptor.source_wal_count
+                    > std::numeric_limits<std::uint32_t>::max()
+                          - selected_source_wals) {
+                    throw StorageError(
+                        "compacted delta source WAL count exceeds uint32");
+                }
+                selected_deltas.push_back(descriptor);
+                selected_input_bytes += bytes;
+                selected_input_entries += descriptor.entry_count;
+                selected_source_wals += descriptor.source_wal_count;
+            }
+            if (selected_deltas.size() < 2) {
+                return mutation_log_stats_locked(false);
+            }
+        }
+
+        if (selected_input_entries
+            > std::numeric_limits<std::size_t>::max()) {
+            throw InvalidArgumentError(
+                "delta compaction entries do not fit the address space");
+        }
+
+        // Validate every source payload before copying it. Normal open checks
+        // the complete index but deliberately avoids a potentially large data
+        // scan; compaction must not bless corrupted payload bytes with a new
+        // checksum before it retires the source runs.
+        std::vector<detail::OpenMutationDelta> opened_inputs;
+        opened_inputs.reserve(selected_deltas.size());
+        for (const detail::MutationDeltaDescriptor& descriptor :
+             selected_deltas) {
+            opened_inputs.push_back(detail::open_mutation_delta(
+                path_, manifest_, descriptor, true));
+        }
+
+        // Every input index is sorted by ID. A bounded fan-in merge avoids an
+        // additional hash table and retains the greatest original commit
+        // sequence for each ID. Tombstones remain first-class output records
+        // because the immutable base still exists as a fallback layer.
+        std::vector<std::size_t> positions(opened_inputs.size(), 0);
+        std::vector<detail::MutationDeltaBuildEntry> build_entries;
+        build_entries.reserve(
+            static_cast<std::size_t>(selected_input_entries));
+        while (true) {
+            std::optional<std::uint64_t> next_id;
+            for (std::size_t input = 0; input != opened_inputs.size(); ++input) {
+                const auto& records = opened_inputs[input].records;
+                if (positions[input] == records.size()) {
+                    continue;
+                }
+                const std::uint64_t id = records[positions[input]].id;
+                if (!next_id.has_value() || id < *next_id) {
+                    next_id = id;
+                }
+            }
+            if (!next_id.has_value()) {
+                break;
+            }
+
+            std::optional<detail::VersionedMutationValue> winning;
+            for (std::size_t input = 0; input != opened_inputs.size(); ++input) {
+                const auto& records = opened_inputs[input].records;
+                if (positions[input] == records.size()
+                    || records[positions[input]].id != *next_id) {
+                    continue;
+                }
+                const detail::VersionedMutationValue value =
+                    records[positions[input]].value;
+                ++positions[input];
+                if (winning.has_value()
+                    && value.sequence() <= winning->sequence()) {
+                    throw CorruptionError(
+                        "delta compaction inputs are not chronological");
+                }
+                winning = value;
+            }
+            if (!winning.has_value()) {
+                throw CorruptionError(
+                    "delta compaction merge lost an input record");
+            }
+            build_entries.push_back(
+                detail::MutationDeltaBuildEntry{*next_id, *winning});
+        }
+
+        // Copy payload from the exact descriptors and file descriptions that
+        // passed the CRC scan above. Reopening source pathnames for validation
+        // and then reading the collection's older pinned descriptors would
+        // leave an avoidable pathname-replacement gap between the two steps.
+        auto verified_sources = std::make_shared<WalResourceSet>();
+        verified_sources->delta_sources.reserve(opened_inputs.size());
+        verified_sources->delta_source_indices.reserve(opened_inputs.size());
+        for (detail::OpenMutationDelta& input : opened_inputs) {
+            auto source = std::make_shared<DeltaSource>();
+            source->descriptor = input.descriptor;
+            source->header = input.data_header;
+            source->fd = std::move(input.data_fd);
+            source->path = detail::mutation_delta_data_path(
+                path_, input.descriptor.delta_id);
+            const std::size_t source_index =
+                verified_sources->delta_sources.size();
+            verified_sources->delta_sources.push_back(std::move(source));
+            if (!verified_sources->delta_source_indices.emplace(
+                     input.descriptor.segment_id, source_index).second) {
+                throw CorruptionError(
+                    "delta compaction input segment ID is duplicated");
+            }
+        }
+        opened_inputs.clear();
+        opened_inputs.shrink_to_fit();
+        if (build_entries.empty()) {
+            throw CorruptionError(
+                "delta compaction produced an empty lineage run");
+        }
+        const std::uint64_t output_put_count = std::count_if(
+            build_entries.begin(), build_entries.end(),
+            [](const detail::MutationDeltaBuildEntry& entry) {
+                return entry.value.is_put();
+            });
+        if (output_put_count > detail::RowRef::kMaximumRowsPerSegment) {
+            throw InvalidArgumentError(
+                "compacted delta PUT rows exceed one RowRef segment");
+        }
+
+        detail::MutationDeltaBuildSpec build_spec;
+        build_spec.source_predecessor_wal_id =
+            selected_deltas.front().source_predecessor_wal_id;
+        build_spec.source_terminal_wal_id =
+            selected_deltas.back().source_terminal_wal_id;
+        build_spec.first_sequence = selected_deltas.front().first_sequence;
+        build_spec.last_sequence = selected_deltas.back().last_sequence;
+        build_spec.source_wal_count =
+            static_cast<std::uint32_t>(selected_source_wals);
+
+        {
+            std::lock_guard mutation(mutation_mutex_);
+            ensure_healthy();
+            if (catalog_.delta_entries.size() < selected_deltas.size()
+                || !std::equal(
+                    selected_deltas.begin(), selected_deltas.end(),
+                    catalog_.delta_entries.begin())) {
+                throw StorageError(
+                    "selected delta prefix changed before compaction reservation");
+            }
+            if (catalog_.generation
+                > std::numeric_limits<std::uint64_t>::max() - 2) {
+                throw StorageError(
+                    "mutation catalog lacks two generations for delta compaction");
+            }
+            if (catalog_.next_segment_id >= detail::SegmentId::kMaximum) {
+                throw StorageError("mutation segment ID space is exhausted");
+            }
+
+            build_spec.delta_id = make_uuid();
+            build_spec.segment_id = catalog_.next_segment_id;
+            detail::MutationCatalog reservation = catalog_;
+            reservation.generation = catalog_.generation + 1;
+            reservation.catalog_id = make_uuid();
+            reservation.previous_catalog_id = catalog_.catalog_id;
+            reservation.next_segment_id = build_spec.segment_id + 1;
+            reservation_generation = reservation.generation;
+            try {
+                detail::ScopedAdvisoryLock commit(
+                    commit_lock_, detail::FileLockMode::Exclusive);
+                static_cast<void>(detail::publish_mutation_catalog(
+                    path_, manifest_, reservation,
+                    detail::NativeCollectionTestOperation::
+                        CompactDeltaRuns));
+                detail::invoke_native_collection_test_hook({
+                    detail::NativeCollectionTestHookPoint::
+                        MutationReservationDurable,
+                    detail::NativeCollectionTestOperation::CompactDeltaRuns,
+                    detail::NativeCollectionTestResourceKind::None,
+                    reservation.generation,
+                    0});
+                std::swap(catalog_, reservation);
+            } catch (...) {
+                poisoned_.store(true, std::memory_order_release);
+                throw;
+            }
+        }
+
+        const detail::MutationDeltaDescriptor descriptor =
+            detail::write_mutation_delta(
+                path_, manifest_, build_spec, build_entries,
+                [this, verified_sources](
+                    const std::span<const detail::RowRef> source_rows,
+                    const std::span<std::byte> destination) {
+                    std::vector<detail::PhysicalReadRequest> requests;
+                    requests.reserve(source_rows.size());
+                    for (std::size_t index = 0;
+                         index != source_rows.size(); ++index) {
+                        requests.push_back(resolve_row_unlocked(
+                            source_rows[index], index, *verified_sources));
+                    }
+                    physical_reader_.execute(
+                        manifest_.record_size, requests, destination);
+                });
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::
+                MutationDeltaOutputDurable,
+            detail::NativeCollectionTestOperation::CompactDeltaRuns,
+            detail::NativeCollectionTestResourceKind::MutationDeltaPair,
+            reservation_generation,
+            0});
+        // Do not make the replacement authoritative until the exact bytes
+        // written to disk pass their stored payload checksum. Normal open
+        // intentionally skips this potentially large scan, so compaction must
+        // perform it before retiring the known-good source runs.
+        detail::OpenMutationDelta opened = detail::open_mutation_delta(
+            path_, manifest_, descriptor, true);
+
+        std::uint64_t reclaimed_delta_runs = 0;
+        std::uint64_t reclaimed_delta_bytes = 0;
+        bool reclamation_complete = true;
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        if (catalog_.delta_entries.size() < selected_deltas.size()
+            || !std::equal(
+                selected_deltas.begin(), selected_deltas.end(),
+                catalog_.delta_entries.begin())) {
+            throw StorageError(
+                "selected delta prefix changed while compaction was built");
+        }
+        if (catalog_.generation
+            == std::numeric_limits<std::uint64_t>::max()) {
+            throw StorageError("mutation catalog generation is exhausted");
+        }
+
+        detail::MutationCatalog next_catalog = catalog_;
+        next_catalog.generation = catalog_.generation + 1;
+        next_catalog.catalog_id = make_uuid();
+        next_catalog.previous_catalog_id = catalog_.catalog_id;
+        next_catalog.delta_entries.erase(
+            next_catalog.delta_entries.begin(),
+            next_catalog.delta_entries.begin()
+                + static_cast<std::ptrdiff_t>(selected_deltas.size()));
+        next_catalog.delta_entries.insert(
+            next_catalog.delta_entries.begin(), descriptor);
+
+        auto delta_source = std::make_shared<DeltaSource>();
+        delta_source->descriptor = descriptor;
+        delta_source->header = opened.data_header;
+        delta_source->fd = std::move(opened.data_fd);
+        delta_source->path = detail::mutation_delta_data_path(
+            path_, descriptor.delta_id);
+
+        auto next_resources = std::make_shared<WalResourceSet>();
+        {
+            std::shared_lock state(state_mutex_);
+            if (wal_resources_->delta_sources.size()
+                < selected_deltas.size()) {
+                throw CorruptionError(
+                    "delta resource prefix is shorter than the catalog");
+            }
+            for (std::size_t index = 0;
+                 index != selected_deltas.size(); ++index) {
+                if (wal_resources_->delta_sources[index]->descriptor
+                    != selected_deltas[index]) {
+                    throw CorruptionError(
+                        "delta resource prefix differs from the catalog");
+                }
+            }
+            next_resources->sources = wal_resources_->sources;
+            next_resources->source_indices =
+                wal_resources_->source_indices;
+            next_resources->active_index = wal_resources_->active_index;
+            next_resources->delta_sources.reserve(
+                1 + wal_resources_->delta_sources.size()
+                    - selected_deltas.size());
+            next_resources->delta_sources.push_back(
+                std::move(delta_source));
+            next_resources->delta_sources.insert(
+                next_resources->delta_sources.end(),
+                wal_resources_->delta_sources.begin()
+                    + static_cast<std::ptrdiff_t>(selected_deltas.size()),
+                wal_resources_->delta_sources.end());
+        }
+        next_resources->delta_source_indices.reserve(
+            next_resources->delta_sources.size());
+        for (std::size_t index = 0;
+             index != next_resources->delta_sources.size(); ++index) {
+            if (!next_resources->delta_source_indices.emplace(
+                     next_resources->delta_sources[index]
+                         ->descriptor.segment_id,
+                     index).second) {
+                throw CorruptionError(
+                    "compacted delta reuses a mutation segment ID");
+            }
+        }
+
+        struct OverlayPatch {
+            OverlayValue* destination;
+            detail::VersionedMutationValue replacement;
+        };
+        static_assert(std::is_nothrow_copy_assignable_v<OverlayValue>);
+        std::vector<OverlayPatch> overlay_patches;
+        overlay_patches.reserve(opened.records.size());
+        {
+            std::shared_lock state(state_mutex_);
+            for (const detail::MutationDeltaVersionRecord& record :
+                 opened.records) {
+                const auto current = overlay_.find(record.id);
+                if (current == overlay_.end()
+                    || !current->second.has_value()
+                    || current->second->sequence()
+                           < record.value.sequence()) {
+                    throw CorruptionError(
+                        "compacted delta is newer than the live overlay");
+                }
+                if (current->second->sequence() == record.value.sequence()) {
+                    overlay_patches.push_back(
+                        OverlayPatch{&current->second, record.value});
+                }
+            }
+        }
+
+        try {
+            detail::ScopedAdvisoryLock commit(
+                commit_lock_, detail::FileLockMode::Exclusive);
+            static_cast<void>(detail::publish_mutation_catalog(
+                path_, manifest_, next_catalog,
+                detail::NativeCollectionTestOperation::CompactDeltaRuns));
+            {
+                std::unique_lock state(state_mutex_);
+                for (const OverlayPatch& patch : overlay_patches) {
+                    *patch.destination = patch.replacement;
+                }
+                wal_resources_.swap(next_resources);
+                std::swap(catalog_, next_catalog);
+            }
+
+            bool removed_any = false;
+            for (std::size_t ordinal = 0;
+                 ordinal != selected_deltas.size(); ++ordinal) {
+                const detail::MutationDeltaDescriptor& input =
+                    selected_deltas[ordinal];
+                const auto remove_one = [&reclamation_complete,
+                                         &reclaimed_delta_bytes,
+                                         &removed_any,
+                                         this,
+                                         ordinal](
+                                            const std::filesystem::path& file,
+                                            const std::uint64_t bytes,
+                                            const detail::
+                                                NativeCollectionTestResourceKind
+                                                    resource_kind) {
+                    const auto context =
+                        detail::NativeCollectionTestHookContext{
+                            detail::NativeCollectionTestHookPoint::
+                                BeforeSourceUnlink,
+                            detail::NativeCollectionTestOperation::
+                                CompactDeltaRuns,
+                            resource_kind,
+                            catalog_.generation,
+                            ordinal};
+                    detail::invoke_native_collection_test_hook(context);
+                    std::error_code error;
+                    const bool removed = std::filesystem::remove(file, error);
+                    if (!error && removed) {
+                        // This is a process-crash checkpoint. The directory
+                        // fsync follows only after every selected source has
+                        // been considered.
+                        detail::invoke_native_collection_test_hook({
+                            detail::NativeCollectionTestHookPoint::
+                                AfterSourceUnlink,
+                            context.operation,
+                            context.resource_kind,
+                            context.generation,
+                            context.ordinal});
+                    }
+                    if (error || !removed) {
+                        reclamation_complete = false;
+                        return false;
+                    }
+                    removed_any = true;
+                    if (reclaimed_delta_bytes
+                        > std::numeric_limits<std::uint64_t>::max() - bytes) {
+                        reclamation_complete = false;
+                    } else {
+                        reclaimed_delta_bytes += bytes;
+                    }
+                    return true;
+                };
+                const bool removed_data = remove_one(
+                    detail::mutation_delta_data_path(path_, input.delta_id),
+                    input.data_file_size,
+                    detail::NativeCollectionTestResourceKind::
+                        MutationDeltaData);
+                const bool removed_index = remove_one(
+                    detail::mutation_delta_index_path(path_, input.delta_id),
+                    input.index_file_size,
+                    detail::NativeCollectionTestResourceKind::
+                        MutationDeltaIndex);
+                if (removed_data && removed_index) {
+                    ++reclaimed_delta_runs;
+                }
+            }
+            if (removed_any) {
+                try {
+                    detail::sync_directory(
+                        detail::mutation_deltas_directory(path_));
+                } catch (...) {
+                    reclamation_complete = false;
+                }
+            }
+        } catch (...) {
+            poisoned_.store(true, std::memory_order_release);
+            throw;
+        }
+
+        NativeMutationLogStats stats = mutation_log_stats_locked(false);
+        stats.compacted = true;
+        stats.compacted_delta_run_count = selected_deltas.size();
+        stats.compacted_delta_input_entries = selected_input_entries;
+        stats.compacted_delta_input_bytes = selected_input_bytes;
+        stats.reclaimed_delta_run_count = reclaimed_delta_runs;
+        stats.reclaimed_delta_bytes = reclaimed_delta_bytes;
+        stats.reclamation_complete = reclamation_complete;
+        return stats;
     }
 
     [[nodiscard]] std::uint64_t count() const {
@@ -1089,6 +1824,7 @@ private:
 
     template <bool Profiled>
     void get_into_impl(
+        const detail::PhysicalReader& physical_reader,
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output,
         NativeReadStats* const stats) const {
@@ -1176,7 +1912,7 @@ private:
         if constexpr (Profiled) {
             stats->lookup_seconds = elapsed_seconds(lookup_started);
             const detail::PhysicalReadStats physical =
-                physical_reader_.execute_profiled(
+                physical_reader.execute_profiled(
                     manifest_.record_size, requests, output);
             stats->physical_plan_seconds = physical.plan_seconds;
             stats->physical_backend_seconds = physical.backend_seconds;
@@ -1185,7 +1921,7 @@ private:
             stats->backend_tasks = physical.task_count;
             stats->total_seconds = elapsed_seconds(total_started);
         } else {
-            physical_reader_.execute(
+            physical_reader.execute(
                 manifest_.record_size, requests, output);
         }
     }
@@ -1890,10 +2626,68 @@ bool NativeCollectionBuilder::finished() const {
     return impl_->finished();
 }
 
-std::unique_ptr<NativeCollection> NativeCollection::open(
-    const std::filesystem::path& path,
-    const ReaderOptions reader_options,
-    const bool writable) {
+NativeReaderCapabilities NativeCollection::reader_capabilities(
+    const std::uint32_t io_uring_queue_depth,
+    const std::uint32_t io_uring_workers) {
+    NativeReaderCapabilities capabilities;
+    capabilities.io_uring_probe_queue_depth = io_uring_queue_depth;
+    capabilities.io_uring_probe_workers = io_uring_workers;
+    if (io_uring_queue_depth == 0 || io_uring_queue_depth > 4096) {
+        capabilities.io_uring_reason =
+            "io_uring_queue_depth must be between 1 and 4096";
+        return capabilities;
+    }
+    if (io_uring_workers == 0 || io_uring_workers > 64) {
+        capabilities.io_uring_reason =
+            "io_uring_workers must be between 1 and 64";
+        return capabilities;
+    }
+    if (io_uring_workers > io_uring_queue_depth) {
+        capabilities.io_uring_reason =
+            "io_uring_queue_depth must be at least io_uring_workers";
+        return capabilities;
+    }
+    try {
+        detail::FileDescriptor zero_fd(
+            ::open("/dev/zero", O_RDONLY | O_CLOEXEC));
+        if (!zero_fd) {
+            throw StorageError(detail::system_error_message(
+                "cannot open capability probe source", "/dev/zero"));
+        }
+        std::vector<std::byte> buffers(io_uring_workers);
+        std::vector<detail::IoUringReadOperation> operations;
+        operations.reserve(io_uring_workers);
+        for (std::uint32_t index = 0; index != io_uring_workers; ++index) {
+            operations.push_back(detail::IoUringReadOperation{
+                .fd = zero_fd.get(),
+                .buffer = &buffers[index],
+                .size = 1,
+                .offset = 0,
+                .user_index = index,
+            });
+        }
+        if (io_uring_workers == 1) {
+            detail::IoUringEngine engine(io_uring_queue_depth);
+            engine.read_exact(operations);
+            capabilities.io_uring_available = engine.usable();
+        } else {
+            detail::IoUringPool pool(
+                io_uring_workers, io_uring_queue_depth);
+            pool.read_exact(operations);
+            capabilities.io_uring_available = true;
+        }
+        if (!capabilities.io_uring_available) {
+            capabilities.io_uring_reason =
+                "io_uring capability probe returned an unusable ring";
+        }
+    } catch (const std::exception& error) {
+        capabilities.io_uring_reason = error.what();
+    }
+    return capabilities;
+}
+
+NativeCollectionMetadata NativeCollection::inspect_metadata(
+    const std::filesystem::path& path) {
     if (path.empty()) {
         throw InvalidArgumentError("storage path must not be empty");
     }
@@ -1901,9 +2695,103 @@ std::unique_ptr<NativeCollection> NativeCollection::open(
         throw InvalidArgumentError(
             "native collection access requires a little-endian host");
     }
+
+    const detail::NativeManifest manifest =
+        detail::read_native_manifest(path);
+    const detail::NativeIndexHeader index_header =
+        detail::read_native_index_header(path, manifest);
+    const bool catalog_managed =
+        detail::mutation_catalog_managed(manifest);
+    const bool delta_managed = detail::mutation_delta_managed(manifest);
+    const bool index_checksum_present =
+        index_header.body_checksum_algorithm != 0;
+
+    NativeCollectionMetadata metadata;
+    metadata.format_version = delta_managed
+        ? kDeltaPublicNativeFormatVersion
+        : (catalog_managed
+               ? kCatalogPublicNativeFormatVersion
+               : (index_checksum_present
+                      ? kCurrentPublicNativeFormatVersion
+                      : kLegacyPublicNativeFormatVersion));
+    metadata.dimension = manifest.schema.dimension;
+    metadata.dtype = public_dtype(manifest.schema.dtype);
+    metadata.record_size = manifest.record_size;
+    metadata.segment_size_bytes = manifest.segment_payload_capacity;
+    metadata.layout = "uint64_dense_row_major_flat_v1";
+    metadata.feature_discriminator = delta_managed
+        ? "catalog_v1+delta_v1"
+        : (catalog_managed
+               ? "catalog_v1"
+               : (index_checksum_present ? "index_crc32c" : "legacy"));
+    metadata.required_feature_bits = manifest.required_feature_bits;
+    metadata.optional_feature_bits = manifest.optional_feature_bits;
+    return metadata;
+}
+
+NativeOrphanInventory NativeCollection::inspect_orphans(
+    const std::filesystem::path& path) {
+    if (path.empty()) {
+        throw InvalidArgumentError("storage path must not be empty");
+    }
+    if (std::endian::native != std::endian::little) {
+        throw InvalidArgumentError(
+            "native collection access requires a little-endian host");
+    }
+
+    detail::AdvisoryLockFile writer =
+        detail::AdvisoryLockFile::open_existing(
+            writer_lock_path(path), true);
+    detail::ScopedAdvisoryLock writer_lease(
+        writer, detail::FileLockMode::Exclusive, true);
+
+    // Read all authoritative metadata only after excluding a builder, writer,
+    // materializer, or compactor. Nothing below loads the flat base index,
+    // opens base segments, or replays mutations.
+    const detail::NativeManifest manifest =
+        detail::read_native_manifest(path);
+    if (!detail::mutation_catalog_managed(manifest)) {
+        throw InvalidArgumentError(
+            "orphan inventory requires a catalog-managed collection");
+    }
+    detail::AdvisoryLockFile commit =
+        detail::AdvisoryLockFile::open_existing(
+            commit_lock_path(path), true);
+    detail::ScopedAdvisoryLock stable(
+        commit, detail::FileLockMode::Exclusive);
+    return public_orphan_inventory(
+        detail::inspect_mutation_resources(path, manifest));
+}
+
+std::unique_ptr<NativeCollection> NativeCollection::open(
+    const std::filesystem::path& path,
+    const ReaderOptions reader_options,
+    const bool writable,
+    const bool calibration) {
+    if (path.empty()) {
+        throw InvalidArgumentError("storage path must not be empty");
+    }
+    if (writable && calibration) {
+        throw InvalidArgumentError(
+            "calibration handles must be read-only");
+    }
+    if (std::endian::native != std::endian::little) {
+        throw InvalidArgumentError(
+            "native collection access requires a little-endian host");
+    }
     return std::unique_ptr<NativeCollection>(new NativeCollection(
         std::make_unique<Impl>(
-            path, reader_options, writable, SteadyClock::now())));
+            path, reader_options, writable, calibration,
+            SteadyClock::now())));
+}
+
+NativeReaderTrial::NativeReaderTrial(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+NativeReaderTrial::~NativeReaderTrial() {
+    if (impl_ != nullptr && !impl_->owned_by_current_process()) {
+        impl_->abandon_after_fork();
+        static_cast<void>(impl_.release());
+    }
 }
 
 NativeCollection::NativeCollection(std::unique_ptr<Impl> impl)
@@ -1927,6 +2815,32 @@ NativeReadStats NativeCollection::get_into_profiled(
     const std::span<const std::uint64_t> ids,
     const std::span<std::byte> output) const {
     return impl_->get_into_profiled(ids, output);
+}
+std::unique_ptr<NativeReaderTrial> NativeCollection::create_reader_trial(
+    const ReaderOptions reader_options) const {
+    impl_->validate_reader_trial_options(reader_options);
+    return std::unique_ptr<NativeReaderTrial>(new NativeReaderTrial(
+        std::make_unique<NativeReaderTrial::Impl>(reader_options)));
+}
+void NativeCollection::get_into_with_reader(
+    const NativeReaderTrial& reader,
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    impl_->get_into_with_reader(
+        reader.impl_->physical_reader(), ids, output);
+}
+NativeReadStats NativeCollection::get_into_with_reader_profiled(
+    const NativeReaderTrial& reader,
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    return impl_->get_into_with_reader_profiled(
+        reader.impl_->physical_reader(), ids, output);
+}
+NativeIdSample NativeCollection::sample_ids(
+    const std::uint64_t requested,
+    const std::uint64_t seed,
+    const std::uint64_t max_inspected_slots) const {
+    return impl_->sample_ids(requested, seed, max_inspected_slots);
 }
 std::vector<std::byte> NativeCollection::get_bytes(
     const std::span<const std::uint64_t> ids) const {
@@ -1959,6 +2873,16 @@ NativeMutationLogStats NativeCollection::rotate_wal() {
 }
 NativeMutationLogStats NativeCollection::materialize_frozen_wals() {
     return impl_->materialize_frozen_wals();
+}
+NativeMutationLogStats NativeCollection::compact_delta_runs(
+    const std::uint64_t max_runs,
+    const std::uint64_t max_input_bytes,
+    const std::uint64_t max_input_entries) {
+    return impl_->compact_delta_runs(
+        max_runs, max_input_bytes, max_input_entries);
+}
+NativeOrphanInventory NativeCollection::collect_orphans() {
+    return impl_->collect_orphans();
 }
 std::uint64_t NativeCollection::count() const { return impl_->count(); }
 std::uint32_t NativeCollection::dimension() const {

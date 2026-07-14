@@ -224,18 +224,24 @@ public:
 
     explicit Impl(const ReaderOptions options) : options_(options) {
         validate_reader_options(options_);
-        if (options_.io_backend == IoBackend::IoUring) {
-            if (options_.io_uring_workers == 1) {
-                io_uring_ = std::make_unique<IoUringEngine>(
-                    options_.io_uring_queue_depth);
-            } else {
-                io_uring_pool_ = std::make_unique<IoUringPool>(
-                    options_.io_uring_workers,
-                    options_.io_uring_queue_depth);
+        try {
+            if (options_.io_backend == IoBackend::IoUring) {
+                if (options_.io_uring_workers == 1) {
+                    io_uring_ = std::make_unique<IoUringEngine>(
+                        options_.io_uring_queue_depth);
+                } else {
+                    io_uring_pool_ = std::make_unique<IoUringPool>(
+                        options_.io_uring_workers,
+                        options_.io_uring_queue_depth);
+                }
+            } else if (options_.io_workers != 0) {
+                executor_ = std::make_unique<BoundedExecutor>(
+                    options_.io_workers, effective_queue_capacity(options_));
             }
-        } else if (options_.io_workers != 0) {
-            executor_ = std::make_unique<BoundedExecutor>(
-                options_.io_workers, effective_queue_capacity(options_));
+        } catch (const std::exception& error) {
+            throw ReaderBackendError(
+                "reader backend initialization failed: "
+                + std::string(error.what()));
         }
     }
 

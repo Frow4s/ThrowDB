@@ -16,10 +16,10 @@ path while the mutable format is experimental.
 The current reader opens all four versions. A checksum-free version-3 index
 falls back to the complete structural scan. Version 4 uses one fixed
 `wal/active.wal`. Version 5 is catalog/WAL-only: it supports rotation but
-`materialize_frozen_wals()` rejects it because the manifest does not require
-DeltaV1. New builders write version 6. Readers that do not implement a required
-manifest feature reject formats 5/6 instead of silently opening an incomplete
-view.
+`materialize_frozen_wals()` and `compact_deltas()` reject it because the
+manifest does not require DeltaV1. New builders write version 6. Readers that
+do not implement a required manifest feature reject formats 5/6 instead of
+silently opening an incomplete view.
 
 ## Layout
 
@@ -145,9 +145,76 @@ poisons the writer handle and requires reopen.
 Catalog and `CURRENT` temporary names include the new catalog UUID. A crash
 before the `CURRENT` rename leaves harmless orphan files; open never scans the
 directory for the numerically newest catalog. A crash after publication opens
-the complete new view. Readers retain one shared owner of the mutation resource set
-through physical I/O, so later catalog switches cannot invalidate an already
-planned raw file descriptor.
+the complete new view.
+
+`locks/commit.lock` serializes both commits/publications and mutation snapshot
+opening. A read-only open holds it shared while reading `CURRENT`, validating
+the catalog, rebuilding delta/WAL state, and pinning every referenced data FD.
+Final publication holds it exclusively through `CURRENT`, the in-memory swap,
+retired-resource unlink, and directory sync. An opener therefore captures all
+old FDs before unlink or waits and selects the new catalog. Readers retain one
+shared owner of that resource set through physical I/O, so later switches cannot
+invalidate an already planned raw file descriptor.
+
+The lock does not currently cover base manifest/index/segment loading because
+base resources are never retired in formats 3 through 6. A later base-generation
+format needs its own base-view lock rather than holding `commit.lock` while a
+multi-gigabyte flat index loads.
+
+## Private crash checkpoints and orphan inventory
+
+The current safety tests use private, non-installed lifecycle hooks. They can
+observe acquisition of the reader-open barrier and the following
+materialization/compaction boundaries: catalog durable before `CURRENT`,
+`CURRENT` durable, reservation generation durable, delta output pair durable,
+and immediately before or after a successful source unlink. Context carries the
+operation, generation, resource kind, and zero-based source ordinal. These
+checkpoints are test instrumentation only. They are not part of the wire format,
+the C++/Python API, or a user-configurable failpoint mechanism.
+
+Crash tests invoke `_exit` in a forked child. They therefore test abrupt process
+termination without stack unwinding; they do not emulate loss of the host,
+device cache, or filesystem journal. A catalog-durable checkpoint follows the
+catalog file and `catalogs/` directory sync, `CURRENT`-durable follows the root
+directory sync, and delta-output-durable follows both file syncs, final renames,
+and the `deltas/` directory sync. By contrast, the per-source after-unlink point
+precedes the batched WAL/delta-directory sync. It proves process-crash recovery
+from a visible partial reclamation, not power-loss durability of that unlink.
+
+There is also a strict read-only mutation-resource inventory. It first
+validates `CURRENT` and exactly its selected catalog, then scans only
+`CURRENT`-like root names and the `catalogs/`, `wal/`, and `deltas/`
+namespaces. Entries are deterministically sorted and classified as reachable,
+superseded catalog, temporary publication, unreferenced WAL, complete or
+partial unreferenced delta pair, or unknown/do-not-touch. Strict lowercase
+UUID-derived filename grammar is required; symlinks and other non-regular
+entries are never followed and remain unknown/do-not-touch.
+
+For operational recovery, reachability starts at validated `CURRENT` and stops
+at the catalog it selects plus the WAL and delta resources named by that
+catalog. `previous_catalog_id` is lineage metadata, not a retained runtime
+snapshot edge, so an older catalog may be classified as superseded. This
+definition does not authorize deletion. The inventory is a potentially stale
+diagnostic snapshot; a future collector must hold the writer lease and
+`commit.lock` exclusively and revalidate each candidate with no-follow identity
+checks immediately before unlinking it.
+
+The inventory is exposed as a public dry-run plan through
+`Collection.inspect_orphans(path, min_age_seconds=3600)` and, for an existing
+mutable handle, `collection.collect_orphans(dry_run=True,
+min_age_seconds=...)`. The class method takes the writer lease and performs the
+scan without loading the base index. The CLI equivalent is
+`throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`, with
+mandatory `--dry-run`.
+
+Temporary publications, unreferenced WALs, and complete or partial
+unreferenced delta pairs are age-filtered candidates. Reachable files,
+superseded catalogs retained by policy, and unknown/do-not-touch entries are
+never candidates. The report is advisory and cannot authorize deletion. The
+public slice performs no deletion, and there is no automatic `maintain()`
+operation yet. Existing materialization and compaction code may only
+best-effort unlink the exact source paths retired by their own durable
+`CURRENT` publication.
 
 ## DeltaV1 materialization
 
@@ -197,6 +264,37 @@ already-running readers may finish through their old descriptors even if the
 WAL pathnames have been unlinked. This behavior is currently part of the local
 POSIX-filesystem contract only.
 
+## DeltaV1 compaction
+
+`compact_deltas()` operates only on format 6 and is serialized with
+materialization and another compaction. It selects an oldest contiguous prefix
+of at least two delta descriptors subject to explicit limits on run count,
+input bytes, and input entries. A call for which fewer than two runs fit is a
+successful no-op.
+
+The operation verifies each selected `.dat` payload CRC before reserving new
+metadata, then k-way merges the sorted `.idx` records. For every ID it retains
+the value with the greatest original commit sequence; tombstones remain durable
+records. The output descriptor spans the selected descriptors' complete
+sequence and WAL-lineage interval, sums their source-WAL counts, and uses a
+fresh monotonically reserved segment ID. One metadata-only catalog generation
+reserves that ID, and a second generation replaces exactly the revalidated
+descriptor prefix with the synced output pair. All later deltas and retained
+WALs are copied unchanged into the new catalog. Selected source pathnames are
+unlinked best-effort only after the output payload passes a complete CRC scan
+and `CURRENT` selects the output.
+
+The on-disk DeltaV1 and catalog wire encodings do not change for compaction.
+Crash recovery therefore follows the ordinary publication rule: before the
+final `CURRENT` switch the old prefix is authoritative; after it, the merged
+descriptor is authoritative. Reserved-ID gaps and unreferenced output pairs are
+safe orphans.
+
+The input-byte limit measures the selected files' catalog footprint. It is not
+a total-I/O limit: source payload verification, rereading winning PUT rows, and
+replacement verification are separate physical reads. The input-entry limit
+bounds the version metadata admitted to one in-memory merge.
+
 ## Current limits
 
 - Numeric IDs only (`uint64` on disk); the Python layer safely accepts
@@ -207,10 +305,13 @@ POSIX-filesystem contract only.
   requested prefix.
 - Manual crash-safe WAL rotation is implemented, with automatic rotation only
   before the 32-bit per-WAL PUT-row limit. Format 6 can manually materialize a
-  frozen prefix and best-effort unlink its WALs; format 5 cannot.
+  frozen prefix, compact a bounded oldest delta prefix, and best-effort unlink
+  replaced resources; format 5 cannot.
 - Delta version metadata is still loaded into the RAM overlay. There is no
-  delta-run merge, payload-scrub command, partitioned authoritative index,
-  selective base compaction, or general orphan-resource collector yet.
+  automatic lifecycle policy, standalone payload-scrub command, partitioned
+  authoritative index, selective base compaction, orphan-deletion executor, or
+  `maintain` operation yet. Public orphan inspection is a diagnostic dry-run
+  only and never removes files.
 - Materialization permits writes during its data build, but briefly pauses
   mutations for the initial segment-ID reservation and final catalog switch.
 - Only local POSIX publication/open-file/unlink semantics are supported;

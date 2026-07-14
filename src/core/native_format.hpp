@@ -196,6 +196,9 @@ void write_native_manifest_atomic(
     const std::filesystem::path& store_path,
     const NativeManifest& manifest,
     std::uint32_t segment_id);
+[[nodiscard]] NativeIndexHeader read_native_index_header(
+    const std::filesystem::path& store_path,
+    const NativeManifest& manifest);
 
 // IndexData::slots[].ordinal contains a raw RowRef in these private APIs.
 // build_and_write scans the authoritative per-row ID sidecars; no global

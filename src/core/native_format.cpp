@@ -432,6 +432,35 @@ void require_manifest_match(
     }
 }
 
+[[nodiscard]] NativeIndexHeader read_native_index_header_from_fd(
+    const int fd,
+    const std::filesystem::path& path,
+    const NativeManifest& manifest) {
+    validate_manifest<CorruptionError>(manifest);
+    if (file_size(fd, path) != manifest.index_file_size) {
+        throw CorruptionError("native index file size does not match manifest");
+    }
+    std::array<std::byte, kNativeHeaderSize> header_bytes{};
+    pread_exact(fd, header_bytes.data(), header_bytes.size(), 0, path);
+    const NativeIndexHeader header = decode_native_index_header(header_bytes);
+    require_manifest_match(
+        manifest, header.collection_id, header.schema_id, "native index");
+    const NativeIndexHeader expected = make_native_index_header(manifest);
+    if (header.record_count != expected.record_count
+        || header.capacity != expected.capacity
+        || header.hash_seed != expected.hash_seed
+        || header.control_offset != expected.control_offset
+        || header.slots_offset != expected.slots_offset
+        || header.slot_size != expected.slot_size
+        || header.file_size != expected.file_size
+        || header.control_encoding != expected.control_encoding
+        || header.value_encoding != expected.value_encoding
+        || header.base_segment_count != expected.base_segment_count) {
+        throw CorruptionError("native index header does not match manifest");
+    }
+    return header;
+}
+
 void insert_native_index(
     IndexData& index,
     const std::uint64_t id,
@@ -1056,6 +1085,14 @@ NativeIdsHeader read_native_ids_header(
     return result;
 }
 
+NativeIndexHeader read_native_index_header(
+    const std::filesystem::path& store_path,
+    const NativeManifest& manifest) {
+    const auto path = native_index_path(store_path);
+    auto fd = open_read_only(path);
+    return read_native_index_header_from_fd(fd.get(), path, manifest);
+}
+
 IndexData build_native_index(
     const std::filesystem::path& store_path,
     const NativeManifest& manifest) {
@@ -1211,28 +1248,8 @@ IndexData read_native_index(
     auto phase_started = SteadyClock::now();
     const auto path = native_index_path(store_path);
     auto fd = open_read_only(path);
-    if (file_size(fd.get(), path) != manifest.index_file_size) {
-        throw CorruptionError("native index file size does not match manifest");
-    }
-    std::array<std::byte, kNativeHeaderSize> header_bytes{};
-    pread_exact(fd.get(), header_bytes.data(), header_bytes.size(), 0, path);
     const NativeIndexHeader header =
-        decode_native_index_header(header_bytes);
-    require_manifest_match(
-        manifest, header.collection_id, header.schema_id, "native index");
-    const NativeIndexHeader expected = make_native_index_header(manifest);
-    if (header.record_count != expected.record_count
-        || header.capacity != expected.capacity
-        || header.hash_seed != expected.hash_seed
-        || header.control_offset != expected.control_offset
-        || header.slots_offset != expected.slots_offset
-        || header.slot_size != expected.slot_size
-        || header.file_size != expected.file_size
-        || header.control_encoding != expected.control_encoding
-        || header.value_encoding != expected.value_encoding
-        || header.base_segment_count != expected.base_segment_count) {
-        throw CorruptionError("native index header does not match manifest");
-    }
+        read_native_index_header_from_fd(fd.get(), path, manifest);
     read_stats.header_seconds = elapsed_seconds(phase_started);
     read_stats.body_checksum_present = header.body_checksum_algorithm != 0;
 

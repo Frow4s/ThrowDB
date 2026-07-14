@@ -953,7 +953,8 @@ MutationCatalog make_initial_mutation_catalog(
 MutationCurrent publish_mutation_catalog(
     const std::filesystem::path& store_path,
     const NativeManifest& manifest,
-    const MutationCatalog& catalog) {
+    const MutationCatalog& catalog,
+    const NativeCollectionTestOperation operation) {
     const std::vector<std::byte> catalog_bytes =
         encode_mutation_catalog(manifest, catalog);
     MutationCurrent current;
@@ -992,6 +993,13 @@ MutationCurrent publish_mutation_catalog(
         catalog_fd.reset();
         rename_file(catalog_temporary, catalog_final, "mutation catalog");
         sync_directory(catalog_directory);
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::
+                MutationCatalogDurableBeforeCurrent,
+            operation,
+            NativeCollectionTestResourceKind::None,
+            catalog.generation,
+            0});
     } catch (...) {
         catalog_fd.reset();
         throw;
@@ -1009,6 +1017,12 @@ MutationCurrent publish_mutation_catalog(
         rename_file(
             current_temporary, mutation_current_path(store_path), "CURRENT");
         sync_directory(store_path);
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::MutationCurrentDurable,
+            operation,
+            NativeCollectionTestResourceKind::None,
+            catalog.generation,
+            0});
     } catch (...) {
         current_fd.reset();
         throw;

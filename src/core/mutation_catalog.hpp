@@ -9,6 +9,7 @@
 
 #include "native_format.hpp"
 #include "mutation_delta.hpp"
+#include "native_collection_test_hooks.hpp"
 
 namespace throwdb::detail {
 
@@ -115,7 +116,9 @@ encode_mutation_current(
 [[nodiscard]] MutationCurrent publish_mutation_catalog(
     const std::filesystem::path& store_path,
     const NativeManifest& manifest,
-    const MutationCatalog& catalog);
+    const MutationCatalog& catalog,
+    NativeCollectionTestOperation operation =
+        NativeCollectionTestOperation::None);
 
 [[nodiscard]] MutationCurrent read_mutation_current(
     const std::filesystem::path& store_path,

@@ -17,8 +17,10 @@ add_library(throwdb_core STATIC
     src/core/io_uring_pool.cpp
     src/core/mutation_catalog.cpp
     src/core/mutation_delta.cpp
+    src/core/mutation_inventory.cpp
     src/core/mutation_wal.cpp
     src/core/native_collection.cpp
+    src/core/native_collection_test_hooks.cpp
     src/core/native_format.cpp
     src/core/physical_reader.cpp
     src/core/storage_reader.cpp
@@ -105,6 +107,17 @@ if(THROWDB_BUILD_TESTS)
         NAME throwdb_mutation_delta_tests
         COMMAND throwdb_mutation_delta_tests)
 
+    add_executable(
+        throwdb_mutation_inventory_tests tests/mutation_inventory_tests.cpp)
+    target_link_libraries(
+        throwdb_mutation_inventory_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_mutation_inventory_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_mutation_inventory_tests)
+    add_test(
+        NAME throwdb_mutation_inventory_tests
+        COMMAND throwdb_mutation_inventory_tests)
+
     add_executable(throwdb_physical_reader_tests tests/physical_reader_tests.cpp)
     target_link_libraries(throwdb_physical_reader_tests PRIVATE throwdb::core)
     target_compile_features(throwdb_physical_reader_tests PRIVATE cxx_std_20)
@@ -147,6 +160,48 @@ if(THROWDB_BUILD_TESTS)
     add_test(
         NAME throwdb_native_collection_materialization_tests
         COMMAND throwdb_native_collection_materialization_tests)
+
+    add_executable(
+        throwdb_native_collection_compaction_tests
+        tests/native_collection_compaction_tests.cpp)
+    target_link_libraries(
+        throwdb_native_collection_compaction_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_native_collection_compaction_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(
+        throwdb_native_collection_compaction_tests)
+    add_test(
+        NAME throwdb_native_collection_compaction_tests
+        COMMAND throwdb_native_collection_compaction_tests)
+
+    add_executable(
+        throwdb_native_collection_compaction_crash_tests
+        tests/native_collection_compaction_crash_tests.cpp)
+    target_link_libraries(
+        throwdb_native_collection_compaction_crash_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_native_collection_compaction_crash_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(
+        throwdb_native_collection_compaction_crash_tests)
+    add_test(
+        NAME throwdb_native_collection_compaction_crash_tests
+        COMMAND throwdb_native_collection_compaction_crash_tests)
+    set_tests_properties(
+        throwdb_native_collection_compaction_crash_tests
+        PROPERTIES TIMEOUT 30)
+
+    add_executable(
+        throwdb_native_collection_reader_barrier_tests
+        tests/native_collection_reader_barrier_tests.cpp)
+    target_link_libraries(
+        throwdb_native_collection_reader_barrier_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_native_collection_reader_barrier_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(
+        throwdb_native_collection_reader_barrier_tests)
+    add_test(
+        NAME throwdb_native_collection_reader_barrier_tests
+        COMMAND throwdb_native_collection_reader_barrier_tests)
 endif()
 
 if(THROWDB_BUILD_BENCHMARKS)

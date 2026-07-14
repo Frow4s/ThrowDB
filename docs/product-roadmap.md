@@ -4,8 +4,9 @@ The current implementation is a testable local mutable engine for numeric-ID
 collections with arbitrary fixed dimension and float16/float32 rows. It has a
 fresh segmented base format, a flat RowRef index, checksummed WAL recovery,
 atomic batch CRUD, one writer lease, Python bindings, and the existing
-pread/io_uring readers. The remaining local-library work is WAL rotation,
-selective cleaning, UTF-8 IDs, direct prefix I/O, and adaptive scheduling.
+pread/io_uring readers, explicit bounded calibration, and bounded selective
+delta-run compaction. The remaining local-library work is lifecycle automation,
+selective base cleaning, UTF-8 IDs, direct prefix I/O, and adaptive scheduling.
 Device-specific settings such as two io_uring rings at total QD32 remain
 measured profiles, not product architecture.
 
@@ -50,11 +51,15 @@ Stage 1 slices are called out inline:
   `int8/16/32/64`, and Python integers;
 - immutable snapshot construction and atomic publication;
 - atomic insert, update, upsert, and tombstone delete batches;
-- checksummed WAL recovery and one writer lease; WAL rotation and selective
-  segment cleaning remain next;
+- checksummed WAL recovery, one writer lease, WAL rotation, bounded
+  WAL-to-delta materialization, and bounded oldest-prefix delta-run compaction;
+  public lightweight orphan inspection and an age-filtered dry-run collection
+  plan are implemented, while orphan deletion, automatic maintenance, and
+  selective base cleaning remain next;
 - `get`, `get_into`, and prefix-dimension reads;
-- manual tuning and an observable conservative `auto` profile; calibrated and
-  request-adaptive tuning remain next;
+- manual tuning, portable per-device profile persistence, an observable
+  exact-match `auto` fallback, and an explicit bounded `throwdb tune`
+  calibrator; request-adaptive policy remains next;
 - explicit source-array rebuild into the fresh format during the experimental
   MVP; backward reading remains available only through the legacy low-level
   API.
@@ -153,5 +158,6 @@ workloads and explainable baselines exist.
    IDs.
 6. Add compact UTF-8 ID storage, collision-verified lookup, and string CRUD.
 7. Extract `ReadPlan`, fair scheduler, and storage-backend interfaces.
-8. Add an explicit calibration profile and request-policy explanation.
+8. Preserve the implemented explicit calibration profile and add a
+   request-policy explanation with the fair scheduler.
 9. Build the single-collection server on the same engine.

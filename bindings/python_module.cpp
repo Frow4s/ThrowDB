@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -30,6 +31,14 @@ constexpr std::int64_t kDefaultIoUringWorkers = 1;
 constexpr std::int64_t kMaxIoUringWorkers = 64;
 constexpr std::int64_t kDefaultIoUringQueueDepth = 32;
 constexpr std::int64_t kMaxIoUringQueueDepth = 4096;
+constexpr std::uint64_t kDefaultMaxReadRangeBytes = 1ULL << 20;
+constexpr std::uint64_t kDefaultMaxGapBytes = 0;
+constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 20;
+constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 24;
+constexpr std::uint64_t kDefaultDeltaCompactionMaxRuns = 8;
+constexpr std::uint64_t kMaximumDeltaCompactionMaxRuns = 64;
+constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
+constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
 
 struct DTypeInfo {
     const char* name;
@@ -78,9 +87,75 @@ struct DTypeInfo {
     result["total_delta_bytes"] = stats.total_delta_bytes;
     result["reclaimed_wal_count"] = stats.reclaimed_wal_count;
     result["reclaimed_wal_bytes"] = stats.reclaimed_wal_bytes;
+    result["compacted_delta_run_count"] =
+        stats.compacted_delta_run_count;
+    result["compacted_delta_input_entries"] =
+        stats.compacted_delta_input_entries;
+    result["compacted_delta_input_bytes"] =
+        stats.compacted_delta_input_bytes;
+    result["reclaimed_delta_run_count"] =
+        stats.reclaimed_delta_run_count;
+    result["reclaimed_delta_bytes"] = stats.reclaimed_delta_bytes;
     result["rotated"] = stats.rotated;
     result["materialized"] = stats.materialized;
+    result["compacted"] = stats.compacted;
     result["reclamation_complete"] = stats.reclamation_complete;
+    return result;
+}
+
+[[nodiscard]] const char* orphan_class_name(
+    const throwdb::NativeOrphanClass classification) {
+    switch (classification) {
+    case throwdb::NativeOrphanClass::Reachable:
+        return "reachable";
+    case throwdb::NativeOrphanClass::SupersededCatalog:
+        return "superseded_catalog";
+    case throwdb::NativeOrphanClass::TempPublication:
+        return "temp_publication";
+    case throwdb::NativeOrphanClass::UnreferencedWal:
+        return "unreferenced_wal";
+    case throwdb::NativeOrphanClass::CompleteUnreferencedDeltaPair:
+        return "complete_unreferenced_delta_pair";
+    case throwdb::NativeOrphanClass::PartialUnreferencedDeltaPair:
+        return "partial_unreferenced_delta_pair";
+    case throwdb::NativeOrphanClass::UnknownDoNotTouch:
+        return "unknown_do_not_touch";
+    }
+    throw std::runtime_error("orphan inventory contains an unknown class");
+}
+
+[[nodiscard]] py::dict orphan_inventory_dict(
+    const throwdb::NativeOrphanInventory& inventory) {
+    py::list entries;
+    for (const throwdb::NativeOrphanEntry& entry : inventory.entries) {
+        py::dict item;
+        item["path"] = entry.path;
+        item["classification"] = orphan_class_name(entry.classification);
+        item["bytes"] = entry.bytes;
+        item["modified_unix_ns"] = entry.modified_unix_ns;
+        entries.append(std::move(item));
+    }
+    py::dict result;
+    result["current_generation"] = inventory.current_generation;
+    result["current_catalog_id"] = inventory.current_catalog_id;
+    result["entries"] = std::move(entries);
+    return result;
+}
+
+[[nodiscard]] py::dict native_read_stats_dict(
+    const throwdb::NativeReadStats& stats) {
+    py::dict result;
+    result["total_seconds"] = stats.total_seconds;
+    result["lookup_seconds"] = stats.lookup_seconds;
+    result["physical_plan_seconds"] = stats.physical_plan_seconds;
+    result["physical_backend_seconds"] = stats.physical_backend_seconds;
+    result["requested_rows"] = stats.requested_rows;
+    result["base_rows"] = stats.base_rows;
+    result["mutation_rows"] = stats.mutation_rows;
+    result["planned_ranges"] = stats.planned_ranges;
+    result["planned_read_bytes"] = stats.planned_read_bytes;
+    result["backend_tasks"] = stats.backend_tasks;
+    result["zero_delta_fast_path"] = stats.zero_delta_fast_path;
     return result;
 }
 
@@ -146,6 +221,36 @@ struct DTypeInfo {
     return py::cast<bool>(value);
 }
 
+[[nodiscard]] std::uint64_t checked_uint64_option(
+    const py::handle value,
+    const char* name,
+    const bool allow_zero) {
+    if (py::isinstance<py::bool_>(value)) {
+        throw py::type_error(std::string(name) + " must be an integer, not bool");
+    }
+
+    PyObject* const indexed_raw = PyNumber_Index(value.ptr());
+    if (indexed_raw == nullptr) {
+        PyErr_Clear();
+        throw py::type_error(std::string(name) + " must be an integer");
+    }
+    const py::object indexed = py::reinterpret_steal<py::object>(indexed_raw);
+    const unsigned long long converted =
+        PyLong_AsUnsignedLongLong(indexed.ptr());
+    if (PyErr_Occurred() != nullptr
+        || converted > std::numeric_limits<std::uint64_t>::max()) {
+        PyErr_Clear();
+        throw py::value_error(
+            std::string(name) + " must be between 0 and 2**64-1");
+    }
+    const auto result = static_cast<std::uint64_t>(converted);
+    if (!allow_zero && result == 0) {
+        throw py::value_error(
+            std::string(name) + " must be greater than zero");
+    }
+    return result;
+}
+
 [[nodiscard]] throwdb::IoBackend checked_io_backend(
     const std::string& value) {
     if (value == "thread_pool") {
@@ -165,8 +270,16 @@ struct DTypeInfo {
     const std::string& io_backend,
     const std::int64_t io_uring_queue_depth,
     const std::int64_t io_uring_workers,
-    const bool verify_native_index = false) {
+    const bool verify_native_index = false,
+    const std::uint64_t max_read_range_bytes = kDefaultMaxReadRangeBytes,
+    const std::uint64_t max_gap_bytes = kDefaultMaxGapBytes) {
     throwdb::ReaderOptions options;
+    if (max_read_range_bytes == 0) {
+        throw py::value_error(
+            "max_read_range_bytes must be greater than zero");
+    }
+    options.max_read_range_bytes = max_read_range_bytes;
+    options.max_gap_bytes = max_gap_bytes;
     options.io_workers =
         checked_io_option(io_workers, kMaxIoWorkers, "io_workers");
     options.io_queue_capacity = checked_io_option(
@@ -468,14 +581,24 @@ public:
         const std::int64_t io_ranges_per_task,
         const std::string& io_backend,
         const std::int64_t io_uring_queue_depth,
-        const std::int64_t io_uring_workers) {
+        const std::int64_t io_uring_workers,
+        const py::object& max_read_range_bytes,
+        const py::object& max_gap_bytes) {
+        const std::uint64_t checked_max_read_range_bytes =
+            checked_uint64_option(
+                max_read_range_bytes, "max_read_range_bytes", false);
+        const std::uint64_t checked_max_gap_bytes = checked_uint64_option(
+            max_gap_bytes, "max_gap_bytes", true);
         const throwdb::ReaderOptions options = checked_reader_options(
             io_workers,
             io_queue_capacity,
             io_ranges_per_task,
             io_backend,
             io_uring_queue_depth,
-            io_uring_workers);
+            io_uring_workers,
+            false,
+            checked_max_read_range_bytes,
+            checked_max_gap_bytes);
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::Storage> reader;
         {
@@ -648,8 +771,142 @@ private:
     bool finished_{false};
 };
 
+class PyNativeReaderTrial {
+public:
+    PyNativeReaderTrial(
+        std::shared_ptr<throwdb::NativeCollection> collection,
+        std::unique_ptr<throwdb::NativeReaderTrial> trial)
+        : collection_(std::move(collection)), trial_(std::move(trial)) {}
+
+    void close() {
+        std::shared_ptr<throwdb::NativeReaderTrial> trial;
+        std::shared_ptr<throwdb::NativeCollection> collection;
+        {
+            const std::scoped_lock lock(mutex_);
+            trial = std::move(trial_);
+            collection = std::move(collection_);
+        }
+        if (trial == nullptr && collection == nullptr) {
+            return;
+        }
+        py::gil_scoped_release release;
+        trial.reset();
+        collection.reset();
+    }
+
+    void get_into(const py::array& ids, py::array output) const {
+        const auto [collection, trial] = acquire();
+        const auto id_span = validate_ids(ids);
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            collection->get_into_with_reader(*trial, id_span, output_span);
+        });
+    }
+
+    [[nodiscard]] py::dict get_into_profiled(
+        const py::array& ids, py::array output) const {
+        const auto [collection, trial] = acquire();
+        const auto id_span = validate_ids(ids);
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            collection->dimension(),
+            collection->dtype(),
+            collection->record_size());
+        const throwdb::NativeReadStats stats = translate_id_errors([&] {
+            py::gil_scoped_release release;
+            return collection->get_into_with_reader_profiled(
+                *trial, id_span, output_span);
+        });
+        return native_read_stats_dict(stats);
+    }
+
+private:
+    using Handles = std::pair<
+        std::shared_ptr<throwdb::NativeCollection>,
+        std::shared_ptr<throwdb::NativeReaderTrial>>;
+
+    [[nodiscard]] Handles acquire() const {
+        const std::scoped_lock lock(mutex_);
+        if (collection_ == nullptr || trial_ == nullptr) {
+            throw std::runtime_error("native reader trial is closed");
+        }
+        return {collection_, trial_};
+    }
+
+    mutable std::mutex mutex_;
+    std::shared_ptr<throwdb::NativeCollection> collection_;
+    std::shared_ptr<throwdb::NativeReaderTrial> trial_;
+};
+
 class PyNativeCollection {
 public:
+    [[nodiscard]] static py::dict reader_capabilities(
+        const std::int64_t io_uring_queue_depth,
+        const std::int64_t io_uring_workers) {
+        const std::uint32_t checked_queue_depth =
+            checked_io_uring_queue_depth(io_uring_queue_depth);
+        const std::uint32_t checked_workers =
+            checked_io_uring_workers(io_uring_workers);
+        if (checked_workers > checked_queue_depth) {
+            throw py::value_error(
+                "io_uring_queue_depth must be at least io_uring_workers");
+        }
+        throwdb::NativeReaderCapabilities capabilities;
+        {
+            py::gil_scoped_release release;
+            capabilities = throwdb::NativeCollection::reader_capabilities(
+                checked_queue_depth, checked_workers);
+        }
+        py::dict result;
+        result["io_uring_available"] = capabilities.io_uring_available;
+        result["io_uring_probe_queue_depth"] =
+            capabilities.io_uring_probe_queue_depth;
+        result["io_uring_probe_workers"] =
+            capabilities.io_uring_probe_workers;
+        result["io_uring_reason"] = capabilities.io_uring_reason.empty()
+            ? py::none()
+            : py::cast(capabilities.io_uring_reason);
+        return result;
+    }
+
+    [[nodiscard]] static py::dict inspect_metadata(const py::object& path) {
+        const auto native_path = filesystem_path(path);
+        throwdb::NativeCollectionMetadata metadata;
+        {
+            py::gil_scoped_release release;
+            metadata = throwdb::NativeCollection::inspect_metadata(native_path);
+        }
+        py::dict result;
+        result["format_version"] = metadata.format_version;
+        result["dimension"] = metadata.dimension;
+        result["dtype"] = dtype_info(metadata.dtype).name;
+        result["record_size"] = metadata.record_size;
+        result["segment_size_bytes"] = metadata.segment_size_bytes;
+        result["layout"] = metadata.layout;
+        result["feature_discriminator"] = metadata.feature_discriminator;
+        result["required_feature_bits"] = metadata.required_feature_bits;
+        result["optional_feature_bits"] = metadata.optional_feature_bits;
+        return result;
+    }
+
+    [[nodiscard]] static py::dict inspect_orphans(const py::object& path) {
+        const auto native_path = filesystem_path(path);
+        throwdb::NativeOrphanInventory inventory;
+        {
+            py::gil_scoped_release release;
+            inventory =
+                throwdb::NativeCollection::inspect_orphans(native_path);
+        }
+        return orphan_inventory_dict(inventory);
+    }
+
     static std::unique_ptr<PyNativeCollection> open(
         const py::object& path,
         const std::string& mode,
@@ -659,7 +916,10 @@ public:
         const std::string& io_backend,
         const std::int64_t io_uring_queue_depth,
         const std::int64_t io_uring_workers,
-        const py::object& verify_native_index) {
+        const py::object& verify_native_index,
+        const py::object& max_read_range_bytes,
+        const py::object& max_gap_bytes,
+        const py::object& calibration) {
         bool writable = false;
         if (mode == "r") {
             writable = false;
@@ -668,7 +928,17 @@ public:
         } else {
             throw py::value_error("mode must be 'r' or 'r+'");
         }
+        const bool checked_calibration = checked_python_bool(
+            calibration, "calibration");
+        if (writable && checked_calibration) {
+            throw py::value_error("calibration handles must be read-only");
+        }
 
+        const std::uint64_t checked_max_read_range_bytes =
+            checked_uint64_option(
+                max_read_range_bytes, "max_read_range_bytes", false);
+        const std::uint64_t checked_max_gap_bytes = checked_uint64_option(
+            max_gap_bytes, "max_gap_bytes", true);
         const throwdb::ReaderOptions options = checked_reader_options(
             io_workers,
             io_queue_capacity,
@@ -677,13 +947,15 @@ public:
             io_uring_queue_depth,
             io_uring_workers,
             checked_python_bool(
-                verify_native_index, "verify_native_index"));
+                verify_native_index, "verify_native_index"),
+            checked_max_read_range_bytes,
+            checked_max_gap_bytes);
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::NativeCollection> collection;
         {
             py::gil_scoped_release release;
             collection = throwdb::NativeCollection::open(
-                native_path, options, writable);
+                native_path, options, writable, checked_calibration);
         }
         return std::unique_ptr<PyNativeCollection>(
             new PyNativeCollection(std::move(collection)));
@@ -765,6 +1037,88 @@ public:
         return mutation_log_stats_dict(stats);
     }
 
+    [[nodiscard]] py::dict collect_orphans() const {
+        const auto collection = acquire_collection();
+        throwdb::NativeOrphanInventory inventory;
+        {
+            py::gil_scoped_release release;
+            inventory = collection->collect_orphans();
+        }
+        return orphan_inventory_dict(inventory);
+    }
+
+    [[nodiscard]] std::unique_ptr<PyNativeReaderTrial> reader_trial(
+        const std::int64_t io_workers,
+        const std::int64_t io_queue_capacity,
+        const std::int64_t io_ranges_per_task,
+        const std::string& io_backend,
+        const std::int64_t io_uring_queue_depth,
+        const std::int64_t io_uring_workers,
+        const py::object& max_read_range_bytes,
+        const py::object& max_gap_bytes) const {
+        const std::uint64_t checked_max_read_range_bytes =
+            checked_uint64_option(
+                max_read_range_bytes, "max_read_range_bytes", false);
+        const std::uint64_t checked_max_gap_bytes = checked_uint64_option(
+            max_gap_bytes, "max_gap_bytes", true);
+        const throwdb::ReaderOptions options = checked_reader_options(
+            io_workers,
+            io_queue_capacity,
+            io_ranges_per_task,
+            io_backend,
+            io_uring_queue_depth,
+            io_uring_workers,
+            false,
+            checked_max_read_range_bytes,
+            checked_max_gap_bytes);
+        const auto collection = acquire_collection();
+        std::unique_ptr<throwdb::NativeReaderTrial> trial;
+        {
+            py::gil_scoped_release release;
+            trial = collection->create_reader_trial(options);
+        }
+        return std::make_unique<PyNativeReaderTrial>(
+            collection, std::move(trial));
+    }
+
+    [[nodiscard]] py::dict sample_ids(
+        const py::object& requested_count,
+        const py::object& seed,
+        const py::object& max_inspected_slots) const {
+        const std::uint64_t requested = checked_uint64_option(
+            requested_count, "requested_count", true);
+        const std::uint64_t checked_seed = checked_uint64_option(
+            seed, "seed", true);
+        const std::uint64_t inspected = checked_uint64_option(
+            max_inspected_slots, "max_inspected_slots", true);
+        if (requested > kMaxIdSampleRows) {
+            throw py::value_error(
+                "requested_count must not exceed "
+                + std::to_string(kMaxIdSampleRows));
+        }
+        if (inspected > kMaxIdSampleInspectedSlots) {
+            throw py::value_error(
+                "max_inspected_slots must not exceed "
+                + std::to_string(kMaxIdSampleInspectedSlots));
+        }
+        const auto collection = acquire_collection();
+        throwdb::NativeIdSample sample;
+        {
+            py::gil_scoped_release release;
+            sample = collection->sample_ids(
+                requested, checked_seed, inspected);
+        }
+        py::array_t<std::uint64_t> ids(
+            static_cast<py::ssize_t>(sample.ids.size()));
+        std::copy(sample.ids.begin(), sample.ids.end(), ids.mutable_data());
+        py::dict result;
+        result["ids"] = std::move(ids);
+        result["requested_count"] = requested;
+        result["inspected_slots"] = sample.inspected_slots;
+        result["complete"] = sample.complete;
+        return result;
+    }
+
     [[nodiscard]] py::dict rotate_wal() {
         const auto collection = acquire_collection();
         throwdb::NativeMutationLogStats stats;
@@ -781,6 +1135,37 @@ public:
         {
             py::gil_scoped_release release;
             stats = collection->materialize_frozen_wals();
+        }
+        return mutation_log_stats_dict(stats);
+    }
+
+    [[nodiscard]] py::dict compact_delta_runs(
+        const py::object& max_runs,
+        const py::object& max_input_bytes,
+        const py::object& max_input_entries) {
+        const std::uint64_t checked_max_runs = checked_uint64_option(
+            max_runs, "max_runs", false);
+        if (checked_max_runs < 2
+            || checked_max_runs > kMaximumDeltaCompactionMaxRuns) {
+            throw py::value_error(
+                "max_runs must be between 2 and "
+                + std::to_string(kMaximumDeltaCompactionMaxRuns));
+        }
+        const std::uint64_t checked_max_input_bytes =
+            checked_uint64_option(
+                max_input_bytes, "max_input_bytes", false);
+        const std::uint64_t checked_max_input_entries =
+            checked_uint64_option(
+                max_input_entries, "max_input_entries", false);
+
+        const auto collection = acquire_collection();
+        throwdb::NativeMutationLogStats stats;
+        {
+            py::gil_scoped_release release;
+            stats = collection->compact_delta_runs(
+                checked_max_runs,
+                checked_max_input_bytes,
+                checked_max_input_entries);
         }
         return mutation_log_stats_dict(stats);
     }
@@ -834,20 +1219,7 @@ public:
             py::gil_scoped_release release;
             return collection->get_into_profiled(id_span, output_span);
         });
-        py::dict result;
-        result["total_seconds"] = stats.total_seconds;
-        result["lookup_seconds"] = stats.lookup_seconds;
-        result["physical_plan_seconds"] = stats.physical_plan_seconds;
-        result["physical_backend_seconds"] =
-            stats.physical_backend_seconds;
-        result["requested_rows"] = stats.requested_rows;
-        result["base_rows"] = stats.base_rows;
-        result["mutation_rows"] = stats.mutation_rows;
-        result["planned_ranges"] = stats.planned_ranges;
-        result["planned_read_bytes"] = stats.planned_read_bytes;
-        result["backend_tasks"] = stats.backend_tasks;
-        result["zero_delta_fast_path"] = stats.zero_delta_fast_path;
-        return result;
+        return native_read_stats_dict(stats);
     }
 
     void insert(const py::array& ids, const py::array& embeddings) {
@@ -938,6 +1310,8 @@ private:
 PYBIND11_MODULE(_throwdb, module) {
     module.doc() = "Native bindings for the ThrowDB storage engine";
     module.attr("__version__") = "0.1.0";
+    py::register_exception<throwdb::ReaderBackendError>(
+        module, "ReaderBackendError", PyExc_RuntimeError);
 
     py::class_<PyWriter>(module, "Writer")
         .def_static(
@@ -967,7 +1341,9 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
             py::arg("io_backend") = "thread_pool",
             py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
-            py::arg("io_uring_workers") = kDefaultIoUringWorkers)
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers,
+            py::arg("max_read_range_bytes") = kDefaultMaxReadRangeBytes,
+            py::arg("max_gap_bytes") = kDefaultMaxGapBytes)
         .def_property_readonly("dimension", &PyStorage::dimension)
         .def_property_readonly("count", &PyStorage::count)
         .def_property_readonly("dtype", &PyStorage::dtype)
@@ -997,7 +1373,33 @@ PYBIND11_MODULE(_throwdb, module) {
         .def_property_readonly(
             "format_version", &PyNativeCollectionBuilder::format_version);
 
+    py::class_<PyNativeReaderTrial>(module, "NativeReaderTrial")
+        .def(
+            "get_into",
+            &PyNativeReaderTrial::get_into,
+            py::arg("ids"),
+            py::arg("output"))
+        .def(
+            "get_into_profiled",
+            &PyNativeReaderTrial::get_into_profiled,
+            py::arg("ids"),
+            py::arg("output"))
+        .def("close", &PyNativeReaderTrial::close);
+
     py::class_<PyNativeCollection>(module, "NativeCollection")
+        .def_static(
+            "reader_capabilities",
+            &PyNativeCollection::reader_capabilities,
+            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers)
+        .def_static(
+            "inspect_metadata",
+            &PyNativeCollection::inspect_metadata,
+            py::arg("path"))
+        .def_static(
+            "inspect_orphans",
+            &PyNativeCollection::inspect_orphans,
+            py::arg("path"))
         .def_static(
             "open",
             &PyNativeCollection::open,
@@ -1009,7 +1411,10 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("io_backend") = "thread_pool",
             py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
             py::arg("io_uring_workers") = kDefaultIoUringWorkers,
-            py::arg("verify_native_index") = false)
+            py::arg("verify_native_index") = false,
+            py::arg("max_read_range_bytes") = kDefaultMaxReadRangeBytes,
+            py::arg("max_gap_bytes") = kDefaultMaxGapBytes,
+            py::arg("calibration") = false)
         .def_property_readonly("dimension", &PyNativeCollection::dimension)
         .def_property_readonly("count", &PyNativeCollection::count)
         .def_property_readonly("dtype", &PyNativeCollection::dtype)
@@ -1018,6 +1423,24 @@ PYBIND11_MODULE(_throwdb, module) {
         .def_property_readonly("open_stats", &PyNativeCollection::open_stats)
         .def_property_readonly(
             "mutation_log_stats", &PyNativeCollection::mutation_log_stats)
+        .def("collect_orphans", &PyNativeCollection::collect_orphans)
+        .def(
+            "reader_trial",
+            &PyNativeCollection::reader_trial,
+            py::arg("io_workers") = 0,
+            py::arg("io_queue_capacity") = 0,
+            py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
+            py::arg("io_backend") = "thread_pool",
+            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
+            py::arg("io_uring_workers") = kDefaultIoUringWorkers,
+            py::arg("max_read_range_bytes") = kDefaultMaxReadRangeBytes,
+            py::arg("max_gap_bytes") = kDefaultMaxGapBytes)
+        .def(
+            "sample_ids",
+            &PyNativeCollection::sample_ids,
+            py::arg("requested_count"),
+            py::arg("seed"),
+            py::arg("max_inspected_slots"))
         .def("get", &PyNativeCollection::get, py::arg("ids"))
         .def(
             "get_into",
@@ -1049,5 +1472,13 @@ PYBIND11_MODULE(_throwdb, module) {
         .def(
             "materialize_frozen_wals",
             &PyNativeCollection::materialize_frozen_wals)
+        .def(
+            "compact_delta_runs",
+            &PyNativeCollection::compact_delta_runs,
+            py::arg("max_runs") = kDefaultDeltaCompactionMaxRuns,
+            py::arg("max_input_bytes") =
+                kDefaultDeltaCompactionMaxInputBytes,
+            py::arg("max_input_entries") =
+                kDefaultDeltaCompactionMaxInputEntries)
         .def("close", &PyNativeCollection::close);
 }

@@ -4,23 +4,40 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 
+from ._calibration import CalibrationError
+from ._tuning import TuningRegistryError
 from .collection import Collection, CollectionSchema, _normalize_numeric_ids
 
 
 DEFAULT_SHARD_SIZE_GIB = 16
 DEFAULT_BATCH_ROWS = 32_768
-DEFAULT_IO_RANGES_PER_TASK = 8
+DEFAULT_DELTA_COMPACTION_MAX_RUNS = 8
+MAX_DELTA_COMPACTION_RUNS = 64
+DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB = 8
+DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES = 1_000_000
+DEFAULT_ORPHAN_MIN_AGE_SECONDS = 3_600.0
 MAX_IO_RANGES_PER_TASK = 1 << 20
-DEFAULT_IO_BACKEND = "thread_pool"
-DEFAULT_IO_URING_WORKERS = 1
 MAX_IO_URING_WORKERS = 64
-DEFAULT_IO_URING_QUEUE_DEPTH = 32
 MAX_IO_URING_QUEUE_DEPTH = 4096
+
+_READER_ARGUMENTS = (
+    "max_read_range_bytes",
+    "max_gap_bytes",
+    "io_workers",
+    "io_queue_capacity",
+    "io_ranges_per_task",
+    "io_backend",
+    "io_uring_queue_depth",
+    "io_uring_workers",
+)
 
 
 def _load_ids(path: Path) -> np.ndarray:
@@ -75,6 +92,24 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "value must be finite and greater than zero"
+        )
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "value must be finite and zero or greater"
+        )
+    return parsed
+
+
 def _io_ranges_per_task(value: str) -> int:
     parsed = int(value)
     if parsed < 1 or parsed > MAX_IO_RANGES_PER_TASK:
@@ -98,6 +133,15 @@ def _io_uring_workers(value: str) -> int:
     if parsed < 1 or parsed > MAX_IO_URING_WORKERS:
         raise argparse.ArgumentTypeError(
             f"value must be between 1 and {MAX_IO_URING_WORKERS}"
+        )
+    return parsed
+
+
+def _delta_compaction_runs(value: str) -> int:
+    parsed = int(value)
+    if parsed < 2 or parsed > MAX_DELTA_COMPACTION_RUNS:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 2 and {MAX_DELTA_COMPACTION_RUNS}"
         )
     return parsed
 
@@ -175,6 +219,7 @@ def _inspect(args: argparse.Namespace) -> None:
                     "dimension": collection.dimension,
                     "dtype": collection.dtype,
                     "format_version": collection.format_version,
+                    "tuning": collection.tuning,
                     "open_stats": collection.open_stats,
                     "mutation_log": collection.mutation_log_stats,
                 },
@@ -206,15 +251,255 @@ def _materialize(args: argparse.Namespace) -> None:
         )
 
 
-def _reader_tuning(args: argparse.Namespace) -> dict[str, object]:
-    return {
-        "io_workers": args.io_workers,
-        "io_queue_capacity": args.io_queue_capacity,
-        "io_ranges_per_task": args.io_ranges_per_task,
-        "io_backend": args.io_backend,
-        "io_uring_queue_depth": args.io_uring_queue_depth,
-        "io_uring_workers": args.io_uring_workers,
+def _compact_deltas(args: argparse.Namespace) -> None:
+    with Collection.open(args.storage, mode="r+") as collection:
+        print(
+            json.dumps(
+                collection.compact_deltas(
+                    max_runs=args.max_runs,
+                    max_input_bytes=args.max_input_gib * (1 << 30),
+                    max_input_entries=args.max_input_entries,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+
+
+def _collect_orphans(args: argparse.Namespace) -> None:
+    report = Collection.inspect_orphans(
+        args.storage,
+        min_age_seconds=args.min_age_seconds,
+    )
+    print(
+        json.dumps(
+            report,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    )
+
+
+def _write_json_atomic(path: Path, serialized: str) -> None:
+    """Write an optional calibration report without exposing a partial file."""
+
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(serialized)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def _calibration_report_error(
+    report: object,
+    action: str,
+    error: BaseException,
+) -> CalibrationError:
+    selection = report.get("selection") if isinstance(report, dict) else None
+    persisted = (
+        isinstance(selection, dict) and selection.get("persisted") is True
+    )
+    persistence = (
+        "the winning profile was saved"
+        if persisted
+        else "no winning profile was reported as saved"
+    )
+    return CalibrationError(
+        f"calibration completed and {persistence}, but failed to {action}: "
+        f"{error}"
+    )
+
+
+def _tune(args: argparse.Namespace) -> None:
+    def progress(message: str) -> None:
+        print(f"[throwdb tune] {message}", file=sys.stderr, flush=True)
+
+    try:
+        report = Collection.tune(
+            args.storage,
+            max_seconds=args.max_seconds,
+            max_read_bytes=args.max_read_gib * (1 << 30),
+            max_memory_bytes=args.max_memory_mib * (1 << 20),
+            seed=args.seed,
+            dry_run=args.dry_run,
+            progress=progress,
+        )
+    except CalibrationError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise CalibrationError(str(error)) from error
+
+    try:
+        serialized = json.dumps(
+            report,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise _calibration_report_error(
+            report,
+            "serialize the JSON calibration report",
+            error,
+        ) from error
+
+    if args.output is not None:
+        try:
+            _write_json_atomic(args.output, serialized)
+        except OSError as error:
+            raise _calibration_report_error(
+                report,
+                f"write the JSON calibration report to {args.output}",
+                error,
+            ) from error
+
+    try:
+        print(serialized)
+    except OSError as error:
+        raise _calibration_report_error(
+            report,
+            "write the JSON calibration report to stdout",
+            error,
+        ) from error
+
+
+def _reader_tuning(
+    args: argparse.Namespace,
+) -> str | dict[str, object]:
+    options = {
+        name: value
+        for name in _READER_ARGUMENTS
+        if (value := getattr(args, name, None)) is not None
     }
+    mode = getattr(args, "tuning", "auto")
+    if options:
+        if mode != "auto":
+            raise ValueError(
+                "explicit --io-* or range options cannot be combined with "
+                f"--tuning {mode}"
+            )
+        return options
+    return mode
+
+
+def _tuning_show(args: argparse.Namespace) -> None:
+    print(
+        json.dumps(
+            Collection.tuning_profiles(args.storage),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _tuning_set(args: argparse.Namespace) -> None:
+    options = _reader_tuning(args)
+    if not isinstance(options, dict):
+        raise ValueError("tuning set requires at least one reader option")
+    print(
+        json.dumps(
+            Collection.save_tuning_profile(args.storage, options),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _tuning_remove(args: argparse.Namespace) -> None:
+    print(
+        json.dumps(
+            Collection.remove_tuning_profile(args.storage),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _tuning_reset(args: argparse.Namespace) -> None:
+    print(
+        json.dumps(
+            Collection.reset_tuning_profiles(
+                args.storage,
+                force=args.force,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def _add_reader_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_mode: bool,
+) -> None:
+    if include_mode:
+        parser.add_argument(
+            "--tuning",
+            choices=("auto", "persisted", "conservative"),
+            default="auto",
+            help="select a saved profile, require one, or bypass saved profiles",
+        )
+    parser.add_argument(
+        "--max-read-range-bytes",
+        type=_positive_int,
+        help="maximum merged physical range in bytes (manual default: 1 MiB)",
+    )
+    parser.add_argument(
+        "--max-gap-bytes",
+        type=_nonnegative_int,
+        help="maximum unrequested gap merged into a range, in bytes",
+    )
+    parser.add_argument(
+        "--io-workers",
+        type=_nonnegative_int,
+        help="pread worker count; 0 uses sequential reads",
+    )
+    parser.add_argument(
+        "--io-queue-capacity",
+        type=_nonnegative_int,
+        help="pread task queue bound; 0 uses twice the worker count",
+    )
+    parser.add_argument(
+        "--io-ranges-per-task",
+        type=_io_ranges_per_task,
+        help="maximum physical ranges in one worker task (manual default: 8)",
+    )
+    parser.add_argument(
+        "--io-backend",
+        choices=("thread_pool", "io_uring"),
+        help="physical reader backend (manual default: thread_pool)",
+    )
+    parser.add_argument(
+        "--io-uring-workers",
+        type=_io_uring_workers,
+        help="independent ring count (manual default: 1)",
+    )
+    parser.add_argument(
+        "--io-uring-queue-depth",
+        type=_io_uring_queue_depth,
+        help="total queue depth across all rings (manual default: 32)",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -243,54 +528,12 @@ def _build_parser() -> argparse.ArgumentParser:
     get.add_argument("--ids", type=Path, required=True)
     get.add_argument("--output", type=Path, required=True)
     get.add_argument("--batch-rows", type=_positive_int, default=DEFAULT_BATCH_ROWS)
-    get.add_argument("--io-workers", type=_nonnegative_int, default=0)
-    get.add_argument("--io-queue-capacity", type=_nonnegative_int, default=0)
-    get.add_argument(
-        "--io-ranges-per-task",
-        type=_io_ranges_per_task,
-        default=DEFAULT_IO_RANGES_PER_TASK,
-    )
-    get.add_argument(
-        "--io-backend",
-        choices=("thread_pool", "io_uring"),
-        default=DEFAULT_IO_BACKEND,
-    )
-    get.add_argument(
-        "--io-uring-workers",
-        type=_io_uring_workers,
-        default=DEFAULT_IO_URING_WORKERS,
-    )
-    get.add_argument(
-        "--io-uring-queue-depth",
-        type=_io_uring_queue_depth,
-        default=DEFAULT_IO_URING_QUEUE_DEPTH,
-    )
+    _add_reader_arguments(get, include_mode=True)
     get.set_defaults(handler=_get)
 
     inspect = subparsers.add_parser("inspect", help="print store metadata")
     inspect.add_argument("--storage", type=Path, required=True)
-    inspect.add_argument("--io-workers", type=_nonnegative_int, default=0)
-    inspect.add_argument("--io-queue-capacity", type=_nonnegative_int, default=0)
-    inspect.add_argument(
-        "--io-ranges-per-task",
-        type=_io_ranges_per_task,
-        default=DEFAULT_IO_RANGES_PER_TASK,
-    )
-    inspect.add_argument(
-        "--io-backend",
-        choices=("thread_pool", "io_uring"),
-        default=DEFAULT_IO_BACKEND,
-    )
-    inspect.add_argument(
-        "--io-uring-workers",
-        type=_io_uring_workers,
-        default=DEFAULT_IO_URING_WORKERS,
-    )
-    inspect.add_argument(
-        "--io-uring-queue-depth",
-        type=_io_uring_queue_depth,
-        default=DEFAULT_IO_URING_QUEUE_DEPTH,
-    )
+    _add_reader_arguments(inspect, include_mode=True)
     inspect.add_argument(
         "--verify-index",
         action="store_true",
@@ -311,9 +554,141 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     materialize.add_argument("--storage", type=Path, required=True)
     materialize.set_defaults(handler=_materialize)
+
+    compact_deltas = subparsers.add_parser(
+        "compact-deltas",
+        help="compact a bounded oldest prefix of immutable delta runs",
+    )
+    compact_deltas.add_argument("--storage", type=Path, required=True)
+    compact_deltas.add_argument(
+        "--max-runs",
+        type=_delta_compaction_runs,
+        default=DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+        help="maximum input delta runs (default: 8)",
+    )
+    compact_deltas.add_argument(
+        "--max-input-gib",
+        type=_positive_int,
+        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB,
+        help="maximum total input size in GiB (default: 8)",
+    )
+    compact_deltas.add_argument(
+        "--max-input-entries",
+        type=_positive_int,
+        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+        help="maximum total input version records (default: 1000000)",
+    )
+    compact_deltas.set_defaults(handler=_compact_deltas)
+
+    collect_orphans = subparsers.add_parser(
+        "collect-orphans",
+        help="report orphan mutation files without deleting them",
+    )
+    collect_orphans.add_argument("--storage", type=Path, required=True)
+    collect_orphans.add_argument(
+        "--dry-run",
+        action="store_true",
+        required=True,
+        help="required safety acknowledgement; no files are deleted",
+    )
+    collect_orphans.add_argument(
+        "--min-age-seconds",
+        type=_nonnegative_float,
+        default=DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+        help="minimum candidate age in seconds (default: 3600)",
+    )
+    collect_orphans.set_defaults(handler=_collect_orphans)
+
+    tune = subparsers.add_parser(
+        "tune",
+        help="benchmark a bounded reader matrix and save the winning profile",
+    )
+    tune.add_argument("--storage", type=Path, required=True)
+    tune.add_argument(
+        "--max-seconds",
+        type=_positive_float,
+        default=300.0,
+        help="cooperative wall-clock budget (default: 300)",
+    )
+    tune.add_argument(
+        "--max-read-gib",
+        type=_positive_int,
+        default=8,
+        help="hard planned physical-read budget in GiB (default: 8)",
+    )
+    tune.add_argument(
+        "--max-memory-mib",
+        type=_positive_int,
+        default=512,
+        help="additional query/output memory budget in MiB (default: 512)",
+    )
+    tune.add_argument(
+        "--seed",
+        type=_nonnegative_int,
+        default=20_260_713,
+        help="deterministic workload seed",
+    )
+    tune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="select a winner without changing tuning metadata",
+    )
+    tune.add_argument(
+        "--output",
+        type=Path,
+        help="also save the complete JSON report atomically",
+    )
+    tune.set_defaults(handler=_tune)
+
+    tuning = subparsers.add_parser(
+        "tuning",
+        help="inspect or manage persisted reader profiles",
+    )
+    tuning_commands = tuning.add_subparsers(
+        dest="tuning_command",
+        required=True,
+    )
+
+    tuning_show = tuning_commands.add_parser(
+        "show",
+        help="show saved profiles and the current target match",
+    )
+    tuning_show.add_argument("--storage", type=Path, required=True)
+    tuning_show.set_defaults(handler=_tuning_show)
+
+    tuning_set = tuning_commands.add_parser(
+        "set",
+        help="save explicit reader options for the current storage target",
+    )
+    tuning_set.add_argument("--storage", type=Path, required=True)
+    _add_reader_arguments(tuning_set, include_mode=False)
+    tuning_set.set_defaults(handler=_tuning_set)
+
+    tuning_remove = tuning_commands.add_parser(
+        "remove",
+        help="remove the current storage target's saved profile",
+    )
+    tuning_remove.add_argument("--storage", type=Path, required=True)
+    tuning_remove.set_defaults(handler=_tuning_remove)
+
+    tuning_reset = tuning_commands.add_parser(
+        "reset",
+        help="remove all profiles; --force also recovers corrupt metadata",
+    )
+    tuning_reset.add_argument("--storage", type=Path, required=True)
+    tuning_reset.add_argument(
+        "--force",
+        action="store_true",
+        help="replace corrupt or unsupported tuning metadata",
+    )
+    tuning_reset.set_defaults(handler=_tuning_reset)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = _build_parser().parse_args(argv)
-    args.handler(args)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.handler(args)
+    except (CalibrationError, TuningRegistryError, TypeError, ValueError) as error:
+        parser.error(str(error))
