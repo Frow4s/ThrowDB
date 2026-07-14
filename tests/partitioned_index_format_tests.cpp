@@ -296,6 +296,8 @@ void test_run_header_records_and_retirement_contract() {
     header.collection_id = uuid(1);
     header.schema_id = uuid(2);
     header.descriptor = run_descriptor();
+    header.descriptor.covered_partitions.clear();
+    header.descriptor.active_partitions.clear();
     header.partition_bits = 2;
     header.hash_seed = 0x123456789abcdef0ULL;
     header.toc_size = 64;
@@ -335,6 +337,8 @@ void test_run_header_records_and_retirement_contract() {
         "run record invalid RowRef had wrong decode error semantics");
 
     PartitionIndexRunDescriptor cleaner = run_descriptor();
+    cleaner.covered_partitions.clear();
+    cleaner.active_partitions.clear();
     cleaner.kind = PartitionedRunKind::Cleaner;
     cleaner.retired_row_ref_segment_id = 1;
     cleaner.retired_segment_id = uuid(10);
@@ -439,6 +443,83 @@ void test_catalog_rejects_resource_aliases_and_lineage_gaps() {
         "catalog active bitmap escaped immutable run coverage");
 }
 
+void test_current_v1_round_trip_and_strict_identity() {
+    const PartitionedManifestV2 expected_manifest = manifest();
+    PartitionedCurrentV1 expected;
+    expected.collection_id = expected_manifest.collection_id;
+    expected.schema_id = expected_manifest.schema_id;
+    expected.generation = 1;
+    expected.catalog_id = uuid(500);
+    expected.catalog_file_size = 8192;
+    expected.catalog_crc32c = 0x12345678U;
+    const auto encoded =
+        encode_partitioned_current_v1(expected_manifest, expected);
+    require_equal(
+        decode_partitioned_current_v1(encoded, expected_manifest), expected,
+        "partitioned CURRENT did not round trip");
+
+    auto checksum_damage = encoded;
+    checksum_damage.back() ^= std::byte{1};
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(decode_partitioned_current_v1(
+                checksum_damage, expected_manifest));
+        },
+        "partitioned CURRENT checksum damage was accepted");
+
+    auto reserved = encoded;
+    reserved[300] = std::byte{1};
+    refresh_checksum(reserved);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(decode_partitioned_current_v1(
+                reserved, expected_manifest));
+        },
+        "partitioned CURRENT reserved bytes were accepted");
+
+    PartitionedCurrentV1 invalid = expected;
+    invalid.collection_id = uuid(999);
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                encode_partitioned_current_v1(expected_manifest, invalid));
+        },
+        "partitioned CURRENT accepted a foreign collection identity");
+    invalid = expected;
+    invalid.generation = 0;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                encode_partitioned_current_v1(expected_manifest, invalid));
+        },
+        "partitioned CURRENT accepted generation zero");
+    invalid = expected;
+    invalid.catalog_file_size = kPartitionedMaximumCatalogFileSize + 1;
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                encode_partitioned_current_v1(expected_manifest, invalid));
+        },
+        "partitioned CURRENT accepted an unbounded catalog allocation");
+    auto huge_catalog = encoded;
+    put_u64(
+        huge_catalog, 80, kPartitionedMaximumCatalogFileSize + 1);
+    refresh_checksum(huge_catalog);
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(decode_partitioned_current_v1(
+                huge_catalog, expected_manifest));
+        },
+        "partitioned CURRENT decoded an unbounded catalog allocation");
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(decode_partitioned_current_v1(
+                std::span<const std::byte>(encoded).first(100),
+                expected_manifest));
+        },
+        "partitioned CURRENT accepted a truncated file");
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -447,7 +528,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 7> tests{{
+    const std::array<TestCase, 8> tests{{
         {"manifest_v2_round_trip_and_feature_rejection",
          test_manifest_v2_round_trip_and_feature_rejection},
         {"segment_headers_round_trip_and_strict_geometry",
@@ -461,6 +542,8 @@ int main() {
          test_catalog_rejects_corruption_reserved_fields_and_bounds},
         {"catalog_rejects_resource_aliases_and_lineage_gaps",
          test_catalog_rejects_resource_aliases_and_lineage_gaps},
+        {"current_v1_round_trip_and_strict_identity",
+         test_current_v1_round_trip_and_strict_identity},
     }};
 
     std::size_t failures = 0;

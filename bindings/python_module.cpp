@@ -737,18 +737,23 @@ public:
         const py::object& path,
         const std::uint32_t dimension,
         const std::uint64_t shard_size_bytes,
-        const std::string& dtype) {
+        const std::string& dtype,
+        const std::uint32_t format_version) {
         if (dimension == 0) {
             throw py::value_error("dimension must be greater than zero");
         }
         if (shard_size_bytes == 0) {
             throw py::value_error("shard_size_bytes must be greater than zero");
         }
+        if (format_version != 6 && format_version != 7) {
+            throw py::value_error("format_version must be 6 or 7");
+        }
 
         throwdb::NativeBuilderOptions options;
         options.dimension = dimension;
         options.dtype = checked_dtype(dtype);
         options.segment_size_bytes = shard_size_bytes;
+        options.format_version = format_version;
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::NativeCollectionBuilder> builder;
         {
@@ -1483,7 +1488,8 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("path"),
             py::arg("dimension") = 1024,
             py::arg("shard_size_bytes") = kDefaultShardSizeBytes,
-            py::arg("dtype") = "float16")
+            py::arg("dtype") = "float16",
+            py::arg("format_version") = 6)
         .def(
             "add",
             &PyNativeCollectionBuilder::add,

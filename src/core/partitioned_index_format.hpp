@@ -33,6 +33,11 @@ inline constexpr std::uint64_t kPartitionedSupportedRequiredFeatureBits =
 inline constexpr std::uint32_t kPartitionedMaximumPartitionBits = 16;
 inline constexpr std::uint64_t kPartitionedMaximumResourceEntries = 1'000'000;
 inline constexpr std::uint64_t kPartitionedMaximumRuns = 4096;
+// Covers the worst supported v3 catalog geometry (segments, snapshots, runs,
+// WALs, and two run bitmaps) with headroom, while preventing corrupt CURRENT
+// metadata from driving an unbounded allocation before catalog validation.
+inline constexpr std::uint64_t kPartitionedMaximumCatalogFileSize =
+    512ULL << 20;
 inline constexpr std::uint64_t kPartitionedSegmentIdEntrySize = 16;
 inline constexpr std::uint64_t kPartitionSnapshotLookupSlotSize = 16;
 inline constexpr std::uint64_t kPartitionSnapshotSequenceSlotSize = 8;
@@ -147,6 +152,17 @@ struct PartitionedCatalogV3 {
     std::vector<MutationWalEntry> wal_entries;
 
     bool operator==(const PartitionedCatalogV3&) const = default;
+};
+
+struct PartitionedCurrentV1 {
+    Uuid128 collection_id;
+    Uuid128 schema_id;
+    std::uint64_t generation{0};
+    Uuid128 catalog_id;
+    std::uint64_t catalog_file_size{0};
+    std::uint32_t catalog_crc32c{0};
+
+    bool operator==(const PartitionedCurrentV1&) const = default;
 };
 
 struct PartitionedSegmentDataHeaderV1 {
@@ -264,5 +280,13 @@ encode_partition_run_record(const PartitionRunRecord& record);
     const PartitionedCatalogV3& catalog);
 [[nodiscard]] PartitionedCatalogV3 decode_partitioned_catalog_v3(
     std::span<const std::byte> bytes);
+
+[[nodiscard]] std::array<std::byte, kPartitionedHeaderSize>
+encode_partitioned_current_v1(
+    const PartitionedManifestV2& manifest,
+    const PartitionedCurrentV1& current);
+[[nodiscard]] PartitionedCurrentV1 decode_partitioned_current_v1(
+    std::span<const std::byte> bytes,
+    const PartitionedManifestV2& manifest);
 
 }  // namespace throwdb::detail

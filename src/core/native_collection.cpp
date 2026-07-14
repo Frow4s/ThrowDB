@@ -11,6 +11,8 @@
 #include "mutation_wal.hpp"
 #include "native_format.hpp"
 #include "native_collection_test_hooks.hpp"
+#include "partitioned_index_format.hpp"
+#include "partitioned_index_storage.hpp"
 #include "physical_reader.hpp"
 #include "wal_file.hpp"
 
@@ -368,12 +370,24 @@ public:
               records_per_segment_, record_size_, "segment payload capacity")),
           collection_id_(make_uuid()),
           schema_id_(make_uuid()),
-          wal_id_(make_uuid()),
-          writer_lock_(create_native_store_directories(path_)) {}
+          wal_id_(make_uuid()) {
+        if (options_.format_version
+            == detail::kPartitionedPublicFormatVersion) {
+            partitioned_builder_ =
+                std::make_unique<detail::PartitionedIndexBuilder>(
+                    path_, options_);
+        } else {
+            writer_lock_ = create_native_store_directories(path_);
+        }
+    }
 
     void append(
         const std::span<const std::uint64_t> ids,
         const std::span<const std::byte> embeddings) {
+        if (partitioned_builder_ != nullptr) {
+            partitioned_builder_->append(ids, embeddings);
+            return;
+        }
         ensure_building();
         validate_embedding_batch(ids, embeddings, record_size_);
         if (ids.empty()) {
@@ -421,6 +435,10 @@ public:
     }
 
     void finish() {
+        if (partitioned_builder_ != nullptr) {
+            partitioned_builder_->finish();
+            return;
+        }
         ensure_owner_process();
         if (finished_) {
             return;
@@ -477,36 +495,61 @@ public:
     }
 
     [[nodiscard]] std::uint64_t count() const {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->count();
+        }
         ensure_owner_process();
         return count_;
     }
     [[nodiscard]] std::uint32_t dimension() const {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->dimension();
+        }
         ensure_owner_process();
         return options_.dimension;
     }
     [[nodiscard]] DType dtype() const {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->dtype();
+        }
         ensure_owner_process();
         return options_.dtype;
     }
     [[nodiscard]] std::uint32_t format_version() const {
+        if (partitioned_builder_ != nullptr) {
+            return detail::kPartitionedPublicFormatVersion;
+        }
         ensure_owner_process();
         return kDeltaPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->record_size();
+        }
         ensure_owner_process();
         return record_size_;
     }
     [[nodiscard]] bool finished() const {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->finished();
+        }
         ensure_owner_process();
         return finished_;
     }
 
     [[nodiscard]] bool owned_by_current_process() const noexcept {
+        if (partitioned_builder_ != nullptr) {
+            return partitioned_builder_->owned_by_current_process();
+        }
         return owner_pid_ == ::getpid();
     }
 
     void abandon_after_fork() noexcept {
         if (owned_by_current_process()) {
+            return;
+        }
+        if (partitioned_builder_ != nullptr) {
+            partitioned_builder_->abandon_after_fork();
             return;
         }
         active_data_fd_.reset();
@@ -614,6 +657,7 @@ private:
     detail::Uuid128 schema_id_;
     detail::Uuid128 wal_id_;
     detail::AdvisoryLockFile writer_lock_;
+    std::unique_ptr<detail::PartitionedIndexBuilder> partitioned_builder_;
 
     detail::FileDescriptor active_data_fd_;
     detail::FileDescriptor active_ids_fd_;
@@ -651,6 +695,8 @@ private:
 
 class NativeCollection::Impl {
 public:
+    struct PartitionedTag {};
+
     Impl(
         std::filesystem::path path,
         const ReaderOptions& reader_options,
@@ -730,6 +776,20 @@ public:
         open_stats_.total_seconds = elapsed_seconds(open_started);
     }
 
+    Impl(
+        std::filesystem::path path,
+        const ReaderOptions& reader_options,
+        const bool writable,
+        const bool calibration,
+        PartitionedTag)
+        : path_(std::move(path)),
+          physical_reader_(reader_options),
+          partitioned_reader_(
+              std::make_unique<detail::PartitionedIndexReader>(
+                  path_, reader_options, writable, calibration)) {
+        open_stats_ = partitioned_reader_->open_stats();
+    }
+
     ~Impl() {
         if (owned_by_current_process() && writer_lock_.locked()) {
             try {
@@ -743,12 +803,20 @@ public:
     void get_into(
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
+        if (partitioned_reader_ != nullptr) {
+            partitioned_reader_->get_into(physical_reader_, ids, output);
+            return;
+        }
         get_into_impl<false>(physical_reader_, ids, output, nullptr);
     }
 
     [[nodiscard]] NativeReadStats get_into_profiled(
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->get_into_profiled(
+                physical_reader_, ids, output);
+        }
         NativeReadStats stats;
         get_into_impl<true>(physical_reader_, ids, output, &stats);
         return stats;
@@ -757,7 +825,7 @@ public:
     void validate_reader_trial_options(
         const ReaderOptions& reader_options) const {
         ensure_healthy();
-        if (reader_options.max_read_range_bytes < manifest_.record_size) {
+        if (reader_options.max_read_range_bytes < record_size()) {
             throw InvalidArgumentError(
                 "max_read_range_bytes must fit at least one record");
         }
@@ -767,6 +835,10 @@ public:
         const detail::PhysicalReader& physical_reader,
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
+        if (partitioned_reader_ != nullptr) {
+            partitioned_reader_->get_into(physical_reader, ids, output);
+            return;
+        }
         get_into_impl<false>(physical_reader, ids, output, nullptr);
     }
 
@@ -774,6 +846,10 @@ public:
         const detail::PhysicalReader& physical_reader,
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->get_into_profiled(
+                physical_reader, ids, output);
+        }
         NativeReadStats stats;
         get_into_impl<true>(physical_reader, ids, output, &stats);
         return stats;
@@ -783,6 +859,10 @@ public:
         const std::uint64_t requested,
         const std::uint64_t seed,
         const std::uint64_t max_inspected_slots) const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->sample_ids(
+                requested, seed, max_inspected_slots);
+        }
         ensure_healthy();
         NativeIdSample sample;
         if (requested == 0) {
@@ -834,7 +914,7 @@ public:
         const std::span<const std::uint64_t> ids) const {
         ensure_owner_process();
         const std::uint64_t bytes = detail::checked_multiply(
-            ids.size(), manifest_.record_size, "get output");
+            ids.size(), record_size(), "get output");
         if (bytes > std::numeric_limits<std::size_t>::max()) {
             throw InvalidArgumentError("get output does not fit address space");
         }
@@ -847,6 +927,17 @@ public:
         const PutMode mode,
         const std::span<const std::uint64_t> ids,
         const std::span<const std::byte> embeddings) {
+        if (partitioned_reader_ != nullptr) {
+            detail::PartitionedPutMode partitioned_mode =
+                detail::PartitionedPutMode::Upsert;
+            if (mode == PutMode::Insert) {
+                partitioned_mode = detail::PartitionedPutMode::Insert;
+            } else if (mode == PutMode::Update) {
+                partitioned_mode = detail::PartitionedPutMode::Update;
+            }
+            partitioned_reader_->put(partitioned_mode, ids, embeddings);
+            return;
+        }
         ensure_mutable();
         validate_embedding_batch(ids, embeddings, manifest_.record_size);
         validate_distinct_ids(ids);
@@ -908,6 +999,9 @@ public:
 
     [[nodiscard]] std::vector<std::uint8_t> erase(
         const std::span<const std::uint64_t> ids) {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->erase(ids);
+        }
         ensure_mutable();
         validate_distinct_ids(ids);
         std::vector<std::uint8_t> deleted(ids.size(), 0);
@@ -947,6 +1041,9 @@ public:
     }
 
     [[nodiscard]] NativeMutationLogStats mutation_log_stats() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->mutation_log_stats();
+        }
         ensure_healthy();
         std::lock_guard mutation(mutation_mutex_);
         ensure_healthy();
@@ -954,6 +1051,10 @@ public:
     }
 
     [[nodiscard]] NativeOrphanInventory collect_orphans() {
+        if (partitioned_reader_ != nullptr) {
+            throw InvalidArgumentError(
+                "orphan collection is not implemented for format-7 yet");
+        }
         // A writable handle owns writer.lock for its complete lifetime. The
         // remaining lock order matches lifecycle publishers and yields one
         // authoritative CURRENT plus a filesystem scan in the same stable
@@ -981,6 +1082,10 @@ public:
 
     [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
         NativeOrphanCollectionOptions options) {
+        if (partitioned_reader_ != nullptr) {
+            throw InvalidArgumentError(
+                "orphan collection is not implemented for format-7 yet");
+        }
         ensure_mutable();
         std::unique_lock lifecycle(materialization_mutex_);
         std::lock_guard mutation(mutation_mutex_);
@@ -1012,6 +1117,9 @@ public:
     }
 
     [[nodiscard]] NativeMutationLogStats rotate_wal() {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->rotate_wal();
+        }
         ensure_mutable();
         std::lock_guard mutation(mutation_mutex_);
         ensure_healthy();
@@ -1026,6 +1134,10 @@ public:
     [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
         const std::uint64_t max_wals,
         const std::uint64_t max_input_bytes) {
+        if (partitioned_reader_ != nullptr) {
+            throw InvalidArgumentError(
+                "WAL materialization is not implemented for format-7 yet");
+        }
         ensure_mutable();
         if (max_wals == 0 || max_input_bytes == 0) {
             throw InvalidArgumentError(
@@ -1404,6 +1516,10 @@ public:
         const std::uint64_t max_runs,
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
+        if (partitioned_reader_ != nullptr) {
+            throw InvalidArgumentError(
+                "index-run compaction is not implemented for format-7 yet");
+        }
         ensure_mutable();
         if (max_runs < 2) {
             throw InvalidArgumentError(
@@ -1874,18 +1990,30 @@ public:
     }
 
     [[nodiscard]] std::uint64_t count() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->count();
+        }
         ensure_owner_process();
         return live_count_.load(std::memory_order_acquire);
     }
     [[nodiscard]] std::uint32_t dimension() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->dimension();
+        }
         ensure_owner_process();
         return manifest_.schema.dimension;
     }
     [[nodiscard]] DType dtype() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->dtype();
+        }
         ensure_owner_process();
         return public_dtype(manifest_.schema.dtype);
     }
     [[nodiscard]] std::uint32_t format_version() const {
+        if (partitioned_reader_ != nullptr) {
+            return detail::kPartitionedPublicFormatVersion;
+        }
         ensure_owner_process();
         if (delta_managed_) {
             return kDeltaPublicNativeFormatVersion;
@@ -1898,12 +2026,17 @@ public:
                    : kLegacyPublicNativeFormatVersion;
     }
     [[nodiscard]] std::uint64_t record_size() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->record_size();
+        }
         ensure_owner_process();
         return manifest_.record_size;
     }
     [[nodiscard]] bool writable() const {
         ensure_owner_process();
-        return writable_;
+        return partitioned_reader_ != nullptr
+                   ? partitioned_reader_->writable()
+                   : writable_;
     }
     [[nodiscard]] NativeOpenStats open_stats() const {
         ensure_owner_process();
@@ -1916,6 +2049,11 @@ public:
 
     void abandon_after_fork() noexcept {
         if (owned_by_current_process()) {
+            return;
+        }
+        if (partitioned_reader_ != nullptr) {
+            partitioned_reader_->abandon_after_fork();
+            physical_reader_.abandon_after_fork();
             return;
         }
         // Close every inherited descriptor reference without explicitly
@@ -2696,6 +2834,7 @@ private:
     detail::NativeManifest manifest_;
     detail::IndexData index_;
     detail::PhysicalReader physical_reader_;
+    std::unique_ptr<detail::PartitionedIndexReader> partitioned_reader_;
     detail::AdvisoryLockFile writer_lock_;
     detail::AdvisoryLockFile commit_lock_;
     bool writable_{false};
@@ -2730,6 +2869,17 @@ std::unique_ptr<NativeCollectionBuilder> NativeCollectionBuilder::create(
     }
     if (options.dimension == 0) {
         throw InvalidArgumentError("dimension must be greater than zero");
+    }
+    if (options.format_version != kDeltaPublicNativeFormatVersion
+        && options.format_version
+               != detail::kPartitionedPublicFormatVersion) {
+        throw InvalidArgumentError("format_version must be 6 or 7");
+    }
+    if (options.format_version == detail::kPartitionedPublicFormatVersion
+        && options.partition_bits
+               > detail::kPartitionedMaximumPartitionBits) {
+        throw InvalidArgumentError(
+            "format-7 partition_bits must be between 0 and 16");
     }
     const detail::DTypeCode code = dtype_code(options.dtype);
     const std::uint64_t record_size = detail::checked_multiply(
@@ -2846,6 +2996,10 @@ NativeCollectionMetadata NativeCollection::inspect_metadata(
     if (std::endian::native != std::endian::little) {
         throw InvalidArgumentError(
             "native collection access requires a little-endian host");
+    }
+
+    if (detail::is_partitioned_index_store(path)) {
+        return detail::inspect_partitioned_index_metadata(path);
     }
 
     const detail::NativeManifest manifest =
@@ -2968,6 +3122,12 @@ std::unique_ptr<NativeCollection> NativeCollection::open(
     if (std::endian::native != std::endian::little) {
         throw InvalidArgumentError(
             "native collection access requires a little-endian host");
+    }
+    if (detail::is_partitioned_index_store(path)) {
+        return std::unique_ptr<NativeCollection>(new NativeCollection(
+            std::make_unique<Impl>(
+                path, reader_options, writable, calibration,
+                Impl::PartitionedTag{})));
     }
     return std::unique_ptr<NativeCollection>(new NativeCollection(
         std::make_unique<Impl>(

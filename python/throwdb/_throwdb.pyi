@@ -102,6 +102,7 @@ class NativeCollectionBuilder:
         dimension: int = 1024,
         shard_size_bytes: int = 17_179_869_184,
         dtype: _DTypeName = "float16",
+        format_version: int = 6,
     ) -> NativeCollectionBuilder: ...
 
     @property

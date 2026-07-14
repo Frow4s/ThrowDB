@@ -29,7 +29,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 _FINGERPRINT_ALGORITHM = "sha256-length-framed-v1"
 _MEDIA_SCHEMA_VERSION = 2
 _RUNTIME_SCHEMA_VERSION = 2
-_DEFAULT_READER_ABI = "throwdb-reader-v1"
+_DEFAULT_READER_ABI = "throwdb-reader-v2"
 _MINIMUM_SALT_BYTES = 16
 _DEFAULT_DISCOVERY_ENTRY_LIMIT = 4096
 

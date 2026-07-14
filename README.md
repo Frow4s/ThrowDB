@@ -105,8 +105,10 @@ fresh locked scan, applies hard file/byte budgets, revalidates every pathname
 without following symlinks, unlinks it, and syncs each affected directory.
 Superseded catalogs remain retained by policy.
 
-`Collection.create()` now builds the checksummed native numeric format reported
-as `collection.format_version == 6`. Version 6 adds the required `DeltaV1`
+`Collection.create()` builds the checksummed native numeric format reported as
+`collection.format_version == 6` by default. Format 7 creation is an explicit
+opt-in through `Collection.create(..., format_version=7)`; the public boundary
+accepts only versions 6 and 7. Version 6 adds the required `DeltaV1`
 feature to the version-5 checksummed `CURRENT`, immutable catalogs, and
 UUID-named active/frozen WAL chain. It can replace a frozen WAL prefix with an
 immutable mutation-delta data/index pair. The reader also opens format 5 and

@@ -896,7 +896,7 @@ def test_runtime_digest_tracks_capacity_capability_abi_and_architecture() -> Non
     abi_changed = probe_collection_storage(
         "/collection",
         collection_salt=SALT,
-        reader_abi="throwdb-reader-v2",
+        reader_abi="throwdb-reader-v3",
         io_uring_policy=io_uring_policy(available=True),
         source=first_source,
     )

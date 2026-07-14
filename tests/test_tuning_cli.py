@@ -7,6 +7,22 @@ from pathlib import Path
 import pytest
 
 from throwdb.cli import _build_parser, _reader_tuning, main
+
+
+def test_create_cli_defaults_to_format6_and_accepts_format7_opt_in() -> None:
+    parser = _build_parser()
+    required = [
+        "--storage", "/tmp/store", "--ids", "/tmp/ids.npy",
+        "--embeddings", "/tmp/embeddings.npy",
+    ]
+    assert parser.parse_args(["create", *required]).format_version == 6
+    assert parser.parse_args(
+        ["create", *required, "--format-version", "7"]
+    ).format_version == 7
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["create", *required, "--format-version", "5"]
+        )
 from throwdb.collection import Collection
 
 

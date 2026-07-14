@@ -76,7 +76,7 @@ _ORPHAN_INVENTORY_CLASSES: Final = frozenset(
     _ORPHAN_INVENTORY_CLASS_NAMES
 )
 
-_READER_POLICY_ABI: Final = "throwdb-reader-v1"
+_READER_POLICY_ABI: Final = "throwdb-reader-v2"
 
 
 OrphanClassification: TypeAlias = Literal[
@@ -413,6 +413,18 @@ def _validate_shard_size_bytes(value: object) -> int:
             "shard_size_bytes must be between 1 and 2**64-1"
         )
     return size
+
+
+def _validate_format_version(value: object) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("format_version must be an integer, not bool")
+    try:
+        version = operator.index(value)
+    except TypeError as error:
+        raise TypeError("format_version must be an integer") from error
+    if version not in {6, 7}:
+        raise ValueError("format_version must be 6 or 7")
+    return version
 
 
 def _validate_delta_compaction_limit(
@@ -1208,6 +1220,7 @@ class Collection:
         *,
         schema: CollectionSchema | None = None,
         shard_size_bytes: int = _DEFAULT_SHARD_SIZE_BYTES,
+        format_version: int = 6,
     ) -> Collection:
         if schema is None:
             schema = CollectionSchema()
@@ -1218,11 +1231,13 @@ class Collection:
                 "utf8 IDs are not implemented by the numeric collection format"
             )
         validated_shard_size = _validate_shard_size_bytes(shard_size_bytes)
+        validated_format_version = _validate_format_version(format_version)
         builder = NativeCollectionBuilder.create(
             path,
             dimension=schema.dimension,
             shard_size_bytes=validated_shard_size,
             dtype=schema.dtype,
+            format_version=validated_format_version,
         )
         return cls(schema=schema, builder=builder)
 

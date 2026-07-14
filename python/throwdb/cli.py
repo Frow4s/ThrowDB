@@ -179,6 +179,7 @@ def _create(args: argparse.Namespace) -> None:
         args.storage,
         schema=schema,
         shard_size_bytes=shard_size_bytes,
+        format_version=args.format_version,
     ) as collection:
         for begin in range(0, ids.shape[0], args.batch_rows):
             end = min(begin + args.batch_rows, ids.shape[0])
@@ -552,6 +553,13 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--ids", type=Path, required=True)
     create.add_argument("--embeddings", type=Path, required=True)
     create.add_argument("--dimension", type=_positive_int)
+    create.add_argument(
+        "--format-version",
+        type=int,
+        choices=(6, 7),
+        default=6,
+        help="on-disk collection format (default: 6; 7 is explicit opt-in)",
+    )
     create.add_argument(
         "--shard-size-gib", type=_positive_int, default=DEFAULT_SHARD_SIZE_GIB
     )

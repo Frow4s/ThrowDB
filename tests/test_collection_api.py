@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import throwdb
+import throwdb.collection as collection_module
 from throwdb.collection import _normalize_numeric_ids
 
 
@@ -270,6 +271,84 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     result = collection.get_into(query, output)
     assert result is None
     _assert_same_bits(output, vectors[order])
+
+
+def test_collection_create_forwards_default_and_opt_in_format_versions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    class FakeBuilder:
+        count = 0
+
+        def __init__(self, format_version: int) -> None:
+            self.format_version = format_version
+
+        def abort(self) -> None:
+            pass
+
+    class FakeNativeCollectionBuilder:
+        @staticmethod
+        def create(_path: object, **options: object) -> FakeBuilder:
+            version = options["format_version"]
+            assert isinstance(version, int)
+            calls.append(version)
+            return FakeBuilder(version)
+
+    monkeypatch.setattr(
+        collection_module,
+        "NativeCollectionBuilder",
+        FakeNativeCollectionBuilder,
+    )
+
+    stable = throwdb.Collection.create(tmp_path / "stable")
+    opt_in = throwdb.Collection.create(
+        tmp_path / "partitioned",
+        format_version=7,
+    )
+
+    assert calls == [6, 7]
+    assert stable.format_version == 6
+    assert opt_in.format_version == 7
+    stable.abort()
+    opt_in.abort()
+
+
+@pytest.mark.parametrize(
+    ("format_version", "error", "message"),
+    [
+        (True, TypeError, "not bool"),
+        (np.bool_(False), TypeError, "not bool"),
+        (6.0, TypeError, "must be an integer"),
+        ("7", TypeError, "must be an integer"),
+        (5, ValueError, "must be 6 or 7"),
+        (8, ValueError, "must be 6 or 7"),
+    ],
+)
+def test_collection_create_rejects_invalid_format_versions_before_native_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_version: object,
+    error: type[Exception],
+    message: str,
+) -> None:
+    class UnexpectedNativeCollectionBuilder:
+        @staticmethod
+        def create(_path: object, **_options: object) -> None:
+            raise AssertionError("native create must not run")
+
+    monkeypatch.setattr(
+        collection_module,
+        "NativeCollectionBuilder",
+        UnexpectedNativeCollectionBuilder,
+    )
+
+    with pytest.raises(error, match=message):
+        throwdb.Collection.create(
+            tmp_path / "invalid-format",
+            format_version=format_version,  # type: ignore[arg-type]
+        )
 
 
 def test_add_normalizes_layout_but_never_silently_casts_embedding_dtype(

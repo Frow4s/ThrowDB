@@ -1,8 +1,6 @@
 #include "physical_reader.hpp"
 
 #include "internal.hpp"
-#include "io_uring_engine.hpp"
-#include "io_uring_pool.hpp"
 #include "read_scheduler.hpp"
 #include "task_partition.hpp"
 
@@ -616,14 +614,16 @@ public:
         validate_reader_options(options_);
         try {
             if (options_.io_backend == IoBackend::IoUring) {
-                if (options_.io_uring_workers == 1) {
-                    io_uring_ = std::make_unique<IoUringEngine>(
-                        options_.io_uring_queue_depth);
-                } else {
-                    io_uring_pool_ = std::make_unique<IoUringPool>(
-                        options_.io_uring_workers,
-                        options_.io_uring_queue_depth);
+                IoUringLaneFactory lane_factory;
+                if (test_hooks != nullptr) {
+                    lane_factory = test_hooks->io_uring_lane_factory;
                 }
+                io_uring_coordinator_ =
+                    std::make_unique<IoUringReadCoordinator>(
+                        options_.io_uring_workers,
+                        options_.io_uring_queue_depth,
+                        options_.max_read_range_bytes,
+                        std::move(lane_factory));
             } else if (options_.io_workers != 0) {
                 thread_pool_coordinator_ =
                     std::make_unique<ThreadPoolReadCoordinator>(
@@ -774,12 +774,20 @@ private:
 
         if constexpr (Profiled) {
             std::size_t task_count = 0;
-            if (ranges.size() == 1) {
-                task_count = 1;
-            } else if (io_uring_pool_ != nullptr) {
-                task_count = std::min<std::size_t>(
-                    io_uring_pool_->worker_count(), ranges.size());
-            } else if (io_uring_ != nullptr) {
+            if (io_uring_coordinator_ != nullptr) {
+                const std::size_t max_ranges_per_task =
+                    options_.io_uring_queue_depth
+                        / options_.io_uring_workers
+                    + (options_.io_uring_queue_depth
+                           % options_.io_uring_workers
+                       != 0
+                       ? 1
+                       : 0);
+                task_count = plan_range_tasks(
+                    ranges.size(),
+                    options_.io_uring_workers,
+                    max_ranges_per_task).task_count;
+            } else if (ranges.size() == 1) {
                 task_count = 1;
             } else if (thread_pool_coordinator_ == nullptr) {
                 task_count = ranges.size();
@@ -824,13 +832,13 @@ private:
             finish_backend();
             return;
         }
-        if (ranges.size() == 1) {
-            read_range(requests, ranges.front(), record_size, output);
+        if (io_uring_coordinator_ != nullptr) {
+            read_ranges_io_uring(requests, ranges, record_size, output);
             finish_backend();
             return;
         }
-        if (io_uring_ != nullptr || io_uring_pool_ != nullptr) {
-            read_ranges_io_uring(requests, ranges, record_size, output);
+        if (ranges.size() == 1) {
+            read_range(requests, ranges.front(), record_size, output);
             finish_backend();
             return;
         }
@@ -947,77 +955,125 @@ private:
         const std::vector<PlannedRange>& ranges,
         const std::uint64_t record_size,
         const std::span<std::byte> output) const {
-        struct PreparedRange {
-            std::vector<std::byte> buffer;
-        };
-
-        std::vector<PreparedRange> prepared(ranges.size());
-        std::vector<IoUringReadOperation> operations;
-        operations.reserve(ranges.size());
-        for (std::size_t range_index = 0; range_index != ranges.size();
-             ++range_index) {
-            const PlannedRange& range = ranges[range_index];
-            void* destination = nullptr;
-            std::size_t size = 0;
-            std::uint64_t offset = range.first_offset;
-            if (range.request_end == range.request_begin + 1) {
-                const Request& request = requests[range.request_begin];
-                const std::uint64_t destination_offset =
-                    request.output_index * record_size;
-                destination = output.data()
-                              + static_cast<std::size_t>(destination_offset);
-                size = static_cast<std::size_t>(record_size);
-                offset = request.absolute_offset;
-            } else {
+        const std::size_t max_ranges_per_task =
+            options_.io_uring_queue_depth / options_.io_uring_workers
+            + (options_.io_uring_queue_depth % options_.io_uring_workers != 0
+                   ? 1
+                   : 0);
+        const RangeTaskPartition partition = plan_range_tasks(
+            ranges.size(),
+            options_.io_uring_workers,
+            max_ranges_per_task);
+        std::vector<ReadWorkUnit> work;
+        work.reserve(partition.task_count);
+        for (std::size_t task_index = 0;
+             task_index != partition.task_count; ++task_index) {
+            const RangeTaskBounds bounds = partition.bounds(task_index);
+            std::uint64_t physical_bytes = 0;
+            for (std::size_t range_index = bounds.begin;
+                 range_index != bounds.end; ++range_index) {
+                const PlannedRange& range = ranges[range_index];
                 const std::uint64_t range_bytes =
                     range.end_offset - range.first_offset;
-                if (range_bytes > std::numeric_limits<std::size_t>::max()) {
+                if (range_bytes
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - physical_bytes) {
                     throw InvalidArgumentError(
-                        "planned io_uring range does not fit in address space");
+                        "scheduled io_uring task byte count overflows uint64");
                 }
-                prepared[range_index].buffer.resize(
-                    static_cast<std::size_t>(range_bytes));
-                destination = prepared[range_index].buffer.data();
-                size = prepared[range_index].buffer.size();
+                physical_bytes += range_bytes;
             }
-            operations.push_back(IoUringReadOperation{
-                range.fd, destination, size, offset, range_index});
+            work.push_back(ReadWorkUnit{
+                static_cast<std::uint64_t>(task_index),
+                static_cast<std::uint64_t>(bounds.end - bounds.begin),
+                physical_bytes});
         }
 
-        if (io_uring_pool_ != nullptr) {
-            io_uring_pool_->read_exact(operations);
-        } else {
-            io_uring_->read_exact(operations);
-        }
+        io_uring_coordinator_->execute(
+            std::move(work),
+            [&requests, &ranges, partition, record_size, output](
+                const std::uint64_t task_index,
+                IoUringLane& lane) {
+                if (task_index >= partition.task_count) {
+                    throw StorageError(
+                        "scheduled io_uring task index is out of range");
+                }
+                const RangeTaskBounds bounds = partition.bounds(
+                    static_cast<std::size_t>(task_index));
 
-        for (std::size_t range_index = 0; range_index != ranges.size();
-             ++range_index) {
-            const PlannedRange& range = ranges[range_index];
-            if (range.request_end == range.request_begin + 1) {
-                continue;
-            }
-            const std::vector<std::byte>& buffer =
-                prepared[range_index].buffer;
-            for (std::size_t request_index = range.request_begin;
-                 request_index != range.request_end; ++request_index) {
-                const Request& request = requests[request_index];
-                const std::uint64_t source_offset =
-                    request.absolute_offset - range.first_offset;
-                const std::uint64_t destination_offset =
-                    request.output_index * record_size;
-                std::memcpy(
-                    output.data()
-                        + static_cast<std::size_t>(destination_offset),
-                    buffer.data() + static_cast<std::size_t>(source_offset),
-                    static_cast<std::size_t>(record_size));
-            }
-        }
+                struct PreparedRange {
+                    std::size_t range_index{0};
+                    std::vector<std::byte> buffer;
+                };
+                std::vector<PreparedRange> prepared;
+                prepared.reserve(bounds.end - bounds.begin);
+                std::vector<IoUringReadOperation> operations;
+                operations.reserve(bounds.end - bounds.begin);
+                for (std::size_t range_index = bounds.begin;
+                     range_index != bounds.end; ++range_index) {
+                    const PlannedRange& range = ranges[range_index];
+                    void* destination = nullptr;
+                    std::size_t size = 0;
+                    std::uint64_t offset = range.first_offset;
+                    if (range.request_end == range.request_begin + 1) {
+                        const Request& request =
+                            requests[range.request_begin];
+                        const std::uint64_t destination_offset =
+                            request.output_index * record_size;
+                        destination = output.data()
+                            + static_cast<std::size_t>(destination_offset);
+                        size = static_cast<std::size_t>(record_size);
+                        offset = request.absolute_offset;
+                    } else {
+                        const std::uint64_t range_bytes =
+                            range.end_offset - range.first_offset;
+                        if (range_bytes
+                            > std::numeric_limits<std::size_t>::max()) {
+                            throw InvalidArgumentError(
+                                "planned io_uring range does not fit in "
+                                "address space");
+                        }
+                        prepared.push_back(PreparedRange{
+                            range_index,
+                            std::vector<std::byte>(
+                                static_cast<std::size_t>(range_bytes))});
+                        destination = prepared.back().buffer.data();
+                        size = prepared.back().buffer.size();
+                    }
+                    operations.push_back(IoUringReadOperation{
+                        range.fd,
+                        destination,
+                        size,
+                        offset,
+                        static_cast<std::uint64_t>(range_index)});
+                }
+
+                lane.read_exact(operations);
+
+                for (const PreparedRange& item : prepared) {
+                    const PlannedRange& range = ranges[item.range_index];
+                    for (std::size_t request_index = range.request_begin;
+                         request_index != range.request_end;
+                         ++request_index) {
+                        const Request& request = requests[request_index];
+                        const std::uint64_t source_offset =
+                            request.absolute_offset - range.first_offset;
+                        const std::uint64_t destination_offset =
+                            request.output_index * record_size;
+                        std::memcpy(
+                            output.data() + static_cast<std::size_t>(
+                                destination_offset),
+                            item.buffer.data() + static_cast<std::size_t>(
+                                source_offset),
+                            static_cast<std::size_t>(record_size));
+                    }
+                }
+            });
     }
 
     ReaderOptions options_;
     std::unique_ptr<ThreadPoolReadCoordinator> thread_pool_coordinator_;
-    std::unique_ptr<IoUringEngine> io_uring_;
-    std::unique_ptr<IoUringPool> io_uring_pool_;
+    std::unique_ptr<IoUringReadCoordinator> io_uring_coordinator_;
     const pid_t owner_pid_{::getpid()};
 };
 

@@ -14,6 +14,7 @@ add_library(throwdb_core STATIC
     src/core/file_lock.cpp
     src/core/format.cpp
     src/core/index.cpp
+    src/core/io_uring_coordinator.cpp
     src/core/io_uring_engine.cpp
     src/core/io_uring_pool.cpp
     src/core/mutation_catalog.cpp
@@ -23,7 +24,11 @@ add_library(throwdb_core STATIC
     src/core/native_collection.cpp
     src/core/native_collection_test_hooks.cpp
     src/core/native_format.cpp
+    src/core/partition_snapshot_storage.cpp
     src/core/partitioned_index_format.cpp
+    src/core/partitioned_index_run_storage.cpp
+    src/core/partitioned_index_storage.cpp
+    src/core/partitioned_segment_storage.cpp
     src/core/physical_reader.cpp
     src/core/read_scheduler.cpp
     src/core/storage_reader.cpp
@@ -96,6 +101,54 @@ if(THROWDB_BUILD_TESTS)
         NAME throwdb_partitioned_index_format_tests
         COMMAND throwdb_partitioned_index_format_tests)
 
+    add_executable(
+        throwdb_partitioned_index_run_storage_tests
+        tests/partitioned_index_run_storage_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_index_run_storage_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_index_run_storage_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_index_run_storage_tests)
+    add_test(
+        NAME throwdb_partitioned_index_run_storage_tests
+        COMMAND throwdb_partitioned_index_run_storage_tests)
+
+    add_executable(
+        throwdb_partition_snapshot_storage_tests
+        tests/partition_snapshot_storage_tests.cpp)
+    target_link_libraries(
+        throwdb_partition_snapshot_storage_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partition_snapshot_storage_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partition_snapshot_storage_tests)
+    add_test(
+        NAME throwdb_partition_snapshot_storage_tests
+        COMMAND throwdb_partition_snapshot_storage_tests)
+
+    add_executable(
+        throwdb_partitioned_index_storage_tests
+        tests/partitioned_index_storage_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_index_storage_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_index_storage_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_index_storage_tests)
+    add_test(
+        NAME throwdb_partitioned_index_storage_tests
+        COMMAND throwdb_partitioned_index_storage_tests)
+
+    add_executable(
+        throwdb_partitioned_segment_storage_tests
+        tests/partitioned_segment_storage_tests.cpp)
+    target_link_libraries(
+        throwdb_partitioned_segment_storage_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_partitioned_segment_storage_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_partitioned_segment_storage_tests)
+    add_test(
+        NAME throwdb_partitioned_segment_storage_tests
+        COMMAND throwdb_partitioned_segment_storage_tests)
+
     add_executable(throwdb_mutation_wal_tests tests/mutation_wal_tests.cpp)
     target_link_libraries(throwdb_mutation_wal_tests PRIVATE throwdb::core)
     target_compile_features(throwdb_mutation_wal_tests PRIVATE cxx_std_20)
@@ -149,6 +202,18 @@ if(THROWDB_BUILD_TESTS)
     add_test(
         NAME throwdb_read_scheduler_tests
         COMMAND throwdb_read_scheduler_tests)
+
+    add_executable(
+        throwdb_io_uring_coordinator_tests
+        tests/io_uring_coordinator_tests.cpp)
+    target_link_libraries(
+        throwdb_io_uring_coordinator_tests PRIVATE throwdb::core)
+    target_compile_features(
+        throwdb_io_uring_coordinator_tests PRIVATE cxx_std_20)
+    throwdb_enable_warnings(throwdb_io_uring_coordinator_tests)
+    add_test(
+        NAME throwdb_io_uring_coordinator_tests
+        COMMAND throwdb_io_uring_coordinator_tests)
 
     add_executable(throwdb_native_format_tests tests/native_format_tests.cpp)
     target_link_libraries(throwdb_native_format_tests PRIVATE throwdb::core)

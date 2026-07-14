@@ -19,6 +19,12 @@ struct NativeBuilderOptions {
     // Target payload bytes per immutable base segment. Headers/ID sidecars are
     // additional. The builder also caps every segment at 2^32 rows.
     std::uint64_t segment_size_bytes = 16ULL << 30;
+    // Format 6 remains the stable default. Format 7 is an explicit opt-in to
+    // the partitioned RowRef layout while its mutation lifecycle is built out.
+    std::uint32_t format_version = 6;
+    // Format-7 builders use 4096 authoritative partitions by default. Kept at
+    // the end to preserve aggregate initialization of the stable v6 fields.
+    std::uint32_t partition_bits = 12;
 };
 
 struct NativeOpenStats {

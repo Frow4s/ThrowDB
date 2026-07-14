@@ -123,6 +123,58 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
     _assert_same_bits(reopened.get(surviving_ids), surviving)
     with pytest.raises(KeyError):
         reopened.get([20])
+
+
+def test_format7_python_read_write_crud_rotation_and_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "partitioned"
+    maximum_id = (1 << 64) - 1
+    base = _vectors(3, 5, "float16", salt=7)
+    schema = throwdb.CollectionSchema(dimension=5, dtype="float16")
+    with throwdb.Collection.create(
+        path,
+        schema=schema,
+        shard_size_bytes=20,
+        format_version=7,
+    ) as builder:
+        builder.add([0, maximum_id, 7], base)
+
+    old_reader = throwdb.Collection.open(path)
+    inserted = _vectors(1, 5, "float16", salt=107)
+    updated = _vectors(2, 5, "float16", salt=207)
+    with throwdb.Collection.open(path, mode="r+") as writer:
+        assert writer.format_version == 7
+        assert writer.mode == "read_write"
+        writer.insert(np.array([9], dtype=np.uint32), inserted)
+        writer.update([0, maximum_id], updated)
+        np.testing.assert_array_equal(writer.delete([7, 123]), [True, False])
+        writer.upsert([7], inserted)
+        stats = writer.rotate_wal()
+        assert stats["rotated"] is True
+        assert stats["generation"] == 2
+        assert stats["frozen_wal_count"] == 1
+        expected = np.stack([updated[0], updated[1], inserted[0], inserted[0]])
+        _assert_same_bits(writer.get([0, maximum_id, 7, 9]), expected)
+        prefix = np.empty((4, 2), dtype=np.float16)
+        writer.get_into(
+            [0, maximum_id, 7, 9], prefix, prefix_dimensions=2
+        )
+        _assert_same_bits(prefix, expected[:, :2].copy(order="C"))
+
+    assert old_reader.count == 3
+    _assert_same_bits(old_reader.get([0, maximum_id, 7]), base)
+    with pytest.raises(KeyError):
+        old_reader.get([9])
+    old_reader.close()
+
+    with throwdb.Collection.open(path) as reopened:
+        assert reopened.format_version == 7
+        assert reopened.count == 4
+        _assert_same_bits(
+            reopened.get([0, maximum_id, 7, 9]),
+            np.stack([updated[0], updated[1], inserted[0], inserted[0]]),
+        )
     reopened.close()
 
 

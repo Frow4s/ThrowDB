@@ -7,6 +7,7 @@
 #include <span>
 
 #include "throwdb/storage.hpp"
+#include "io_uring_coordinator.hpp"
 
 namespace throwdb::detail {
 
@@ -45,6 +46,9 @@ struct PhysicalReaderTestHooks {
     // Runs under the coordinator lock after every dispatch returned by one
     // pump has been handed to the executor. Intended for drain/error tests.
     std::function<void()> after_dispatch_batch_submitted;
+    // Replaces real rings for deterministic io_uring coordinator and scatter
+    // tests. Production readers leave this empty.
+    IoUringLaneFactory io_uring_lane_factory;
 };
 
 // Executes physical reads after logical ID lookup and RowRef resolution have

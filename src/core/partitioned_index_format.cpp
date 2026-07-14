@@ -28,6 +28,8 @@ constexpr std::array<char, 8> kPartitionedRunMagic{
     'T', 'D', 'B', 'P', 'R', 'U', 'N', '1'};
 constexpr std::array<char, 8> kPartitionedCatalogMagic{
     'T', 'D', 'B', 'M', 'C', 'A', 'T', '3'};
+constexpr std::array<char, 8> kPartitionedCurrentMagic{
+    'T', 'D', 'B', 'M', 'C', 'U', 'R', '1'};
 
 constexpr std::size_t kChecksumOffset = 20;
 constexpr std::size_t kManifestKnownBytes = 176;
@@ -36,6 +38,7 @@ constexpr std::size_t kSegmentIdsKnownBytes = 168;
 constexpr std::size_t kSnapshotKnownBytes = 168;
 constexpr std::size_t kRunKnownBytes = 224;
 constexpr std::size_t kCatalogKnownHeaderBytes = 264;
+constexpr std::size_t kCurrentKnownBytes = 96;
 
 constexpr std::uint64_t kCatalogSegmentEntrySize = 128;
 constexpr std::uint64_t kCatalogSnapshotEntrySize = 128;
@@ -414,6 +417,33 @@ void validate_run_descriptor(
                 && descriptor.retired_ids_payload_crc32c == 0,
             "non-cleaner run contains retirement metadata");
     }
+}
+
+template <typename Error>
+void validate_run_header_descriptor(
+    const PartitionIndexRunDescriptor& descriptor,
+    const std::uint32_t partition_bits) {
+    require<Error>(
+        descriptor.covered_partitions.empty()
+            && descriptor.active_partitions.empty(),
+        "partition run file header must not contain catalog-only bitmaps");
+    PartitionIndexRunDescriptor scalar = descriptor;
+    const std::uint64_t partition_count =
+        validate_partition_bits<Error>(partition_bits);
+    const std::uint64_t bitmap_size = (partition_count + 7) / 8;
+    require<Error>(
+        bitmap_size <= std::numeric_limits<std::size_t>::max(),
+        "partition run bitmap does not fit memory");
+    scalar.covered_partitions.assign(
+        static_cast<std::size_t>(bitmap_size), std::byte{0xff});
+    scalar.active_partitions = scalar.covered_partitions;
+    if (partition_count % 8 != 0) {
+        const std::byte tail = static_cast<std::byte>(
+            (std::uint32_t{1} << (partition_count % 8)) - 1);
+        scalar.covered_partitions.back() = tail;
+        scalar.active_partitions.back() = tail;
+    }
+    validate_run_descriptor<Error>(scalar, partition_bits);
 }
 
 struct UuidHash {
@@ -1089,7 +1119,7 @@ encode_partition_index_run_header_v1(
     require<InvalidArgumentError>(
         !header.collection_id.empty() && !header.schema_id.empty(),
         "partition run identity is empty");
-    validate_run_descriptor<InvalidArgumentError>(
+    validate_run_header_descriptor<InvalidArgumentError>(
         header.descriptor, header.partition_bits);
     const std::uint64_t partition_count =
         validate_partition_bits<InvalidArgumentError>(header.partition_bits);
@@ -1189,24 +1219,6 @@ PartitionIndexRunHeaderV1 decode_partition_index_run_header_v1(
     header.descriptor.retired_segment_id = get_uuid(bytes, 192);
     header.descriptor.retired_row_count = get_u64(bytes, 208);
     header.descriptor.retired_ids_payload_crc32c = get_u32(bytes, 216);
-    const std::uint64_t partition_count =
-        validate_partition_bits<CorruptionError>(header.partition_bits);
-    const std::uint64_t bitmap_bytes = (partition_count + 7) / 8;
-    if (bitmap_bytes > std::numeric_limits<std::size_t>::max()) {
-        throw CorruptionError("partition run bitmap does not fit memory");
-    }
-    // The active mask is catalog state rather than immutable run-header state.
-    // Populate all partitions solely to reuse geometry/retirement validation.
-    header.descriptor.active_partitions.assign(
-        static_cast<std::size_t>(bitmap_bytes), std::byte{0xff});
-    header.descriptor.covered_partitions =
-        header.descriptor.active_partitions;
-    if (partition_count % 8 != 0) {
-        header.descriptor.active_partitions.back() = static_cast<std::byte>(
-            (std::uint32_t{1} << (partition_count % 8)) - 1);
-        header.descriptor.covered_partitions.back() =
-            header.descriptor.active_partitions.back();
-    }
     try {
         static_cast<void>(encode_partition_index_run_header_v1(header));
     } catch (const InvalidArgumentError& error) {
@@ -1599,6 +1611,65 @@ PartitionedCatalogV3 decode_partitioned_catalog_v3(
     }
     validate_catalog<CorruptionError>(catalog);
     return catalog;
+}
+
+std::array<std::byte, kPartitionedHeaderSize> encode_partitioned_current_v1(
+    const PartitionedManifestV2& manifest,
+    const PartitionedCurrentV1& current) {
+    validate_manifest<InvalidArgumentError>(manifest);
+    require<InvalidArgumentError>(
+        current.collection_id == manifest.collection_id
+            && current.schema_id == manifest.schema_id,
+        "partitioned CURRENT identity does not match manifest");
+    require<InvalidArgumentError>(
+        current.generation != 0 && !current.catalog_id.empty()
+            && current.catalog_file_size >= kPartitionedHeaderSize
+            && current.catalog_file_size
+                   <= kPartitionedMaximumCatalogFileSize,
+        "partitioned CURRENT metadata is invalid");
+    std::array<std::byte, kPartitionedHeaderSize> bytes{};
+    encode_common(
+        bytes, kPartitionedCurrentMagic, 1,
+        static_cast<std::uint32_t>(kPartitionedHeaderSize));
+    put_uuid(bytes, 24, current.collection_id);
+    put_uuid(bytes, 40, current.schema_id);
+    put_u64(bytes, 56, current.generation);
+    put_uuid(bytes, 64, current.catalog_id);
+    put_u64(bytes, 80, current.catalog_file_size);
+    put_u32(bytes, 88, current.catalog_crc32c);
+    put_u32(bytes, 92, 0);
+    finish_checksum(bytes);
+    return bytes;
+}
+
+PartitionedCurrentV1 decode_partitioned_current_v1(
+    const std::span<const std::byte> bytes,
+    const PartitionedManifestV2& manifest) {
+    require<CorruptionError>(
+        bytes.size() == kPartitionedHeaderSize,
+        "partitioned CURRENT is not exactly 4096 bytes");
+    decode_common<CorruptionError>(
+        bytes, kPartitionedCurrentMagic, 1,
+        static_cast<std::uint32_t>(kPartitionedHeaderSize),
+        "partitioned CURRENT");
+    require_zero_range<CorruptionError>(
+        bytes, kCurrentKnownBytes, bytes.size(), "partitioned CURRENT");
+    require<CorruptionError>(
+        get_u32(bytes, 92) == 0,
+        "partitioned CURRENT has unsupported flags");
+    PartitionedCurrentV1 current;
+    current.collection_id = get_uuid(bytes, 24);
+    current.schema_id = get_uuid(bytes, 40);
+    current.generation = get_u64(bytes, 56);
+    current.catalog_id = get_uuid(bytes, 64);
+    current.catalog_file_size = get_u64(bytes, 80);
+    current.catalog_crc32c = get_u32(bytes, 88);
+    try {
+        static_cast<void>(encode_partitioned_current_v1(manifest, current));
+    } catch (const InvalidArgumentError& error) {
+        throw CorruptionError(error.what());
+    }
+    return current;
 }
 
 }  // namespace throwdb::detail

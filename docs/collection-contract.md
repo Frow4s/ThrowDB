@@ -132,9 +132,17 @@ schema = throwdb.CollectionSchema(
     dtype="float16",
 )
 
-with throwdb.Collection.create(path, schema=schema) as collection:
+with throwdb.Collection.create(
+    path,
+    schema=schema,
+    format_version=6,  # stable default; pass 7 only as an explicit opt-in
+) as collection:
     collection.add(ids, embeddings)
 ```
+
+The creation boundary accepts only native format versions 6 and 7. Omitting
+`format_version` preserves the stable version-6 layout; selecting version 7 is
+always explicit and is reflected by `collection.format_version`.
 
 Writers accept bounded batches and may spill build metadata to disk. Successful
 context-manager exit calls `finish()`; exceptional exit must not publish the
