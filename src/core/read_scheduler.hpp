@@ -120,6 +120,13 @@ public:
     // round when every head unit costs more than its current deficit.
     [[nodiscard]] std::vector<ReadDispatch> pump(std::uint64_t now_tick);
 
+    // Equivalent to repeatedly calling pump() through empty DRR rounds, but
+    // fast-forwards all runnable deficits by the exact common round count
+    // needed by the nearest admissible head unit. It remains O(job count) per
+    // scheduling decision even when unit cost is many quanta.
+    [[nodiscard]] std::vector<ReadDispatch> pump_until_blocked(
+        std::uint64_t now_tick);
+
     // failure_code is opaque and only retained for the first terminal failure.
     // A dispatch ID is accepted exactly once; duplicate/unknown completion is
     // an InvalidArgumentError.

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 
@@ -33,12 +34,28 @@ struct PhysicalReadStats {
     std::uint64_t planned_read_bytes{0};
 };
 
+// Private deterministic test seam for the thread-pool coordinator. Production
+// readers leave it null, so the physical task fast path has only one pointer
+// check. Hooks must be thread-safe and must not call back into the reader.
+struct PhysicalReaderTestHooks {
+    std::function<void(std::size_t task_count)> before_admission_wait;
+    std::function<void(std::size_t task_count)> after_job_submitted;
+    std::function<void(std::size_t task_count, std::size_t task_index)>
+        before_task;
+    // Runs under the coordinator lock after every dispatch returned by one
+    // pump has been handed to the executor. Intended for drain/error tests.
+    std::function<void()> after_dispatch_batch_submitted;
+};
+
 // Executes physical reads after logical ID lookup and RowRef resolution have
 // completed. One instance owns a bounded backend shared by all concurrent
 // execute() calls; execution is synchronous from each caller's perspective.
 class PhysicalReader {
 public:
     explicit PhysicalReader(ReaderOptions options = {});
+    PhysicalReader(
+        ReaderOptions options,
+        std::shared_ptr<const PhysicalReaderTestHooks> test_hooks);
     ~PhysicalReader();
 
     PhysicalReader(const PhysicalReader&) = delete;

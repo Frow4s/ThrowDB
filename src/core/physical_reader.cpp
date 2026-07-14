@@ -3,6 +3,7 @@
 #include "internal.hpp"
 #include "io_uring_engine.hpp"
 #include "io_uring_pool.hpp"
+#include "read_scheduler.hpp"
 #include "task_partition.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -169,35 +171,420 @@ private:
     bool stopping_{false};
 };
 
-class ReadBatchState {
+class ScheduledReadJob {
 public:
-    explicit ReadBatchState(const std::size_t task_count)
-        : remaining_(task_count) {}
+    using Task = std::function<void(std::uint64_t)>;
 
-    void complete(std::exception_ptr error = nullptr) noexcept {
-        std::lock_guard lock(mutex_);
-        if (error != nullptr && error_ == nullptr) {
-            error_ = std::move(error);
+    ScheduledReadJob(
+        Task task,
+        const std::size_t task_count,
+        std::shared_ptr<const PhysicalReaderTestHooks> test_hooks)
+        : task_(std::move(task)),
+          task_count_(task_count),
+          test_hooks_(std::move(test_hooks)) {}
+
+    void run(const std::uint64_t task_index) const {
+        if (test_hooks_ != nullptr && test_hooks_->before_task) {
+            test_hooks_->before_task(
+                task_count_, static_cast<std::size_t>(task_index));
         }
-        if (remaining_ != 0) {
-            --remaining_;
+        task_(task_index);
+    }
+
+    void remember_task_error(std::exception_ptr error) noexcept {
+        if (first_task_error_ == nullptr) {
+            first_task_error_ = std::move(error);
         }
-        if (remaining_ == 0) {
-            complete_.notify_all();
+    }
+
+    void remember_terminal_error(std::exception_ptr error) noexcept {
+        if (terminal_error_ == nullptr) {
+            terminal_error_ = std::move(error);
         }
+    }
+
+    void finish(const ReadJobOutcome outcome) {
+        std::exception_ptr result_error;
+        switch (outcome) {
+            case ReadJobOutcome::Succeeded:
+                break;
+            case ReadJobOutcome::Failed:
+                result_error = first_task_error_;
+                if (result_error == nullptr) {
+                    result_error = make_storage_error(
+                        "scheduled physical read failed");
+                }
+                break;
+            case ReadJobOutcome::Cancelled:
+                result_error = terminal_error_ != nullptr
+                    ? terminal_error_
+                    : make_storage_error(
+                          "scheduled physical read was cancelled");
+                break;
+            case ReadJobOutcome::DeadlineExceeded:
+                result_error = make_storage_error(
+                    "scheduled physical read exceeded its deadline");
+                break;
+            case ReadJobOutcome::Shutdown:
+                result_error = terminal_error_ != nullptr
+                    ? terminal_error_
+                    : make_storage_error(
+                          "physical read coordinator is stopping");
+                break;
+        }
+
+        {
+            std::lock_guard lock(wait_mutex_);
+            if (finished_) {
+                return;
+            }
+            result_error_ = std::move(result_error);
+            finished_ = true;
+        }
+        finished_condition_.notify_all();
     }
 
     [[nodiscard]] std::exception_ptr wait() {
-        std::unique_lock lock(mutex_);
-        complete_.wait(lock, [this] { return remaining_ == 0; });
-        return error_;
+        std::unique_lock lock(wait_mutex_);
+        finished_condition_.wait(lock, [this] { return finished_; });
+        return result_error_;
     }
 
 private:
+    [[nodiscard]] static std::exception_ptr make_storage_error(
+        const char* const message) {
+        try {
+            throw StorageError(message);
+        } catch (...) {
+            return std::current_exception();
+        }
+    }
+
+    Task task_;
+    std::size_t task_count_{0};
+    std::shared_ptr<const PhysicalReaderTestHooks> test_hooks_;
+    // Protected by ThreadPoolReadCoordinator::mutex_.
+    std::exception_ptr first_task_error_;
+    std::exception_ptr terminal_error_;
+    std::mutex wait_mutex_;
+    std::condition_variable finished_condition_;
+    std::exception_ptr result_error_;
+    bool finished_{false};
+};
+
+[[nodiscard]] ReadSchedulerOptions thread_pool_scheduler_options(
+    const std::size_t worker_count) {
+    return ReadSchedulerOptions{
+        ReadSchedulerBudget{
+            static_cast<std::uint64_t>(worker_count),
+            std::numeric_limits<std::uint64_t>::max(),
+            std::numeric_limits<std::uint64_t>::max()},
+        256ULL << 10,
+        kMaximumReadSchedulerWeight};
+}
+
+[[nodiscard]] std::size_t admitted_job_capacity(
+    const std::size_t worker_count,
+    const std::size_t queue_capacity) noexcept {
+    return queue_capacity
+               > std::numeric_limits<std::size_t>::max() - worker_count
+        ? std::numeric_limits<std::size_t>::max()
+        : worker_count + queue_capacity;
+}
+
+class ThreadPoolReadCoordinator {
+public:
+    ThreadPoolReadCoordinator(
+        const std::size_t worker_count,
+        const std::size_t queue_capacity,
+        std::shared_ptr<const PhysicalReaderTestHooks> test_hooks)
+        : worker_count_(worker_count),
+          max_admitted_jobs_(
+              admitted_job_capacity(worker_count, queue_capacity)),
+          scheduler_(thread_pool_scheduler_options(worker_count)),
+          executor_(std::make_unique<BoundedExecutor>(
+              worker_count, queue_capacity)),
+          test_hooks_(std::move(test_hooks)) {}
+
+    ~ThreadPoolReadCoordinator() { shutdown_and_join(); }
+
+    ThreadPoolReadCoordinator(const ThreadPoolReadCoordinator&) = delete;
+    ThreadPoolReadCoordinator& operator=(
+        const ThreadPoolReadCoordinator&) = delete;
+
+    void execute(
+        std::vector<ReadWorkUnit> work,
+        ScheduledReadJob::Task task) {
+        const std::size_t task_count = work.size();
+        auto job = std::make_shared<ScheduledReadJob>(
+            std::move(task), task_count, test_hooks_);
+
+        {
+            std::unique_lock lock(mutex_);
+            wait_for_admission_locked(lock, task_count);
+            ReadJobId job_id = 0;
+            try {
+                job_id = scheduler_.submit(ReadJobSpec{
+                    std::move(work), 1, std::nullopt});
+            } catch (...) {
+                admission_available_.notify_all();
+                throw;
+            }
+            try {
+                const auto [position, inserted] = jobs_.emplace(job_id, job);
+                static_cast<void>(position);
+                if (!inserted) {
+                    throw StorageError(
+                        "physical read coordinator reused a live job ID");
+                }
+            } catch (...) {
+                static_cast<void>(scheduler_.cancel(job_id));
+                deliver_completions_locked();
+                admission_available_.notify_all();
+                throw;
+            }
+
+            try {
+                if (test_hooks_ != nullptr
+                    && test_hooks_->after_job_submitted) {
+                    test_hooks_->after_job_submitted(task_count);
+                }
+                pump_until_stable_locked();
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                job->remember_terminal_error(error);
+                try {
+                    static_cast<void>(scheduler_.cancel(job_id));
+                    deliver_completions_locked();
+                } catch (...) {
+                    fail_coordinator_locked(std::current_exception());
+                }
+                // Do not rethrow here: pump may already have handed closures
+                // to workers, and they capture the caller-owned read plan and
+                // output. The terminal scheduler event is emitted only after
+                // every such closure drains, so waiting below is the lifetime
+                // barrier for those references.
+            }
+        }
+
+        if (std::exception_ptr error = job->wait(); error != nullptr) {
+            std::rethrow_exception(error);
+        }
+    }
+
+private:
+    void wait_for_admission_locked(
+        std::unique_lock<std::mutex>& lock,
+        const std::size_t task_count) {
+        if (stopping_) {
+            throw StorageError("physical read coordinator is stopping");
+        }
+        if (jobs_.size() < max_admitted_jobs_
+            && admission_waiters_.empty()) {
+            return;
+        }
+        if (next_admission_ticket_ == 0) {
+            throw StorageError(
+                "physical read admission ticket space is exhausted");
+        }
+
+        const std::uint64_t ticket = next_admission_ticket_++;
+        admission_waiters_.push_back(ticket);
+        try {
+            if (test_hooks_ != nullptr
+                && test_hooks_->before_admission_wait) {
+                test_hooks_->before_admission_wait(task_count);
+            }
+            admission_available_.wait(lock, [this, ticket] {
+                return stopping_
+                       || (!admission_waiters_.empty()
+                           && admission_waiters_.front() == ticket
+                           && jobs_.size() < max_admitted_jobs_);
+            });
+        } catch (...) {
+            erase_admission_waiter(ticket);
+            admission_available_.notify_all();
+            throw;
+        }
+        if (stopping_) {
+            erase_admission_waiter(ticket);
+            admission_available_.notify_all();
+            throw StorageError("physical read coordinator is stopping");
+        }
+        if (admission_waiters_.empty()
+            || admission_waiters_.front() != ticket) {
+            throw StorageError(
+                "physical read admission FIFO lost its next ticket");
+        }
+        admission_waiters_.pop_front();
+        admission_available_.notify_all();
+    }
+
+    void erase_admission_waiter(const std::uint64_t ticket) noexcept {
+        const auto position = std::find(
+            admission_waiters_.begin(), admission_waiters_.end(), ticket);
+        if (position != admission_waiters_.end()) {
+            admission_waiters_.erase(position);
+        }
+    }
+
+    void pump_until_stable_locked() {
+        while (!stopping_) {
+            const ReadSchedulerSnapshot before = scheduler_.snapshot();
+            if (before.runnable_jobs == 0
+                || before.inflight_dispatches >= worker_count_) {
+                return;
+            }
+
+            std::vector<ReadDispatch> dispatches =
+                scheduler_.pump_until_blocked(0);
+            if (dispatches.empty()) {
+                return;
+            }
+
+            for (const ReadDispatch& dispatch : dispatches) {
+                const auto position = jobs_.find(dispatch.job_id);
+                if (position == jobs_.end()) {
+                    throw StorageError(
+                        "scheduled dispatch lost its physical read job");
+                }
+                const std::shared_ptr<ScheduledReadJob> job =
+                    position->second;
+                try {
+                    executor_->submit([this, job, dispatch] {
+                        std::exception_ptr error;
+                        try {
+                            job->run(dispatch.user_token);
+                        } catch (...) {
+                            error = std::current_exception();
+                        }
+                        task_completed(
+                            dispatch.dispatch_id, job, std::move(error));
+                    });
+                } catch (...) {
+                    const std::exception_ptr error =
+                        std::current_exception();
+                    job->remember_task_error(error);
+                    scheduler_.complete(
+                        dispatch.dispatch_id,
+                        ReadDispatchStatus::Failed,
+                        1);
+                }
+            }
+            if (test_hooks_ != nullptr
+                && test_hooks_->after_dispatch_batch_submitted) {
+                test_hooks_->after_dispatch_batch_submitted();
+            }
+            deliver_completions_locked();
+        }
+    }
+
+    void task_completed(
+        const ReadDispatchId dispatch_id,
+        const std::shared_ptr<ScheduledReadJob>& job,
+        std::exception_ptr error) noexcept {
+        std::unique_lock lock(mutex_);
+        try {
+            const ReadDispatchStatus status = error == nullptr
+                ? ReadDispatchStatus::Succeeded
+                : ReadDispatchStatus::Failed;
+            if (error != nullptr) {
+                job->remember_task_error(std::move(error));
+            }
+            scheduler_.complete(
+                dispatch_id,
+                status,
+                status == ReadDispatchStatus::Failed ? 1 : 0);
+            // Publish the just-finished synchronous job before potentially
+            // queuing replacement work for peers.
+            deliver_completions_locked();
+            pump_until_stable_locked();
+        } catch (...) {
+            fail_coordinator_locked(std::current_exception());
+        }
+    }
+
+    void fail_coordinator_locked(std::exception_ptr error) noexcept {
+        const bool first_stop = !stopping_;
+        stopping_ = true;
+        admission_available_.notify_all();
+        if (first_stop) {
+            for (auto& [job_id, job] : jobs_) {
+                static_cast<void>(job_id);
+                job->remember_terminal_error(error);
+            }
+        }
+        try {
+            scheduler_.shutdown();
+        } catch (...) {
+        }
+        try {
+            deliver_completions_locked();
+        } catch (...) {
+            // Issued closures still own their job records. Later callbacks
+            // retry scheduler completion delivery while stopping_ prevents
+            // any new physical work from being dispatched.
+        }
+    }
+
+    void deliver_completions_locked() {
+        std::vector<ReadJobCompletion> completions =
+            scheduler_.take_completions();
+        bool released_admission = false;
+        for (const ReadJobCompletion& completion : completions) {
+            const auto position = jobs_.find(completion.job_id);
+            if (position == jobs_.end()) {
+                continue;
+            }
+            const std::shared_ptr<ScheduledReadJob> job = position->second;
+            jobs_.erase(position);
+            released_admission = true;
+            job->finish(completion.outcome);
+        }
+        if (released_admission) {
+            admission_available_.notify_all();
+        }
+    }
+
+    void shutdown_and_join() noexcept {
+        try {
+            std::unique_lock lock(mutex_);
+            if (!stopping_) {
+                stopping_ = true;
+                admission_available_.notify_all();
+                scheduler_.shutdown();
+                deliver_completions_locked();
+            }
+        } catch (...) {
+            // Continue into the mandatory executor join below. A callback may
+            // still be the only owner of caller-referenced plan data.
+        }
+
+        // BoundedExecutor drains every already-issued closure. Their callbacks
+        // return scheduler credits and publish terminal jobs; stopping_
+        // prevents replacement dispatches during the join. This reset must run
+        // even if scheduler shutdown delivery encountered an allocation error.
+        executor_.reset();
+
+        try {
+            std::unique_lock lock(mutex_);
+            deliver_completions_locked();
+        } catch (...) {
+            // Destructors must not throw.
+        }
+    }
+
+    const std::size_t worker_count_;
+    const std::size_t max_admitted_jobs_;
     std::mutex mutex_;
-    std::condition_variable complete_;
-    std::size_t remaining_;
-    std::exception_ptr error_;
+    std::condition_variable admission_available_;
+    ReadScheduler scheduler_;
+    std::map<ReadJobId, std::shared_ptr<ScheduledReadJob>> jobs_;
+    std::deque<std::uint64_t> admission_waiters_;
+    std::unique_ptr<BoundedExecutor> executor_;
+    std::shared_ptr<const PhysicalReaderTestHooks> test_hooks_;
+    std::uint64_t next_admission_ticket_{1};
+    bool stopping_{false};
 };
 
 [[nodiscard]] std::filesystem::path descriptor_description(const int fd) {
@@ -222,7 +609,10 @@ public:
         std::uint64_t end_offset{0};
     };
 
-    explicit Impl(const ReaderOptions options) : options_(options) {
+    explicit Impl(
+        const ReaderOptions options,
+        std::shared_ptr<const PhysicalReaderTestHooks> test_hooks = nullptr)
+        : options_(options) {
         validate_reader_options(options_);
         try {
             if (options_.io_backend == IoBackend::IoUring) {
@@ -235,8 +625,11 @@ public:
                         options_.io_uring_queue_depth);
                 }
             } else if (options_.io_workers != 0) {
-                executor_ = std::make_unique<BoundedExecutor>(
-                    options_.io_workers, effective_queue_capacity(options_));
+                thread_pool_coordinator_ =
+                    std::make_unique<ThreadPoolReadCoordinator>(
+                        options_.io_workers,
+                        effective_queue_capacity(options_),
+                        std::move(test_hooks));
             }
         } catch (const std::exception& error) {
             throw ReaderBackendError(
@@ -388,7 +781,7 @@ private:
                     io_uring_pool_->worker_count(), ranges.size());
             } else if (io_uring_ != nullptr) {
                 task_count = 1;
-            } else if (executor_ == nullptr) {
+            } else if (thread_pool_coordinator_ == nullptr) {
                 task_count = ranges.size();
             } else {
                 task_count = plan_range_tasks(
@@ -425,6 +818,12 @@ private:
             }
         };
 
+        if (thread_pool_coordinator_ != nullptr) {
+            read_ranges_thread_pool(
+                requests, ranges, record_size, output);
+            finish_backend();
+            return;
+        }
         if (ranges.size() == 1) {
             read_range(requests, ranges.front(), record_size, output);
             finish_backend();
@@ -435,52 +834,65 @@ private:
             finish_backend();
             return;
         }
-        if (executor_ == nullptr) {
-            for (const PlannedRange& range : ranges) {
-                read_range(requests, range, record_size, output);
-            }
-            finish_backend();
-            return;
-        }
-
-        const RangeTaskPartition partition = plan_range_tasks(
-            ranges.size(), options_.io_workers, options_.io_ranges_per_task);
-        auto state = std::make_shared<ReadBatchState>(partition.task_count);
-        std::size_t submitted = 0;
-        try {
-            for (; submitted != partition.task_count; ++submitted) {
-                const RangeTaskBounds task_bounds = partition.bounds(submitted);
-                executor_->submit(
-                    [&requests, &ranges, task_bounds, record_size, output,
-                     state] {
-                        std::exception_ptr error;
-                        for (std::size_t range_index = task_bounds.begin;
-                             range_index != task_bounds.end; ++range_index) {
-                            try {
-                                read_range(
-                                    requests, ranges[range_index], record_size,
-                                    output);
-                            } catch (...) {
-                                if (error == nullptr) {
-                                    error = std::current_exception();
-                                }
-                            }
-                        }
-                        state->complete(std::move(error));
-                    });
-            }
-        } catch (...) {
-            state->complete(std::current_exception());
-            ++submitted;
-            while (submitted != partition.task_count) {
-                state->complete();
-                ++submitted;
-            }
-        }
-        if (std::exception_ptr error = state->wait(); error != nullptr) {
-            std::rethrow_exception(error);
+        for (const PlannedRange& range : ranges) {
+            read_range(requests, range, record_size, output);
         }
         finish_backend();
+    }
+
+    void read_ranges_thread_pool(
+        const std::vector<Request>& requests,
+        const std::vector<PlannedRange>& ranges,
+        const std::uint64_t record_size,
+        const std::span<std::byte> output) const {
+        const RangeTaskPartition partition = plan_range_tasks(
+            ranges.size(), options_.io_workers, options_.io_ranges_per_task);
+        std::vector<ReadWorkUnit> work;
+        work.reserve(partition.task_count);
+        for (std::size_t task_index = 0;
+             task_index != partition.task_count; ++task_index) {
+            const RangeTaskBounds bounds = partition.bounds(task_index);
+            const std::size_t range_count = bounds.end - bounds.begin;
+            if (range_count > std::numeric_limits<std::uint64_t>::max()) {
+                throw InvalidArgumentError(
+                    "scheduled range-task count does not fit uint64");
+            }
+            std::uint64_t physical_bytes = 0;
+            for (std::size_t range_index = bounds.begin;
+                 range_index != bounds.end; ++range_index) {
+                const PlannedRange& range = ranges[range_index];
+                const std::uint64_t range_bytes =
+                    range.end_offset - range.first_offset;
+                if (range_bytes
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - physical_bytes) {
+                    throw InvalidArgumentError(
+                        "scheduled range-task byte count overflows uint64");
+                }
+                physical_bytes += range_bytes;
+            }
+            work.push_back(ReadWorkUnit{
+                static_cast<std::uint64_t>(task_index),
+                static_cast<std::uint64_t>(range_count),
+                physical_bytes});
+        }
+
+        thread_pool_coordinator_->execute(
+            std::move(work),
+            [&requests, &ranges, partition, record_size, output](
+                const std::uint64_t task_index) {
+                if (task_index >= partition.task_count) {
+                    throw StorageError(
+                        "scheduled physical task index is out of range");
+                }
+                const RangeTaskBounds bounds = partition.bounds(
+                    static_cast<std::size_t>(task_index));
+                for (std::size_t range_index = bounds.begin;
+                     range_index != bounds.end; ++range_index) {
+                    read_range(
+                        requests, ranges[range_index], record_size, output);
+                }
+            });
     }
 
     static void read_range(
@@ -603,7 +1015,7 @@ private:
     }
 
     ReaderOptions options_;
-    std::unique_ptr<BoundedExecutor> executor_;
+    std::unique_ptr<ThreadPoolReadCoordinator> thread_pool_coordinator_;
     std::unique_ptr<IoUringEngine> io_uring_;
     std::unique_ptr<IoUringPool> io_uring_pool_;
     const pid_t owner_pid_{::getpid()};
@@ -611,6 +1023,11 @@ private:
 
 PhysicalReader::PhysicalReader(const ReaderOptions options)
     : impl_(std::make_unique<Impl>(options)) {}
+
+PhysicalReader::PhysicalReader(
+    const ReaderOptions options,
+    std::shared_ptr<const PhysicalReaderTestHooks> test_hooks)
+    : impl_(std::make_unique<Impl>(options, std::move(test_hooks))) {}
 
 PhysicalReader::~PhysicalReader() {
     if (impl_ != nullptr && !impl_->owned_by_current_process()) {

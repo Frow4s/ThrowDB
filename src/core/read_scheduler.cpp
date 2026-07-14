@@ -162,7 +162,8 @@ public:
     }
 
     [[nodiscard]] std::vector<ReadDispatch> pump(
-        const std::uint64_t now_tick) {
+        const std::uint64_t now_tick,
+        const bool fast_forward_empty_rounds) {
         expire_deadlines(now_tick);
         if (stopping_) {
             return {};
@@ -181,11 +182,8 @@ public:
         result.reserve(std::min(
             available_for_reserve, pending_unit_count()));
         std::size_t visits_without_dispatch = 0;
-        while (true) {
-            const std::size_t runnable = runnable_job_count();
-            if (runnable == 0) {
-                break;
-            }
+        std::size_t runnable = runnable_job_count();
+        while (runnable != 0) {
             const bool solo = runnable == 1;
             const std::optional<ReadJobId> selected = pop_runnable();
             if (!selected.has_value()) {
@@ -217,6 +215,7 @@ public:
                 && !job.terminal_cause.has_value()) {
                 enqueue(job);
             } else {
+                --runnable;
                 emit_if_drained(job);
             }
 
@@ -224,8 +223,12 @@ public:
                 visits_without_dispatch = 0;
             } else {
                 ++visits_without_dispatch;
-                if (visits_without_dispatch >= runnable_job_count()) {
-                    break;
+                if (visits_without_dispatch >= runnable) {
+                    if (!fast_forward_empty_rounds
+                        || !fast_forward_deficits()) {
+                        break;
+                    }
+                    visits_without_dispatch = 0;
                 }
             }
         }
@@ -405,6 +408,60 @@ private:
                       > options_.budget.max_inflight_bytes;
     }
 
+    [[nodiscard]] bool fast_forward_deficits() noexcept {
+        std::uint64_t rounds_until_ready =
+            std::numeric_limits<std::uint64_t>::max();
+        for (const auto& [id, job] : jobs_) {
+            static_cast<void>(id);
+            if (job.completion_emitted
+                || job.terminal_cause.has_value()
+                || job.pending.empty()) {
+                continue;
+            }
+            const Unit& unit = job.pending.front();
+            const bool oversized = individually_oversized(unit);
+            if (!can_admit(unit, oversized)) {
+                continue;
+            }
+            if (unit.cost <= job.deficit) {
+                // A complete no-dispatch round should not leave an admissible
+                // head ready. Refuse to spin if an invariant is ever broken.
+                return false;
+            }
+            const std::uint64_t per_round = saturating_multiply(
+                options_.quantum_cost, job.weight);
+            const std::uint64_t missing = unit.cost - job.deficit;
+            const std::uint64_t rounds =
+                missing / per_round + (missing % per_round != 0 ? 1 : 0);
+            rounds_until_ready = std::min(rounds_until_ready, rounds);
+        }
+        if (rounds_until_ready
+            == std::numeric_limits<std::uint64_t>::max()) {
+            return false;
+        }
+
+        // The ordinary visit immediately following this fast-forward adds one
+        // quantum to every job in queue order. Skip only the earlier empty
+        // rounds so the dispatching visit leaves exactly the same deficit as
+        // repeated calls to pump().
+        const std::uint64_t skipped_empty_rounds = rounds_until_ready - 1;
+
+        for (auto& [id, job] : jobs_) {
+            static_cast<void>(id);
+            if (job.completion_emitted
+                || job.terminal_cause.has_value()
+                || job.pending.empty()) {
+                continue;
+            }
+            const std::uint64_t per_round = saturating_multiply(
+                options_.quantum_cost, job.weight);
+            job.deficit = saturating_add(
+                job.deficit,
+                saturating_multiply(per_round, skipped_empty_rounds));
+        }
+        return true;
+    }
+
     [[nodiscard]] bool can_admit(
         const Unit& unit,
         const bool oversized) const noexcept {
@@ -541,7 +598,12 @@ bool ReadScheduler::cancel(const ReadJobId job_id) {
 
 std::vector<ReadDispatch> ReadScheduler::pump(
     const std::uint64_t now_tick) {
-    return impl_->pump(now_tick);
+    return impl_->pump(now_tick, false);
+}
+
+std::vector<ReadDispatch> ReadScheduler::pump_until_blocked(
+    const std::uint64_t now_tick) {
+    return impl_->pump(now_tick, true);
 }
 
 void ReadScheduler::complete(

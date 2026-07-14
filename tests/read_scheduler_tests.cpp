@@ -349,6 +349,86 @@ void test_drr_no_starvation_and_bounded_weights() {
         "job exceeded configured maximum weight");
 }
 
+void test_fast_forward_skips_adversarial_empty_round_count() {
+    constexpr std::uint64_t huge_cost = 1ULL << 60;
+    throwdb::detail::ReadScheduler scheduler(options(
+        2,
+        2,
+        std::numeric_limits<std::uint64_t>::max(),
+        4096));
+    const auto first = scheduler.submit(job({work(1, 1, huge_cost)}));
+    const auto second = scheduler.submit(job({work(2, 1, huge_cost)}));
+
+    require(scheduler.pump(0).empty(),
+            "ordinary pump unexpectedly skipped its documented empty round");
+    const auto dispatches = scheduler.pump_until_blocked(0);
+    require_equal(dispatches.size(), std::size_t{2},
+                  "fast-forward did not fill available dispatch credits");
+    require_equal(dispatches[0].job_id, first,
+                  "fast-forward changed equal-weight DRR order");
+    require_equal(dispatches[1].job_id, second,
+                  "fast-forward starved the second equal-weight job");
+    for (const auto& dispatch : dispatches) {
+        scheduler.complete(
+            dispatch.dispatch_id,
+            throwdb::detail::ReadDispatchStatus::Succeeded);
+    }
+    require_equal(scheduler.take_completions().size(), std::size_t{2},
+                  "fast-forwarded jobs did not complete");
+}
+
+void test_fast_forward_matches_repeated_rounds_across_units() {
+    const auto configuration = options(
+        1,
+        1,
+        std::numeric_limits<std::uint64_t>::max(),
+        4096,
+        2);
+    throwdb::detail::ReadScheduler reference(configuration);
+    throwdb::detail::ReadScheduler fast(configuration);
+    const auto first_spec = job({
+        work(10, 1, 8192),
+        work(11, 1, 8192),
+        work(12, 1, 8192),
+    });
+    const auto second_spec = job({
+        work(20, 1, 12288),
+        work(21, 1, 12288),
+        work(22, 1, 12288),
+    }, 2);
+    static_cast<void>(reference.submit(first_spec));
+    static_cast<void>(reference.submit(second_spec));
+    static_cast<void>(fast.submit(first_spec));
+    static_cast<void>(fast.submit(second_spec));
+
+    for (std::size_t completed = 0; completed != 6; ++completed) {
+        std::vector<throwdb::detail::ReadDispatch> expected;
+        for (std::size_t rounds = 0; rounds != 16 && expected.empty();
+             ++rounds) {
+            expected = reference.pump(0);
+        }
+        const auto actual = fast.pump_until_blocked(0);
+        require_equal(expected.size(), std::size_t{1},
+                      "reference DRR did not make bounded progress");
+        require_equal(actual.size(), std::size_t{1},
+                      "fast-forward DRR did not make bounded progress");
+        require_equal(actual[0].job_id, expected[0].job_id,
+                      "fast-forward changed later job order");
+        require_equal(actual[0].user_token, expected[0].user_token,
+                      "fast-forward changed FIFO/leftover behavior");
+        reference.complete(
+            expected[0].dispatch_id,
+            throwdb::detail::ReadDispatchStatus::Succeeded);
+        fast.complete(
+            actual[0].dispatch_id,
+            throwdb::detail::ReadDispatchStatus::Succeeded);
+    }
+    require_equal(reference.take_completions().size(), std::size_t{2},
+                  "reference multi-unit jobs did not complete");
+    require_equal(fast.take_completions().size(), std::size_t{2},
+                  "fast-forward multi-unit jobs did not complete");
+}
+
 void test_global_credit_dimensions() {
     const auto configuration = options(3, 4, 8192, 8192);
     throwdb::detail::ReadScheduler scheduler(configuration);
@@ -643,12 +723,16 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 9> tests{{
+    const std::array<TestCase, 11> tests{{
         {"cost_model_and_input_bounds", test_cost_model_and_input_bounds},
         {"fifo_and_solo_work_conserving_burst",
          test_fifo_and_solo_work_conserving_burst},
         {"drr_no_starvation_and_bounded_weights",
          test_drr_no_starvation_and_bounded_weights},
+        {"fast_forward_skips_adversarial_empty_round_count",
+         test_fast_forward_skips_adversarial_empty_round_count},
+        {"fast_forward_matches_repeated_rounds_across_units",
+         test_fast_forward_matches_repeated_rounds_across_units},
         {"global_credit_dimensions", test_global_credit_dimensions},
         {"oversized_single_escape_is_exclusive",
          test_oversized_single_escape_is_exclusive},

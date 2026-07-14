@@ -36,6 +36,8 @@ struct ReaderOptions {
     std::uint32_t io_workers = 0;
     // Maximum number of tasks waiting for a worker. With workers enabled,
     // zero selects 2 * io_workers. submit() applies backpressure at the bound.
+    // The fair coordinator additionally admits at most io_workers plus this
+    // effective capacity execute() jobs; later callers wait in ticket order.
     std::uint32_t io_queue_capacity = 0;
     // Maximum number of planned read ranges grouped into one executor task.
     // The effective value may be smaller so a batch can use every I/O worker.
