@@ -185,14 +185,72 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
             (entry["path"], entry["classification"], entry["bytes"])
             for entry in report["entries"]
         ]
-        with pytest.raises(NotImplementedError, match="deletion is not implemented"):
-            writer.collect_orphans(dry_run=False)
+        executed = writer.collect_orphans(
+            dry_run=False,
+            min_age_seconds=10.0,
+        )
+        assert executed["format"] == "throwdb-orphan-collection-report"
+        assert executed["dry_run"] is False
+        assert executed["eligible_file_count"] == 5
+        assert executed["selected_file_count"] == 5
+        assert executed["removed_file_count"] == 5
+        assert executed["failed_file_count"] == 0
+        assert executed["durability_complete"] is True
+        assert executed["policy_complete"] is True
+        assert executed["reclamation_complete"] is True
+        assert executed["synced_directories"] == [".", "wal", "deltas"]
+        assert all(
+            entry["durable"]
+            for entry in executed["entries"]
+            if entry["removed"]
+        )
 
     with throwdb.Collection.open(store) as reader:
         with pytest.raises(RuntimeError, match=r"mode='r\+'"):
             reader.collect_orphans()
 
-    assert all((store / relative).exists() for relative in expected_paths)
+    assert not current_temp.exists()
+    assert not old_wal.exists()
+    assert young_wal.exists()
+    assert not partial_delta.exists()
+    assert not complete_data.exists()
+    assert not complete_index.exists()
+    assert unknown.exists()
+
+
+def test_orphan_execute_enforces_byte_budget_and_skips_oversized_entries(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "byte-budget"
+    _build_store(store)
+    oversized = store / "wal" / f"wal-{'1' * 32}.wal"
+    fitting = store / "wal" / f"wal-{'2' * 32}.wal"
+    oversized.write_bytes(b"0123456789")
+    fitting.write_bytes(b"ok")
+
+    with throwdb.Collection.open(store, mode="r+") as writer:
+        report = writer.collect_orphans(
+            dry_run=False,
+            min_age_seconds=0,
+            max_files=10,
+            max_bytes=2,
+        )
+
+    assert report["eligible_file_count"] == 2
+    assert report["selected_file_count"] == 1
+    assert report["selected_bytes"] == 2
+    assert report["budget_deferred_file_count"] == 1
+    assert report["budget_deferred_bytes"] == 10
+    assert report["removed_file_count"] == 1
+    assert report["durability_complete"] is True
+    assert report["policy_complete"] is False
+    assert report["reclamation_complete"] is False
+    assert oversized.exists()
+    assert not fitting.exists()
+    by_path = {entry["path"]: entry for entry in report["entries"]}
+    assert by_path[oversized.relative_to(store).as_posix()]["reason"] == (
+        "max_bytes_reached"
+    )
 
 
 @pytest.mark.parametrize("value", [True, np.bool_(False)])

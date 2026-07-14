@@ -71,6 +71,8 @@ enum class PutMode {
 
 using OverlayValue = std::optional<detail::VersionedMutationValue>;
 
+[[nodiscard]] std::uint64_t current_unix_time_ns() noexcept;
+
 [[nodiscard]] detail::DTypeCode dtype_code(const DType dtype) {
     switch (dtype) {
         case DType::Float16:
@@ -148,6 +150,94 @@ using OverlayValue = std::optional<detail::VersionedMutationValue>;
             entry.modified_unix_ns});
     }
     return result;
+}
+
+[[nodiscard]] NativeOrphanDisposition public_orphan_disposition(
+    const detail::MutationOrphanDisposition disposition) {
+    switch (disposition) {
+        case detail::MutationOrphanDisposition::NotCandidate:
+            return NativeOrphanDisposition::NotCandidate;
+        case detail::MutationOrphanDisposition::InvalidModificationTime:
+            return NativeOrphanDisposition::InvalidModificationTime;
+        case detail::MutationOrphanDisposition::MinimumAgeNotReached:
+            return NativeOrphanDisposition::MinimumAgeNotReached;
+        case detail::MutationOrphanDisposition::MaximumFilesReached:
+            return NativeOrphanDisposition::MaximumFilesReached;
+        case detail::MutationOrphanDisposition::MaximumBytesReached:
+            return NativeOrphanDisposition::MaximumBytesReached;
+        case detail::MutationOrphanDisposition::Removed:
+            return NativeOrphanDisposition::Removed;
+        case detail::MutationOrphanDisposition::NoLongerPresent:
+            return NativeOrphanDisposition::NoLongerPresent;
+        case detail::MutationOrphanDisposition::IdentityChanged:
+            return NativeOrphanDisposition::IdentityChanged;
+        case detail::MutationOrphanDisposition::UnlinkFailed:
+            return NativeOrphanDisposition::UnlinkFailed;
+    }
+    throw StorageError("orphan collector contains an unknown disposition");
+}
+
+[[nodiscard]] std::string orphan_area_name(
+    const detail::MutationInventoryArea area) {
+    switch (area) {
+        case detail::MutationInventoryArea::Root:
+            return ".";
+        case detail::MutationInventoryArea::Catalogs:
+            return "catalogs";
+        case detail::MutationInventoryArea::Wal:
+            return "wal";
+        case detail::MutationInventoryArea::Deltas:
+            return "deltas";
+    }
+    throw StorageError("orphan collector contains an unknown area");
+}
+
+[[nodiscard]] NativeOrphanCollectionResult public_orphan_result(
+    detail::MutationOrphanCollectionResult collected) {
+    NativeOrphanCollectionResult result;
+    result.current_generation = collected.current_generation;
+    result.current_catalog_id =
+        uuid_filename_token(collected.current_catalog_id);
+    result.snapshot_unix_ns = collected.options.snapshot_unix_ns;
+    result.min_age_ns = collected.options.min_age_ns;
+    result.max_files = collected.options.max_files;
+    result.max_bytes = collected.options.max_bytes;
+    result.durability_complete = collected.durability_complete;
+    result.synced_directories.reserve(collected.synced_directories.size());
+    for (const detail::MutationInventoryArea area :
+         collected.synced_directories) {
+        result.synced_directories.push_back(orphan_area_name(area));
+    }
+    result.entries.reserve(collected.entries.size());
+    for (detail::MutationOrphanCollectionEntry& entry : collected.entries) {
+        NativeOrphanCollectionEntry converted;
+        converted.file.path = std::move(entry.file.relative_path);
+        converted.file.classification =
+            public_orphan_class(entry.file.classification);
+        converted.file.bytes = entry.file.bytes;
+        converted.file.modified_unix_ns = entry.file.modified_unix_ns;
+        converted.disposition =
+            public_orphan_disposition(entry.disposition);
+        converted.eligible = entry.eligible;
+        converted.selected = entry.selected;
+        converted.removed = entry.removed;
+        converted.durable = entry.durable;
+        converted.error = std::move(entry.error);
+        result.entries.push_back(std::move(converted));
+    }
+    return result;
+}
+
+[[nodiscard]] NativeOrphanCollectionOptions normalized_orphan_options(
+    NativeOrphanCollectionOptions options) {
+    if (options.max_files == 0 || options.max_bytes == 0) {
+        throw InvalidArgumentError(
+            "orphan collection file and byte budgets must be positive");
+    }
+    if (options.snapshot_unix_ns == 0) {
+        options.snapshot_unix_ns = current_unix_time_ns();
+    }
+    return options;
 }
 
 [[nodiscard]] std::uint64_t current_unix_time_ns() noexcept {
@@ -889,6 +979,38 @@ public:
         return public_orphan_inventory(std::move(inventory));
     }
 
+    [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
+        NativeOrphanCollectionOptions options) {
+        ensure_mutable();
+        std::unique_lock lifecycle(materialization_mutex_);
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        if (!catalog_managed_) {
+            throw InvalidArgumentError(
+                "orphan collection requires a catalog-managed collection");
+        }
+        detail::ScopedAdvisoryLock commit(
+            commit_lock_, detail::FileLockMode::Exclusive);
+        options = normalized_orphan_options(options);
+        detail::MutationOrphanCollectionResult collected =
+            detail::collect_mutation_orphans(
+                path_, manifest_, detail::MutationOrphanCollectionOptions{
+                    options.snapshot_unix_ns,
+                    options.min_age_ns,
+                    options.max_files,
+                    options.max_bytes,
+                    true,
+                    catalog_.generation,
+                    catalog_.catalog_id});
+        if (collected.current_generation != catalog_.generation
+            || collected.current_catalog_id != catalog_.catalog_id) {
+            throw StorageError(
+                "orphan collection CURRENT differs from the open writer "
+                "snapshot; reopen the collection");
+        }
+        return public_orphan_result(std::move(collected));
+    }
+
     [[nodiscard]] NativeMutationLogStats rotate_wal() {
         ensure_mutable();
         std::lock_guard mutation(mutation_mutex_);
@@ -901,14 +1023,21 @@ public:
         return mutation_log_stats_locked(rotated);
     }
 
-    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals() {
+    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
+        const std::uint64_t max_wals,
+        const std::uint64_t max_input_bytes) {
         ensure_mutable();
+        if (max_wals == 0 || max_input_bytes == 0) {
+            throw InvalidArgumentError(
+                "WAL materialization budgets must be positive");
+        }
         std::unique_lock lifecycle(materialization_mutex_);
 
         std::shared_ptr<WalResourceSet> source_resources;
         std::vector<detail::MutationWalEntry> selected_wals;
         detail::MutationDeltaBuildSpec build_spec;
         std::uint64_t reservation_generation = 0;
+        std::uint64_t selected_input_bytes = 0;
         {
             std::lock_guard mutation(mutation_mutex_);
             ensure_healthy();
@@ -920,12 +1049,25 @@ public:
 
             std::size_t frozen_count = 0;
             while (frozen_count < catalog_.wal_entries.size()
+                   && frozen_count < max_wals
                    && catalog_.wal_entries[frozen_count].state
                           == detail::MutationWalState::Frozen) {
+                const std::uint64_t bytes =
+                    catalog_.wal_entries[frozen_count].sealed_file_size;
+                if (bytes > max_input_bytes - selected_input_bytes) {
+                    break;
+                }
+                selected_input_bytes += bytes;
                 ++frozen_count;
             }
             if (frozen_count == 0) {
-                return mutation_log_stats_locked(false);
+                NativeMutationLogStats stats =
+                    mutation_log_stats_locked(false);
+                stats.materialization_budget_blocked =
+                    !catalog_.wal_entries.empty()
+                    && catalog_.wal_entries.front().state
+                           == detail::MutationWalState::Frozen;
+                return stats;
             }
             if (catalog_.generation
                 > std::numeric_limits<std::uint64_t>::max() - 2) {
@@ -1253,7 +1395,9 @@ public:
         }
         return mutation_log_stats_locked(
             false, true, reclaimed_wal_count, reclaimed_wal_bytes,
-            reclamation_complete);
+            reclamation_complete,
+            static_cast<std::uint64_t>(selected_wals.size()),
+            selected_input_bytes, false);
     }
 
     [[nodiscard]] NativeMutationLogStats compact_delta_runs(
@@ -2263,7 +2407,10 @@ private:
         const bool materialized = false,
         const std::uint64_t reclaimed_wal_count = 0,
         const std::uint64_t reclaimed_wal_bytes = 0,
-        const bool reclamation_complete = true) const {
+        const bool reclamation_complete = true,
+        const std::uint64_t materialized_wal_count = 0,
+        const std::uint64_t materialized_wal_input_bytes = 0,
+        const bool materialization_budget_blocked = false) const {
         NativeMutationLogStats stats;
         stats.catalog_managed = catalog_managed_;
         stats.delta_managed = delta_managed_;
@@ -2277,6 +2424,11 @@ private:
         stats.materialized = materialized;
         stats.reclaimed_wal_count = reclaimed_wal_count;
         stats.reclaimed_wal_bytes = reclaimed_wal_bytes;
+        stats.materialized_wal_count = materialized_wal_count;
+        stats.materialized_wal_input_bytes =
+            materialized_wal_input_bytes;
+        stats.materialization_budget_blocked =
+            materialization_budget_blocked;
         stats.reclamation_complete = reclamation_complete;
         for (const auto& source : wal_resources_->sources) {
             if (source->entry.state == detail::MutationWalState::Frozen) {
@@ -2763,6 +2915,44 @@ NativeOrphanInventory NativeCollection::inspect_orphans(
         detail::inspect_mutation_resources(path, manifest));
 }
 
+NativeOrphanCollectionResult NativeCollection::reclaim_orphans(
+    const std::filesystem::path& path,
+    NativeOrphanCollectionOptions options) {
+    if (path.empty()) {
+        throw InvalidArgumentError("storage path must not be empty");
+    }
+    if (std::endian::native != std::endian::little) {
+        throw InvalidArgumentError(
+            "native collection access requires a little-endian host");
+    }
+    detail::AdvisoryLockFile writer =
+        detail::AdvisoryLockFile::open_existing(
+            writer_lock_path(path), true);
+    detail::ScopedAdvisoryLock writer_lease(
+        writer, detail::FileLockMode::Exclusive, true);
+    const detail::NativeManifest manifest =
+        detail::read_native_manifest(path);
+    if (!detail::mutation_catalog_managed(manifest)) {
+        throw InvalidArgumentError(
+            "orphan collection requires a catalog-managed collection");
+    }
+    detail::AdvisoryLockFile commit =
+        detail::AdvisoryLockFile::open_existing(
+            commit_lock_path(path), true);
+    detail::ScopedAdvisoryLock stable(
+        commit, detail::FileLockMode::Exclusive);
+    options = normalized_orphan_options(options);
+    return public_orphan_result(detail::collect_mutation_orphans(
+        path, manifest, detail::MutationOrphanCollectionOptions{
+            options.snapshot_unix_ns,
+            options.min_age_ns,
+            options.max_files,
+            options.max_bytes,
+            false,
+            0,
+            {}}));
+}
+
 std::unique_ptr<NativeCollection> NativeCollection::open(
     const std::filesystem::path& path,
     const ReaderOptions reader_options,
@@ -2871,8 +3061,10 @@ NativeMutationLogStats NativeCollection::mutation_log_stats() const {
 NativeMutationLogStats NativeCollection::rotate_wal() {
     return impl_->rotate_wal();
 }
-NativeMutationLogStats NativeCollection::materialize_frozen_wals() {
-    return impl_->materialize_frozen_wals();
+NativeMutationLogStats NativeCollection::materialize_frozen_wals(
+    const std::uint64_t max_wals,
+    const std::uint64_t max_input_bytes) {
+    return impl_->materialize_frozen_wals(max_wals, max_input_bytes);
 }
 NativeMutationLogStats NativeCollection::compact_delta_runs(
     const std::uint64_t max_runs,
@@ -2883,6 +3075,10 @@ NativeMutationLogStats NativeCollection::compact_delta_runs(
 }
 NativeOrphanInventory NativeCollection::collect_orphans() {
     return impl_->collect_orphans();
+}
+NativeOrphanCollectionResult NativeCollection::reclaim_orphans(
+    NativeOrphanCollectionOptions options) {
+    return impl_->reclaim_orphans(options);
 }
 std::uint64_t NativeCollection::count() const { return impl_->count(); }
 std::uint32_t NativeCollection::dimension() const {

@@ -16,12 +16,17 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
     MutationDeltaOutputDurable = 5,
     BeforeSourceUnlink = 6,
     AfterSourceUnlink = 7,
+    BeforeOrphanRevalidation = 8,
+    AfterOrphanUnlink = 9,
+    BeforeOrphanDirectorySync = 10,
+    AfterOrphanDirectorySync = 11,
 };
 
 enum class NativeCollectionTestOperation : std::uint8_t {
     None = 0,
     MaterializeFrozenWals = 1,
     CompactDeltaRuns = 2,
+    CollectOrphans = 3,
 };
 
 enum class NativeCollectionTestResourceKind : std::uint8_t {
@@ -30,6 +35,8 @@ enum class NativeCollectionTestResourceKind : std::uint8_t {
     MutationDeltaPair = 2,
     MutationDeltaData = 3,
     MutationDeltaIndex = 4,
+    OrphanFile = 5,
+    OrphanDirectory = 6,
 };
 
 // Keep the callback payload a plain value so fork-based crash tests can

@@ -5,8 +5,9 @@ collections with arbitrary fixed dimension and float16/float32 rows. It has a
 fresh segmented base format, a flat RowRef index, checksummed WAL recovery,
 atomic batch CRUD, one writer lease, Python bindings, and the existing
 pread/io_uring readers, explicit bounded calibration, and bounded selective
-delta-run compaction. The remaining local-library work is lifecycle automation,
-selective base cleaning, UTF-8 IDs, direct prefix I/O, and adaptive scheduling.
+delta-run compaction, fail-closed orphan reclamation, and explicit bounded
+maintenance. The remaining local-library work is selective base cleaning,
+UTF-8 IDs, direct prefix I/O, and adaptive scheduling.
 Device-specific settings such as two io_uring rings at total QD32 remain
 measured profiles, not product architecture.
 
@@ -53,9 +54,9 @@ Stage 1 slices are called out inline:
 - atomic insert, update, upsert, and tombstone delete batches;
 - checksummed WAL recovery, one writer lease, WAL rotation, bounded
   WAL-to-delta materialization, and bounded oldest-prefix delta-run compaction;
-  public lightweight orphan inspection and an age-filtered dry-run collection
-  plan are implemented, while orphan deletion, automatic maintenance, and
-  selective base cleaning remain next;
+  public lightweight orphan inspection, fresh-scan bounded deletion, bounded
+  frozen-WAL selection, and explicit deterministic maintenance are implemented;
+  selective base cleaning remains next;
 - `get`, `get_into`, and prefix-dimension reads;
 - manual tuning, portable per-device profile persistence, an observable
   exact-match `auto` fallback, and an explicit bounded `throwdb tune`

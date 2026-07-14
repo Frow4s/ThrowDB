@@ -369,6 +369,51 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
             read_only.materialize_frozen_wals()
 
 
+def test_materialization_selects_a_bounded_oldest_prefix(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bounded-materialization"
+    base = _vectors(1, 4, "float16", salt=11)
+    first = _vectors(1, 4, "float16", salt=111)
+    second = _vectors(1, 4, "float16", salt=211)
+    _build(path, [1], base)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        collection.update([1], first)
+        collection.rotate_wal()
+        collection.update([1], second)
+        collection.rotate_wal()
+        before = collection.mutation_log_stats
+        assert before is not None
+        assert before["frozen_wal_count"] == 2
+
+        blocked = collection.materialize_frozen_wals(
+            max_wals=1,
+            max_input_bytes=1,
+        )
+        assert blocked["materialized"] is False
+        assert blocked["materialization_budget_blocked"] is True
+        assert blocked["generation"] == before["generation"]
+        assert blocked["frozen_wal_count"] == 2
+
+        bounded = collection.materialize_frozen_wals(
+            max_wals=1,
+            max_input_bytes=1 << 20,
+        )
+        assert bounded["materialized"] is True
+        assert bounded["materialization_budget_blocked"] is False
+        assert bounded["materialized_wal_count"] == 1
+        assert bounded["materialized_wal_input_bytes"] > 0
+        assert bounded["frozen_wal_count"] == 1
+        assert bounded["delta_run_count"] == 1
+        _assert_same_bits(collection.get([1]), second)
+
+        with pytest.raises(ValueError, match="max_wals.*between"):
+            collection.materialize_frozen_wals(max_wals=0)
+        with pytest.raises(TypeError, match="max_input_bytes.*integer"):
+            collection.materialize_frozen_wals(max_input_bytes=1.5)
+
+
 def test_delta_compaction_public_api_is_bounded_and_reopenable(
     tmp_path: Path,
 ) -> None:

@@ -24,6 +24,14 @@ MAX_DELTA_COMPACTION_RUNS = 64
 DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB = 8
 DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES = 1_000_000
 DEFAULT_ORPHAN_MIN_AGE_SECONDS = 3_600.0
+DEFAULT_ORPHAN_MAX_FILES = 1_024
+DEFAULT_ORPHAN_MAX_BYTES = 8 << 30
+DEFAULT_MAINTAIN_MAX_SECONDS = 300.0
+DEFAULT_MAINTAIN_MAX_ACTIONS = 4
+DEFAULT_MAINTAIN_ROTATE_WAL_BYTES = 1 << 30
+DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS = 8
+DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES = 8 << 30
+DEFAULT_MAINTAIN_COMPACT_MIN_RUNS = 8
 MAX_IO_RANGES_PER_TASK = 1 << 20
 MAX_IO_URING_WORKERS = 64
 MAX_IO_URING_QUEUE_DEPTH = 4096
@@ -244,7 +252,10 @@ def _materialize(args: argparse.Namespace) -> None:
     with Collection.open(args.storage, mode="r+") as collection:
         print(
             json.dumps(
-                collection.materialize_frozen_wals(),
+                collection.materialize_frozen_wals(
+                    max_wals=args.max_wals,
+                    max_input_bytes=args.max_input_bytes,
+                ),
                 indent=2,
                 sort_keys=True,
             )
@@ -267,10 +278,18 @@ def _compact_deltas(args: argparse.Namespace) -> None:
 
 
 def _collect_orphans(args: argparse.Namespace) -> None:
-    report = Collection.inspect_orphans(
-        args.storage,
-        min_age_seconds=args.min_age_seconds,
-    )
+    if args.dry_run:
+        report = Collection.inspect_orphans(
+            args.storage,
+            min_age_seconds=args.min_age_seconds,
+        )
+    else:
+        report = Collection._reclaim_orphans_at(
+            args.storage,
+            min_age_seconds=args.min_age_seconds,
+            max_files=args.max_files,
+            max_bytes=args.max_bytes,
+        )
     print(
         json.dumps(
             report,
@@ -279,6 +298,26 @@ def _collect_orphans(args: argparse.Namespace) -> None:
             allow_nan=False,
         )
     )
+
+
+def _maintain(args: argparse.Namespace) -> None:
+    with Collection.open(args.storage, mode="r+") as collection:
+        report = collection.maintain(
+            dry_run=args.dry_run,
+            max_seconds=args.max_seconds,
+            max_actions=args.max_actions,
+            rotate_wal_bytes=args.rotate_wal_bytes,
+            materialize_max_wals=args.materialize_max_wals,
+            materialize_max_input_bytes=args.materialize_max_input_bytes,
+            compact_min_runs=args.compact_min_runs,
+            compact_max_runs=args.compact_max_runs,
+            compact_max_input_bytes=args.compact_max_input_bytes,
+            compact_max_input_entries=args.compact_max_input_entries,
+            orphan_min_age_seconds=args.orphan_min_age_seconds,
+            orphan_max_files=args.orphan_max_files,
+            orphan_max_bytes=args.orphan_max_bytes,
+        )
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
 
 
 def _write_json_atomic(path: Path, serialized: str) -> None:
@@ -553,6 +592,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="replace the frozen WAL prefix with an immutable delta run",
     )
     materialize.add_argument("--storage", type=Path, required=True)
+    materialize.add_argument(
+        "--max-wals",
+        type=_positive_int,
+        default=None,
+        help="maximum oldest frozen WALs (default: all)",
+    )
+    materialize.add_argument(
+        "--max-input-bytes",
+        type=_positive_int,
+        default=None,
+        help="maximum selected WAL bytes (default: unlimited)",
+    )
     materialize.set_defaults(handler=_materialize)
 
     compact_deltas = subparsers.add_parser(
@@ -582,14 +633,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     collect_orphans = subparsers.add_parser(
         "collect-orphans",
-        help="report orphan mutation files without deleting them",
+        help="plan or execute bounded orphan mutation-file collection",
     )
     collect_orphans.add_argument("--storage", type=Path, required=True)
-    collect_orphans.add_argument(
+    orphan_mode = collect_orphans.add_mutually_exclusive_group(required=True)
+    orphan_mode.add_argument(
         "--dry-run",
         action="store_true",
-        required=True,
-        help="required safety acknowledgement; no files are deleted",
+        help="report eligible files without deleting them",
+    )
+    orphan_mode.add_argument(
+        "--execute",
+        action="store_true",
+        help="freshly rescan, revalidate, unlink, and sync eligible files",
     )
     collect_orphans.add_argument(
         "--min-age-seconds",
@@ -597,7 +653,77 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ORPHAN_MIN_AGE_SECONDS,
         help="minimum candidate age in seconds (default: 3600)",
     )
+    collect_orphans.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=DEFAULT_ORPHAN_MAX_FILES,
+        help="maximum files removed in execute mode (default: 1024)",
+    )
+    collect_orphans.add_argument(
+        "--max-bytes",
+        type=_positive_int,
+        default=DEFAULT_ORPHAN_MAX_BYTES,
+        help="maximum candidate bytes removed (default: 8589934592)",
+    )
     collect_orphans.set_defaults(handler=_collect_orphans)
+
+    maintain = subparsers.add_parser(
+        "maintain",
+        help="run one deterministic bounded mutation-lifecycle pass",
+    )
+    maintain.add_argument("--storage", type=Path, required=True)
+    maintain_mode = maintain.add_mutually_exclusive_group(required=True)
+    maintain_mode.add_argument("--dry-run", action="store_true")
+    maintain_mode.add_argument("--execute", action="store_true")
+    maintain.add_argument(
+        "--max-seconds", type=_nonnegative_float,
+        default=DEFAULT_MAINTAIN_MAX_SECONDS,
+    )
+    maintain.add_argument(
+        "--max-actions", type=_positive_int,
+        default=DEFAULT_MAINTAIN_MAX_ACTIONS,
+    )
+    maintain.add_argument(
+        "--rotate-wal-bytes", type=_positive_int,
+        default=DEFAULT_MAINTAIN_ROTATE_WAL_BYTES,
+    )
+    maintain.add_argument(
+        "--materialize-max-wals", type=_positive_int,
+        default=DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS,
+    )
+    maintain.add_argument(
+        "--materialize-max-input-bytes", type=_positive_int,
+        default=DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES,
+    )
+    maintain.add_argument(
+        "--compact-min-runs", type=_delta_compaction_runs,
+        default=DEFAULT_MAINTAIN_COMPACT_MIN_RUNS,
+    )
+    maintain.add_argument(
+        "--compact-max-runs", type=_delta_compaction_runs,
+        default=DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+    )
+    maintain.add_argument(
+        "--compact-max-input-bytes", type=_positive_int,
+        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB * (1 << 30),
+    )
+    maintain.add_argument(
+        "--compact-max-input-entries", type=_positive_int,
+        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+    )
+    maintain.add_argument(
+        "--orphan-min-age-seconds", type=_nonnegative_float,
+        default=DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+    )
+    maintain.add_argument(
+        "--orphan-max-files", type=_positive_int,
+        default=DEFAULT_ORPHAN_MAX_FILES,
+    )
+    maintain.add_argument(
+        "--orphan-max-bytes", type=_positive_int,
+        default=DEFAULT_ORPHAN_MAX_BYTES,
+    )
+    maintain.set_defaults(handler=_maintain)
 
     tune = subparsers.add_parser(
         "tune",

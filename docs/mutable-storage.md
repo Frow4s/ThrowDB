@@ -29,9 +29,9 @@ multiple frozen WALs, and exactly one active WAL. Manual materialization removes
 a frozen WAL prefix from the current catalog without rewriting the base, and
 manual delta compaction can replace several oldest runs with one bounded run;
 format 5 remains catalog/WAL-only and rejects both operations. Partitioned
-index runs, base-segment selective cleaning, orphan deletion, and automatic
-maintenance remain later integration slices. A public orphan dry-run plan is
-available today. Materialization and delta compaction reduce retained resources
+index runs and base-segment selective cleaning remain later integration slices.
+Public orphan planning/deletion and explicit bounded maintenance are available
+today. Materialization and delta compaction reduce retained resources
 and replay work, but all surviving delta version metadata is still rebuilt into
 a RAM overlay on open. The exact shipped MVP layout and limits are in
 `native-format-v3.md`.
@@ -87,9 +87,9 @@ the new view. POSIX keeps unlinked inodes alive until older readers release the
 final open descriptor.
 
 The global order is `writer.lock -> lifecycle mutex -> mutation mutex ->
-commit.lock -> state mutex`. A future collector must own the writer lease before
-the commit lock; otherwise it could mistake an unlocked in-progress delta build
-for an orphan. The current barrier protects mutation resources only. Future
+commit.lock -> state mutex`. The collector follows the same order, so it cannot
+mistake an unlocked in-progress delta build for an orphan. The current barrier
+protects mutation resources only. Future
 base generations require a separate base-view barrier so loading a large base
 index does not stall every WAL commit.
 
@@ -139,27 +139,43 @@ lowercase UUID filename grammar is required for orphan classification;
 malformed names, symlinks, and non-regular entries fail safe to
 unknown/do-not-touch.
 
-The inventory powers two public dry-run surfaces. The class method
+The inventory powers two public planning surfaces. The class method
 `Collection.inspect_orphans(path, min_age_seconds=3600)` briefly takes the
 writer lease and performs the lightweight scan without loading the base index.
 An already-open mutable handle may call
-`collection.collect_orphans(dry_run=True, min_age_seconds=...)`. The CLI form
-is `throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`;
-`--dry-run` is required.
+`collection.collect_orphans(dry_run=True, min_age_seconds=...)`. The CLI
+requires exactly one of `--dry-run` and `--execute`.
 
 Only temporary publications, unreferenced WALs, and complete or partial
 unreferenced delta pairs are candidates. The age threshold separates eligible
 from deferred candidates. Reachable files, superseded catalogs retained by
 policy, and unknown/do-not-touch entries are never candidates.
 
-An inventory result is diagnostic data, not an authorization token. It can be
-stale, and a path can change after inspection. Any future deleter must hold the
-writer lease and `commit.lock` exclusively, repeat no-follow type and identity
-checks immediately before each unlink, apply age/durability policy, and sync the
-affected directory. The current public slice performs no deletion. A deletion
-executor and automatic `maintain()` operation are still not implemented;
-materialization and delta compaction only reclaim the exact source resources
-replaced by their own publication.
+An inventory result is diagnostic data, not an authorization token. Execute
+mode never consumes it: while holding the writer lease and `commit.lock`
+exclusively it performs a fresh scan, deterministically selects within hard
+file/byte budgets, and compares no-follow `{device,inode,mode,size,mtime,ctime}`
+identity immediately before `unlinkat`. Missing or changed entries are skipped;
+successful unlinks are followed by an `fsync` of every affected namespace.
+The contract assumes a trusted local POSIX collection directory: POSIX has no
+conditional unlink-by-inode primitive that could defeat a hostile process
+renaming pathnames outside ThrowDB's locks.
+
+`maintain(dry_run=...)` is an explicit deterministic pass, not a background
+thread. In order it may rotate a non-empty active WAL at the configured byte
+threshold, materialize a bounded oldest frozen prefix, compact a bounded oldest
+delta prefix, and collect bounded orphans. Each action is attempted at most
+once. `max_actions` is hard; `max_seconds` is cooperative and is checked only
+between durable primitives. Publication failures remain fail-fast, while
+individual orphan unlink/fsync failures are represented in the report.
+Superseded catalogs remain retained by policy.
+
+The version-1 defaults are: 300 cooperative seconds, four attempted actions,
+a 1 GiB active-WAL rotation threshold, at most 8 frozen WALs / 8 GiB input for
+materialization, delta compaction when 8 runs are present with the existing
+8-run / 8-GiB / 1,000,000-entry limits, and orphan age/file/byte limits of
+3600 seconds / 1024 files / 8 GiB. Each normalized value is repeated in the
+maintenance report so a run is reproducible.
 
 ## Row references and tombstones
 
@@ -449,6 +465,12 @@ short catalog publications around an unlocked data build:
 Thus materialization is not a base compaction: it bounds the selected mutation
 history without copying any base embedding or flat-index entry.
 
+`materialize_frozen_wals(max_wals=..., max_input_bytes=...)` may select only
+the oldest contiguous frozen prefix fitting both limits. The legacy no-argument
+call remains unlimited. If the oldest frozen WAL does not fit, the operation is
+a no-op with `materialization_budget_blocked=true`; it never silently exceeds a
+maintenance budget.
+
 Format 6 also exposes `compact_deltas()` (CLI: `throwdb compact-deltas`). It
 selects the oldest contiguous prefix of at least two DeltaV1 runs subject to
 explicit run-count, input-byte, and input-entry budgets. Before reserving an
@@ -476,8 +498,8 @@ This compaction reduces run/file count, duplicated delta payload, and reopen
 work without reading or copying the immutable base. It deliberately cannot
 discard tombstones while the flat base index remains a fallback. Reclaiming
 garbage inside base segments still requires an authoritative partitioned
-RowRef index in a later format. There is currently no automatic size/age policy
-for invoking lifecycle operations.
+RowRef index in a later format. Explicit `maintain()` supplies deterministic
+size/age triggers; there is intentionally no background invocation yet.
 
 ### Current DeltaV1 limits
 
@@ -491,9 +513,9 @@ for invoking lifecycle operations.
   rows, and the complete `.idx` body CRC. It intentionally does not stream the
   complete `.dat` embedding payload to verify its stored CRC; no public payload
   scrub operation exists yet.
-- Delta compaction is explicit and prefix-only. Its budgets bound one operation,
-  but no automatic policy currently prevents repeated materializations from
-  accumulating runs between calls. Base segments are not compacted.
+- Delta compaction is prefix-only. Explicit `maintain()` applies its bounded
+  trigger policy, but no background worker invokes it. Base segments are not
+  compacted.
 - Publication, old-view safety, and post-switch WAL unlink currently rely on
   local POSIX `rename`, `fsync`, open-descriptor, and unlink semantics. CephFS,
   other network filesystems, and object storage require a separately validated

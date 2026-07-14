@@ -6,7 +6,10 @@ from ._tuning import TuningRegistryError
 from .collection import (
     Collection,
     CollectionSchema,
+    MaintenanceReport,
     OrphanClassification,
+    OrphanCollectionExecutionEntry,
+    OrphanCollectionExecutionReport,
     OrphanCollectionReport,
     OrphanInventoryEntry,
 )
@@ -14,7 +17,10 @@ from .collection import (
 __all__ = [
     "Collection",
     "CollectionSchema",
+    "MaintenanceReport",
     "OrphanClassification",
+    "OrphanCollectionExecutionEntry",
+    "OrphanCollectionExecutionReport",
     "OrphanCollectionReport",
     "OrphanInventoryEntry",
     "CalibrationError",

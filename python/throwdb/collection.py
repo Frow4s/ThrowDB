@@ -46,6 +46,14 @@ _MAX_DELTA_COMPACTION_RUNS: Final = 64
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES: Final = 1_000_000
 _DEFAULT_ORPHAN_MIN_AGE_SECONDS: Final = 3_600.0
+_DEFAULT_ORPHAN_MAX_FILES: Final = 1_024
+_DEFAULT_ORPHAN_MAX_BYTES: Final = 8 << 30
+_DEFAULT_MAINTAIN_MAX_SECONDS: Final = 300.0
+_DEFAULT_MAINTAIN_MAX_ACTIONS: Final = 4
+_DEFAULT_MAINTAIN_ROTATE_WAL_BYTES: Final = 1 << 30
+_DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS: Final = 8
+_DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES: Final = 8 << 30
+_DEFAULT_MAINTAIN_COMPACT_MIN_RUNS: Final = 8
 
 _ORPHAN_CANDIDATE_CLASSES: Final = frozenset(
     {
@@ -115,6 +123,47 @@ class OrphanCollectionReport(TypedDict):
     classification_counts: dict[str, int]
     classification_bytes: dict[str, int]
     entries: list[OrphanInventoryEntry]
+
+
+class OrphanCollectionExecutionEntry(OrphanInventoryEntry):
+    selected: bool
+    removed: bool
+    durable: bool
+    error: str | None
+
+
+class OrphanCollectionExecutionReport(OrphanCollectionReport):
+    max_files: int
+    max_bytes: int
+    selected_file_count: int
+    selected_bytes: int
+    budget_deferred_file_count: int
+    budget_deferred_bytes: int
+    removed_file_count: int
+    removed_bytes: int
+    failed_file_count: int
+    synced_directories: list[str]
+    durability_complete: bool
+    policy_complete: bool
+    reclamation_complete: bool
+    entries: list[OrphanCollectionExecutionEntry]  # type: ignore[misc]
+
+
+class MaintenanceReport(TypedDict):
+    format: str
+    version: int
+    dry_run: bool
+    started_unix_ns: int
+    finished_unix_ns: int
+    elapsed_seconds: float
+    policy: dict[str, object]
+    before: dict[str, object]
+    after: dict[str, object]
+    actions: list[dict[str, object]]
+    actions_performed: int
+    deadline_reached: bool
+    action_budget_reached: bool
+    work_performed: bool
 
 
 def _storage_match_level(probe: StorageProbeResult) -> str:
@@ -386,17 +435,15 @@ def _validate_delta_compaction_limit(
     return validated
 
 
-def _validate_orphan_dry_run_options(
+def _validate_orphan_options(
     *,
     dry_run: object,
     min_age_seconds: object,
-) -> float:
+    max_files: object = _DEFAULT_ORPHAN_MAX_FILES,
+    max_bytes: object = _DEFAULT_ORPHAN_MAX_BYTES,
+) -> tuple[float, int, int]:
     if not isinstance(dry_run, bool):
         raise TypeError("dry_run must be a bool")
-    if not dry_run:
-        raise NotImplementedError(
-            "orphan deletion is not implemented; use dry_run=True"
-        )
     if isinstance(min_age_seconds, (bool, np.bool_)):
         raise TypeError("min_age_seconds must be a number, not bool")
     if not isinstance(
@@ -412,7 +459,13 @@ def _validate_orphan_dry_run_options(
         raise ValueError(
             "min_age_seconds must be finite and zero or greater"
         )
-    return seconds
+    validated_max_files = _validate_delta_compaction_limit(
+        max_files, name="max_files"
+    )
+    validated_max_bytes = _validate_delta_compaction_limit(
+        max_bytes, name="max_bytes"
+    )
+    return seconds, validated_max_files, validated_max_bytes
 
 
 def _seconds_to_nanoseconds_ceil(seconds: float) -> int:
@@ -425,10 +478,19 @@ def _seconds_to_nanoseconds_ceil(seconds: float) -> int:
     )
 
 
+def _native_orphan_min_age_ns(seconds: float) -> int:
+    # Native metadata timestamps use uint64 nanoseconds. Saturation preserves
+    # the useful semantics for a larger valid Python threshold: no present-day
+    # candidate can become eligible merely because the API representation is
+    # wider than the wire value.
+    return min(_seconds_to_nanoseconds_ceil(seconds), _UINT64_MAX)
+
+
 def _orphan_report(
     raw_inventory: object,
     *,
     min_age_seconds: float,
+    snapshot_unix_ns: int | None = None,
 ) -> OrphanCollectionReport:
     if not isinstance(raw_inventory, dict):
         raise RuntimeError("native orphan inventory is not a dictionary")
@@ -456,7 +518,14 @@ def _orphan_report(
     if not isinstance(raw_entries, list):
         raise RuntimeError("native orphan inventory has invalid entries")
 
-    snapshot_unix_ns = time.time_ns()
+    if snapshot_unix_ns is None:
+        snapshot_unix_ns = time.time_ns()
+    elif (
+        not isinstance(snapshot_unix_ns, int)
+        or isinstance(snapshot_unix_ns, bool)
+        or snapshot_unix_ns < 0
+    ):
+        raise RuntimeError("native orphan result has an invalid snapshot time")
     minimum_age_ns = _seconds_to_nanoseconds_ceil(min_age_seconds)
     entries: list[OrphanInventoryEntry] = []
     total_bytes = 0
@@ -574,6 +643,180 @@ def _orphan_report(
         "classification_counts": classification_counts,
         "classification_bytes": classification_bytes,
         "entries": entries,
+    }
+
+
+def _orphan_execution_report(
+    raw_result: object,
+    *,
+    min_age_seconds: float,
+    max_files: int,
+    max_bytes: int,
+) -> OrphanCollectionExecutionReport:
+    if not isinstance(raw_result, dict):
+        raise RuntimeError("native orphan collection result is not a dictionary")
+    snapshot_unix_ns = raw_result.get("snapshot_unix_ns")
+    min_age_ns = raw_result.get("min_age_ns")
+    if (
+        not isinstance(min_age_ns, int)
+        or isinstance(min_age_ns, bool)
+        or min_age_ns != _native_orphan_min_age_ns(min_age_seconds)
+    ):
+        raise RuntimeError("native orphan collection used an invalid age limit")
+    if raw_result.get("max_files") != max_files:
+        raise RuntimeError("native orphan collection used an invalid file budget")
+    if raw_result.get("max_bytes") != max_bytes:
+        raise RuntimeError("native orphan collection used an invalid byte budget")
+    raw_entries = raw_result.get("entries")
+    if not isinstance(raw_entries, list):
+        raise RuntimeError("native orphan collection has invalid entries")
+
+    inventory_entries: list[dict[str, object]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("native orphan collection contains an invalid entry")
+        inventory_entries.append(
+            {
+                "path": entry.get("path"),
+                "classification": entry.get("classification"),
+                "bytes": entry.get("bytes"),
+                "modified_unix_ns": entry.get("modified_unix_ns"),
+            }
+        )
+    plan = _orphan_report(
+        {
+            "current_generation": raw_result.get("current_generation"),
+            "current_catalog_id": raw_result.get("current_catalog_id"),
+            "entries": inventory_entries,
+        },
+        min_age_seconds=min_age_seconds,
+        snapshot_unix_ns=snapshot_unix_ns,
+    )
+
+    dispositions = {
+        "not_candidate",
+        "invalid_modification_time",
+        "minimum_age_not_reached",
+        "max_files_reached",
+        "max_bytes_reached",
+        "removed",
+        "no_longer_present",
+        "identity_changed",
+        "unlink_failed",
+    }
+    execution_entries: list[OrphanCollectionExecutionEntry] = []
+    selected_file_count = 0
+    selected_bytes = 0
+    budget_deferred_file_count = 0
+    budget_deferred_bytes = 0
+    removed_file_count = 0
+    removed_bytes = 0
+    failed_file_count = 0
+    for planned, raw_entry in zip(plan["entries"], raw_entries, strict=True):
+        disposition = raw_entry.get("disposition")
+        eligible = raw_entry.get("eligible")
+        selected = raw_entry.get("selected")
+        removed = raw_entry.get("removed")
+        durable = raw_entry.get("durable")
+        error = raw_entry.get("error")
+        if not isinstance(disposition, str) or disposition not in dispositions:
+            raise RuntimeError("native orphan collection has an invalid disposition")
+        if not all(
+            isinstance(value, bool)
+            for value in (eligible, selected, removed, durable)
+        ):
+            raise RuntimeError("native orphan collection has invalid state flags")
+        if error is not None and not isinstance(error, str):
+            raise RuntimeError("native orphan collection has an invalid error")
+        if eligible != planned["eligible"]:
+            raise RuntimeError("native orphan collection eligibility disagrees")
+        if selected and not eligible:
+            raise RuntimeError("native orphan collection selected an ineligible file")
+        if removed and (not selected or disposition != "removed"):
+            raise RuntimeError("native orphan collection has invalid removal state")
+        if durable and not removed:
+            raise RuntimeError("native orphan collection has invalid durability state")
+        if disposition in {
+            "removed",
+            "no_longer_present",
+            "identity_changed",
+            "unlink_failed",
+        } and not selected:
+            raise RuntimeError("native orphan collection has an invalid outcome")
+        if disposition in {
+            "max_files_reached",
+            "max_bytes_reached",
+        } and (selected or not eligible):
+            raise RuntimeError("native orphan collection has an invalid budget state")
+
+        byte_count = planned["bytes"]
+        if selected:
+            selected_file_count += 1
+            selected_bytes += byte_count
+        if disposition in {"max_files_reached", "max_bytes_reached"}:
+            budget_deferred_file_count += 1
+            budget_deferred_bytes += byte_count
+        if removed:
+            removed_file_count += 1
+            removed_bytes += byte_count
+        elif selected and disposition not in {"no_longer_present"}:
+            failed_file_count += 1
+        execution_entries.append(
+            {
+                **planned,
+                "selected": selected,
+                "removed": removed,
+                "durable": durable,
+                "reason": (
+                    planned["reason"]
+                    if disposition == "not_candidate"
+                    else disposition
+                ),
+                "error": error,
+            }
+        )
+
+    synced_directories = raw_result.get("synced_directories")
+    durability_complete = raw_result.get("durability_complete")
+    if (
+        not isinstance(synced_directories, list)
+        or not all(isinstance(value, str) for value in synced_directories)
+        or len(synced_directories) != len(set(synced_directories))
+        or any(
+            value not in {".", "catalogs", "wal", "deltas"}
+            for value in synced_directories
+        )
+    ):
+        raise RuntimeError("native orphan collection has invalid synced directories")
+    if not isinstance(durability_complete, bool):
+        raise RuntimeError("native orphan collection has invalid durability state")
+    if selected_file_count > max_files or selected_bytes > max_bytes:
+        raise RuntimeError("native orphan collection exceeded a hard budget")
+    reclamation_complete = (
+        durability_complete
+        and failed_file_count == 0
+        and budget_deferred_file_count == 0
+        and all(not entry["removed"] or entry["durable"] for entry in execution_entries)
+    )
+    return {
+        **plan,
+        "format": "throwdb-orphan-collection-report",
+        "version": 1,
+        "dry_run": False,
+        "max_files": max_files,
+        "max_bytes": max_bytes,
+        "selected_file_count": selected_file_count,
+        "selected_bytes": selected_bytes,
+        "budget_deferred_file_count": budget_deferred_file_count,
+        "budget_deferred_bytes": budget_deferred_bytes,
+        "removed_file_count": removed_file_count,
+        "removed_bytes": removed_bytes,
+        "failed_file_count": failed_file_count,
+        "synced_directories": list(synced_directories),
+        "durability_complete": durability_complete,
+        "policy_complete": reclamation_complete,
+        "reclamation_complete": reclamation_complete,
+        "entries": execution_entries,
     }
 
 
@@ -1064,13 +1307,47 @@ class Collection:
         """
 
         del cls
-        validated_min_age = _validate_orphan_dry_run_options(
+        validated_min_age, _, _ = _validate_orphan_options(
             dry_run=True,
             min_age_seconds=min_age_seconds,
         )
         return _orphan_report(
             NativeCollection.inspect_orphans(path),
             min_age_seconds=validated_min_age,
+        )
+
+    @classmethod
+    def _reclaim_orphans_at(
+        cls,
+        path: str | PathLike[str],
+        *,
+        min_age_seconds: float = _DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+        max_files: int = _DEFAULT_ORPHAN_MAX_FILES,
+        max_bytes: int = _DEFAULT_ORPHAN_MAX_BYTES,
+    ) -> OrphanCollectionExecutionReport:
+        """Private lightweight path used by the CLI execute mode."""
+
+        del cls
+        validated_age, validated_files, validated_bytes = (
+            _validate_orphan_options(
+                dry_run=False,
+                min_age_seconds=min_age_seconds,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            )
+        )
+        raw = NativeCollection._reclaim_orphans_at(
+            path,
+            snapshot_unix_ns=0,
+            min_age_ns=_native_orphan_min_age_ns(validated_age),
+            max_files=validated_files,
+            max_bytes=validated_bytes,
+        )
+        return _orphan_execution_report(
+            raw,
+            min_age_seconds=validated_age,
+            max_files=validated_files,
+            max_bytes=validated_bytes,
         )
 
     @classmethod
@@ -2027,7 +2304,12 @@ class Collection:
             raise RuntimeError("native WAL rotation returned invalid diagnostics")
         return dict(stats)
 
-    def materialize_frozen_wals(self) -> dict[str, object]:
+    def materialize_frozen_wals(
+        self,
+        *,
+        max_wals: int | None = None,
+        max_input_bytes: int | None = None,
+    ) -> dict[str, object]:
         """Replace the frozen WAL prefix with an immutable delta run.
 
         The durable catalog is switched atomically. Referenced WAL files are
@@ -2035,7 +2317,24 @@ class Collection:
         """
 
         native = self._ensure_mutable("materialize frozen mutation WALs")
-        stats = native.materialize_frozen_wals()
+        validated_max_wals = (
+            _UINT64_MAX
+            if max_wals is None
+            else _validate_delta_compaction_limit(
+                max_wals, name="max_wals"
+            )
+        )
+        validated_max_input_bytes = (
+            _UINT64_MAX
+            if max_input_bytes is None
+            else _validate_delta_compaction_limit(
+                max_input_bytes, name="max_input_bytes"
+            )
+        )
+        stats = native.materialize_frozen_wals(
+            validated_max_wals,
+            validated_max_input_bytes,
+        )
         if not isinstance(stats, dict):
             raise RuntimeError(
                 "native WAL materialization returned invalid diagnostics"
@@ -2086,23 +2385,321 @@ class Collection:
         *,
         dry_run: bool = True,
         min_age_seconds: float = _DEFAULT_ORPHAN_MIN_AGE_SECONDS,
-    ) -> OrphanCollectionReport:
-        """Build an orphan-file collection plan without deleting anything.
+        max_files: int = _DEFAULT_ORPHAN_MAX_FILES,
+        max_bytes: int = _DEFAULT_ORPHAN_MAX_BYTES,
+    ) -> OrphanCollectionReport | OrphanCollectionExecutionReport:
+        """Plan or execute bounded orphan mutation-resource collection.
 
-        This first lifecycle slice intentionally supports only ``dry_run``.
-        A mutable handle is required so the writer lease remains held for the
-        complete native inventory snapshot.
+        Execute mode never consumes a previous plan. It performs a fresh scan,
+        no-follow identity revalidation, unlink, and directory sync while this
+        mutable handle retains the writer lease.
         """
 
-        validated_min_age = _validate_orphan_dry_run_options(
-            dry_run=dry_run,
-            min_age_seconds=min_age_seconds,
+        validated_min_age, validated_files, validated_bytes = (
+            _validate_orphan_options(
+                dry_run=dry_run,
+                min_age_seconds=min_age_seconds,
+                max_files=max_files,
+                max_bytes=max_bytes,
+            )
         )
         native = self._ensure_mutable("collect orphan mutation resources")
+        if not dry_run:
+            raw = native.reclaim_orphans(
+                snapshot_unix_ns=0,
+                min_age_ns=_native_orphan_min_age_ns(validated_min_age),
+                max_files=validated_files,
+                max_bytes=validated_bytes,
+            )
+            return _orphan_execution_report(
+                raw,
+                min_age_seconds=validated_min_age,
+                max_files=validated_files,
+                max_bytes=validated_bytes,
+            )
         return _orphan_report(
             native.collect_orphans(),
             min_age_seconds=validated_min_age,
         )
+
+    def maintain(
+        self,
+        *,
+        dry_run: bool = True,
+        max_seconds: float = _DEFAULT_MAINTAIN_MAX_SECONDS,
+        max_actions: int = _DEFAULT_MAINTAIN_MAX_ACTIONS,
+        rotate_wal_bytes: int = _DEFAULT_MAINTAIN_ROTATE_WAL_BYTES,
+        materialize_max_wals: int = _DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS,
+        materialize_max_input_bytes: int = (
+            _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES
+        ),
+        compact_min_runs: int = _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS,
+        compact_max_runs: int = _DEFAULT_DELTA_COMPACTION_MAX_RUNS,
+        compact_max_input_bytes: int = (
+            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES
+        ),
+        compact_max_input_entries: int = (
+            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES
+        ),
+        orphan_min_age_seconds: float = _DEFAULT_ORPHAN_MIN_AGE_SECONDS,
+        orphan_max_files: int = _DEFAULT_ORPHAN_MAX_FILES,
+        orphan_max_bytes: int = _DEFAULT_ORPHAN_MAX_BYTES,
+    ) -> MaintenanceReport:
+        """Run one deterministic, bounded lifecycle-maintenance pass.
+
+        The wall-clock limit is cooperative: it is checked between durable
+        actions, never by interrupting a publication in the middle.
+        """
+
+        native = self._ensure_mutable("maintain mutation resources")
+        if not isinstance(dry_run, bool):
+            raise TypeError("dry_run must be a bool")
+        if isinstance(max_seconds, (bool, np.bool_)) or not isinstance(
+            max_seconds, (numbers.Real, np.integer, np.floating)
+        ):
+            raise TypeError("max_seconds must be a number, not bool")
+        seconds = float(max_seconds)
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("max_seconds must be finite and zero or greater")
+        validated_max_actions = _validate_delta_compaction_limit(
+            max_actions, name="max_actions", maximum=4
+        )
+        validated_rotate_bytes = _validate_delta_compaction_limit(
+            rotate_wal_bytes, name="rotate_wal_bytes"
+        )
+        validated_materialize_wals = _validate_delta_compaction_limit(
+            materialize_max_wals, name="materialize_max_wals"
+        )
+        validated_materialize_bytes = _validate_delta_compaction_limit(
+            materialize_max_input_bytes,
+            name="materialize_max_input_bytes",
+        )
+        validated_compact_min_runs = _validate_delta_compaction_limit(
+            compact_min_runs,
+            name="compact_min_runs",
+            minimum=2,
+            maximum=_MAX_DELTA_COMPACTION_RUNS,
+        )
+        validated_compact_max_runs = _validate_delta_compaction_limit(
+            compact_max_runs,
+            name="compact_max_runs",
+            minimum=2,
+            maximum=_MAX_DELTA_COMPACTION_RUNS,
+        )
+        if validated_compact_max_runs < validated_compact_min_runs:
+            raise ValueError("compact_max_runs must be >= compact_min_runs")
+        validated_compact_bytes = _validate_delta_compaction_limit(
+            compact_max_input_bytes, name="compact_max_input_bytes"
+        )
+        validated_compact_entries = _validate_delta_compaction_limit(
+            compact_max_input_entries, name="compact_max_input_entries"
+        )
+        orphan_age, validated_orphan_files, validated_orphan_bytes = (
+            _validate_orphan_options(
+                dry_run=dry_run,
+                min_age_seconds=orphan_min_age_seconds,
+                max_files=orphan_max_files,
+                max_bytes=orphan_max_bytes,
+            )
+        )
+        policy: dict[str, object] = {
+            "max_seconds": seconds,
+            "max_actions": validated_max_actions,
+            "rotate_wal_bytes": validated_rotate_bytes,
+            "materialize_max_wals": validated_materialize_wals,
+            "materialize_max_input_bytes": validated_materialize_bytes,
+            "compact_min_runs": validated_compact_min_runs,
+            "compact_max_runs": validated_compact_max_runs,
+            "compact_max_input_bytes": validated_compact_bytes,
+            "compact_max_input_entries": validated_compact_entries,
+            "orphan_min_age_seconds": orphan_age,
+            "orphan_max_files": validated_orphan_files,
+            "orphan_max_bytes": validated_orphan_bytes,
+        }
+
+        def stats_snapshot() -> dict[str, object]:
+            value = native.mutation_log_stats
+            if not isinstance(value, dict):
+                raise RuntimeError("native mutation-log stats are invalid")
+            return dict(value)
+
+        def stat_int(stats: Mapping[str, object], name: str) -> int:
+            value = stats.get(name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(f"native mutation-log stat {name!r} is invalid")
+            return value
+
+        started_unix_ns = time.time_ns()
+        started = time.monotonic()
+        before = stats_snapshot()
+        current = dict(before)
+        actions: list[dict[str, object]] = []
+        actions_attempted = 0
+        actions_performed = 0
+        deadline_reached = False
+        action_budget_reached = False
+
+        def may_attempt() -> bool:
+            nonlocal deadline_reached, action_budget_reached
+            if actions_attempted >= validated_max_actions:
+                action_budget_reached = True
+                return False
+            if time.monotonic() - started >= seconds:
+                deadline_reached = True
+                return False
+            return True
+
+        def record_skipped(name: str, planned: bool, reason: str) -> None:
+            actions.append(
+                {
+                    "name": name,
+                    "planned": planned,
+                    "attempted": False,
+                    "performed": False,
+                    "reason": reason,
+                    "before": dict(current),
+                    "after": dict(current),
+                    "result": None,
+                }
+            )
+
+        rotate_planned = (
+            stat_int(current, "active_wal_put_rows") > 0
+            and stat_int(current, "active_wal_bytes") >= validated_rotate_bytes
+        )
+        if dry_run:
+            record_skipped(
+                "rotate_wal", rotate_planned,
+                "threshold_reached" if rotate_planned else "below_threshold",
+            )
+        elif not rotate_planned:
+            record_skipped("rotate_wal", False, "below_threshold")
+        elif not may_attempt():
+            record_skipped("rotate_wal", True, "maintenance_budget_reached")
+        else:
+            actions_attempted += 1
+            action_before = dict(current)
+            result = self.rotate_wal()
+            performed = bool(result.get("rotated"))
+            actions_performed += int(performed)
+            current = stats_snapshot()
+            actions.append({"name": "rotate_wal", "planned": True,
+                            "attempted": True, "performed": performed,
+                            "reason": "completed", "before": action_before,
+                            "after": dict(current), "result": result})
+
+        materialize_planned = stat_int(current, "frozen_wal_count") > 0
+        if dry_run:
+            record_skipped(
+                "materialize_frozen_wals", materialize_planned,
+                "frozen_wals_present" if materialize_planned else "no_frozen_wals",
+            )
+        elif not materialize_planned:
+            record_skipped("materialize_frozen_wals", False, "no_frozen_wals")
+        elif not may_attempt():
+            record_skipped(
+                "materialize_frozen_wals", True, "maintenance_budget_reached"
+            )
+        else:
+            actions_attempted += 1
+            action_before = dict(current)
+            result = self.materialize_frozen_wals(
+                max_wals=validated_materialize_wals,
+                max_input_bytes=validated_materialize_bytes,
+            )
+            performed = bool(result.get("materialized"))
+            actions_performed += int(performed)
+            reason = (
+                "input_exceeds_budget"
+                if result.get("materialization_budget_blocked")
+                else "completed"
+            )
+            current = stats_snapshot()
+            actions.append({"name": "materialize_frozen_wals", "planned": True,
+                            "attempted": True, "performed": performed,
+                            "reason": reason, "before": action_before,
+                            "after": dict(current), "result": result})
+
+        compact_planned = (
+            stat_int(current, "delta_run_count") >= validated_compact_min_runs
+        )
+        if dry_run:
+            record_skipped(
+                "compact_deltas", compact_planned,
+                "threshold_reached" if compact_planned else "below_threshold",
+            )
+        elif not compact_planned:
+            record_skipped("compact_deltas", False, "below_threshold")
+        elif not may_attempt():
+            record_skipped("compact_deltas", True, "maintenance_budget_reached")
+        else:
+            actions_attempted += 1
+            action_before = dict(current)
+            result = self.compact_deltas(
+                max_runs=validated_compact_max_runs,
+                max_input_bytes=validated_compact_bytes,
+                max_input_entries=validated_compact_entries,
+            )
+            performed = bool(result.get("compacted"))
+            actions_performed += int(performed)
+            current = stats_snapshot()
+            actions.append({"name": "compact_deltas", "planned": True,
+                            "attempted": True, "performed": performed,
+                            "reason": (
+                                "completed" if performed
+                                else "input_exceeds_budget"
+                            ), "before": action_before,
+                            "after": dict(current), "result": result})
+
+        if dry_run:
+            orphan_result = self.collect_orphans(
+                dry_run=True,
+                min_age_seconds=orphan_age,
+                max_files=validated_orphan_files,
+                max_bytes=validated_orphan_bytes,
+            )
+            orphan_planned = orphan_result["eligible_file_count"] > 0
+            actions.append({"name": "collect_orphans", "planned": orphan_planned,
+                            "attempted": False, "performed": False,
+                            "reason": "eligible_files_present" if orphan_planned else "no_eligible_files",
+                            "before": dict(current), "after": dict(current),
+                            "result": orphan_result})
+        elif not may_attempt():
+            record_skipped("collect_orphans", True, "maintenance_budget_reached")
+        else:
+            actions_attempted += 1
+            orphan_result = self.collect_orphans(
+                dry_run=False,
+                min_age_seconds=orphan_age,
+                max_files=validated_orphan_files,
+                max_bytes=validated_orphan_bytes,
+            )
+            assert orphan_result["dry_run"] is False
+            performed = orphan_result["removed_file_count"] > 0
+            actions_performed += int(performed)
+            actions.append({"name": "collect_orphans", "planned": True,
+                            "attempted": True, "performed": performed,
+                            "reason": "completed", "before": dict(current),
+                            "after": dict(current), "result": orphan_result})
+
+        after = dict(before) if dry_run else stats_snapshot()
+        finished_unix_ns = time.time_ns()
+        return {
+            "format": "throwdb-maintenance-report",
+            "version": 1,
+            "dry_run": dry_run,
+            "started_unix_ns": started_unix_ns,
+            "finished_unix_ns": finished_unix_ns,
+            "elapsed_seconds": time.monotonic() - started,
+            "policy": policy,
+            "before": before,
+            "after": after,
+            "actions": actions,
+            "actions_performed": actions_performed,
+            "deadline_reached": deadline_reached,
+            "action_budget_reached": action_budget_reached,
+            "work_performed": actions_performed > 0,
+        }
 
     def get(
         self,
@@ -2193,4 +2790,13 @@ class Collection:
         return False
 
 
-__all__ = ["Collection", "CollectionSchema"]
+__all__ = [
+    "Collection",
+    "CollectionSchema",
+    "MaintenanceReport",
+    "OrphanClassification",
+    "OrphanCollectionExecutionEntry",
+    "OrphanCollectionExecutionReport",
+    "OrphanCollectionReport",
+    "OrphanInventoryEntry",
+]

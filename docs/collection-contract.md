@@ -151,10 +151,17 @@ deleted = collection.delete(ids)     # boolean result per requested ID
 collection.rotate_wal()              # freeze a non-empty active WAL
 collection.materialize_frozen_wals() # replace frozen prefix with DeltaV1
 collection.compact_deltas()           # merge a bounded oldest delta prefix
-plan = collection.collect_orphans(    # advisory report; no deletion
+plan = collection.collect_orphans(    # advisory report
     dry_run=True,
     min_age_seconds=3600,
 )
+reclaimed = collection.collect_orphans(
+    dry_run=False,                    # fresh locked scan; never reuses plan
+    min_age_seconds=3600,
+    max_files=1024,
+    max_bytes=8 << 30,
+)
+maintenance = collection.maintain(dry_run=False)
 ```
 
 Mutation rules:
@@ -229,17 +236,25 @@ read-only plan without first opening the collection or loading its base index.
 It briefly acquires the writer lease while validating `CURRENT`, its selected
 catalog, and the mutation namespaces. An existing `r+` handle can instead call
 `collect_orphans(dry_run=True, min_age_seconds=...)` while retaining its writer
-lease. `dry_run=False` is deliberately unsupported. The CLI equivalent is
-`throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`, and
-the `--dry-run` flag is mandatory.
+lease. `dry_run=False` executes only from an `r+` handle and always performs a
+fresh scan; it never consumes the earlier plan. The CLI requires exactly one of
+`--dry-run` and `--execute`; its execute path remains lightweight and does not
+load the flat base index.
 
 Temporary publications, unreferenced WALs, and complete or partial
 unreferenced delta pairs are candidates; the minimum age only decides whether
 a candidate is currently eligible. Reachable files, superseded catalogs
 retained by policy, and unknown/do-not-touch entries are never candidates. The
 report is a potentially stale diagnostic snapshot, not an authorization token
-for deletion. There is no public deletion executor or automatic `maintain()`
-operation yet.
+for deletion. Execute mode revalidates identity without following symlinks,
+unlinks only within hard file/byte budgets, and fsyncs affected directories.
+Its report separates durability of performed unlinks from completeness of the
+bounded policy pass. Superseded catalogs remain retained.
+
+`maintain(dry_run=True)` explains one deterministic pass; explicit
+`dry_run=False` may rotate, bounded-materialize, bounded-compact, then collect
+orphans. No background thread invokes it. `max_actions` is hard and
+`max_seconds` is cooperative between complete durable actions.
 
 `max_input_bytes` bounds the selected source-file footprint, not aggregate
 physical I/O: integrity scans, copying winning rows, and replacement readback

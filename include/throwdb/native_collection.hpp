@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -111,6 +112,8 @@ struct NativeMutationLogStats {
     std::uint64_t total_delta_bytes = 0;
     std::uint64_t reclaimed_wal_count = 0;
     std::uint64_t reclaimed_wal_bytes = 0;
+    std::uint64_t materialized_wal_count = 0;
+    std::uint64_t materialized_wal_input_bytes = 0;
     std::uint64_t compacted_delta_run_count = 0;
     std::uint64_t compacted_delta_input_entries = 0;
     std::uint64_t compacted_delta_input_bytes = 0;
@@ -118,13 +121,14 @@ struct NativeMutationLogStats {
     std::uint64_t reclaimed_delta_bytes = 0;
     bool rotated = false;
     bool materialized = false;
+    bool materialization_budget_blocked = false;
     bool compacted = false;
     bool reclamation_complete = true;
 };
 
 // Read-only classification of files in the mutable-resource namespaces. The
-// class is diagnostic only: no value authorizes unlinking a path without a
-// fresh, locked revalidation by a future collector.
+// class is diagnostic only: no value authorizes unlinking a path without the
+// executor's fresh locked scan and no-follow identity revalidation.
 enum class NativeOrphanClass : std::uint8_t {
     Reachable,
     SupersededCatalog,
@@ -155,6 +159,48 @@ struct NativeOrphanInventory {
     std::string current_catalog_id;
     // Deterministically sorted by path.
     std::vector<NativeOrphanEntry> entries;
+};
+
+enum class NativeOrphanDisposition : std::uint8_t {
+    NotCandidate,
+    InvalidModificationTime,
+    MinimumAgeNotReached,
+    MaximumFilesReached,
+    MaximumBytesReached,
+    Removed,
+    NoLongerPresent,
+    IdentityChanged,
+    UnlinkFailed,
+};
+
+struct NativeOrphanCollectionOptions {
+    std::uint64_t snapshot_unix_ns = 0;
+    std::uint64_t min_age_ns = 0;
+    std::uint64_t max_files = 1024;
+    std::uint64_t max_bytes = 8ULL << 30;
+};
+
+struct NativeOrphanCollectionEntry {
+    NativeOrphanEntry file;
+    NativeOrphanDisposition disposition{
+        NativeOrphanDisposition::NotCandidate};
+    bool eligible = false;
+    bool selected = false;
+    bool removed = false;
+    bool durable = false;
+    std::string error;
+};
+
+struct NativeOrphanCollectionResult {
+    std::uint64_t current_generation = 0;
+    std::string current_catalog_id;
+    std::uint64_t snapshot_unix_ns = 0;
+    std::uint64_t min_age_ns = 0;
+    std::uint64_t max_files = 0;
+    std::uint64_t max_bytes = 0;
+    std::vector<std::string> synced_directories;
+    std::vector<NativeOrphanCollectionEntry> entries;
+    bool durability_complete = true;
 };
 
 class NativeCollectionBuilder {
@@ -222,6 +268,12 @@ public:
     // base segments, or replaying mutation data.
     [[nodiscard]] static NativeOrphanInventory inspect_orphans(
         const std::filesystem::path& path);
+    // Lightweight destructive counterpart to inspect_orphans(). It always
+    // performs a fresh locked scan and never accepts a previous plan as an
+    // authorization token.
+    [[nodiscard]] static NativeOrphanCollectionResult reclaim_orphans(
+        const std::filesystem::path& path,
+        NativeOrphanCollectionOptions options = {});
 
     static std::unique_ptr<NativeCollection> open(
         const std::filesystem::path& path,
@@ -273,7 +325,11 @@ public:
 
     [[nodiscard]] NativeMutationLogStats mutation_log_stats() const;
     [[nodiscard]] NativeMutationLogStats rotate_wal();
-    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals();
+    [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
+        std::uint64_t max_wals =
+            std::numeric_limits<std::uint64_t>::max(),
+        std::uint64_t max_input_bytes =
+            std::numeric_limits<std::uint64_t>::max());
     // Merge the oldest contiguous DeltaV1 prefix when at least two complete
     // runs fit every budget. Original sequences and tombstones are retained;
     // base segments and newer delta/WAL resources are never rewritten.
@@ -285,6 +341,8 @@ public:
     // handle. A writable handle is required because its lifetime writer lease
     // excludes unpublished materialization/compaction output.
     [[nodiscard]] NativeOrphanInventory collect_orphans();
+    [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
+        NativeOrphanCollectionOptions options = {});
 
     [[nodiscard]] std::uint64_t count() const;
     [[nodiscard]] std::uint32_t dimension() const;

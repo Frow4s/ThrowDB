@@ -195,33 +195,41 @@ at the catalog it selects plus the WAL and delta resources named by that
 catalog. `previous_catalog_id` is lineage metadata, not a retained runtime
 snapshot edge, so an older catalog may be classified as superseded. This
 definition does not authorize deletion. The inventory is a potentially stale
-diagnostic snapshot; a future collector must hold the writer lease and
-`commit.lock` exclusively and revalidate each candidate with no-follow identity
-checks immediately before unlinking it.
+diagnostic snapshot and is never accepted by execute mode as an authorization
+token.
 
 The inventory is exposed as a public dry-run plan through
 `Collection.inspect_orphans(path, min_age_seconds=3600)` and, for an existing
 mutable handle, `collection.collect_orphans(dry_run=True,
 min_age_seconds=...)`. The class method takes the writer lease and performs the
-scan without loading the base index. The CLI equivalent is
-`throwdb collect-orphans --storage PATH --dry-run --min-age-seconds 3600`, with
-mandatory `--dry-run`.
+scan without loading the base index. The CLI requires exactly one of
+`--dry-run` and `--execute`.
 
 Temporary publications, unreferenced WALs, and complete or partial
 unreferenced delta pairs are age-filtered candidates. Reachable files,
 superseded catalogs retained by policy, and unknown/do-not-touch entries are
-never candidates. The report is advisory and cannot authorize deletion. The
-public slice performs no deletion, and there is no automatic `maintain()`
-operation yet. Existing materialization and compaction code may only
-best-effort unlink the exact source paths retired by their own durable
-`CURRENT` publication.
+never candidates. Execute mode repeats the scan under `writer.lock` and
+`commit.lock`, applies age and hard file/byte budgets, and compares no-follow
+device/inode/type/size/timestamp identity immediately before `unlinkat`. It
+fsyncs every affected directory. `durability_complete` reports whether
+performed unlinks were synced; `policy_complete` and its compatibility alias
+`reclamation_complete` additionally require no failed or budget-deferred
+eligible entry. Superseded catalogs remain retained.
+
+The explicit `maintain()` policy attempts at most one rotation, bounded frozen
+WAL materialization, bounded delta compaction, and bounded orphan pass in that
+fixed order. It is not a background thread. Its wall-clock limit is
+cooperative between durable primitives.
 
 ## DeltaV1 materialization
 
 `materialize_frozen_wals()` operates only on format 6 and is serialized with
 another materialization. With no frozen WAL it is a successful no-op. Otherwise
-it replaces the complete frozen prefix visible when the operation starts; it
-never rewrites a base data segment or the flat base index.
+it replaces the oldest contiguous frozen prefix visible when the operation
+starts and fitting optional `max_wals` and `max_input_bytes` limits. The
+no-argument call preserves unlimited selection. If the oldest WAL does not fit,
+the bounded call reports `materialization_budget_blocked` and publishes
+nothing. It never rewrites a base data segment or the flat base index.
 
 Publication deliberately uses two short metadata transactions:
 
@@ -303,15 +311,14 @@ bounds the version metadata admitted to one in-memory merge.
 - Local files only; remote media and a network API are later stages.
 - Prefix reads currently perform a full-row physical read and then copy the
   requested prefix.
-- Manual crash-safe WAL rotation is implemented, with automatic rotation only
-  before the 32-bit per-WAL PUT-row limit. Format 6 can manually materialize a
-  frozen prefix, compact a bounded oldest delta prefix, and best-effort unlink
-  replaced resources; format 5 cannot.
+- Manual crash-safe WAL rotation is implemented, with the commit path's hard
+  safety rotation before the 32-bit per-WAL PUT-row limit. Format 6 can
+  bounded-materialize a frozen prefix, compact a bounded oldest delta prefix,
+  and reclaim unreachable mutation resources; format 5 cannot materialize.
 - Delta version metadata is still loaded into the RAM overlay. There is no
-  automatic lifecycle policy, standalone payload-scrub command, partitioned
-  authoritative index, selective base compaction, orphan-deletion executor, or
-  `maintain` operation yet. Public orphan inspection is a diagnostic dry-run
-  only and never removes files.
+  background lifecycle worker, standalone payload-scrub command, partitioned
+  authoritative index, or selective base compaction. Explicit `maintain()` and
+  orphan execute mode are available.
 - Materialization permits writes during its data build, but briefly pauses
   mutations for the initial segment-ID reservation and final catalog switch.
 - Only local POSIX publication/open-file/unlink semantics are supported;

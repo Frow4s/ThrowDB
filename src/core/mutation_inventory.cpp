@@ -2,9 +2,13 @@
 
 #include "mutation_catalog.hpp"
 #include "mutation_delta.hpp"
+#include "native_collection_test_hooks.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
+#include <exception>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <optional>
@@ -14,29 +18,52 @@
 #include <utility>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace throwdb::detail {
 namespace {
 
-enum class InventoryArea {
-    Root,
-    Catalogs,
-    Wal,
-    Deltas,
-};
-
 struct ScannedEntry {
-    InventoryArea area{InventoryArea::Root};
+    MutationInventoryArea area{MutationInventoryArea::Root};
     std::string name;
     std::string relative_path;
     bool regular{false};
     std::uint64_t bytes{0};
     std::int64_t modified_unix_ns{0};
+    MutationFileIdentity identity;
 };
 
+[[nodiscard]] std::int64_t unix_timestamp_ns(
+    const std::int64_t seconds,
+    const std::int64_t nanoseconds,
+    const std::filesystem::path& path,
+    const std::string_view description) {
+    constexpr std::int64_t billion = 1'000'000'000;
+    if (nanoseconds < 0 || nanoseconds >= billion) {
+        throw StorageError(
+            "mutation inventory " + std::string(description)
+            + " has invalid nanoseconds: '" + path.string() + "'");
+    }
+    constexpr std::int64_t maximum =
+        std::numeric_limits<std::int64_t>::max();
+    constexpr std::int64_t minimum =
+        std::numeric_limits<std::int64_t>::min();
+    if (seconds > maximum / billion || seconds < minimum / billion) {
+        throw StorageError(
+            "mutation inventory " + std::string(description)
+            + " overflows Unix nanoseconds: '" + path.string() + "'");
+    }
+    const std::int64_t scaled = seconds * billion;
+    if (seconds >= 0 && nanoseconds > maximum - scaled) {
+        throw StorageError(
+            "mutation inventory " + std::string(description)
+            + " overflows Unix nanoseconds: '" + path.string() + "'");
+    }
+    return scaled + nanoseconds;
+}
+
 [[nodiscard]] std::int64_t unix_mtime_ns(
-    const struct stat& status,
-    const std::filesystem::path& path) {
+    const struct stat& status, const std::filesystem::path& path) {
 #if defined(__APPLE__)
     const auto seconds_raw = status.st_mtimespec.tv_sec;
     const auto nanoseconds_raw = status.st_mtimespec.tv_nsec;
@@ -54,28 +81,56 @@ struct ScannedEntry {
         static_cast<std::int64_t>(seconds_raw);
     const std::int64_t nanoseconds =
         static_cast<std::int64_t>(nanoseconds_raw);
-    constexpr std::int64_t billion = 1'000'000'000;
-    if (nanoseconds < 0 || nanoseconds >= billion) {
+    return unix_timestamp_ns(seconds, nanoseconds, path, "mtime");
+}
+
+[[nodiscard]] std::int64_t unix_ctime_ns(
+    const struct stat& status, const std::filesystem::path& path) {
+#if defined(__APPLE__)
+    const auto seconds_raw = status.st_ctimespec.tv_sec;
+    const auto nanoseconds_raw = status.st_ctimespec.tv_nsec;
+#else
+    const auto seconds_raw = status.st_ctim.tv_sec;
+    const auto nanoseconds_raw = status.st_ctim.tv_nsec;
+#endif
+    if (!std::in_range<std::int64_t>(seconds_raw)
+        || !std::in_range<std::int64_t>(nanoseconds_raw)) {
         throw StorageError(
-            "mutation inventory timestamp has invalid nanoseconds: '"
+            "mutation inventory ctime does not fit int64: '"
             + path.string() + "'");
     }
-    constexpr std::int64_t maximum =
-        std::numeric_limits<std::int64_t>::max();
-    constexpr std::int64_t minimum =
-        std::numeric_limits<std::int64_t>::min();
-    if (seconds > maximum / billion || seconds < minimum / billion) {
+    return unix_timestamp_ns(
+        static_cast<std::int64_t>(seconds_raw),
+        static_cast<std::int64_t>(nanoseconds_raw), path, "ctime");
+}
+
+[[nodiscard]] std::uint64_t checked_status_word(
+    const auto value,
+    const std::filesystem::path& path,
+    const std::string_view description) {
+    if (!std::in_range<std::uint64_t>(value)) {
         throw StorageError(
-            "mutation inventory timestamp overflows Unix nanoseconds: '"
+            "mutation inventory " + std::string(description)
+            + " does not fit uint64: '" + path.string() + "'");
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
+[[nodiscard]] MutationFileIdentity file_identity(
+    const struct stat& status, const std::filesystem::path& path) {
+    if (status.st_size < 0
+        || !std::in_range<std::uint64_t>(status.st_size)) {
+        throw StorageError(
+            "mutation inventory file size exceeds uint64: '"
             + path.string() + "'");
     }
-    const std::int64_t scaled = seconds * billion;
-    if (seconds >= 0 && nanoseconds > maximum - scaled) {
-        throw StorageError(
-            "mutation inventory timestamp overflows Unix nanoseconds: '"
-            + path.string() + "'");
-    }
-    return scaled + nanoseconds;
+    return MutationFileIdentity{
+        checked_status_word(status.st_dev, path, "device"),
+        checked_status_word(status.st_ino, path, "inode"),
+        checked_status_word(status.st_mode, path, "mode"),
+        static_cast<std::uint64_t>(status.st_size),
+        unix_mtime_ns(status, path),
+        unix_ctime_ns(status, path)};
 }
 
 [[nodiscard]] std::optional<std::uint64_t> parse_hex_word(
@@ -157,7 +212,7 @@ void require_real_directory(
 
 [[nodiscard]] ScannedEntry inspect_entry(
     const std::filesystem::directory_entry& entry,
-    const InventoryArea area,
+    const MutationInventoryArea area,
     const std::filesystem::path& relative_directory) {
     ScannedEntry result;
     result.area = area;
@@ -178,20 +233,15 @@ void require_real_directory(
     if (!result.regular) {
         return result;
     }
-    if (status.st_size < 0
-        || !std::in_range<std::uint64_t>(status.st_size)) {
-        throw StorageError(
-            "mutation inventory file size exceeds uint64: '"
-            + entry.path().string() + "'");
-    }
-    result.bytes = static_cast<std::uint64_t>(status.st_size);
+    result.identity = file_identity(status, entry.path());
+    result.bytes = result.identity.bytes;
     return result;
 }
 
 void scan_directory(
     const std::filesystem::path& directory,
     const std::filesystem::path& relative_directory,
-    const InventoryArea area,
+    const MutationInventoryArea area,
     const bool current_names_only,
     std::vector<ScannedEntry>& output) {
     require_real_directory(directory, "mutation inventory directory");
@@ -228,7 +278,7 @@ void scan_directory(
         return MutationInventoryClass::UnknownDoNotTouch;
     }
 
-    if (entry.area == InventoryArea::Root) {
+    if (entry.area == MutationInventoryArea::Root) {
         if (entry.name == "CURRENT") {
             return MutationInventoryClass::Reachable;
         }
@@ -239,7 +289,7 @@ void scan_directory(
         return MutationInventoryClass::UnknownDoNotTouch;
     }
 
-    if (entry.area == InventoryArea::Catalogs) {
+    if (entry.area == MutationInventoryArea::Catalogs) {
         if (const auto id = parse_uuid_filename(
                 entry.name, "catalog-", ".bin"); id.has_value()) {
             return *id == catalog.catalog_id
@@ -253,7 +303,7 @@ void scan_directory(
         return MutationInventoryClass::UnknownDoNotTouch;
     }
 
-    if (entry.area == InventoryArea::Wal) {
+    if (entry.area == MutationInventoryArea::Wal) {
         if (const auto id = parse_uuid_filename(
                 entry.name, "wal-", ".wal"); id.has_value()) {
             return reachable_wals.contains(*id)
@@ -289,6 +339,74 @@ void scan_directory(
     return MutationInventoryClass::UnknownDoNotTouch;
 }
 
+[[nodiscard]] bool orphan_candidate(
+    const MutationInventoryClass classification) noexcept {
+    return classification == MutationInventoryClass::TempPublication
+        || classification == MutationInventoryClass::UnreferencedWal
+        || classification
+               == MutationInventoryClass::CompleteUnreferencedDeltaPair
+        || classification
+               == MutationInventoryClass::PartialUnreferencedDeltaPair;
+}
+
+[[nodiscard]] std::size_t area_index(
+    const MutationInventoryArea area) noexcept {
+    return static_cast<std::size_t>(area);
+}
+
+[[nodiscard]] std::filesystem::path area_path(
+    const std::filesystem::path& store_path,
+    const MutationInventoryArea area) {
+    switch (area) {
+        case MutationInventoryArea::Root:
+            return store_path;
+        case MutationInventoryArea::Catalogs:
+            return store_path / "catalogs";
+        case MutationInventoryArea::Wal:
+            return store_path / "wal";
+        case MutationInventoryArea::Deltas:
+            return store_path / "deltas";
+    }
+    throw StorageError("mutation inventory contains an unknown area");
+}
+
+[[nodiscard]] FileDescriptor open_area_directory(
+    const std::filesystem::path& path) {
+    int flags = O_RDONLY | O_CLOEXEC;
+#if defined(O_DIRECTORY)
+    flags |= O_DIRECTORY;
+#endif
+#if defined(O_NOFOLLOW)
+    flags |= O_NOFOLLOW;
+#endif
+    const int raw = ::open(path.c_str(), flags);
+    if (raw < 0) {
+        throw StorageError(
+            system_error_message("cannot open orphan namespace", path));
+    }
+    FileDescriptor result(raw);
+    struct stat status {};
+    if (::fstat(result.get(), &status) < 0) {
+        throw StorageError(
+            system_error_message("cannot inspect orphan namespace", path));
+    }
+    if (!S_ISDIR(status.st_mode)) {
+        throw StorageError(
+            "orphan namespace is not a directory: '" + path.string() + "'");
+    }
+    return result;
+}
+
+[[nodiscard]] bool same_identity(
+    const MutationFileIdentity& expected,
+    const struct stat& actual,
+    const std::filesystem::path& path) {
+    if (!S_ISREG(actual.st_mode)) {
+        return false;
+    }
+    return file_identity(actual, path) == expected;
+}
+
 }  // namespace
 
 MutationResourceInventory inspect_mutation_resources(
@@ -316,24 +434,26 @@ MutationResourceInventory inspect_mutation_resources(
 
     std::vector<ScannedEntry> scanned;
     scan_directory(
-        store_path, {}, InventoryArea::Root, true, scanned);
+        store_path, {}, MutationInventoryArea::Root, true, scanned);
     scan_directory(
         mutation_catalogs_directory(store_path), "catalogs",
-        InventoryArea::Catalogs, false, scanned);
+        MutationInventoryArea::Catalogs, false, scanned);
     scan_directory(
-        store_path / "wal", "wal", InventoryArea::Wal, false, scanned);
+        store_path / "wal", "wal", MutationInventoryArea::Wal, false,
+        scanned);
     // Format 5 does not assign semantics to the deltas namespace. Ignoring it
     // is both backwards-compatible and fail-closed: arbitrary user content
     // cannot become a deletion candidate merely because of a filename.
     if (mutation_delta_managed(manifest)) {
         scan_directory(
             mutation_deltas_directory(store_path), "deltas",
-            InventoryArea::Deltas, false, scanned);
+            MutationInventoryArea::Deltas, false, scanned);
     }
 
     std::map<Uuid128, std::uint8_t> unreferenced_delta_parts;
     for (const ScannedEntry& entry : scanned) {
-        if (!entry.regular || entry.area != InventoryArea::Deltas) {
+        if (!entry.regular
+            || entry.area != MutationInventoryArea::Deltas) {
             continue;
         }
         if (const auto id = parse_uuid_filename(
@@ -358,7 +478,10 @@ MutationResourceInventory inspect_mutation_resources(
                 entry, catalog, reachable_wals, reachable_deltas,
                 unreferenced_delta_parts),
             entry.bytes,
-            entry.modified_unix_ns});
+            entry.modified_unix_ns,
+            entry.area,
+            std::move(entry.name),
+            entry.identity});
     }
     std::sort(
         inventory.entries.begin(), inventory.entries.end(),
@@ -367,6 +490,185 @@ MutationResourceInventory inspect_mutation_resources(
             return left.relative_path < right.relative_path;
         });
     return inventory;
+}
+
+MutationOrphanCollectionResult collect_mutation_orphans(
+    const std::filesystem::path& store_path,
+    const NativeManifest& manifest,
+    const MutationOrphanCollectionOptions options) {
+    if (options.max_files == 0 || options.max_bytes == 0) {
+        throw InvalidArgumentError(
+            "orphan collection file and byte budgets must be positive");
+    }
+
+    MutationResourceInventory inventory =
+        inspect_mutation_resources(store_path, manifest);
+    if (options.require_expected_current
+        && (inventory.current_generation != options.expected_generation
+            || inventory.current_catalog_id
+                   != options.expected_catalog_id)) {
+        throw StorageError(
+            "orphan collection CURRENT differs from the open writer "
+            "snapshot; reopen the collection");
+    }
+    MutationOrphanCollectionResult result;
+    result.current_generation = inventory.current_generation;
+    result.current_catalog_id = inventory.current_catalog_id;
+    result.options = options;
+    result.entries.reserve(inventory.entries.size());
+
+    std::uint64_t selected_files = 0;
+    std::uint64_t selected_bytes = 0;
+    std::array<bool, 4> selected_areas{};
+    for (MutationInventoryEntry& file : inventory.entries) {
+        MutationOrphanCollectionEntry entry;
+        entry.file = std::move(file);
+        if (!orphan_candidate(entry.file.classification)) {
+            entry.disposition = MutationOrphanDisposition::NotCandidate;
+        } else if (entry.file.modified_unix_ns < 0
+                   || static_cast<std::uint64_t>(
+                          entry.file.modified_unix_ns)
+                          > options.snapshot_unix_ns) {
+            entry.disposition =
+                MutationOrphanDisposition::InvalidModificationTime;
+        } else if (options.snapshot_unix_ns
+                       - static_cast<std::uint64_t>(
+                           entry.file.modified_unix_ns)
+                       < options.min_age_ns) {
+            entry.disposition =
+                MutationOrphanDisposition::MinimumAgeNotReached;
+        } else {
+            entry.eligible = true;
+            if (selected_files == options.max_files) {
+                entry.disposition =
+                    MutationOrphanDisposition::MaximumFilesReached;
+            } else if (entry.file.bytes > options.max_bytes - selected_bytes) {
+                entry.disposition =
+                    MutationOrphanDisposition::MaximumBytesReached;
+            } else {
+                entry.selected = true;
+                ++selected_files;
+                selected_bytes += entry.file.bytes;
+                selected_areas[area_index(entry.file.area)] = true;
+            }
+        }
+        result.entries.push_back(std::move(entry));
+    }
+
+    // Validate and pin every namespace needed by this execution before the
+    // first unlink. A later open failure therefore cannot leave a partially
+    // executed batch merely because one reserved directory was replaced.
+    std::array<std::optional<FileDescriptor>, 4> directories;
+    for (std::size_t index = 0; index != selected_areas.size(); ++index) {
+        if (!selected_areas[index]) {
+            continue;
+        }
+        const auto area = static_cast<MutationInventoryArea>(index);
+        directories[index].emplace(
+            open_area_directory(area_path(store_path, area)));
+    }
+
+    std::array<bool, 4> removed_areas{};
+    for (std::size_t ordinal = 0; ordinal != result.entries.size();
+         ++ordinal) {
+        MutationOrphanCollectionEntry& entry = result.entries[ordinal];
+        if (!entry.selected) {
+            continue;
+        }
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::BeforeOrphanRevalidation,
+            NativeCollectionTestOperation::CollectOrphans,
+            NativeCollectionTestResourceKind::OrphanFile,
+            result.current_generation,
+            ordinal});
+        const std::size_t index = area_index(entry.file.area);
+        const int directory_fd = directories[index]->get();
+        struct stat status {};
+        if (::fstatat(
+                directory_fd, entry.file.name.c_str(), &status,
+                AT_SYMLINK_NOFOLLOW)
+            < 0) {
+            const int error = errno;
+            if (error == ENOENT) {
+                entry.disposition =
+                    MutationOrphanDisposition::NoLongerPresent;
+            } else {
+                entry.disposition = MutationOrphanDisposition::UnlinkFailed;
+                entry.error = std::system_category().message(error);
+            }
+            continue;
+        }
+        const std::filesystem::path diagnostic =
+            area_path(store_path, entry.file.area) / entry.file.name;
+        bool identity_matches = false;
+        try {
+            identity_matches =
+                same_identity(entry.file.identity, status, diagnostic);
+        } catch (const std::exception& error) {
+            entry.error = error.what();
+        }
+        if (!identity_matches) {
+            entry.disposition = MutationOrphanDisposition::IdentityChanged;
+            continue;
+        }
+        if (::unlinkat(directory_fd, entry.file.name.c_str(), 0) < 0) {
+            const int error = errno;
+            if (error == ENOENT) {
+                entry.disposition =
+                    MutationOrphanDisposition::NoLongerPresent;
+            } else {
+                entry.disposition = MutationOrphanDisposition::UnlinkFailed;
+                entry.error = std::system_category().message(error);
+            }
+            continue;
+        }
+        entry.disposition = MutationOrphanDisposition::Removed;
+        entry.removed = true;
+        removed_areas[index] = true;
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::AfterOrphanUnlink,
+            NativeCollectionTestOperation::CollectOrphans,
+            NativeCollectionTestResourceKind::OrphanFile,
+            result.current_generation,
+            ordinal});
+    }
+
+    for (std::size_t index = 0; index != removed_areas.size(); ++index) {
+        if (!removed_areas[index]) {
+            continue;
+        }
+        const auto area = static_cast<MutationInventoryArea>(index);
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::BeforeOrphanDirectorySync,
+            NativeCollectionTestOperation::CollectOrphans,
+            NativeCollectionTestResourceKind::OrphanDirectory,
+            result.current_generation,
+            index});
+        try {
+            sync_file(
+                directories[index]->get(), area_path(store_path, area));
+            result.synced_directories.push_back(area);
+            for (MutationOrphanCollectionEntry& entry : result.entries) {
+                if (entry.removed && entry.file.area == area) {
+                    entry.durable = true;
+                }
+            }
+        } catch (const std::exception& error) {
+            result.durability_complete = false;
+            for (MutationOrphanCollectionEntry& entry : result.entries) {
+                if (entry.removed && entry.file.area == area) {
+                    entry.error = error.what();
+                }
+            }
+        }
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::AfterOrphanDirectorySync,
+            NativeCollectionTestOperation::CollectOrphans,
+            NativeCollectionTestResourceKind::OrphanDirectory,
+            result.current_generation,
+            index});
+    }
+    return result;
 }
 
 }  // namespace throwdb::detail

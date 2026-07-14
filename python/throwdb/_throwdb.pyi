@@ -161,6 +161,15 @@ class NativeCollection:
     ) -> dict[str, object]: ...
 
     @staticmethod
+    def _reclaim_orphans_at(
+        path: str | PathLike[str],
+        snapshot_unix_ns: int = 0,
+        min_age_ns: int = 0,
+        max_files: int = 1024,
+        max_bytes: int = 8_589_934_592,
+    ) -> dict[str, object]: ...
+
+    @staticmethod
     def open(
         path: str | bytes | PathLike[str] | PathLike[bytes],
         mode: Literal["r", "r+"] = "r",
@@ -195,6 +204,13 @@ class NativeCollection:
     def mutation_log_stats(self) -> dict[str, object]: ...
 
     def collect_orphans(self) -> dict[str, object]: ...
+    def reclaim_orphans(
+        self,
+        snapshot_unix_ns: int = 0,
+        min_age_ns: int = 0,
+        max_files: int = 1024,
+        max_bytes: int = 8_589_934_592,
+    ) -> dict[str, object]: ...
 
     def get(self, ids: npt.NDArray[np.uint64]) -> _EmbeddingArray: ...
 
@@ -253,7 +269,11 @@ class NativeCollection:
     ) -> npt.NDArray[np.bool_]: ...
 
     def rotate_wal(self) -> dict[str, object]: ...
-    def materialize_frozen_wals(self) -> dict[str, object]: ...
+    def materialize_frozen_wals(
+        self,
+        max_wals: int = 18_446_744_073_709_551_615,
+        max_input_bytes: int = 18_446_744_073_709_551_615,
+    ) -> dict[str, object]: ...
     def compact_delta_runs(
         self,
         max_runs: int = 8,

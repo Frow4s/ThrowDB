@@ -39,6 +39,8 @@ constexpr std::uint64_t kDefaultDeltaCompactionMaxRuns = 8;
 constexpr std::uint64_t kMaximumDeltaCompactionMaxRuns = 64;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
+constexpr std::uint64_t kDefaultOrphanMaxFiles = 1024;
+constexpr std::uint64_t kDefaultOrphanMaxBytes = 8ULL << 30;
 
 struct DTypeInfo {
     const char* name;
@@ -87,6 +89,9 @@ struct DTypeInfo {
     result["total_delta_bytes"] = stats.total_delta_bytes;
     result["reclaimed_wal_count"] = stats.reclaimed_wal_count;
     result["reclaimed_wal_bytes"] = stats.reclaimed_wal_bytes;
+    result["materialized_wal_count"] = stats.materialized_wal_count;
+    result["materialized_wal_input_bytes"] =
+        stats.materialized_wal_input_bytes;
     result["compacted_delta_run_count"] =
         stats.compacted_delta_run_count;
     result["compacted_delta_input_entries"] =
@@ -98,6 +103,8 @@ struct DTypeInfo {
     result["reclaimed_delta_bytes"] = stats.reclaimed_delta_bytes;
     result["rotated"] = stats.rotated;
     result["materialized"] = stats.materialized;
+    result["materialization_budget_blocked"] =
+        stats.materialization_budget_blocked;
     result["compacted"] = stats.compacted;
     result["reclamation_complete"] = stats.reclamation_complete;
     return result;
@@ -140,6 +147,69 @@ struct DTypeInfo {
     result["current_catalog_id"] = inventory.current_catalog_id;
     result["entries"] = std::move(entries);
     return result;
+}
+
+[[nodiscard]] const char* orphan_disposition_name(
+    const throwdb::NativeOrphanDisposition disposition) {
+    switch (disposition) {
+    case throwdb::NativeOrphanDisposition::NotCandidate:
+        return "not_candidate";
+    case throwdb::NativeOrphanDisposition::InvalidModificationTime:
+        return "invalid_modification_time";
+    case throwdb::NativeOrphanDisposition::MinimumAgeNotReached:
+        return "minimum_age_not_reached";
+    case throwdb::NativeOrphanDisposition::MaximumFilesReached:
+        return "max_files_reached";
+    case throwdb::NativeOrphanDisposition::MaximumBytesReached:
+        return "max_bytes_reached";
+    case throwdb::NativeOrphanDisposition::Removed:
+        return "removed";
+    case throwdb::NativeOrphanDisposition::NoLongerPresent:
+        return "no_longer_present";
+    case throwdb::NativeOrphanDisposition::IdentityChanged:
+        return "identity_changed";
+    case throwdb::NativeOrphanDisposition::UnlinkFailed:
+        return "unlink_failed";
+    }
+    throw std::runtime_error("orphan result contains an unknown disposition");
+}
+
+[[nodiscard]] py::dict orphan_collection_result_dict(
+    const throwdb::NativeOrphanCollectionResult& result) {
+    py::list entries;
+    for (const throwdb::NativeOrphanCollectionEntry& entry : result.entries) {
+        py::dict item;
+        item["path"] = entry.file.path;
+        item["classification"] =
+            orphan_class_name(entry.file.classification);
+        item["bytes"] = entry.file.bytes;
+        item["modified_unix_ns"] = entry.file.modified_unix_ns;
+        item["disposition"] =
+            orphan_disposition_name(entry.disposition);
+        item["eligible"] = entry.eligible;
+        item["selected"] = entry.selected;
+        item["removed"] = entry.removed;
+        item["durable"] = entry.durable;
+        item["error"] = entry.error.empty()
+            ? py::none()
+            : py::cast(entry.error);
+        entries.append(std::move(item));
+    }
+    py::list synced_directories;
+    for (const std::string& directory : result.synced_directories) {
+        synced_directories.append(directory);
+    }
+    py::dict output;
+    output["current_generation"] = result.current_generation;
+    output["current_catalog_id"] = result.current_catalog_id;
+    output["snapshot_unix_ns"] = result.snapshot_unix_ns;
+    output["min_age_ns"] = result.min_age_ns;
+    output["max_files"] = result.max_files;
+    output["max_bytes"] = result.max_bytes;
+    output["synced_directories"] = std::move(synced_directories);
+    output["durability_complete"] = result.durability_complete;
+    output["entries"] = std::move(entries);
+    return output;
 }
 
 [[nodiscard]] py::dict native_read_stats_dict(
@@ -907,6 +977,31 @@ public:
         return orphan_inventory_dict(inventory);
     }
 
+    [[nodiscard]] static py::dict reclaim_orphans_at(
+        const py::object& path,
+        const py::object& snapshot_unix_ns,
+        const py::object& min_age_ns,
+        const py::object& max_files,
+        const py::object& max_bytes) {
+        throwdb::NativeOrphanCollectionOptions options;
+        options.snapshot_unix_ns = checked_uint64_option(
+            snapshot_unix_ns, "snapshot_unix_ns", true);
+        options.min_age_ns = checked_uint64_option(
+            min_age_ns, "min_age_ns", true);
+        options.max_files = checked_uint64_option(
+            max_files, "max_files", false);
+        options.max_bytes = checked_uint64_option(
+            max_bytes, "max_bytes", false);
+        const auto native_path = filesystem_path(path);
+        throwdb::NativeOrphanCollectionResult result;
+        {
+            py::gil_scoped_release release;
+            result = throwdb::NativeCollection::reclaim_orphans(
+                native_path, options);
+        }
+        return orphan_collection_result_dict(result);
+    }
+
     static std::unique_ptr<PyNativeCollection> open(
         const py::object& path,
         const std::string& mode,
@@ -1047,6 +1142,29 @@ public:
         return orphan_inventory_dict(inventory);
     }
 
+    [[nodiscard]] py::dict reclaim_orphans(
+        const py::object& snapshot_unix_ns,
+        const py::object& min_age_ns,
+        const py::object& max_files,
+        const py::object& max_bytes) const {
+        throwdb::NativeOrphanCollectionOptions options;
+        options.snapshot_unix_ns = checked_uint64_option(
+            snapshot_unix_ns, "snapshot_unix_ns", true);
+        options.min_age_ns = checked_uint64_option(
+            min_age_ns, "min_age_ns", true);
+        options.max_files = checked_uint64_option(
+            max_files, "max_files", false);
+        options.max_bytes = checked_uint64_option(
+            max_bytes, "max_bytes", false);
+        const auto collection = acquire_collection();
+        throwdb::NativeOrphanCollectionResult result;
+        {
+            py::gil_scoped_release release;
+            result = collection->reclaim_orphans(options);
+        }
+        return orphan_collection_result_dict(result);
+    }
+
     [[nodiscard]] std::unique_ptr<PyNativeReaderTrial> reader_trial(
         const std::int64_t io_workers,
         const std::int64_t io_queue_capacity,
@@ -1129,12 +1247,19 @@ public:
         return mutation_log_stats_dict(stats);
     }
 
-    [[nodiscard]] py::dict materialize_frozen_wals() {
+    [[nodiscard]] py::dict materialize_frozen_wals(
+        const py::object& max_wals,
+        const py::object& max_input_bytes) {
+        const std::uint64_t checked_max_wals = checked_uint64_option(
+            max_wals, "max_wals", false);
+        const std::uint64_t checked_max_input_bytes = checked_uint64_option(
+            max_input_bytes, "max_input_bytes", false);
         const auto collection = acquire_collection();
         throwdb::NativeMutationLogStats stats;
         {
             py::gil_scoped_release release;
-            stats = collection->materialize_frozen_wals();
+            stats = collection->materialize_frozen_wals(
+                checked_max_wals, checked_max_input_bytes);
         }
         return mutation_log_stats_dict(stats);
     }
@@ -1401,6 +1526,14 @@ PYBIND11_MODULE(_throwdb, module) {
             &PyNativeCollection::inspect_orphans,
             py::arg("path"))
         .def_static(
+            "_reclaim_orphans_at",
+            &PyNativeCollection::reclaim_orphans_at,
+            py::arg("path"),
+            py::arg("snapshot_unix_ns") = 0,
+            py::arg("min_age_ns") = 0,
+            py::arg("max_files") = kDefaultOrphanMaxFiles,
+            py::arg("max_bytes") = kDefaultOrphanMaxBytes)
+        .def_static(
             "open",
             &PyNativeCollection::open,
             py::arg("path"),
@@ -1424,6 +1557,13 @@ PYBIND11_MODULE(_throwdb, module) {
         .def_property_readonly(
             "mutation_log_stats", &PyNativeCollection::mutation_log_stats)
         .def("collect_orphans", &PyNativeCollection::collect_orphans)
+        .def(
+            "reclaim_orphans",
+            &PyNativeCollection::reclaim_orphans,
+            py::arg("snapshot_unix_ns") = 0,
+            py::arg("min_age_ns") = 0,
+            py::arg("max_files") = kDefaultOrphanMaxFiles,
+            py::arg("max_bytes") = kDefaultOrphanMaxBytes)
         .def(
             "reader_trial",
             &PyNativeCollection::reader_trial,
@@ -1471,7 +1611,11 @@ PYBIND11_MODULE(_throwdb, module) {
         .def("rotate_wal", &PyNativeCollection::rotate_wal)
         .def(
             "materialize_frozen_wals",
-            &PyNativeCollection::materialize_frozen_wals)
+            &PyNativeCollection::materialize_frozen_wals,
+            py::arg("max_wals") =
+                std::numeric_limits<std::uint64_t>::max(),
+            py::arg("max_input_bytes") =
+                std::numeric_limits<std::uint64_t>::max())
         .def(
             "compact_delta_runs",
             &PyNativeCollection::compact_delta_runs,

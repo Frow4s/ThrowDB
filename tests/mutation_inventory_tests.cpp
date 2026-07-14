@@ -5,14 +5,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "throwdb/errors.hpp"
 #include "throwdb/native_collection.hpp"
@@ -20,6 +24,7 @@
 #include "../src/core/mutation_delta.hpp"
 #include "../src/core/mutation_inventory.hpp"
 #include "../src/core/native_format.hpp"
+#include "../src/core/native_collection_test_hooks.hpp"
 
 namespace {
 
@@ -27,6 +32,43 @@ using throwdb::detail::MutationInventoryClass;
 using throwdb::detail::MutationInventoryEntry;
 using throwdb::detail::MutationResourceInventory;
 using throwdb::detail::Uuid128;
+
+std::filesystem::path identity_replacement_path;
+std::atomic<bool> identity_replacement_done{false};
+
+void replace_orphan_before_revalidation(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    if (context.point
+            != throwdb::detail::NativeCollectionTestHookPoint::
+                BeforeOrphanRevalidation
+        || context.operation
+               != throwdb::detail::NativeCollectionTestOperation::
+                   CollectOrphans
+        || identity_replacement_done.exchange(true)) {
+        return;
+    }
+    static_cast<void>(::unlink(identity_replacement_path.c_str()));
+    const int fd = ::open(
+        identity_replacement_path.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        const char replacement[] = "replacement";
+        static_cast<void>(::write(fd, replacement, sizeof(replacement) - 1));
+        static_cast<void>(::close(fd));
+    }
+}
+
+void crash_after_orphan_unlink(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    if (context.point
+            == throwdb::detail::NativeCollectionTestHookPoint::
+                AfterOrphanUnlink
+        && context.operation
+               == throwdb::detail::NativeCollectionTestOperation::
+                   CollectOrphans) {
+        ::_exit(77);
+    }
+}
 
 class TempDirectory {
 public:
@@ -473,6 +515,9 @@ void test_invalid_current_or_current_catalog_fails_closed() {
 
     static_cast<void>(
         throwdb::detail::inspect_mutation_resources(store, manifest));
+    const auto orphan =
+        store / "wal" / ("wal-" + std::string(32, '9') + ".wal");
+    write_sized_file(orphan, 13, 'o');
     flip_file_byte(current, 0);
     require_throws<throwdb::CorruptionError>(
         [&] {
@@ -480,6 +525,18 @@ void test_invalid_current_or_current_catalog_fails_closed() {
                 throwdb::detail::inspect_mutation_resources(store, manifest));
         },
         "inventory derived reachability from corrupted CURRENT");
+    throwdb::NativeOrphanCollectionOptions options;
+    options.snapshot_unix_ns =
+        std::numeric_limits<std::uint64_t>::max();
+    options.min_age_ns = 0;
+    require_throws<throwdb::CorruptionError>(
+        [&] {
+            static_cast<void>(
+                throwdb::NativeCollection::reclaim_orphans(store, options));
+        },
+        "executor unlinked before validating corrupted CURRENT");
+    require(std::filesystem::exists(orphan),
+            "executor removed an orphan before CURRENT validation");
     flip_file_byte(current, 0);
 
     flip_file_byte(current_catalog, 0);
@@ -758,6 +815,176 @@ void test_lightweight_inventory_excludes_builder_and_ignores_format5_deltas() {
             "format-5 inventory assigned semantics to the deltas namespace");
 }
 
+[[nodiscard]] const throwdb::NativeOrphanCollectionEntry& collected_entry_for(
+    const throwdb::NativeOrphanCollectionResult& result,
+    const std::string& path) {
+    const auto found = std::find_if(
+        result.entries.begin(), result.entries.end(),
+        [&path](const auto& entry) { return entry.file.path == path; });
+    if (found == result.entries.end()) {
+        fail("orphan collection result is missing '" + path + "'");
+    }
+    return *found;
+}
+
+[[nodiscard]] throwdb::NativeOrphanCollectionOptions collection_options(
+    const std::uint64_t max_files = 1024,
+    const std::uint64_t max_bytes = 1ULL << 30) {
+    throwdb::NativeOrphanCollectionOptions options;
+    options.snapshot_unix_ns =
+        std::numeric_limits<std::uint64_t>::max();
+    options.min_age_ns = 0;
+    options.max_files = max_files;
+    options.max_bytes = max_bytes;
+    return options;
+}
+
+void test_orphan_executor_is_bounded_nofollow_and_idempotent() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "executor-store";
+    build_store(store);
+    const auto current_temp =
+        store / ("CURRENT." + std::string(32, '1') + ".tmp");
+    const auto first_wal =
+        store / "wal" / ("wal-" + std::string(32, '2') + ".wal");
+    const auto second_wal =
+        store / "wal" / ("wal-" + std::string(32, '3') + ".wal");
+    const auto symlink_wal =
+        store / "wal" / ("wal-" + std::string(32, '4') + ".wal");
+    write_sized_file(current_temp, 3, 'c');
+    write_sized_file(first_wal, 5, 'a');
+    write_sized_file(second_wal, 7, 'b');
+    std::error_code error;
+    std::filesystem::create_symlink(first_wal.filename(), symlink_wal, error);
+    require(!error, "cannot create orphan symlink fixture");
+
+    const auto index_path = throwdb::detail::native_index_path(store);
+    const auto hidden_index = store / "index" / "index.hidden";
+    error.clear();
+    std::filesystem::rename(index_path, hidden_index, error);
+    require(!error, "cannot hide index for lightweight executor test");
+    const auto first = throwdb::NativeCollection::reclaim_orphans(
+        store, collection_options(2));
+    error.clear();
+    std::filesystem::rename(hidden_index, index_path, error);
+    require(!error, "cannot restore index after lightweight executor test");
+    require_equal(
+        collected_entry_for(first, relative_path(store, current_temp))
+            .disposition,
+        throwdb::NativeOrphanDisposition::Removed,
+        "bounded executor did not remove the first sorted candidate");
+    require_equal(
+        collected_entry_for(first, relative_path(store, first_wal))
+            .disposition,
+        throwdb::NativeOrphanDisposition::Removed,
+        "bounded executor did not remove the second sorted candidate");
+    require_equal(
+        collected_entry_for(first, relative_path(store, second_wal))
+            .disposition,
+        throwdb::NativeOrphanDisposition::MaximumFilesReached,
+        "bounded executor exceeded its file budget");
+    require_equal(
+        collected_entry_for(first, relative_path(store, symlink_wal))
+            .disposition,
+        throwdb::NativeOrphanDisposition::NotCandidate,
+        "executor followed a symlink with candidate spelling");
+    require(!std::filesystem::exists(current_temp),
+            "executor retained removed CURRENT temp");
+    require(!std::filesystem::exists(first_wal),
+            "executor retained removed WAL");
+    require(std::filesystem::exists(second_wal),
+            "executor removed a budget-deferred WAL");
+    require(std::filesystem::is_symlink(symlink_wal),
+            "executor removed or followed an orphan symlink");
+    require(first.durability_complete,
+            "executor did not durably sync removed candidates");
+
+    const auto second = throwdb::NativeCollection::reclaim_orphans(
+        store, collection_options());
+    require_equal(
+        collected_entry_for(second, relative_path(store, second_wal))
+            .disposition,
+        throwdb::NativeOrphanDisposition::Removed,
+        "second bounded pass did not converge");
+    const auto third = throwdb::NativeCollection::reclaim_orphans(
+        store, collection_options());
+    require(std::none_of(
+                third.entries.begin(), third.entries.end(),
+                [](const auto& entry) { return entry.removed; }),
+            "idempotent orphan pass removed another file");
+}
+
+void test_orphan_executor_revalidates_identity_before_unlink() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "identity-store";
+    build_store(store);
+    identity_replacement_path =
+        store / "wal" / ("wal-" + std::string(32, '7') + ".wal");
+    write_sized_file(identity_replacement_path, 19, 'x');
+    identity_replacement_done.store(false);
+    throwdb::detail::set_native_collection_test_hook(
+        replace_orphan_before_revalidation);
+    throwdb::NativeOrphanCollectionResult result;
+    try {
+        result = throwdb::NativeCollection::reclaim_orphans(
+            store, collection_options());
+    } catch (...) {
+        throwdb::detail::set_native_collection_test_hook(nullptr);
+        throw;
+    }
+    throwdb::detail::set_native_collection_test_hook(nullptr);
+    const auto& entry = collected_entry_for(
+        result, relative_path(store, identity_replacement_path));
+    require_equal(
+        entry.disposition,
+        throwdb::NativeOrphanDisposition::IdentityChanged,
+        "executor unlinked a pathname whose inode changed after scanning");
+    require(!entry.removed,
+            "identity-changed entry was reported as removed");
+    require(std::filesystem::is_regular_file(identity_replacement_path),
+            "executor removed the replacement inode");
+}
+
+void test_orphan_executor_crash_after_unlink_is_retry_safe() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "crash-store";
+    build_store(store);
+    const auto orphan =
+        store / "wal" / ("wal-" + std::string(32, '8') + ".wal");
+    write_sized_file(orphan, 23, 'z');
+
+    const pid_t child = ::fork();
+    require(child >= 0, "fork failed for orphan crash test");
+    if (child == 0) {
+        throwdb::detail::set_native_collection_test_hook(
+            crash_after_orphan_unlink);
+        try {
+            static_cast<void>(throwdb::NativeCollection::reclaim_orphans(
+                store, collection_options()));
+        } catch (...) {
+            ::_exit(78);
+        }
+        ::_exit(79);
+    }
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child,
+            "waitpid failed for orphan crash test");
+    require(WIFEXITED(status) && WEXITSTATUS(status) == 77,
+            "orphan crash child missed the post-unlink checkpoint");
+
+    auto reader = throwdb::NativeCollection::open(store);
+    const std::array<std::uint64_t, 2> ids{1, 2};
+    require_equal(reader->get_bytes(ids).size(), std::size_t{16},
+                  "post-crash collection did not reopen bit-exactly");
+    reader.reset();
+    const auto retry = throwdb::NativeCollection::reclaim_orphans(
+        store, collection_options());
+    require(std::none_of(
+                retry.entries.begin(), retry.entries.end(),
+                [](const auto& entry) { return entry.removed; }),
+            "post-crash retry was not idempotent");
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -766,7 +993,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 4> tests{{
+    const std::array<TestCase, 7> tests{{
         {"classifies_current_history_orphans_and_unknowns",
          test_classifies_current_history_orphans_and_unknowns},
         {"invalid_current_or_current_catalog_fails_closed",
@@ -775,6 +1002,12 @@ int main() {
          test_public_inventory_is_lightweight_stable_and_writable_only},
         {"lightweight_inventory_excludes_builder_and_ignores_format5_deltas",
          test_lightweight_inventory_excludes_builder_and_ignores_format5_deltas},
+        {"orphan_executor_is_bounded_nofollow_and_idempotent",
+         test_orphan_executor_is_bounded_nofollow_and_idempotent},
+        {"orphan_executor_revalidates_identity_before_unlink",
+         test_orphan_executor_revalidates_identity_before_unlink},
+        {"orphan_executor_crash_after_unlink_is_retry_safe",
+         test_orphan_executor_crash_after_unlink_is_retry_safe},
     }};
 
     std::size_t failures = 0;

@@ -92,14 +92,18 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
         dry_run=True,
         min_age_seconds=3600,
     )
+    maintenance_plan = collection.maintain(dry_run=True)
+    maintenance = collection.maintain(dry_run=False)
 ```
 
 For diagnostics that do not otherwise need an open collection, use
 `Collection.inspect_orphans("/data/example", min_age_seconds=3600)`. This
 lightweight path validates the selected catalog and scans mutation namespaces
-without loading the base index. Both APIs only produce an advisory dry-run
-report: they do not delete files, and the report is not authorization for a
-later unlink.
+without loading the base index. A previous plan is never accepted as deletion
+authorization. `collect_orphans(dry_run=False)` on an `r+` handle performs a
+fresh locked scan, applies hard file/byte budgets, revalidates every pathname
+without following symlinks, unlinks it, and syncs each affected directory.
+Superseded catalogs remain retained by policy.
 
 `Collection.create()` now builds the checksummed native numeric format reported
 as `collection.format_version == 6`. Version 6 adds the required `DeltaV1`
@@ -334,13 +338,28 @@ throwdb collect-orphans \
   --storage /data/example \
   --dry-run \
   --min-age-seconds 3600
+
+throwdb collect-orphans \
+  --storage /data/example \
+  --execute \
+  --min-age-seconds 3600 \
+  --max-files 1024 \
+  --max-bytes 8589934592
+
+throwdb maintain --storage /data/example --dry-run
+throwdb maintain --storage /data/example --execute
 ```
 
-`collect-orphans` requires the explicit `--dry-run` acknowledgement. It marks
-old temporary publications, unreferenced WALs, and complete or partial
-unreferenced delta pairs as eligible candidates after the age threshold.
-Reachable files, superseded catalogs retained by policy, and unknown entries
-are never candidates. The command does not remove anything.
+`collect-orphans` requires exactly one explicit mode. `--dry-run` is advisory;
+`--execute` always rescans under the writer and commit leases before deleting.
+It considers only old temporary publications, unreferenced WALs, and complete
+or partial unreferenced delta pairs. Reachable files, superseded catalogs
+retained by policy, symlinks, and unknown entries are never removed.
+
+`maintain` is an explicit one-pass policy, not a background thread. In fixed
+order it may rotate a large active WAL, materialize a bounded oldest frozen
+prefix, compact a bounded oldest delta prefix, and collect bounded orphans.
+Its wall-clock limit is cooperative and checked only between durable actions.
 
 `ids.npy` may use any 8/16/32/64-bit unsigned integer dtype, or a signed integer
 dtype whose values are all non-negative. `embeddings.npy` must use `float16` or
@@ -386,9 +405,8 @@ can interrupt cleanup.
 - manual bounded oldest-prefix DeltaV1 compaction with source-payload
   verification, newest-version collapse, tombstone preservation, atomic
   publication, and best-effort source reclamation;
-- public lightweight orphan inspection and a writer-held dry-run collection
-  plan with age-based eligibility, but no orphan deletion or automatic
-  `maintain()` policy yet;
+- public lightweight orphan inspection, fail-closed bounded orphan deletion,
+  bounded frozen-WAL materialization, and explicit deterministic `maintain()`;
 - no base compaction/selective cleaning, UTF-8 IDs, delta payload scrub command,
   or network service yet. Delta version metadata is still loaded into the RAM
   overlay on open. The lifecycle currently relies on local POSIX rename,

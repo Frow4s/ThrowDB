@@ -211,7 +211,7 @@ def test_compact_deltas_command_has_bounded_defaults_and_forwards_limits(
     assert json.loads(capsys.readouterr().out) == report
 
 
-def test_collect_orphans_requires_explicit_dry_run_and_uses_lightweight_scan(
+def test_collect_orphans_requires_explicit_mode_and_uses_lightweight_scan(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -224,6 +224,15 @@ def test_collect_orphans_requires_explicit_dry_run_and_uses_lightweight_scan(
 
     with pytest.raises(SystemExit) as stopped:
         parser.parse_args(["collect-orphans", "--storage", "/tmp/store"])
+    assert stopped.value.code == 2
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as stopped:
+        parser.parse_args(
+            [
+                "collect-orphans", "--storage", "/tmp/store",
+                "--dry-run", "--execute",
+            ]
+        )
     assert stopped.value.code == 2
     capsys.readouterr()
 
@@ -271,6 +280,112 @@ def test_collect_orphans_requires_explicit_dry_run_and_uses_lightweight_scan(
     assert observed == {
         "path": Path("/tmp/store"),
         "min_age_seconds": 12.5,
+    }
+    assert json.loads(capsys.readouterr().out) == report
+
+
+def test_collect_orphans_execute_uses_private_lightweight_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report = {
+        "format": "throwdb-orphan-collection-report",
+        "version": 1,
+        "dry_run": False,
+        "removed_file_count": 2,
+        "removed_bytes": 17,
+        "entries": [],
+    }
+    observed: dict[str, object] = {}
+
+    def fake_reclaim(
+        cls: type[Collection], path: Path, **kwargs: object
+    ) -> dict[str, object]:
+        del cls
+        observed["path"] = path
+        observed.update(kwargs)
+        return report
+
+    monkeypatch.setattr(
+        Collection, "_reclaim_orphans_at", classmethod(fake_reclaim)
+    )
+    main(
+        [
+            "collect-orphans", "--storage", "/tmp/store", "--execute",
+            "--min-age-seconds", "5", "--max-files", "7",
+            "--max-bytes", "99",
+        ]
+    )
+    assert observed == {
+        "path": Path("/tmp/store"),
+        "min_age_seconds": 5.0,
+        "max_files": 7,
+        "max_bytes": 99,
+    }
+    assert json.loads(capsys.readouterr().out) == report
+
+
+def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["maintain", "--storage", "/tmp/store"])
+    capsys.readouterr()
+    report = {"format": "throwdb-maintenance-report", "version": 1}
+    observed: dict[str, object] = {}
+
+    class FakeCollection:
+        def __enter__(self) -> FakeCollection:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def maintain(self, **kwargs: object) -> dict[str, object]:
+            observed.update(kwargs)
+            return report
+
+    def fake_open(
+        cls: type[Collection], path: Path, **kwargs: object
+    ) -> FakeCollection:
+        del cls
+        observed["path"] = path
+        observed["open"] = kwargs
+        return FakeCollection()
+
+    monkeypatch.setattr(Collection, "open", classmethod(fake_open))
+    main(
+        [
+            "maintain", "--storage", "/tmp/store", "--execute",
+            "--max-seconds", "0", "--max-actions", "2",
+            "--rotate-wal-bytes", "10",
+            "--materialize-max-wals", "3",
+            "--materialize-max-input-bytes", "20",
+            "--compact-min-runs", "4", "--compact-max-runs", "5",
+            "--compact-max-input-bytes", "30",
+            "--compact-max-input-entries", "40",
+            "--orphan-min-age-seconds", "6",
+            "--orphan-max-files", "7", "--orphan-max-bytes", "50",
+        ]
+    )
+    assert observed == {
+        "path": Path("/tmp/store"),
+        "open": {"mode": "r+"},
+        "dry_run": False,
+        "max_seconds": 0.0,
+        "max_actions": 2,
+        "rotate_wal_bytes": 10,
+        "materialize_max_wals": 3,
+        "materialize_max_input_bytes": 20,
+        "compact_min_runs": 4,
+        "compact_max_runs": 5,
+        "compact_max_input_bytes": 30,
+        "compact_max_input_entries": 40,
+        "orphan_min_age_seconds": 6.0,
+        "orphan_max_files": 7,
+        "orphan_max_bytes": 50,
     }
     assert json.loads(capsys.readouterr().out) == report
 
