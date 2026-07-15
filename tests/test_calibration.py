@@ -222,6 +222,7 @@ def _run_fake(
     *,
     seed: int = 123,
     max_read_bytes: int = 2 << 20,
+    max_memory_bytes: int = 4 << 20,
     deadline: float = 10_000.0,
     clock: object | None = None,
     progress: Callable[[str], None] | None = None,
@@ -245,7 +246,7 @@ def _run_fake(
         current_options=None,
         seed=seed,
         max_read_bytes=max_read_bytes,
-        max_memory_bytes=1 << 20,
+        max_memory_bytes=max_memory_bytes,
         deadline=deadline,
         clock=_StepClock() if clock is None else clock,  # type: ignore[arg-type]
         progress=progress,
@@ -510,12 +511,17 @@ def test_bounded_calibration_is_deterministic_bit_exact_and_report_only(
     first = _run_fake(first_native, monkeypatch, seed=987)
     second = _run_fake(second_native, monkeypatch, seed=987)
 
-    reserved_workspace = max(
-        2 * first_native.record_size + 8,
-        4 * (first_native.record_size + 8),
-        32,
+    reserved_workspace = calibration._minimum_workspace_bytes(
+        first_native.record_size,
+        4,
     )
-    requested_count = ((1 << 20) - reserved_workspace) // 16
+    requested_count = min(
+        ((4 << 20) - reserved_workspace) // 16,
+        (
+            (4 << 20) - calibration._NATIVE_SAMPLE_FIXED_BYTES
+        )
+        // calibration._NATIVE_SAMPLE_BYTES_PER_ROW,
+    )
     expected_sample_call = {
         "requested_count": requested_count,
         "seed": 987,
@@ -540,48 +546,77 @@ def test_bounded_calibration_is_deterministic_bit_exact_and_report_only(
         item["correctness"]["passed"]  # type: ignore[index]
         for item in first["candidates"]  # type: ignore[index]
     )
-    assert first["workload"]["warmup"] == {  # type: ignore[index]
+    workload = first["workload"]
+    assert workload["matrix"] == "two_stage_v3"  # type: ignore[index]
+    assert workload["warmup"] == {  # type: ignore[index]
         "rounds": 1,
         "measured": False,
         "accounting": "charged_not_measured",
-        "blocks_per_candidate": 3,
-        "rows_per_candidate": 16_144,
+        "blocks_per_candidate": 7,
+        "rows_per_candidate": 10_331,
     }
-    assert all(
-        item["warmup"]
-        == {
-            "status": "complete",
-            "rounds": 1,
-            "blocks_total": 3,
-            "blocks_completed": 3,
-            "rows": 16_144,
-            "planned_read_bytes": 129_152,
-        }
-        for item in first["candidates"]  # type: ignore[index]
-    )
-    assert all(
-        len(scenario["repetitions"]) == 3
-        for item in first["candidates"]  # type: ignore[index]
-        for scenario in item["scenarios"]
-    )
-    assert len(first_native.timed_ids) == 84
-    assert sum(ids.size for ids in first_native.timed_ids) == 193_728
-    assert first["planned_read_bytes"] == 1_551_872
+    stages = {stage["name"]: stage for stage in workload["stages"]}  # type: ignore[index]
+    assert set(stages) == {"screening", "verification"}
+    assert stages["screening"]["repeats"] == 2
+    assert stages["verification"]["repeats"] == 4
+    candidate_count = len(first["candidates"])  # type: ignore[arg-type]
+    expected_calls = 0
+    expected_rows = 0
+    for stage_name, stage in stages.items():
+        rows_per_round = sum(
+            sum(scenario["query_rows"])
+            if scenario["query_rows"] is not None
+            else scenario["batch_rows"] * scenario["calls_per_repeat"]
+            for scenario in stage["scenarios"]
+        )
+        calls_per_round = sum(
+            scenario["calls_per_repeat"] for scenario in stage["scenarios"]
+        )
+        rounds = stage["warmup_rounds"] + stage["repeats"]
+        expected_calls += candidate_count * rounds * calls_per_round
+        expected_rows += candidate_count * rounds * rows_per_round
+        for item in first["candidates"]:  # type: ignore[index]
+            stage_report = item[stage_name]
+            assert stage_report["warmup"] == {
+                "status": "complete",
+                "rounds": 1,
+                "blocks_total": len(stage["scenarios"]),
+                "blocks_completed": len(stage["scenarios"]),
+                "rows": rows_per_round,
+                "planned_read_bytes": rows_per_round * first_native.record_size,
+            }
+            assert all(
+                len(scenario["repetitions"]) == stage["repeats"]
+                for scenario in stage_report["scenarios"]
+            )
+    assert len(first_native.timed_ids) == expected_calls
+    assert sum(ids.size for ids in first_native.timed_ids) == expected_rows
+    correctness_rows = workload["correctness_rows"]  # type: ignore[index]
+    expected_bound = (
+        expected_rows + correctness_rows * (candidate_count + 1)
+    ) * first_native.record_size
+    assert first["planned_read_bytes"] == expected_bound
     assert first["planned_read_bytes"] <= 2 << 20
     assert (
         first["planned_read_bytes"]
-        == first["workload"]["requested_read_bound_bytes"]  # type: ignore[index]
+        <= workload["requested_read_bound_bytes"]  # type: ignore[index]
     )
     assert first_native.closed_trials == len(first_native.trial_options)
     assert len(first_native.trial_options) == len(first["candidates"])
     assert first["workload"]["cache_control"] == (  # type: ignore[index]
         "ambient_replacement_warm_interleaved"
     )
+    assert first["workload"]["stage_cache_control"] == {  # type: ignore[index]
+        "screening": "ambient_replacement_warm_interleaved",
+        "verification": (
+            "ambient_replacement_warm_interleaved+explicit_hot_reuse"
+        ),
+    }
     assert "persisted" not in first
     assert "profile" not in first
 
 
-def test_measured_candidate_order_rotates_for_three_active_profiles(
+def test_candidate_order_rotates_within_each_v3_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     messages: list[str] = []
@@ -593,18 +628,26 @@ def test_measured_candidate_order_rotates_for_three_active_profiles(
     )
 
     assert report["status"] == "complete"
-    first_candidate: dict[tuple[int, str], str] = {}
+    first_candidate: dict[tuple[str, int, str], str] = {}
     for message in messages:
-        if not message.startswith("repeat "):
+        if not message.startswith(("screening ", "verification ")):
             continue
         prefix, block = message.split(": ", 1)
-        repetition = int(prefix.split()[1].split("/", 1)[0])
+        stage, phase, round_value = prefix.split()
+        round_index = int(round_value.split("/", 1)[0])
+        phase_index = 0 if phase == "warm-up" else round_index
         candidate, scenario = block.split(" / ", 1)
-        first_candidate.setdefault((repetition, scenario), candidate)
+        first_candidate.setdefault(
+            (stage, phase_index, scenario), candidate
+        )
 
-    for scenario in ("serial_1024", "parallel_1024", "serial_10000"):
-        order = [first_candidate[(repetition, scenario)] for repetition in (1, 2, 3)]
-        assert len(set(order)) == 3
+    for stage in ("screening", "verification"):
+        for scenario in ("serial_1024", "parallel_1024", "serial_10000"):
+            order = [
+                first_candidate[(stage, phase_index, scenario)]
+                for phase_index in (0, 1, 2)
+            ]
+            assert len(set(order)) == 3
 
 
 def test_bounded_calibration_stops_before_sampling_after_deadline(
@@ -635,7 +678,7 @@ def test_bounded_calibration_returns_partial_report_when_matrix_hits_deadline(
     repeats_started = [0]
 
     def progress(message: str) -> None:
-        if not message.startswith("repeat "):
+        if not message.startswith("screening repeat "):
             return
         repeats_started[0] += 1
         if repeats_started[0] == 2:
@@ -652,7 +695,7 @@ def test_bounded_calibration_returns_partial_report_when_matrix_hits_deadline(
         current_options=None,
         seed=123,
         max_read_bytes=2 << 20,
-        max_memory_bytes=1 << 20,
+        max_memory_bytes=4 << 20,
         deadline=1.0,
         clock=lambda: now[0],
         progress=progress,
@@ -672,9 +715,9 @@ def test_bounded_calibration_returns_partial_report_when_matrix_hits_deadline(
         for scenario in item["scenarios"]
     )
     assert measured_repetitions == 1
-    assert len(native.timed_ids) == 23
-    assert sum(ids.size for ids in native.timed_ids) == 50_480
-    assert report["planned_read_bytes"] == 405_888
+    assert len(native.timed_ids) == 141
+    assert sum(ids.size for ids in native.timed_ids) == 7_377
+    assert report["planned_read_bytes"] == 61_064
     assert native.closed_trials == len(native.trial_options)
 
 
@@ -685,7 +728,7 @@ def test_progress_callback_cannot_start_a_measured_read_after_the_deadline(
     now = [0.0]
 
     def progress(message: str) -> None:
-        if message.startswith("repeat "):
+        if message.startswith("screening repeat "):
             now[0] = 2.0
 
     monkeypatch.setattr(
@@ -699,7 +742,7 @@ def test_progress_callback_cannot_start_a_measured_read_after_the_deadline(
         current_options=None,
         seed=123,
         max_read_bytes=2 << 20,
-        max_memory_bytes=1 << 20,
+        max_memory_bytes=4 << 20,
         deadline=1.0,
         clock=lambda: now[0],
         progress=progress,
@@ -712,9 +755,9 @@ def test_progress_callback_cannot_start_a_measured_read_after_the_deadline(
         for item in report["candidates"]  # type: ignore[index]
         for scenario in item["scenarios"]
     ) == 0
-    assert len(native.timed_ids) == 21
-    assert sum(ids.size for ids in native.timed_ids) == 48_432
-    assert report["planned_read_bytes"] == 389_504
+    assert len(native.timed_ids) == 123
+    assert sum(ids.size for ids in native.timed_ids) == 7_359
+    assert report["planned_read_bytes"] == 60_920
 
 
 def test_deadline_during_warmup_prevents_any_measured_read(
@@ -724,7 +767,7 @@ def test_deadline_during_warmup_prevents_any_measured_read(
     now = [0.0]
 
     def progress(message: str) -> None:
-        if message.startswith("warm-up "):
+        if message.startswith("screening warm-up "):
             now[0] = 2.0
 
     monkeypatch.setattr(
@@ -738,7 +781,7 @@ def test_deadline_during_warmup_prevents_any_measured_read(
         current_options=None,
         seed=123,
         max_read_bytes=2 << 20,
-        max_memory_bytes=1 << 20,
+        max_memory_bytes=4 << 20,
         deadline=1.0,
         clock=lambda: now[0],
         progress=progress,
@@ -746,8 +789,9 @@ def test_deadline_during_warmup_prevents_any_measured_read(
     )
 
     assert report["status"] == "budget_exhausted"
-    assert report["reason"] == "cooperative deadline expired during warm-up"
+    assert report["reason"] == "cooperative deadline expired during screening"
     assert report["selection"] is None
+    assert report["planned_read_bytes"] == 2_048
     assert native.timed_ids == []
     assert all(
         not scenario["repetitions"]
@@ -781,7 +825,7 @@ def test_trial_construction_crossing_deadline_skips_correctness_read(
         current_options=None,
         seed=123,
         max_read_bytes=2 << 20,
-        max_memory_bytes=1 << 20,
+        max_memory_bytes=4 << 20,
         deadline=1.0,
         clock=lambda: now[0],
         capability_probe=_no_io_uring,
@@ -869,10 +913,20 @@ def test_correctness_backend_failure_keeps_conservative_read_accounting(
     assert report["status"] == "complete"
     assert failed["status"] == "unavailable"
     assert failed["warmup"]["status"] == "not_run"
-    omitted_warmup_and_measurement = 4 * 16_144 * native.record_size
-    assert report["planned_read_bytes"] == (
-        report["workload"]["requested_read_bound_bytes"]  # type: ignore[index]
-        - omitted_warmup_and_measurement
+    stage_rows_per_candidate = sum(
+        (stage["warmup_rounds"] + stage["repeats"])
+        * sum(
+            sum(scenario["query_rows"])
+            if scenario["query_rows"] is not None
+            else scenario["batch_rows"] * scenario["calls_per_repeat"]
+            for scenario in stage["scenarios"]
+        )
+        for stage in report["workload"]["stages"]  # type: ignore[index]
+    )
+    correctness_rows = report["workload"]["correctness_rows"]  # type: ignore[index]
+    assert report["planned_read_bytes"] == native.record_size * (
+        stage_rows_per_candidate * 2
+        + correctness_rows * (len(report["candidates"]) + 1)  # type: ignore[arg-type]
     )
 
 
@@ -893,12 +947,22 @@ def test_default_matrix_includes_bounded_io_oversubscription(
         },
     )
 
-    assert len(candidates) == 8
-    assert "thread_pool_w16" in [candidate.name for candidate in candidates]
+    assert [candidate.name for candidate in candidates] == [
+        "sequential",
+        "thread_pool_w8",
+        "thread_pool_w10",
+        "thread_pool_w16",
+        "thread_pool_w24",
+        "thread_pool_w32",
+        "io_uring_w1_qd16",
+        "io_uring_w1_qd32",
+        "io_uring_w1_qd64",
+        "io_uring_w2_qd32",
+    ]
     assert not [
         item
         for item in unavailable
-        if "exceeds the matrix-v2 cap" in str(item["reason"])
+        if "exceeds the matrix-v3 cap" in str(item["reason"])
     ]
 
 
@@ -925,15 +989,34 @@ def test_oversized_current_profile_is_not_instantiated(
     assert not any(candidate.name.startswith("current") for candidate in candidates)
     assert any(
         item["name"] == "current_w1024"
-        and "exceeds the matrix-v2 cap" in str(item["reason"])
+        and "exceeds the matrix-v3 cap" in str(item["reason"])
         for item in unavailable
     )
 
 
 def test_read_and_memory_budgets_reduce_correctness_rows_exactly() -> None:
     record_size = 64 << 10
-    minimum_rows = 3 + 1 + 3 * (2 + calibration._WARMUP_ROUNDS) * (4 + 2)
-    scenarios, repeats, correctness, requested = calibration._build_scenarios(
+    candidate_count = 3
+    screening_rows_per_round = 1 + 1 + 1 + 4 + 1
+    verification_rows_per_round = 1 + 1 + 1 + 4 + 1 + 5 + 1
+    minimum_verification_repeats = 4
+    minimum_rows = (
+        candidate_count
+        + 1
+        + candidate_count
+        * (2 + calibration._WARMUP_ROUNDS)
+        * screening_rows_per_round
+        + min(calibration._MAX_FINALISTS, candidate_count)
+        * (minimum_verification_repeats + calibration._WARMUP_ROUNDS)
+        * verification_rows_per_round
+        + candidate_count
+        * (
+            calibration._STABILITY_RECHECK_REPEATS
+            + calibration._WARMUP_ROUNDS
+        )
+        * verification_rows_per_round
+    )
+    stage_plans = calibration._build_stage_plans(
         candidate_count=3,
         sample_rows=100,
         record_size=record_size,
@@ -941,41 +1024,138 @@ def test_read_and_memory_budgets_reduce_correctness_rows_exactly() -> None:
         max_read_bytes=minimum_rows * record_size,
         max_memory_bytes=1 << 20,
     )
+    screening, verification, correctness, requested = stage_plans
 
-    assert repeats == 2
+    assert screening.repeats == 2
+    assert verification.repeats == minimum_verification_repeats
     assert correctness == 1
     assert requested == minimum_rows * record_size
-    assert all(scenario.batch_rows == 1 for scenario in scenarios)
+    assert screening.rows_per_round == screening_rows_per_round
+    assert verification.rows_per_round == verification_rows_per_round
+    assert all(scenario.batch_rows == 1 for scenario in screening.scenarios)
+    mixed = next(
+        scenario
+        for scenario in verification.scenarios
+        if scenario.name == "mixed_small_large"
+    )
+    assert mixed.query_rows == (2, 1, 1, 1)
+    assert (
+        minimum_verification_repeats * (len(mixed.query_rows) - 1)
+        >= calibration._MIN_MIXED_SMALL_SAMPLES
+    )
     assert 100 * 8 + correctness * (2 * record_size + 8) <= 1 << 20
+
+
+def test_replacement_queries_account_for_indices_and_selected_ids() -> None:
+    sample_rows = 16
+    record_size = 2_048
+    max_memory_bytes = 200_000
+    screening, verification, correctness, _ = calibration._build_stage_plans(
+        candidate_count=3,
+        sample_rows=sample_rows,
+        record_size=record_size,
+        effective_cpu=2,
+        max_read_bytes=1 << 30,
+        max_memory_bytes=max_memory_bytes,
+    )
+
+    for stage in (screening, verification):
+        for scenario in stage.scenarios:
+            assert (
+                sample_rows * 16
+                + scenario.total_rows * 16
+                + scenario.concurrent_output_rows * record_size
+                <= max_memory_bytes
+            )
+    assert (
+        sample_rows * 8 + correctness * (2 * record_size + 8)
+        <= max_memory_bytes
+    )
 
 
 def test_large_sample_uses_one_globally_disjoint_query_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     native = _FakeNative(sampled_rows=100_000)
+    original = calibration._queries_for_candidate
+    generated: dict[str, list[np.ndarray]] = {}
+
+    def tracked(*args: object, **kwargs: object) -> list[np.ndarray]:
+        result = original(*args, **kwargs)
+        scenario = kwargs["scenario"]
+        assert isinstance(scenario, calibration._Scenario)
+        generated.setdefault(scenario.name, []).append(
+            np.concatenate(result).copy()
+        )
+        return result
+
+    monkeypatch.setattr(calibration, "_queries_for_candidate", tracked)
 
     report = _run_fake(
         native,
         monkeypatch,
         max_read_bytes=200_000,
+        max_memory_bytes=8 << 20,
     )
 
     assert report["status"] == "complete"
     assert report["workload"]["cache_control"] == (  # type: ignore[index]
         "ambient_global_disjoint_interleaved"
     )
+    assert report["workload"]["stage_cache_control"] == {  # type: ignore[index]
+        "screening": "ambient_global_disjoint_interleaved",
+        "verification": (
+            "ambient_global_disjoint_interleaved+explicit_hot_reuse"
+        ),
+    }
     measured_ids = np.concatenate(native.timed_ids)
     workload = report["workload"]
-    expected_rows = (  # type: ignore[index]
-        len(report["candidates"])
-        * (workload["repeats"] + workload["warmup"]["rounds"])
+    candidate_count = len(report["candidates"])
+    expected_rows = sum(  # type: ignore[index]
+        candidate_count
+        * (stage["repeats"] + stage["warmup_rounds"])
         * sum(
-            scenario["batch_rows"] * scenario["calls_per_repeat"]
-            for scenario in workload["scenarios"]
+            sum(scenario["query_rows"])
+            if scenario["query_rows"] is not None
+            else scenario["batch_rows"] * scenario["calls_per_repeat"]
+            for scenario in stage["scenarios"]
         )
+        for stage in workload["stages"]
     )
     assert measured_ids.size == expected_rows
-    assert np.unique(measured_ids).size == measured_ids.size
+
+    offsets: dict[str, int] = {}
+    all_ambient_parts: list[np.ndarray] = []
+    hot_ids: np.ndarray | None = None
+    for stage in workload["stages"]:  # type: ignore[index]
+        stage_invocations = candidate_count * (
+            stage["repeats"] + stage["warmup_rounds"]
+        )
+        ambient_parts: list[np.ndarray] = []
+        for scenario in stage["scenarios"]:
+            chunks = generated[scenario["name"]]
+            begin = offsets.get(scenario["name"], 0)
+            end = begin + stage_invocations
+            selected = chunks[begin:end]
+            assert len(selected) == stage_invocations
+            offsets[scenario["name"]] = end
+            if scenario["cache_mode"] != "hot":
+                ambient_parts.extend(selected)
+            else:
+                assert scenario["name"] == "hot_small"
+                assert all(
+                    np.array_equal(selected[0], value)
+                    for value in selected[1:]
+                )
+                hot_ids = selected[0]
+        ambient_ids = np.concatenate(ambient_parts)
+        assert np.unique(ambient_ids).size == ambient_ids.size
+        all_ambient_parts.append(ambient_ids)
+    all_ambient_ids = np.concatenate(all_ambient_parts)
+    assert np.unique(all_ambient_ids).size == all_ambient_ids.size
+    assert workload["cache_sampling"]["cross_stage_ambient_disjoint"] is True
+    assert hot_ids is not None
+    assert not np.intersect1d(all_ambient_ids, hot_ids).size
 
 
 def test_replacement_mode_releases_previous_queries_before_allocating_next(
@@ -1005,4 +1185,16 @@ def test_replacement_mode_releases_previous_queries_before_allocating_next(
     assert report["workload"]["cache_control"] == (  # type: ignore[index]
         "ambient_replacement_warm_interleaved"
     )
-    assert calls == 36
+    assert report["workload"]["stage_cache_control"] == {  # type: ignore[index]
+        "screening": "ambient_replacement_warm_interleaved",
+        "verification": (
+            "ambient_replacement_warm_interleaved+explicit_hot_reuse"
+        ),
+    }
+    expected_query_builds = sum(
+        len(report["candidates"])
+        * (stage["warmup_rounds"] + stage["repeats"])
+        * len(stage["scenarios"])
+        for stage in report["workload"]["stages"]  # type: ignore[index]
+    )
+    assert calls == expected_query_builds

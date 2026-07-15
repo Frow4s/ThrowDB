@@ -33,8 +33,8 @@ constexpr std::int64_t kDefaultIoUringQueueDepth = 32;
 constexpr std::int64_t kMaxIoUringQueueDepth = 4096;
 constexpr std::uint64_t kDefaultMaxReadRangeBytes = 1ULL << 20;
 constexpr std::uint64_t kDefaultMaxGapBytes = 0;
-constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 20;
-constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 24;
+constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 22;
+constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 25;
 constexpr std::uint64_t kMaximumDeltaCompactionMaxRuns = 64;
 constexpr std::uint64_t kMaximumPartitionedFoldRuns = 4096;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
@@ -978,6 +978,118 @@ private:
     std::shared_ptr<throwdb::NativeReaderTrial> trial_;
 };
 
+class PyNativeIdScan {
+public:
+    explicit PyNativeIdScan(std::unique_ptr<throwdb::NativeIdScan> scan)
+        : scan_(std::move(scan)) {
+        if (scan_ == nullptr) {
+            throw std::runtime_error("native ID scan is null");
+        }
+    }
+
+    void close() {
+        std::shared_ptr<throwdb::NativeIdScan> scan;
+        {
+            const std::scoped_lock lock(handle_mutex_);
+            scan = std::move(scan_);
+        }
+        if (scan == nullptr) {
+            return;
+        }
+        py::gil_scoped_release release;
+        scan.reset();
+    }
+
+    [[nodiscard]] py::dict metadata() const {
+        const auto scan = acquire();
+        const throwdb::NativeIdScanMetadata& metadata = scan->metadata();
+        py::dict result;
+        result["collection_id_low"] = metadata.collection_id_low;
+        result["collection_id_high"] = metadata.collection_id_high;
+        result["catalog_generation"] = metadata.catalog_generation;
+        result["committed_sequence"] = metadata.committed_sequence;
+        result["live_count"] = metadata.live_count;
+        return result;
+    }
+
+    [[nodiscard]] bool done() const {
+        const std::scoped_lock operation(operation_mutex_);
+        return acquire()->done();
+    }
+
+    [[nodiscard]] std::uint64_t read_into(
+        py::array ids,
+        const py::object& locations_object) {
+        if (!dtype_equal(ids.dtype(), py::dtype::of<std::uint64_t>())) {
+            throw py::value_error(
+                "ids must have native-endian dtype uint64, got "
+                + py::cast<std::string>(py::str(ids.dtype())));
+        }
+        require_native_endian(ids, "ids");
+        if (ids.ndim() != 1) {
+            throw py::value_error("ids must have shape (N,)");
+        }
+        require_c_contiguous(ids, "ids");
+        require_aligned(ids, "ids");
+        if (!ids.writeable()) {
+            throw py::value_error("ids must be writable");
+        }
+        std::span<std::uint64_t> id_span{
+            static_cast<std::uint64_t*>(ids.mutable_data()),
+            static_cast<std::size_t>(ids.shape(0))};
+
+        py::array locations;
+        std::span<throwdb::NativeIdLocation> location_span;
+        if (!locations_object.is_none()) {
+            if (!py::isinstance<py::array>(locations_object)) {
+                throw py::type_error(
+                    "locations must be a NumPy ndarray or None");
+            }
+            locations = py::cast<py::array>(locations_object);
+            if (!dtype_equal(
+                    locations.dtype(),
+                    py::dtype::of<throwdb::NativeIdLocation>())) {
+                throw py::value_error(
+                    "locations must have dtype "
+                    "[('segment_id', '<u4'), ('row_index', '<u4')]");
+            }
+            require_native_endian(locations, "locations");
+            if (locations.ndim() != 1
+                || locations.shape(0) != ids.shape(0)) {
+                throw py::value_error(
+                    "locations must have shape (len(ids),)");
+            }
+            require_c_contiguous(locations, "locations");
+            require_aligned(locations, "locations");
+            if (!locations.writeable()) {
+                throw py::value_error("locations must be writable");
+            }
+            location_span = {
+                static_cast<throwdb::NativeIdLocation*>(
+                    locations.mutable_data()),
+                static_cast<std::size_t>(locations.shape(0))};
+        }
+
+        const std::scoped_lock operation(operation_mutex_);
+        const auto scan = acquire();
+        py::gil_scoped_release release;
+        return scan->read_into(id_span, location_span);
+    }
+
+private:
+    [[nodiscard]] std::shared_ptr<throwdb::NativeIdScan> acquire() const {
+        const std::scoped_lock lock(handle_mutex_);
+        if (scan_ == nullptr) {
+            throw std::runtime_error("native ID scan is closed");
+        }
+        return scan_;
+    }
+
+    mutable std::mutex handle_mutex_;
+    mutable std::mutex operation_mutex_;
+    std::shared_ptr<throwdb::NativeIdScan> scan_;
+};
+
 class PyNativeCollection {
 public:
     [[nodiscard]] static py::dict reader_capabilities(
@@ -1300,6 +1412,16 @@ public:
         return result;
     }
 
+    [[nodiscard]] std::unique_ptr<PyNativeIdScan> scan_ids() const {
+        const auto collection = acquire_collection();
+        std::unique_ptr<throwdb::NativeIdScan> scan;
+        {
+            py::gil_scoped_release release;
+            scan = collection->scan_ids();
+        }
+        return std::make_unique<PyNativeIdScan>(std::move(scan));
+    }
+
     [[nodiscard]] py::dict rotate_wal() {
         const auto collection = acquire_collection();
         throwdb::NativeMutationLogStats stats;
@@ -1536,6 +1658,8 @@ private:
 PYBIND11_MODULE(_throwdb, module) {
     module.doc() = "Native bindings for the ThrowDB storage engine";
     module.attr("__version__") = "0.1.0";
+    PYBIND11_NUMPY_DTYPE(
+        throwdb::NativeIdLocation, segment_id, row_index);
     py::register_exception<throwdb::ReaderBackendError>(
         module, "ReaderBackendError", PyExc_RuntimeError);
 
@@ -1613,6 +1737,26 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("output"))
         .def("close", &PyNativeReaderTrial::close);
 
+    py::class_<PyNativeIdScan>(module, "NativeIdScan")
+        .def_property_readonly("metadata", &PyNativeIdScan::metadata)
+        .def_property_readonly("done", &PyNativeIdScan::done)
+        .def(
+            "read_into",
+            &PyNativeIdScan::read_into,
+            py::arg("ids"),
+            py::arg("locations") = py::none())
+        .def("close", &PyNativeIdScan::close)
+        .def(
+            "__enter__",
+            [](PyNativeIdScan& scan) -> PyNativeIdScan& { return scan; },
+            py::return_value_policy::reference_internal)
+        .def(
+            "__exit__",
+            [](PyNativeIdScan& scan,
+               const py::object&,
+               const py::object&,
+               const py::object&) { scan.close(); });
+
     py::class_<PyNativeCollection>(module, "NativeCollection")
         .def_static(
             "reader_capabilities",
@@ -1683,6 +1827,7 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("requested_count"),
             py::arg("seed"),
             py::arg("max_inspected_slots"))
+        .def("scan_ids", &PyNativeCollection::scan_ids)
         .def("get", &PyNativeCollection::get, py::arg("ids"))
         .def(
             "get_into",

@@ -17,6 +17,12 @@ void create_wal_file(
     WalScanMode mode,
     const WalRecoveryVisitor& visitor = {});
 
+[[nodiscard]] WalMutationFingerprint fingerprint_recovered_wal_batch(
+    int fd,
+    const std::filesystem::path& path,
+    const RecoveredWalBatch& batch,
+    std::uint64_t record_size);
+
 // Enforces the durable ordering required by the codec contract:
 // BATCH -> sync -> COMMIT -> sync. Returns the first byte after COMMIT.
 [[nodiscard]] std::uint64_t append_wal_transaction_durable(

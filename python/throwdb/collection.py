@@ -9,17 +9,18 @@ import operator
 import os
 import secrets
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from os import PathLike
 from types import TracebackType
-from typing import Final, Literal, TypeAlias, TypedDict, cast
+from typing import Final, Literal, TypeAlias, TypedDict, cast, overload
 
 import numpy as np
 
 from ._throwdb import (
     NativeCollection,
     NativeCollectionBuilder,
+    NativeIdScan,
     ReaderBackendError,
 )
 from ._device import StorageProbeResult, probe_collection_storage
@@ -35,6 +36,12 @@ from ._tuning import (
     reset_registry,
     upsert_profile,
 )
+from .id_scan import (
+    ID_LOCATION_DTYPE,
+    IdScanSnapshot,
+    LocatedIdBatch,
+    LocatedIds,
+)
 
 
 _UINT32_MAX: Final = (1 << 32) - 1
@@ -42,6 +49,7 @@ _ROW_REF_SEGMENT_ID_MAX: Final = _UINT32_MAX - 1
 _UINT64_MAX: Final = (1 << 64) - 1
 _DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
 _ID_SCAN_CHUNK_ROWS: Final = 1 << 20
+_DEFAULT_ID_SCAN_BATCH_ROWS: Final = 65_536
 _DEFAULT_DELTA_COMPACTION_MAX_RUNS: Final = 8
 _MAX_DELTA_COMPACTION_RUNS: Final = 64
 _MAX_PARTITIONED_FOLD_RUNS: Final = 4096
@@ -1010,6 +1018,39 @@ def _reader_capabilities(
     }
 
 
+def _execute_reader_calibration(
+    native: object,
+    *,
+    path: str | bytes | PathLike[str] | PathLike[bytes],
+    record_size: int,
+    current_options: Mapping[str, object] | None,
+    seed: int,
+    max_read_bytes: int,
+    max_memory_bytes: int,
+    deadline: float,
+    expected_root_identity: tuple[int, int],
+    progress: Callable[[str], None] | None,
+) -> dict[str, object]:
+    """Execute the authoritative matrix outside the embedding application."""
+
+    from ._calibration_process import run_isolated_calibration
+
+    return run_isolated_calibration(
+        path,
+        record_size=record_size,
+        current_options=current_options,
+        seed=seed,
+        max_read_bytes=max_read_bytes,
+        max_memory_bytes=max_memory_bytes,
+        deadline=deadline,
+        expected_dimension=int(getattr(native, "dimension")),
+        expected_dtype=str(getattr(native, "dtype")),
+        expected_format_version=int(getattr(native, "format_version")),
+        expected_root_identity=expected_root_identity,
+        progress=progress,
+    )
+
+
 def _probe_storage_identity(
     path: str | bytes | PathLike[str] | PathLike[bytes],
     salt: str,
@@ -1291,6 +1332,214 @@ def _resolve_tuning(
     }
 
 
+def _validate_id_scan_batch_rows(value: object) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError("batch_rows must be an integer, not bool")
+    try:
+        rows = operator.index(value)
+    except TypeError as error:
+        raise TypeError("batch_rows must be an integer") from error
+    if not 1 <= rows <= _UINT32_MAX:
+        raise ValueError(
+            f"batch_rows must be between 1 and {_UINT32_MAX}"
+        )
+    return rows
+
+
+def _id_scan_snapshot(metadata: object) -> IdScanSnapshot:
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("native ID scan returned invalid metadata")
+    names = (
+        "collection_id_low",
+        "collection_id_high",
+        "catalog_generation",
+        "committed_sequence",
+        "live_count",
+    )
+    values: dict[str, int] = {}
+    for name in names:
+        value = metadata.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(
+                f"native ID scan metadata field {name!r} is invalid"
+            )
+        values[name] = value
+    low = values["collection_id_low"]
+    high = values["collection_id_high"]
+    generation = values["catalog_generation"]
+    sequence = values["committed_sequence"]
+    count = values["live_count"]
+    if low > _UINT64_MAX or high > _UINT64_MAX:
+        raise RuntimeError("native ID scan collection identity is invalid")
+    if generation > _UINT64_MAX or sequence > _UINT64_MAX:
+        raise RuntimeError("native ID scan view identity is invalid")
+    if count > _UINT64_MAX:
+        raise RuntimeError("native ID scan count is invalid")
+    collection_id = f"{high:016x}{low:016x}"
+    token = f"local:{collection_id}:{generation:016x}:{sequence:016x}"
+    return IdScanSnapshot(
+        collection_id=collection_id,
+        catalog_generation=generation,
+        committed_sequence=sequence,
+        count=count,
+        token=token,
+    )
+
+
+def _validate_id_scan_output(
+    ids: object,
+    locations: object | None,
+    *,
+    with_locations: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    if not isinstance(ids, np.ndarray):
+        raise TypeError("ids output must be a NumPy ndarray")
+    if ids.dtype != np.dtype(np.uint64) or not ids.dtype.isnative:
+        raise TypeError("ids output must have native-endian dtype uint64")
+    if ids.ndim != 1:
+        raise ValueError("ids output must have shape (N,)")
+    if not ids.flags.c_contiguous:
+        raise ValueError("ids output must be C-contiguous")
+    if not ids.flags.aligned:
+        raise ValueError("ids output must be memory-aligned")
+    if not ids.flags.writeable:
+        raise ValueError("ids output must be writable")
+    if ids.size == 0:
+        raise ValueError("ids output must contain at least one row")
+
+    if not with_locations:
+        if locations is not None:
+            raise ValueError(
+                "locations output requires scan_ids(with_locations=True)"
+            )
+        return ids, None
+    if not isinstance(locations, np.ndarray):
+        raise TypeError("locations output must be a NumPy ndarray")
+    if locations.dtype != ID_LOCATION_DTYPE:
+        raise TypeError(
+            "locations output must have dtype "
+            "[('segment_id', '<u4'), ('row_index', '<u4')]"
+        )
+    if locations.ndim != 1 or locations.shape != ids.shape:
+        raise ValueError("locations output must have shape (len(ids),)")
+    if not locations.flags.c_contiguous:
+        raise ValueError("locations output must be C-contiguous")
+    if not locations.flags.aligned:
+        raise ValueError("locations output must be memory-aligned")
+    if not locations.flags.writeable:
+        raise ValueError("locations output must be writable")
+    return ids, locations
+
+
+class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
+    """Snapshot cursor over live IDs in physical segment/row order."""
+
+    def __init__(
+        self,
+        native: NativeIdScan,
+        *,
+        batch_rows: int,
+        with_locations: bool,
+    ) -> None:
+        self._native = native
+        self._batch_rows = batch_rows
+        self._with_locations = with_locations
+        self._snapshot = _id_scan_snapshot(native.metadata)
+        self._emitted = 0
+        self._closed = False
+        self._finished = self._snapshot.count == 0 or bool(native.done)
+
+    @property
+    def snapshot(self) -> IdScanSnapshot:
+        return self._snapshot
+
+    @property
+    def snapshot_count(self) -> int:
+        return self._snapshot.count
+
+    @property
+    def done(self) -> bool:
+        return self._finished
+
+    def read_into(
+        self,
+        ids: object,
+        locations: object | None = None,
+    ) -> int:
+        if self._closed:
+            raise RuntimeError("ID scan is closed")
+        output_ids, output_locations = _validate_id_scan_output(
+            ids,
+            locations,
+            with_locations=self._with_locations,
+        )
+        if self._finished:
+            return 0
+        count = int(self._native.read_into(output_ids, output_locations))
+        if not 0 <= count <= output_ids.size:
+            raise RuntimeError("native ID scan returned an invalid row count")
+        if count == 0 and not self._native.done:
+            raise RuntimeError("native ID scan stopped without reaching EOF")
+        if self._emitted + count > self._snapshot.count:
+            raise RuntimeError("native ID scan exceeded its snapshot count")
+        self._emitted += count
+        if self._native.done:
+            if self._emitted != self._snapshot.count:
+                raise RuntimeError(
+                    "native ID scan ended before its snapshot count"
+                )
+            self._finished = True
+        return count
+
+    def __iter__(self) -> EmbeddedIdScan:
+        return self
+
+    def __next__(self) -> np.ndarray | LocatedIdBatch:
+        if self._closed or self._finished:
+            raise StopIteration
+        ids = np.empty(self._batch_rows, dtype=np.uint64)
+        locations = (
+            np.empty(self._batch_rows, dtype=ID_LOCATION_DTYPE)
+            if self._with_locations
+            else None
+        )
+        emitted_offset = self._emitted
+        count = self.read_into(ids, locations)
+        if count == 0:
+            raise StopIteration
+        ids = ids[:count]
+        if locations is None:
+            return ids
+        return LocatedIdBatch(
+            ids=ids,
+            locations=locations[:count],
+            emitted_offset=emitted_offset,
+            snapshot=self._snapshot,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finished = True
+        self._native.close()
+
+    def __enter__(self) -> EmbeddedIdScan:
+        if self._closed:
+            raise RuntimeError("ID scan is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
+
+
 class Collection:
     """User-facing collection wrapper with safe ID normalization."""
 
@@ -1490,14 +1739,19 @@ class Collection:
     ) -> dict[str, object]:
         """Calibrate and optionally persist a reader profile for this target.
 
-        The command opens one stable read-only native snapshot, samples a
-        bounded number of live IDs directly from its loaded base index, and
-        measures a small executor/backend matrix.  It never reloads the large
-        index for individual candidates.  ``max_seconds`` is a cooperative
-        deadline: one already-started OS read may finish after it expires.
+        The command keeps one stable read-only native snapshot in the parent
+        and runs the complete matrix in a fresh worker process, so application
+        I/O cannot contaminate process-wide storage counters.  The worker
+        samples live IDs from one loaded base index and never reloads it for
+        individual candidates. ``max_seconds`` is a cooperative deadline: one
+        already-started OS read may finish after it expires.
+        Each measurement stage uses file-scoped ``POSIX_FADV_DONTNEED`` when
+        available and automatic persistence additionally requires observed
+        backing-storage reads, so a warm page-cache run cannot publish a disk
+        profile.
         """
 
-        from ._calibration import run_bounded_calibration, validate_limits
+        from ._calibration import validate_limits
 
         max_seconds, max_read_bytes, max_memory_bytes, seed = validate_limits(
             max_seconds=max_seconds,
@@ -1524,8 +1778,11 @@ class Collection:
                 "workload": None,
                 "candidates": [],
                 "stability": None,
+                "resource_stability": None,
+                "storage_stability": None,
                 "selection": None,
                 "planned_read_bytes": 0,
+                "measurement_process": None,
             }
 
         def report(
@@ -1577,7 +1834,7 @@ class Collection:
                     "max_read_bytes": max_read_bytes,
                     "max_memory_bytes": max_memory_bytes,
                     "deadline": "cooperative",
-                    "matrix_version": 2,
+                    "matrix_version": 3,
                 },
                 "target": {
                     "profile_key": (
@@ -1636,6 +1893,9 @@ class Collection:
                 "workload": measured.get("workload"),
                 "candidates": measured.get("candidates", []),
                 "stability": measured.get("stability"),
+                "resource_stability": measured.get("resource_stability"),
+                "storage_stability": measured.get("storage_stability"),
+                "measurement_process": measured.get("measurement_process"),
                 "selection": dict(selection) if selection is not None else None,
             }
 
@@ -1867,8 +2127,9 @@ class Collection:
                 if original_registry is not None
                 else None
             )
-            measured = run_bounded_calibration(
+            measured = _execute_reader_calibration(
                 native,
+                path=path,
                 record_size=record_size,
                 current_options=(
                     dict(existing.options) if existing is not None else None
@@ -1877,6 +2138,10 @@ class Collection:
                 max_read_bytes=max_read_bytes,
                 max_memory_bytes=max_memory_bytes,
                 deadline=deadline,
+                expected_root_identity=(
+                    root_at_start[3],
+                    root_at_start[4],
+                ),
                 progress=progress,
             )
 
@@ -1886,11 +2151,168 @@ class Collection:
                 if isinstance(selection_value, Mapping)
                 else None
             )
+            selection_safe = bool(
+                selection is not None
+                and selection.get("selection_valid") is True
+            )
+            stability_value = measured.get("stability")
+            resource_stability_value = measured.get("resource_stability")
+            matrix_safe = bool(
+                isinstance(stability_value, Mapping)
+                and stability_value.get("passed") is True
+                and isinstance(resource_stability_value, Mapping)
+                and resource_stability_value.get("passed") is True
+            )
             status = str(measured["status"])
             persisted = False
             saved_profile: dict[str, object] | None = None
             target_stable: bool | None = None
 
+            storage_stability_value = measured.get("storage_stability")
+            storage_stability = (
+                dict(storage_stability_value)
+                if isinstance(storage_stability_value, Mapping)
+                else {
+                    "classification": "unknown",
+                    "passed": False,
+                    "persistence_safe": False,
+                    "reason": "storage backing-read evidence is missing",
+                }
+            )
+            workload_value = measured.get("workload")
+            stage_preparation_value = (
+                workload_value.get("stage_cache_preparation")
+                if isinstance(workload_value, Mapping)
+                else None
+            )
+            preparation_shape_valid = bool(
+                isinstance(stage_preparation_value, Mapping)
+                and all(
+                    isinstance(value, Mapping)
+                    for value in stage_preparation_value.values()
+                )
+            )
+            stage_preparations = (
+                {
+                    str(name): dict(value)
+                    for name, value in stage_preparation_value.items()
+                    if isinstance(value, Mapping)
+                }
+                if isinstance(stage_preparation_value, Mapping)
+                else {}
+            )
+            required_preparation_stages = {"screening", "verification"}
+            discovery_value = measured.get("candidate_discovery")
+            if isinstance(discovery_value, Mapping):
+                backfill_value = discovery_value.get("verification_backfill")
+                if (
+                    isinstance(backfill_value, Mapping)
+                    and backfill_value.get("attempted") is True
+                ):
+                    required_preparation_stages.add("verification_backfill")
+                recheck_value = discovery_value.get("stability_recheck")
+                if (
+                    isinstance(recheck_value, Mapping)
+                    and recheck_value.get("attempted") is True
+                ):
+                    required_preparation_stages.add("verification_recheck")
+            prepared_stages = sorted(stage_preparations)
+            preparation_statuses = {
+                name: str(value.get("status", "unknown"))
+                for name, value in stage_preparations.items()
+            }
+            preparation_safe = bool(
+                preparation_shape_valid
+                and required_preparation_stages.issubset(stage_preparations)
+                and all(
+                    status == "performed"
+                    for status in preparation_statuses.values()
+                )
+            )
+            preparation_reason = (
+                "every measured stage completed file-scoped cache preparation"
+                if preparation_safe
+                else (
+                    "file-scoped cache preparation was not completed for "
+                    "every measured stage"
+                )
+            )
+            measurement_process_value = measured.get("measurement_process")
+            measurement_process = (
+                dict(measurement_process_value)
+                if isinstance(measurement_process_value, Mapping)
+                else {}
+            )
+            worker_pid = measurement_process.get("pid")
+            isolation_safe = bool(
+                measurement_process.get("isolation") == "subprocess_exec"
+                and measurement_process.get("status") == "complete"
+                and measurement_process.get("parent_verified") is True
+                and not isinstance(worker_pid, bool)
+                and isinstance(worker_pid, int)
+                and worker_pid > 0
+                and worker_pid != os.getpid()
+                and storage_stability.get("telemetry_scope")
+                == "isolated_calibration_process"
+            )
+            process_isolation_value = storage_stability.get(
+                "process_isolation"
+            )
+            process_isolation = (
+                dict(process_isolation_value)
+                if isinstance(process_isolation_value, Mapping)
+                else {}
+            )
+            isolation_safe = bool(
+                isolation_safe
+                and process_isolation.get("passed") is True
+                and process_isolation.get("method") == "subprocess_exec"
+                and process_isolation.get("parent_verified") is True
+                and process_isolation.get("pid") == worker_pid
+            )
+            process_isolation.update(
+                {
+                    "passed": isolation_safe,
+                    "required": "subprocess_exec",
+                    "measurement_process": measurement_process,
+                }
+            )
+            storage_stability["process_isolation"] = process_isolation
+            storage_stability["cache_preparation"] = {
+                "passed": preparation_safe,
+                "reason": preparation_reason,
+                "well_formed": preparation_shape_valid,
+                "required_stages": sorted(required_preparation_stages),
+                "observed_stages": prepared_stages,
+                "statuses": preparation_statuses,
+            }
+            backing_read_safe = bool(
+                storage_stability.get("passed") is True
+                and storage_stability.get("persistence_safe") is True
+                and storage_stability.get("classification")
+                == "backing_storage"
+            )
+            storage_stability["backing_read_passed"] = backing_read_safe
+            storage_stability["passed"] = bool(
+                backing_read_safe and preparation_safe and isolation_safe
+            )
+            storage_stability["persistence_safe"] = bool(
+                backing_read_safe and preparation_safe and isolation_safe
+            )
+            if backing_read_safe and not preparation_safe:
+                storage_stability["reason"] = preparation_reason
+            elif backing_read_safe and preparation_safe and not isolation_safe:
+                storage_stability["reason"] = (
+                    "backing-read telemetry was not collected in the "
+                    "dedicated calibration process"
+                )
+            measured["storage_stability"] = storage_stability
+            storage_safe = bool(
+                storage_stability.get("passed") is True
+                and storage_stability.get("persistence_safe") is True
+                and storage_stability.get("classification")
+                == "backing_storage"
+            )
             if status == "complete" and expired():
                 status = "budget_exhausted"
                 measured["reason"] = (
@@ -1964,7 +2386,35 @@ class Collection:
                 measured["reason"] = (
                     "device, runtime, layout, root, or mutation snapshot changed"
                 )
-            elif status == "complete" and selection is not None:
+            elif status == "complete" and not matrix_safe:
+                status = "calibration_unverified"
+                measured["reason"] = (
+                    "automatic profile persistence requires passed baseline "
+                    "and resource stability guardrails"
+                )
+            elif status == "complete" and not selection_safe:
+                status = "selection_unverified"
+                measured["reason"] = (
+                    "automatic profile persistence requires an explicitly "
+                    "valid calibration selection"
+                )
+            elif status == "complete" and not storage_safe:
+                classification = (
+                    str(storage_stability.get("classification"))
+                )
+                status = (
+                    "cache_unrepresentative"
+                    if classification in {"page_cache", "mixed"}
+                    else "cache_unverified"
+                )
+                detail = (
+                    str(storage_stability.get("reason"))
+                )
+                measured["reason"] = (
+                    "automatic profile persistence requires a "
+                    f"backing-storage calibration; {detail}"
+                )
+            elif status == "complete" and selection_safe:
                 if dry_run:
                     status = "dry_run"
                 elif not _storage_identity_is_reusable(probe):
@@ -1983,7 +2433,7 @@ class Collection:
                         runtime=runtime,
                         layout=layout,
                         options=selection["options"],
-                        source="calibrated-v2",
+                        source="calibrated-v3",
                         record_size=record_size,
                         expected_salt=salt,
                         expected_generation=generation,
@@ -3076,6 +3526,118 @@ class Collection:
             raise RuntimeError("native profiled read returned invalid diagnostics")
         return dict(stats)
 
+    @overload
+    def scan_ids(
+        self,
+        *,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+        with_locations: Literal[False] = False,
+    ) -> EmbeddedIdScan: ...
+
+    @overload
+    def scan_ids(
+        self,
+        *,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+        with_locations: Literal[True],
+    ) -> EmbeddedIdScan: ...
+
+    def scan_ids(
+        self,
+        *,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+        with_locations: bool = False,
+    ) -> EmbeddedIdScan:
+        """Open a snapshot cursor in physical ``(segment_id, row_index)`` order.
+
+        Only the current live version of every ID is returned.  Locations are
+        exact for the cursor snapshot, but may change after updates or storage
+        maintenance and therefore must not be reused with another snapshot.
+        """
+
+        rows = _validate_id_scan_batch_rows(batch_rows)
+        if not isinstance(with_locations, bool):
+            raise TypeError("with_locations must be a bool")
+        native = self._ensure_reader().scan_ids()
+        return EmbeddedIdScan(
+            native,
+            batch_rows=rows,
+            with_locations=with_locations,
+        )
+
+    @overload
+    def list_ids(
+        self,
+        *,
+        with_locations: Literal[False] = False,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+    ) -> np.ndarray: ...
+
+    @overload
+    def list_ids(
+        self,
+        *,
+        with_locations: Literal[True],
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+    ) -> LocatedIds: ...
+
+    def list_ids(
+        self,
+        *,
+        with_locations: bool = False,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+    ) -> np.ndarray | LocatedIds:
+        """Materialize all live IDs in physical storage order.
+
+        There is intentionally no memory guard.  This method performs one
+        exact-size allocation for IDs (and optionally one for locations).  Use
+        :meth:`scan_ids` when the complete result may not fit in memory.
+        """
+
+        with self.scan_ids(
+            batch_rows=batch_rows,
+            with_locations=with_locations,
+        ) as scan:
+            count = scan.snapshot_count
+            ids = np.empty(count, dtype=np.uint64)
+            locations = (
+                np.empty(count, dtype=ID_LOCATION_DTYPE)
+                if with_locations
+                else None
+            )
+            offset = 0
+            while offset != count:
+                stop = min(count, offset + scan._batch_rows)
+                location_slice = (
+                    locations[offset:stop]
+                    if locations is not None
+                    else None
+                )
+                produced = scan.read_into(ids[offset:stop], location_slice)
+                if produced == 0:
+                    raise RuntimeError(
+                        "ID scan ended before its advertised snapshot count"
+                    )
+                offset += produced
+            if not scan.done:
+                probe_ids = np.empty(1, dtype=np.uint64)
+                probe_locations = (
+                    np.empty(1, dtype=ID_LOCATION_DTYPE)
+                    if locations is not None
+                    else None
+                )
+                if scan.read_into(probe_ids, probe_locations) != 0:
+                    raise RuntimeError(
+                        "ID scan exceeded its advertised snapshot count"
+                    )
+            if locations is None:
+                return ids
+            return LocatedIds(
+                ids=ids,
+                locations=locations,
+                snapshot=scan.snapshot,
+            )
+
     def clean_segments(
         self,
         *,
@@ -3194,6 +3756,7 @@ class Collection:
 __all__ = [
     "Collection",
     "CollectionSchema",
+    "EmbeddedIdScan",
     "MaintenanceReport",
     "OrphanClassification",
     "OrphanCollectionExecutionEntry",

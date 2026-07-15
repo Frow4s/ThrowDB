@@ -144,6 +144,31 @@ class NativeReaderTrial:
     def close(self) -> None: ...
 
 
+class NativeIdScan:
+    @property
+    def metadata(self) -> dict[str, int]: ...
+
+    @property
+    def done(self) -> bool: ...
+
+    def read_into(
+        self,
+        ids: npt.NDArray[np.uint64],
+        locations: npt.NDArray[np.void] | None = None,
+    ) -> int: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> NativeIdScan: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
+
+
 class NativeCollection:
     @staticmethod
     def reader_capabilities(
@@ -245,6 +270,8 @@ class NativeCollection:
         seed: int,
         max_inspected_slots: int,
     ) -> dict[str, object]: ...
+
+    def scan_ids(self) -> NativeIdScan: ...
 
     def insert(
         self,

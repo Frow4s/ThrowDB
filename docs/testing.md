@@ -114,6 +114,26 @@ throughput; neither claims to measure physical bytes read. Use
 `run_load_test.py` for executor, chunk-size, and concurrent-reader comparisons;
 it auto-detects both fresh native and legacy immutable manifests.
 
+After calibrating and saving a native collection profile, exercise both profile
+lookup and the selected backend with the production-shaped reader benchmark:
+
+```bash
+python benchmarks/run_load_test.py \
+  --store /nvme/store \
+  --ids /datasets/ids.npy \
+  --source-embeddings /datasets/embeddings.npy \
+  --source-kind npy \
+  --results benchmark-results/persisted-reader \
+  --profile full \
+  --cache-mode both \
+  --tuning persisted
+```
+
+`persisted` is strict: a missing, incompatible, or unavailable saved profile
+fails the run rather than benchmarking conservative defaults. The report's
+`storage.tuning` object records the actual selected profile and effective reader
+options. Use the default `--tuning explicit` for manual `--io-*` sweeps.
+
 Before a large read run, exercise the native mutation path on a rebuildable
 collection. Normal completion restores the sampled logical data, although the
 test transactions remain in WAL history:

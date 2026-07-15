@@ -9,6 +9,7 @@
 
 #include "internal.hpp"
 #include "mutation_types.hpp"
+#include "sha256.hpp"
 
 namespace throwdb::detail {
 
@@ -89,6 +90,30 @@ struct EncodedWalTransaction {
     std::uint64_t batch_size{0};
     std::uint32_t batch_crc32c{0};
 };
+
+using WalMutationFingerprint = std::array<std::byte, 32>;
+
+class WalMutationFingerprintBuilder {
+public:
+    WalMutationFingerprintBuilder(
+        std::uint64_t record_size,
+        std::uint64_t operation_count);
+    void add(
+        WalOperationKind kind,
+        std::uint64_t id,
+        std::span<const std::byte> value);
+    [[nodiscard]] WalMutationFingerprint finish();
+
+private:
+    Sha256 hash_;
+    std::uint64_t record_size_ = 0;
+    std::uint64_t expected_count_ = 0;
+    std::uint64_t added_count_ = 0;
+};
+
+[[nodiscard]] WalMutationFingerprint fingerprint_wal_mutations(
+    std::uint64_t record_size,
+    std::span<const WalMutation> operations);
 
 struct RecoveredWalOperation {
     std::uint64_t id{0};

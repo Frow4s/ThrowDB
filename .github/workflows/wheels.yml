@@ -35,7 +35,15 @@ jobs:
           cache: pip
       - name: Build sdist
         run: python -m pip install build && python -m build --sdist
+      - name: Build pinned userspace gRPC and Protobuf
+        env:
+          THROWDB_GRPC_JOBS: "2"
+          THROWDB_GRPC_PREFIX: ${{ runner.temp }}/throwdb-grpc
+          THROWDB_GRPC_WORK_DIR: ${{ runner.temp }}/throwdb-grpc-work
+        run: ./tools/bootstrap_grpc.sh
       - name: Test installed sdist in an isolated environment
+        env:
+          THROWDB_GRPC_PREFIX: ${{ runner.temp }}/throwdb-grpc
         run: |
           python -m venv "${RUNNER_TEMP}/throwdb-sdist-smoke"
           "${RUNNER_TEMP}/throwdb-sdist-smoke/bin/python" -m pip install --upgrade pip

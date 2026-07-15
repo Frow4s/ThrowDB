@@ -447,6 +447,124 @@ void test_float32_and_reader_trial() {
         "format-7 reader trial returned wrong rows");
 }
 
+void test_physical_id_scan_order_locations_and_snapshot_isolation() {
+    TemporaryDirectory temporary("physical-id-scan");
+    const std::array<std::uint64_t, 5> base_ids{50, 10, 40, 20, 30};
+    build_collection(
+        temporary.path(), base_ids, rows(base_ids.size(), 4),
+        throwdb::DType::Float16, 2, 8, 1);
+
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    writer->update(
+        std::array<std::uint64_t, 1>{10}, rows(1, 4));
+    writer->insert(
+        std::array<std::uint64_t, 1>{60}, rows(1, 4));
+    require(
+        writer->erase(std::array<std::uint64_t, 1>{40})
+            == std::vector<std::uint8_t>({1}),
+        "physical ID scan setup delete failed");
+    writer->upsert(
+        std::array<std::uint64_t, 1>{50}, rows(1, 4));
+
+    auto old_scan = writer->scan_ids();
+    const throwdb::NativeIdScanMetadata old_metadata = old_scan->metadata();
+    require(
+        old_metadata.live_count == 5
+            && old_metadata.catalog_generation == 1
+            && old_metadata.committed_sequence == 4
+            && (old_metadata.collection_id_low != 0
+                || old_metadata.collection_id_high != 0),
+        "physical ID scan captured wrong metadata");
+    std::array<std::uint64_t, 2> invalid_ids{};
+    std::array<throwdb::NativeIdLocation, 1> invalid_locations{};
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(
+                old_scan->read_into(invalid_ids, invalid_locations));
+        },
+        "physical ID scan accepted mismatched buffer capacities");
+
+    // Mutate the live writer after the cursor captured its resource set and
+    // overlay. The old cursor must retain both its logical contents and the
+    // exact physical coordinates from sequence 4.
+    writer->update(
+        std::array<std::uint64_t, 1>{20}, rows(1, 4));
+    require(
+        writer->erase(std::array<std::uint64_t, 1>{30})
+            == std::vector<std::uint8_t>({1}),
+        "physical ID scan snapshot setup delete failed");
+    writer->insert(
+        std::array<std::uint64_t, 1>{70}, rows(1, 4));
+    require(
+        old_scan->metadata().committed_sequence == 4
+            && old_scan->metadata().live_count == 5,
+        "physical ID scan metadata changed after later commits");
+
+    std::array<std::uint64_t, 8> id_buffer{};
+    std::array<throwdb::NativeIdLocation, 8> location_buffer{};
+    std::vector<std::uint64_t> old_ids;
+    std::vector<throwdb::NativeIdLocation> old_locations;
+    const std::array<std::uint64_t, 3> expected_batch_sizes{1, 1, 3};
+    for (const std::uint64_t expected_size : expected_batch_sizes) {
+        const std::uint64_t count = old_scan->read_into(
+            id_buffer, location_buffer);
+        require(
+            count == expected_size,
+            "physical ID scan crossed a segment boundary");
+        old_ids.insert(
+            old_ids.end(), id_buffer.begin(),
+            id_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+        old_locations.insert(
+            old_locations.end(), location_buffer.begin(),
+            location_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    }
+    require(old_scan->done(), "physical ID scan did not finish at live_count");
+    require(
+        old_scan->read_into(id_buffer, location_buffer) == 0,
+        "completed physical ID scan returned another row");
+    require(
+        old_ids == std::vector<std::uint64_t>({20, 30, 10, 60, 50}),
+        "physical ID scan did not return authoritative RowRef order");
+    require(
+        old_locations
+            == std::vector<throwdb::NativeIdLocation>({
+                {2, 1}, {3, 0}, {4, 0}, {4, 1}, {4, 2}}),
+        "physical ID scan returned wrong exact locations");
+
+    auto current_scan = writer->scan_ids();
+    require(
+        current_scan->metadata().live_count == 5
+            && current_scan->metadata().committed_sequence == 7,
+        "new physical ID scan missed later commits");
+    std::array<std::uint64_t, 2> small_buffer{};
+    std::vector<std::uint64_t> current_ids;
+    while (!current_scan->done()) {
+        const std::uint64_t count = current_scan->read_into(small_buffer);
+        current_ids.insert(
+            current_ids.end(), small_buffer.begin(),
+            small_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    }
+    require(
+        current_ids == std::vector<std::uint64_t>({10, 60, 50, 20, 70}),
+        "new physical ID scan returned stale or non-physical order");
+
+    // A cursor owns the pinned collection view rather than borrowing the
+    // NativeCollection object itself.
+    auto detached_scan = writer->scan_ids();
+    writer.reset();
+    std::vector<std::uint64_t> detached_ids;
+    while (!detached_scan->done()) {
+        const std::uint64_t count = detached_scan->read_into(small_buffer);
+        detached_ids.insert(
+            detached_ids.end(), small_buffer.begin(),
+            small_buffer.begin() + static_cast<std::ptrdiff_t>(count));
+    }
+    require(
+        detached_ids == current_ids,
+        "physical ID scan borrowed a destroyed collection handle");
+}
+
 void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
     TemporaryDirectory temporary("crud");
     const std::uint64_t maximum =
@@ -604,6 +722,16 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
         std::set<std::uint64_t>(sample.ids.begin(), sample.ids.end())
             == std::set<std::uint64_t>({0, maximum, 7, 42, 9, 10, 11}),
         "format-7 mutation-aware sample was not authoritative");
+    const throwdb::NativeIdSample bounded = writer->sample_ids(2, 19, 3);
+    const throwdb::NativeIdSample bounded_repeat =
+        writer->sample_ids(2, 19, 3);
+    require(
+        bounded.ids.size() <= 2 && bounded.inspected_slots == 3,
+        "format-7 overlay sample did not honor its bounded scan");
+    require(
+        bounded.ids == bounded_repeat.ids
+            && bounded.inspected_slots == bounded_repeat.inspected_slots,
+        "format-7 bounded overlay sample is not deterministic");
     const throwdb::NativeMutationLogStats materialized =
         writer->materialize_frozen_wals();
     require(
@@ -628,6 +756,42 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
                 updated_extremes.begin(), updated_extremes.begin() + 4),
         "format-7 materialization changed an older reader view");
 
+    auto materialized_scan = writer->scan_ids();
+    std::array<std::uint64_t, 16> materialized_ids_buffer{};
+    std::array<throwdb::NativeIdLocation, 16> materialized_locations_buffer{};
+    std::vector<std::uint64_t> materialized_ids;
+    std::vector<throwdb::NativeIdLocation> materialized_locations;
+    while (!materialized_scan->done()) {
+        const std::uint64_t count = materialized_scan->read_into(
+            materialized_ids_buffer, materialized_locations_buffer);
+        materialized_ids.insert(
+            materialized_ids.end(), materialized_ids_buffer.begin(),
+            materialized_ids_buffer.begin()
+                + static_cast<std::ptrdiff_t>(count));
+        materialized_locations.insert(
+            materialized_locations.end(),
+            materialized_locations_buffer.begin(),
+            materialized_locations_buffer.begin()
+                + static_cast<std::ptrdiff_t>(count));
+    }
+    require(
+        std::set<std::uint64_t>(
+            materialized_ids.begin(), materialized_ids.end())
+            == std::set<std::uint64_t>(
+                {0, maximum, 7, 42, 9, 10, 11}),
+        "physical ID scan exposed stale materialized-run rows");
+    for (std::size_t index = 1;
+         index < materialized_locations.size(); ++index) {
+        const auto packed = [](const throwdb::NativeIdLocation location) {
+            return (static_cast<std::uint64_t>(location.segment_id) << 32)
+                   | location.row_index;
+        };
+        require(
+            packed(materialized_locations[index - 1])
+                < packed(materialized_locations[index]),
+            "physical ID scan lost RowRef order after materialization");
+    }
+
     writer.reset();
     auto reopened = throwdb::NativeCollection::open(temporary.path());
     require(reopened->count() == 7, "format-7 replay changed live count");
@@ -648,6 +812,165 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
             && replayed.active_wal_put_rows == 1
             && replayed.delta_run_count == 1,
         "format-7 reopen mutation stats changed");
+}
+
+void test_sampler_sparse_snapshot_and_overlay_quotas() {
+    TemporaryDirectory temporary("sample-sparse-snapshot");
+    std::vector<std::uint64_t> base_ids(100);
+    std::vector<std::uint64_t> overlay_ids(100);
+    for (std::size_t index = 0; index != base_ids.size(); ++index) {
+        base_ids[index] = static_cast<std::uint64_t>(index + 1);
+        overlay_ids[index] = static_cast<std::uint64_t>(10'000 + index);
+    }
+    build_collection(
+        temporary.path(), base_ids, rows(base_ids.size(), 4),
+        throwdb::DType::Float16, 2, 4, 0);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    writer->insert(overlay_ids, rows(overlay_ids.size(), 4));
+
+    // A 100-row single-partition snapshot has 256 raw hash-table slots.
+    // Inspecting exactly half of the 100 overlay + 256 snapshot slots must
+    // therefore allocate 50 overlay records and 128 snapshot slots. Keeping K
+    // equal to the inspection limit prevents any accepted overlay ID from
+    // being evicted by the bottom-K heap.
+    const throwdb::NativeIdSample sample = writer->sample_ids(178, 2, 178);
+    const std::size_t sampled_overlay = static_cast<std::size_t>(std::count_if(
+        sample.ids.begin(), sample.ids.end(), [](const std::uint64_t id) {
+            return id >= 10'000 && id < 10'100;
+        }));
+    require(
+        sample.inspected_slots == 178 && !sample.complete,
+        "sparse snapshot sample did not honor its bounded raw-slot plan");
+    require(
+        sampled_overlay == 50,
+        "sparse snapshot density biased the overlay source quota");
+}
+
+void test_sampler_distributes_quota_between_materialized_runs() {
+    TemporaryDirectory temporary("sample-multiple-runs");
+    build_collection(
+        temporary.path(), {}, {}, throwdb::DType::Float16,
+        2, 4, 0);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    std::vector<std::uint64_t> older_ids(100);
+    std::vector<std::uint64_t> newer_ids(100);
+    for (std::size_t index = 0; index != older_ids.size(); ++index) {
+        older_ids[index] = static_cast<std::uint64_t>(10'000 + index);
+        newer_ids[index] = static_cast<std::uint64_t>(20'000 + index);
+    }
+
+    writer->insert(older_ids, rows(older_ids.size(), 4));
+    require(writer->rotate_wal().rotated, "older sample WAL did not rotate");
+    require(
+        writer->materialize_frozen_wals().materialized,
+        "older sample WAL did not materialize");
+    writer->insert(newer_ids, rows(newer_ids.size(), 4));
+    require(writer->rotate_wal().rotated, "newer sample WAL did not rotate");
+    const throwdb::NativeMutationLogStats materialized =
+        writer->materialize_frozen_wals();
+    require(
+        materialized.materialized && materialized.delta_run_count == 2,
+        "multiple-run sample fixture did not retain two runs");
+
+    // The empty snapshot contributes eight raw slots. With a 100-slot limit,
+    // proportional source quotas are 96 run records and four snapshot slots;
+    // two equal runs must then contribute 48 records each.
+    const throwdb::NativeIdSample sample = writer->sample_ids(100, 2, 100);
+    const std::size_t sampled_older = static_cast<std::size_t>(std::count_if(
+        sample.ids.begin(), sample.ids.end(), [](const std::uint64_t id) {
+            return id >= 10'000 && id < 10'100;
+        }));
+    const std::size_t sampled_newer = static_cast<std::size_t>(std::count_if(
+        sample.ids.begin(), sample.ids.end(), [](const std::uint64_t id) {
+            return id >= 20'000 && id < 20'100;
+        }));
+    require(
+        sample.inspected_slots == 100 && !sample.complete
+            && sample.ids.size() == 96,
+        "multiple-run sample did not honor its bounded source quotas");
+    require(
+        sampled_older == 48 && sampled_newer == 48,
+        "multiple-run sample quota favored run recency");
+}
+
+void test_sampler_counts_only_active_run_sections() {
+    TemporaryDirectory temporary("sample-active-run-sections");
+    using namespace throwdb::detail;
+    constexpr std::uint32_t partition_bits = 1;
+    std::array<std::uint64_t, 2> ids{};
+    std::array<bool, 2> found{};
+    for (std::uint64_t candidate = 1;
+         candidate != 10'000 && (!found[0] || !found[1]); ++candidate) {
+        const std::size_t partition = static_cast<std::size_t>(
+            hash_id(candidate, kHashSeed) >> 63);
+        if (!found[partition]) {
+            ids[partition] = candidate;
+            found[partition] = true;
+        }
+    }
+    require(
+        found[0] && found[1],
+        "active-run sample fixture could not cover both partitions");
+    const std::vector<std::byte> base = rows(ids.size(), 4);
+    const std::vector<std::byte> replacement{
+        std::byte{0x31}, std::byte{0x32}, std::byte{0x33}, std::byte{0x34},
+        std::byte{0x41}, std::byte{0x42}, std::byte{0x43}, std::byte{0x44}};
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, partition_bits);
+    {
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(ids, replacement);
+        require(writer->rotate_wal().rotated, "active-run WAL did not rotate");
+        require(
+            writer->materialize_frozen_wals().materialized,
+            "active-run WAL did not materialize");
+    }
+
+    const PartitionedManifestV2 manifest = current_manifest(temporary.path());
+    PartitionedCatalogV3 catalog = current_catalog(temporary.path());
+    require(
+        catalog.runs.size() == 1,
+        "active-run sample fixture did not create one run");
+    PartitionIndexRunReader mutation_run(
+        temporary.path(), manifest.collection_id, manifest.schema_id,
+        manifest.partition_bits, manifest.hash_seed, catalog.runs.front());
+    const PartitionRunRecord folded_record = *mutation_run.lookup(0, ids[0]);
+
+    PartitionSnapshotBuildSpec snapshot_spec;
+    snapshot_spec.collection_id = manifest.collection_id;
+    snapshot_spec.schema_id = manifest.schema_id;
+    snapshot_spec.snapshot_id = Uuid128{0xd001, 0xd002};
+    snapshot_spec.partition_bits = manifest.partition_bits;
+    snapshot_spec.partition_id = 0;
+    snapshot_spec.hash_seed = manifest.hash_seed;
+    snapshot_spec.epoch = catalog.runs.front().epoch;
+    const std::array<PartitionRunRecord, 1> folded_records{folded_record};
+    catalog.snapshots[0] = write_partition_snapshot(
+        temporary.path(), snapshot_spec, folded_records);
+    sync_directory(partitioned_partition_snapshots_directory(temporary.path()));
+    catalog.generation += 1;
+    catalog.previous_catalog_id = catalog.catalog_id;
+    catalog.catalog_id = Uuid128{0xd003, 0xd004};
+    clear_folded_partition(catalog.runs, manifest.partition_bits, 0);
+    require(
+        catalog.runs.size() == 1
+            && std::to_integer<std::uint8_t>(
+                   catalog.runs.front().active_partitions.front())
+                   == 0x02,
+        "active-run sample fixture did not retire one run section");
+    publish_test_catalog(temporary.path(), manifest, catalog);
+
+    auto reader = throwdb::NativeCollection::open(temporary.path());
+    const throwdb::NativeIdSample sample = reader->sample_ids(2, 17, 100);
+    require(
+        sample.complete && sample.inspected_slots == 17
+            && std::set<std::uint64_t>(sample.ids.begin(), sample.ids.end())
+                   == std::set<std::uint64_t>(ids.begin(), ids.end()),
+        "sample counted a covered-but-inactive run section");
 }
 
 void test_active_wal_tail_recovery_and_frozen_corruption() {
@@ -1760,6 +2083,14 @@ void test_empty_collection_surface() {
         !unavailable.complete && unavailable.ids.empty()
             && unavailable.inspected_slots == 16,
         "empty collection sample did not terminate at snapshot capacity");
+    auto empty_scan = collection->scan_ids();
+    require(
+        empty_scan->metadata().live_count == 0 && empty_scan->done(),
+        "empty physical ID scan did not finish immediately");
+    std::array<std::uint64_t, 1> empty_output{};
+    require(
+        empty_scan->read_into(empty_output) == 0,
+        "empty physical ID scan returned a row");
     require_throws<throwdb::MissingIdError>(
         [&] {
             const std::array<std::uint64_t, 1> missing{1};
@@ -1995,12 +2326,20 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 21> tests{{
+    const std::array<TestCase, 25> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
+        {"physical_id_scan_order_locations_and_snapshot_isolation",
+         test_physical_id_scan_order_locations_and_snapshot_isolation},
         {"writable_crud_reopen_rotation_and_snapshot_isolation",
          test_writable_crud_reopen_rotation_and_snapshot_isolation},
+        {"sampler_sparse_snapshot_and_overlay_quotas",
+         test_sampler_sparse_snapshot_and_overlay_quotas},
+        {"sampler_distributes_quota_between_materialized_runs",
+         test_sampler_distributes_quota_between_materialized_runs},
+        {"sampler_counts_only_active_run_sections",
+         test_sampler_counts_only_active_run_sections},
         {"active_wal_tail_recovery_and_frozen_corruption",
          test_active_wal_tail_recovery_and_frozen_corruption},
         {"materialization_budget_and_tombstone_only_run",

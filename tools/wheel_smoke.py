@@ -8,10 +8,15 @@ mutation lifecycle were all packaged together correctly.
 
 from __future__ import annotations
 
+import json
+import os
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +31,97 @@ def _assert_rows(store: Path, expected: np.ndarray) -> None:
             reader.get([4, 2], prefix_dimensions=3),
             expected[[2, 0], :3],
         )
+
+
+def _assert_grpc_server(
+    server: Path,
+    store: Path,
+    expected: np.ndarray,
+) -> None:
+    process = subprocess.Popen(
+        [
+            str(server),
+            "--storage",
+            str(store),
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_lines: list[str] = []
+    ready_lines: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            for line in process.stdout:
+                stripped = line.rstrip("\r\n")
+                stdout_lines.append(stripped)
+                ready_lines.put(stripped)
+        finally:
+            ready_lines.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+    ready: dict[str, object] | None = None
+    deadline = time.monotonic() + 15
+    try:
+        while ready is None and time.monotonic() < deadline:
+            try:
+                line = ready_lines.get(timeout=0.25)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            if line is None:
+                break
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("event") == "ready":
+                ready = event
+
+        if ready is None:
+            raise AssertionError("packaged throwdbd did not become ready")
+        if ready.get("protocol") != "grpc/throwdb.v1":
+            raise AssertionError(
+                "packaged throwdbd did not announce the public gRPC protocol"
+            )
+        endpoint = ready.get("endpoint")
+        if not isinstance(endpoint, str):
+            raise AssertionError("packaged throwdbd announced no endpoint")
+        with throwdb.RemoteCollection.connect(endpoint, timeout=5) as remote:
+            if not remote.health()["serving"]:
+                raise AssertionError("packaged throwdbd is not serving")
+            np.testing.assert_array_equal(
+                remote.get([2, 3, 4]),
+                expected,
+            )
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        reader.join(timeout=1)
+        stderr = process.stderr.read()
+        if process.returncode != 0:
+            raise AssertionError(
+                "packaged throwdbd exited unsuccessfully\n"
+                + "\n".join(stdout_lines)
+                + "\n"
+                + stderr
+            )
 
 
 def main() -> None:
@@ -174,6 +270,33 @@ def main() -> None:
         )
         if '"dimension": 8' not in completed.stdout:
             raise AssertionError("installed CLI did not inspect the smoke collection")
+
+        require_server = os.environ.get(
+            "THROWDB_WHEEL_SMOKE_REQUIRE_SERVER", "1"
+        ) not in {"0", "false", "False"}
+        if not require_server:
+            return
+
+        server_name = shutil.which("throwdbd")
+        if server_name is None:
+            adjacent = Path(sys.executable).with_name("throwdbd")
+            server_name = str(adjacent) if adjacent.is_file() else None
+        if server_name is None:
+            raise AssertionError(
+                "installed wheel did not provide the public gRPC throwdbd command"
+            )
+        server = Path(server_name)
+        server_help = subprocess.run(
+            [str(server), "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if "usage: throwdbd" not in server_help.stdout:
+            raise AssertionError(
+                "packaged throwdbd is not the expected gRPC daemon"
+            )
+        _assert_grpc_server(server, store, expected)
 
 
 if __name__ == "__main__":

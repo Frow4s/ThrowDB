@@ -1,0 +1,43 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "server-release",
+      "displayName": "ThrowDB single-collection server (gRPC + TCP)",
+      "description": "Release server build; gRPC dependencies are mandatory and never silently disabled.",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/server-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "THROWDB_BUILD_PYTHON": "OFF",
+        "THROWDB_BUILD_TESTS": "ON",
+        "THROWDB_BUILD_BENCHMARKS": "OFF",
+        "THROWDB_BUILD_SERVER": "ON",
+        "THROWDB_BUILD_GRPC_SERVER": "ON",
+        "THROWDB_GRPC_ENABLE_REFLECTION": "ON",
+        "THROWDB_INSTALL_CPP_SDK": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "server-release",
+      "configurePreset": "server-release",
+      "jobs": 4
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "server-release",
+      "configurePreset": "server-release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

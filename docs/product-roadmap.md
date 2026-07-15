@@ -1,7 +1,8 @@
 # ThrowDB product roadmap
 
-The current implementation is a testable local mutable engine for numeric-ID
-collections with arbitrary fixed dimension and float16/float32 rows. Format 7
+The current implementation is a testable local mutable engine plus a C++ gRPC
+single-collection server for numeric-ID collections with arbitrary fixed
+dimension and float16/float32 rows. Format 7
 adds an authoritative partitioned RowRef index, WAL-to-segment materialization,
 selective partition folding, selective segment cleaning, deferred orphan
 reclamation, and explicit bounded maintenance. When a parallel coordinator is
@@ -76,16 +77,22 @@ The scheduler and backend interfaces keep the public API independent of
 
 ## Stage 2: server for one collection
 
-Run one long-lived collection per server process and add:
+Run one long-lived collection per server process. The first functional slice
+now includes the versioned dense-bytes gRPC contract, C++ daemon, Python
+client, CRUD, prefix Get, physical-order ID streaming, bounded messages and
+threads, health/reflection, graceful shutdown, writer fencing, and durable
+`operation_id` replay. Remaining Stage 2 hardening includes:
 
-- a binary batched read protocol and Python client;
-- request deadlines, cancellation, backpressure, and maximum batch sizes;
+- a dedicated local-loopback/remote server benchmark that separates collection
+  I/O from protobuf/gRPC copies, queue delay, and client-visible latency;
+- tune-aware startup that selects a compatible persisted profile without
+  running calibration implicitly; explicit `--io-*` settings remain the
+  override;
+- complete queue/admission metrics on top of the implemented deadlines,
+  cancellation, bounded worker pool, message limits, and local fair scheduler;
 - server-wide admission, priorities, deadlines, and optional batching on top
   of the local fair scheduler;
-- network CRUD mapped to the same commit and snapshot-view semantics;
-- health checks, metrics, graceful shutdown, and a minimal trusted-network
-  authentication model;
-- one shared RAM index instead of one copy per client process.
+- metrics and a minimal trusted-network authentication model, followed by TLS.
 
 Local NVMe remains the first media backend. Network filesystem or object-store
 reads are added through the backend interface, with their own concurrency,
@@ -132,12 +139,26 @@ and whether media is local or remote. Device names alone do not choose policy.
 
 ### Calibration profile
 
-An explicit short `throwdb tune` workflow compares the bounded matrix-v2
-backend topologies, queue depths, worker counts, and concurrency. Matrix v2
-holds its 1 MiB range and zero-gap policy fixed; workload-aware range selection
-is a later stage. Its versioned result is keyed by media identity, runtime
-compatibility including the reader-policy ABI, and collection layout. A
-profile stops matching when those assumptions change.
+An explicit bounded `throwdb tune` workflow compares matrix-v3.1 backend
+topologies, queue depths, worker counts, and concurrency. A short screening
+stage covers the full bounded matrix and a longer verification stage retains
+at most five finalists. One pre-budgeted backfill protects against an unlucky
+screening cutoff by interleaving the candidate with a fresh sequential control,
+and one pre-budgeted paired recheck handles a 10-20% CV when every observed
+gain remains at least 5%. Matrix v3.1 combines paired throughput
+with reliable process-CPU efficiency, sample-rich P99 latency, attributable
+cgroup throttling, mixed-request fairness, and ambient-load guardrails. Mixed
+small-request starvation requires both candidate-local slowdown and an
+absolute regression against the baseline. The result exposes the eligible
+comparison set, decision-active objectives, and observed versus eligible
+maximum-throughput alternatives through a revisioned, validity-marked selection
+schema; low-confidence shared-cgroup attribution makes publication
+inconclusive. It reports a performance/efficiency/topology
+Pareto frontier and persists the balanced winner. It still holds its 1 MiB
+range and zero-gap policy fixed; workload-aware range selection is a later
+stage. Its versioned result is keyed by media identity, runtime compatibility
+including the reader-policy ABI, and collection layout. A profile stops
+matching when those assumptions change.
 
 ### Request-level scheduler
 
@@ -168,6 +189,7 @@ product sequence is:
    reports on production-size local NVMe collections.
 2. Preserve explicit calibration profiles and add request-policy explanation
    around the implemented fair scheduler.
-3. Build the single-collection server on the same engine.
+3. Harden the implemented single-collection gRPC server: tune-aware startup,
+   metrics, admission, TLS/auth, journal retention, and fewer unary copies.
 4. Add compact UTF-8 ID storage, collision-verified lookup, and string CRUD as
    an extension of the stable numeric lifecycle.

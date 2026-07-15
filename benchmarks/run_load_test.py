@@ -72,6 +72,18 @@ MAX_IO_URING_WORKERS = 64
 IO_URING_QUEUE_DEPTH = 32
 MAX_IO_URING_QUEUE_DEPTH = 4096
 ID_VALIDATION_CHUNK_ROWS = 1 << 20
+TUNING_MODE = "explicit"
+
+READER_OPTION_NAMES = (
+    "io_workers",
+    "io_queue_capacity",
+    "io_ranges_per_task",
+    "io_backend",
+    "io_uring_workers",
+    "io_uring_queue_depth",
+    "max_gap_bytes",
+    "max_read_range_bytes",
+)
 
 LEGACY_MANIFEST_MAGIC = b"THROWDBM"
 NATIVE_MANIFEST_MAGICS = frozenset({b"TDBNMNF1", b"TDBNMNF2"})
@@ -342,9 +354,14 @@ def open_benchmark_storage(
     io_backend: str,
     io_uring_workers: int,
     io_uring_queue_depth: int,
+    tuning_mode: str = TUNING_MODE,
 ) -> tuple[Any, str]:
     """Open either format through its supported public Python interface."""
 
+    if tuning_mode not in {"explicit", "auto", "persisted", "conservative"}:
+        raise ValueError(
+            "tuning_mode must be explicit, auto, persisted, or conservative"
+        )
     store_format = detect_store_format(store_path)
     tuning = {
         "io_workers": io_workers,
@@ -359,9 +376,13 @@ def open_benchmark_storage(
             throwdb.Collection.open(
                 store_path,
                 mode="r",
-                tuning=tuning,
+                tuning=tuning if tuning_mode == "explicit" else tuning_mode,
             ),
             store_format,
+        )
+    if tuning_mode != "explicit":
+        raise ValueError(
+            "saved reader tuning is supported only by native collections"
         )
     return throwdb.Storage.open(store_path, **tuning), store_format
 
@@ -383,6 +404,17 @@ def storage_open_stats(storage: Any) -> dict[str, Any] | None:
     if callable(stats):
         stats = stats()
     return dict(stats)
+
+
+def storage_tuning(storage: Any) -> dict[str, Any] | None:
+    """Return the actual native reader selection when it is observable."""
+
+    tuning = getattr(storage, "tuning", None)
+    if tuning is None:
+        return None
+    if callable(tuning):
+        tuning = tuning()
+    return dict(tuning)
 
 
 def atomic_json_dump(path: Path, value: Any) -> None:
@@ -1018,6 +1050,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results", type=Path, default=RESULTS_DIR)
     parser.add_argument("--profile", choices=("quick", "full"), default=PROFILE)
     parser.add_argument(
+        "--tuning",
+        choices=("explicit", "auto", "persisted", "conservative"),
+        default=TUNING_MODE,
+        help=(
+            "reader selection: explicit uses the --io-* flags; persisted "
+            "requires a matching saved profile; auto may fall back; "
+            "conservative bypasses saved profiles"
+        ),
+    )
+    parser.add_argument(
         "--io-workers",
         type=non_negative_int,
         default=IO_WORKERS,
@@ -1087,6 +1129,44 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    requested_reader_options = {
+        "io_workers": args.io_workers,
+        "io_queue_capacity": args.io_queue_capacity,
+        "io_ranges_per_task": args.io_ranges_per_task,
+        "io_backend": args.io_backend,
+        "io_uring_workers": args.io_uring_workers,
+        "io_uring_queue_depth": args.io_uring_queue_depth,
+    }
+    default_reader_options = {
+        "io_workers": IO_WORKERS,
+        "io_queue_capacity": IO_QUEUE_CAPACITY,
+        "io_ranges_per_task": IO_RANGES_PER_TASK,
+        "io_backend": IO_BACKEND,
+        "io_uring_workers": IO_URING_WORKERS,
+        "io_uring_queue_depth": IO_URING_QUEUE_DEPTH,
+    }
+    if (
+        args.tuning != "explicit"
+        and requested_reader_options != default_reader_options
+    ):
+        raise ValueError(
+            "--io-* options cannot be combined with a non-explicit "
+            "--tuning mode"
+        )
+    requested_admission_capacity = (
+        (1 if args.io_uring_workers == 1 else 2 * args.io_uring_workers)
+        if args.tuning == "explicit" and args.io_backend == "io_uring"
+        else None
+    )
+    requested_admission_policy = (
+        (
+            "serialized_mutex"
+            if args.io_uring_workers == 1
+            else "fifo_ticket"
+        )
+        if args.tuning == "explicit" and args.io_backend == "io_uring"
+        else None
+    )
     if not 1 <= args.io_ranges_per_task <= MAX_IO_RANGES_PER_TASK:
         raise ValueError(
             "--io-ranges-per-task must be in "
@@ -1119,16 +1199,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "--io-queue-capacity must be zero when --io-workers is zero"
         )
-    io_uring_admission_capacity = (
-        (1 if args.io_uring_workers == 1 else 2 * args.io_uring_workers)
-        if args.io_backend == "io_uring"
-        else None
-    )
-    io_uring_admission_policy = (
-        ("serialized_mutex" if args.io_uring_workers == 1 else "fifo_ticket")
-        if args.io_backend == "io_uring"
-        else None
-    )
     args.results.mkdir(parents=True, exist_ok=True)
     report_path = args.results / "report.json"
 
@@ -1146,6 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "ids": str(args.ids.resolve()),
             "results": str(args.results.resolve()),
             "profile": args.profile,
+            "tuning_mode": args.tuning,
             "cache_mode": args.cache_mode,
             "source_embeddings": (
                 str(args.source_embeddings.resolve())
@@ -1154,14 +1225,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "source_kind": args.source_kind,
             "seed": RANDOM_SEED,
-            "io_workers": args.io_workers,
-            "io_queue_capacity": args.io_queue_capacity,
-            "io_ranges_per_task": args.io_ranges_per_task,
-            "io_backend": args.io_backend,
-            "io_uring_workers": args.io_uring_workers,
-            "io_uring_queue_depth": args.io_uring_queue_depth,
-            "io_uring_admission_capacity": io_uring_admission_capacity,
-            "io_uring_admission_policy": io_uring_admission_policy,
+            "requested_reader_options": (
+                requested_reader_options
+                if args.tuning == "explicit"
+                else None
+            ),
+            # Preserve the original report fields for explicit A/B consumers.
+            # Registry-driven modes set them to null until the effective
+            # selection is recorded under storage below.
+            "io_workers": (
+                args.io_workers if args.tuning == "explicit" else None
+            ),
+            "io_queue_capacity": (
+                args.io_queue_capacity
+                if args.tuning == "explicit"
+                else None
+            ),
+            "io_ranges_per_task": (
+                args.io_ranges_per_task
+                if args.tuning == "explicit"
+                else None
+            ),
+            "io_backend": (
+                args.io_backend if args.tuning == "explicit" else None
+            ),
+            "io_uring_workers": (
+                args.io_uring_workers
+                if args.tuning == "explicit"
+                else None
+            ),
+            "io_uring_queue_depth": (
+                args.io_uring_queue_depth
+                if args.tuning == "explicit"
+                else None
+            ),
+            "io_uring_admission_capacity": requested_admission_capacity,
+            "io_uring_admission_policy": requested_admission_policy,
         },
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "system": collect_system_information(args.store),
@@ -1192,8 +1291,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         io_backend=args.io_backend,
         io_uring_workers=args.io_uring_workers,
         io_uring_queue_depth=args.io_uring_queue_depth,
+        tuning_mode=args.tuning,
     )
     open_seconds = time.perf_counter() - open_started
+    selected_tuning = storage_tuning(storage)
+    effective_reader_options = dict(requested_reader_options)
+    if selected_tuning is not None:
+        effective_reader_options.update(
+            {
+                name: selected_tuning[name]
+                for name in READER_OPTION_NAMES
+                if name in selected_tuning
+            }
+        )
+    if args.tuning == "persisted" and (
+        selected_tuning is None
+        or selected_tuning.get("source") != "persisted"
+        or selected_tuning.get("status") != "selected"
+    ):
+        close_benchmark_storage(storage)
+        raise RuntimeError(
+            "the benchmark requested persisted tuning but the collection "
+            "did not select a saved profile"
+        )
+    effective_backend = str(effective_reader_options["io_backend"])
+    effective_io_uring_workers = int(
+        effective_reader_options["io_uring_workers"]
+    )
+    io_uring_admission_capacity = (
+        (
+            1
+            if effective_io_uring_workers == 1
+            else 2 * effective_io_uring_workers
+        )
+        if effective_backend == "io_uring"
+        else None
+    )
+    io_uring_admission_policy = (
+        (
+            "serialized_mutex"
+            if effective_io_uring_workers == 1
+            else "fifo_ticket"
+        )
+        if effective_backend == "io_uring"
+        else None
+    )
     report["storage"] = {
         "count": storage.count,
         "dimension": storage.dimension,
@@ -1202,12 +1344,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "format_version": storage.format_version,
         "directory_bytes": directory_size(args.store),
         "open_seconds": open_seconds,
-        "io_workers": args.io_workers,
-        "io_queue_capacity": args.io_queue_capacity,
-        "io_ranges_per_task": args.io_ranges_per_task,
-        "io_backend": args.io_backend,
-        "io_uring_workers": args.io_uring_workers,
-        "io_uring_queue_depth": args.io_uring_queue_depth,
+        "tuning": selected_tuning,
+        **effective_reader_options,
         "io_uring_admission_capacity": io_uring_admission_capacity,
         "io_uring_admission_policy": io_uring_admission_policy,
         "process_thread_count_before_open": thread_count_before_open,
@@ -1219,7 +1357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     log(
         f"storage opened in {open_seconds:.3f}s: "
         f"format={store_format}, count={storage.count:,}, "
-        f"dimension={storage.dimension}, dtype={storage.dtype}"
+        f"dimension={storage.dimension}, dtype={storage.dtype}, "
+        f"tuning={args.tuning}, backend={effective_backend}"
     )
 
     population = load_ids(args.ids, storage.count)
@@ -1272,12 +1411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 result["cache_mode"] = cache_mode
                 result["external_reader_workers"] = 1
-                result["io_workers"] = args.io_workers
-                result["io_queue_capacity"] = args.io_queue_capacity
-                result["io_ranges_per_task"] = args.io_ranges_per_task
-                result["io_backend"] = args.io_backend
-                result["io_uring_workers"] = args.io_uring_workers
-                result["io_uring_queue_depth"] = args.io_uring_queue_depth
+                result.update(effective_reader_options)
                 result["io_uring_admission_capacity"] = (
                     io_uring_admission_capacity
                 )
@@ -1310,12 +1444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 result["cache_mode"] = cache_mode
                 result["external_reader_workers"] = workers
-                result["io_workers"] = args.io_workers
-                result["io_queue_capacity"] = args.io_queue_capacity
-                result["io_ranges_per_task"] = args.io_ranges_per_task
-                result["io_backend"] = args.io_backend
-                result["io_uring_workers"] = args.io_uring_workers
-                result["io_uring_queue_depth"] = args.io_uring_queue_depth
+                result.update(effective_reader_options)
                 result["io_uring_admission_capacity"] = (
                     io_uring_admission_capacity
                 )

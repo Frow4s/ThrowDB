@@ -11,10 +11,17 @@ version = "0.1.0"
 description = "Read-optimized disk-backed embedding storage"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24"]
+dependencies = [
+    "numpy>=1.24",
+    "grpcio>=1.81.1,<2",
+    "protobuf>=6.33.5,<7",
+]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = [
+    "pytest>=8",
+    "grpcio-tools>=1.81.1,<1.82",
+]
 
 [project.scripts]
 throwdb = "throwdb.cli:main"
@@ -27,6 +34,13 @@ wheel.packages = ["python/throwdb"]
 THROWDB_BUILD_TESTS = "OFF"
 THROWDB_BUILD_BENCHMARKS = "OFF"
 THROWDB_INSTALL_CPP_SDK = "OFF"
+# The installed product exposes gRPC as its public server contract. Official
+# wheel builders must provide the pinned C++ gRPC/Protobuf CMake packages;
+# configuration fails explicitly instead of silently shipping a TCP-only
+# daemon when those build dependencies are absent.
+THROWDB_BUILD_SERVER = "ON"
+THROWDB_BUILD_GRPC_SERVER = "ON"
+THROWDB_GRPC_ENABLE_REFLECTION = "OFF"
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
@@ -37,7 +51,8 @@ test-command = "python {project}/tools/wheel_smoke.py"
 [tool.cibuildwheel.linux]
 archs = ["x86_64"]
 manylinux-x86_64-image = "manylinux_2_28"
-environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2" }
+before-all = "dnf install -y git make perl gcc-c++ && python3 -m pip install 'cmake>=3.28,<4' && ./tools/bootstrap_grpc.sh"
+environment = { CMAKE_BUILD_PARALLEL_LEVEL = "2", THROWDB_GRPC_PREFIX = "/opt/throwdb-grpc", THROWDB_GRPC_WORK_DIR = "/tmp/throwdb-grpc-work", THROWDB_GRPC_JOBS = "2" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

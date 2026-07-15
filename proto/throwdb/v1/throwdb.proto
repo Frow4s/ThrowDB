@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package throwdb.v1;
+
+option cc_enable_arenas = true;
+
+// One process serves exactly one collection. Collection selection and a
+// multi-collection catalog belong to a future service layer, not this API.
+service ThrowDB {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+
+  rpc Insert(MutationRequest) returns (MutationResponse);
+  rpc Update(MutationRequest) returns (MutationResponse);
+  rpc Upsert(MutationRequest) returns (MutationResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Pins one logical collection view and emits every live ID exactly once in
+  // physical (segment_id, row_index) order. Each response is bounded by the
+  // requested batch_rows and the server's configured message-byte limit.
+  rpc ScanIds(ScanIdsRequest) returns (stream ScanIdsResponse);
+}
+
+enum IdType {
+  ID_TYPE_UNSPECIFIED = 0;
+  ID_TYPE_UINT64 = 1;
+  // Reserved by the protocol. Numeric format 7 currently returns
+  // UNIMPLEMENTED for UTF-8 collections.
+  ID_TYPE_UTF8 = 2;
+}
+
+enum EmbeddingDType {
+  EMBEDDING_DTYPE_UNSPECIFIED = 0;
+  EMBEDDING_DTYPE_FLOAT16 = 1;
+  EMBEDDING_DTYPE_FLOAT32 = 2;
+}
+
+message UInt64Ids {
+  uint64 count = 1;
+  // Exactly count*8 bytes: numeric IDs encoded little-endian. A dense bytes
+  // field avoids per-element protobuf work and maps directly to NumPy and the
+  // C++ batch API after validation.
+  bytes values_le = 2;
+}
+
+message Utf8Ids {
+  repeated string values = 1;
+}
+
+message IdBatch {
+  oneof encoding {
+    UInt64Ids uint64_ids = 1;
+    Utf8Ids utf8_ids = 2;
+  }
+}
+
+message EmbeddingBatch {
+  EmbeddingDType dtype = 1;
+  uint32 dimension = 2;
+  uint64 row_count = 3;
+  // Dense row-major IEEE values in little-endian byte order. Its length must
+  // equal row_count*dimension*element_size(dtype).
+  bytes values_le = 4;
+}
+
+message OperationId {
+  fixed64 high = 1;
+  fixed64 low = 2;
+}
+
+message CollectionId {
+  fixed64 low = 1;
+  fixed64 high = 2;
+}
+
+message ScanToken {
+  fixed64 high = 1;
+  fixed64 low = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum ServingStatus {
+    SERVING_STATUS_UNSPECIFIED = 0;
+    SERVING_STATUS_SERVING = 1;
+    SERVING_STATUS_NOT_SERVING = 2;
+  }
+
+  ServingStatus status = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+}
+
+message DescribeRequest {}
+
+message Capabilities {
+  bool writable = 1;
+  bool prefix_get = 2;
+  bool scan_locations = 3;
+  // True when the server durably journals operation_id and can resolve an
+  // interrupted request against WAL recovery. Clients must not retry an
+  // ambiguous mutation while this is false.
+  bool durable_idempotency = 4;
+}
+
+message CollectionSchema {
+  IdType id_type = 1;
+  EmbeddingDType embedding_dtype = 2;
+  uint32 dimension = 3;
+}
+
+message DescribeResponse {
+  uint32 format_version = 1;
+  CollectionSchema schema = 2;
+  uint64 record_size = 3;
+  uint64 count = 4;
+  Capabilities capabilities = 5;
+}
+
+message GetRequest {
+  IdBatch ids = 1;
+  // Zero means the collection's complete dimension.
+  uint32 prefix_dimensions = 2;
+}
+
+message GetResponse {
+  EmbeddingBatch embeddings = 1;
+}
+
+message MutationRequest {
+  // Required and nonzero. Reusing it with the same operation and payload
+  // returns the original committed result; reusing it for another payload is
+  // rejected. Retry only when Describe advertises durable_idempotency.
+  OperationId operation_id = 1;
+  IdBatch ids = 2;
+  EmbeddingBatch embeddings = 3;
+}
+
+message MutationResponse {
+  uint64 committed_sequence = 1;
+  uint64 affected_count = 2;
+}
+
+message DeleteRequest {
+  OperationId operation_id = 1;
+  IdBatch ids = 2;
+}
+
+message DeleteResponse {
+  uint64 committed_sequence = 1;
+  uint64 affected_count = 2;
+  // Exactly affected_count bytes. Values are restricted to 0 and 1 and
+  // preserve request order.
+  bytes deleted_mask = 3;
+}
+
+message ScanIdsRequest {
+  uint32 batch_rows = 1;
+  bool include_locations = 2;
+}
+
+message IdScanSnapshot {
+  CollectionId collection_id = 1;
+  uint64 catalog_generation = 2;
+  uint64 committed_sequence = 3;
+  uint64 count = 4;
+  // Cursor-scoped, opaque, and nonzero. It is not an authorization secret and
+  // is not resumable after the stream ends in protocol v1.
+  ScanToken token = 5;
+}
+
+enum LocationEncoding {
+  LOCATION_ENCODING_UNSPECIFIED = 0;
+  // Exactly row_count*8 bytes, each row encoded as little-endian
+  // (uint32 segment_id, uint32 row_index).
+  LOCATION_ENCODING_SEGMENT_ROW_U32_LE = 1;
+}
+
+message ScanIdsResponse {
+  IdScanSnapshot snapshot = 1;
+  uint64 emitted_offset = 2;
+  IdBatch ids = 3;
+  LocationEncoding location_encoding = 4;
+  bytes locations_le = 5;
+}

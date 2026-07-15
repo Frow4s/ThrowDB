@@ -206,6 +206,115 @@ def test_format7_python_read_write_crud_rotation_and_reopen(
     reopened.close()
 
 
+def test_format7_list_and_scan_ids_follow_snapshot_physical_order(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "physical-id-scan"
+    dimension = 4
+    base = _vectors(4, dimension, "float16", salt=31)
+    schema = throwdb.CollectionSchema(dimension=dimension, dtype="float16")
+    with throwdb.Collection.create(
+        path,
+        schema=schema,
+        shard_size_bytes=base[0].nbytes * 2,
+        format_version=7,
+    ) as builder:
+        builder.add([30, 10, 20, 50], base)
+
+    replacement = _vectors(1, dimension, "float16", salt=331)
+    inserted = _vectors(1, dimension, "float16", salt=631)
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        collection.update([10], replacement)
+        np.testing.assert_array_equal(collection.delete([20]), [True])
+        collection.insert([40], inserted)
+
+        located = collection.list_ids(with_locations=True, batch_rows=2)
+        assert located.ids.dtype == np.dtype(np.uint64)
+        assert located.locations.dtype == throwdb.ID_LOCATION_DTYPE
+        assert located.ids.flags.c_contiguous
+        assert located.locations.flags.c_contiguous
+        assert set(located.ids.tolist()) == {10, 30, 40, 50}
+        coordinates = [
+            (int(segment), int(row))
+            for segment, row in zip(
+                located.locations["segment_id"],
+                located.locations["row_index"],
+                strict=True,
+            )
+        ]
+        assert coordinates == sorted(coordinates)
+        assert len(set(coordinates)) == len(coordinates)
+
+        plain = collection.list_ids(batch_rows=1)
+        np.testing.assert_array_equal(plain, located.ids)
+
+        with collection.scan_ids(
+            batch_rows=2,
+            with_locations=True,
+        ) as scan:
+            assert scan.snapshot.count == collection.count
+            batches = list(scan)
+            assert scan.done
+        np.testing.assert_array_equal(
+            np.concatenate([batch.ids for batch in batches]),
+            located.ids,
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([batch.locations for batch in batches]),
+            located.locations,
+        )
+        offsets: list[int] = []
+        emitted = 0
+        for batch in batches:
+            offsets.append(emitted)
+            emitted += batch.ids.size
+        assert [batch.emitted_offset for batch in batches] == offsets
+        assert all(batch.snapshot == located.snapshot for batch in batches)
+
+        # A cursor pins both its logical winners and physical resources.  A
+        # later commit may relocate an ID, but cannot change this scan.
+        snapshot_scan = collection.scan_ids(batch_rows=1)
+        snapshot_count = snapshot_scan.snapshot_count
+        collection.delete([30])
+        collection.insert([60], inserted)
+        snapshot_ids = np.concatenate(list(snapshot_scan))
+        snapshot_scan.close()
+        assert snapshot_ids.size == snapshot_count
+        assert set(snapshot_ids.tolist()) == {10, 30, 40, 50}
+
+        current = collection.list_ids()
+        assert set(current.tolist()) == {10, 40, 50, 60}
+
+
+def test_scan_ids_validates_buffers_and_empty_collection(tmp_path: Path) -> None:
+    path = tmp_path / "empty-scan"
+    schema = throwdb.CollectionSchema(dimension=3, dtype="float16")
+    with throwdb.Collection.create(
+        path,
+        schema=schema,
+        shard_size_bytes=1 << 20,
+        format_version=7,
+    ):
+        pass
+
+    with throwdb.Collection.open(path) as collection:
+        assert collection.list_ids().shape == (0,)
+        located = collection.list_ids(with_locations=True)
+        assert located.ids.shape == (0,)
+        assert located.locations.shape == (0,)
+        with pytest.raises(ValueError, match="batch_rows"):
+            collection.scan_ids(batch_rows=0)
+        with pytest.raises(TypeError, match="with_locations"):
+            collection.scan_ids(with_locations=1)
+
+        with collection.scan_ids(with_locations=True) as scan:
+            ids = np.empty(1, dtype=np.uint64)
+            locations = np.empty(1, dtype=throwdb.ID_LOCATION_DTYPE)
+            assert scan.read_into(ids, locations) == 0
+            with pytest.raises(TypeError, match="uint64"):
+                scan.read_into(np.empty(1, dtype=np.uint32), locations)
+
+
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 def test_insert_update_preconditions_and_duplicate_batches_are_atomic(
     tmp_path: Path,

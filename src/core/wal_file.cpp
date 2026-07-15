@@ -75,6 +75,33 @@ WalScanResult scan_wal_file(
     return scan_wal(mapping.bytes(), expected, mode, visitor);
 }
 
+WalMutationFingerprint fingerprint_recovered_wal_batch(
+    const int fd,
+    const std::filesystem::path& path,
+    const RecoveredWalBatch& batch,
+    const std::uint64_t record_size) {
+    WalMutationFingerprintBuilder builder(record_size, batch.operations.size());
+    std::vector<std::byte> value(static_cast<std::size_t>(record_size));
+    for (const RecoveredWalOperation& operation : batch.operations) {
+        if (operation.kind == WalOperationKind::Put) {
+            if (operation.payload_size != record_size) {
+                throw CorruptionError(
+                    "recovered WAL PUT has unexpected payload size");
+            }
+            pread_exact(
+                fd,
+                value.data(),
+                value.size(),
+                operation.payload_offset,
+                path);
+            builder.add(operation.kind, operation.id, value);
+        } else {
+            builder.add(operation.kind, operation.id, {});
+        }
+    }
+    return builder.finish();
+}
+
 std::uint64_t append_wal_transaction_durable(
     const int fd,
     const std::filesystem::path& path,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -90,14 +91,68 @@ struct NativeReadStats {
     bool zero_delta_fast_path = false;
 };
 
-// A deterministic, bounded sample from the currently authoritative ID sources.
-// Format 7 includes active snapshots, run sections, and WAL overlays. Sampling
-// never scans more than inspected_slots and complete is true only when the
-// requested number of currently-live IDs was collected.
+// A deterministic, bounded sample within one open collection snapshot and
+// runtime. Format 7 proportionally inspects active snapshot slots, active run
+// records, and WAL overlays, then keeps one seed-ordered bottom-K of currently
+// live IDs. inspected_slots counts ID-bearing and raw snapshot slots and never
+// exceeds max_inspected_slots; bounded run-bitmap metadata traversal is not an
+// ID slot. complete is true only when the requested number of live IDs was
+// collected.
 struct NativeIdSample {
     std::vector<std::uint64_t> ids;
     std::uint64_t inspected_slots = 0;
     bool complete = false;
+};
+
+// Stable physical coordinates within one captured collection view. Segment
+// IDs are monotonically allocated inside a collection and row_index is the
+// zero-based record position in that segment. A location is a hint outside
+// the NativeIdScan that produced it: lifecycle operations may publish a new
+// view which relocates an otherwise unchanged logical ID.
+struct NativeIdLocation {
+    std::uint32_t segment_id = 0;
+    std::uint32_t row_index = 0;
+
+    bool operator==(const NativeIdLocation&) const = default;
+};
+
+static_assert(sizeof(NativeIdLocation) == sizeof(std::uint64_t));
+
+// Identity and exact logical size of the immutable view captured by an ID
+// scan. catalog_generation changes for lifecycle publications, while
+// committed_sequence changes for WAL commits; together with collection_id
+// they identify the view in which returned physical locations are valid.
+struct NativeIdScanMetadata {
+    std::uint64_t collection_id_low = 0;
+    std::uint64_t collection_id_high = 0;
+    std::uint64_t catalog_generation = 0;
+    std::uint64_t committed_sequence = 0;
+    std::uint64_t live_count = 0;
+};
+
+// Lightweight identity of the currently published logical view. Unlike an ID
+// scan this does not pin resources or copy the WAL overlay.
+struct NativeCollectionIdentity {
+    std::uint64_t collection_id_low = 0;
+    std::uint64_t collection_id_high = 0;
+    std::uint64_t catalog_generation = 0;
+    std::uint64_t committed_sequence = 0;
+};
+
+enum class NativeMutationOperation : std::uint8_t {
+    Put = 1,
+    Delete = 2,
+};
+
+struct NativeMutationFingerprint {
+    std::array<std::byte, 32> bytes{};
+    bool operator==(const NativeMutationFingerprint&) const = default;
+};
+
+enum class NativeMutationVerification : std::uint8_t {
+    Match = 1,
+    Mismatch = 2,
+    Unavailable = 3,
 };
 
 // Durable mutation-log state captured under the collection's mutation lock.
@@ -312,6 +367,33 @@ private:
 
 class NativeCollection;
 
+// Snapshot cursor over authoritative live IDs in physical RowRef order:
+// (segment_id, row_index). read_into() never mixes two physical segments in
+// one non-empty result. Passing an empty locations span disables location
+// output; otherwise it must have exactly the same capacity as ids.
+class NativeIdScan {
+public:
+    ~NativeIdScan();
+
+    NativeIdScan(const NativeIdScan&) = delete;
+    NativeIdScan& operator=(const NativeIdScan&) = delete;
+    NativeIdScan(NativeIdScan&&) = delete;
+    NativeIdScan& operator=(NativeIdScan&&) = delete;
+
+    [[nodiscard]] const NativeIdScanMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<NativeIdLocation> locations = {});
+    [[nodiscard]] bool done() const noexcept;
+
+private:
+    class Impl;
+    explicit NativeIdScan(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+
+    friend class NativeCollection;
+};
+
 // One persistent physical-reader candidate used to compare reader policies
 // against an already-open collection snapshot. It owns only executor/backend
 // state; the collection continues to own the loaded index and file handles.
@@ -334,6 +416,14 @@ private:
 
 class NativeCollection {
 public:
+    // Canonical SHA-256 over the exact logical operations written to one WAL
+    // transaction. Server-side crash recovery uses this as a witness without
+    // changing the stable local mutation API or WAL layout.
+    [[nodiscard]] static NativeMutationFingerprint fingerprint_mutation(
+        NativeMutationOperation operation,
+        std::span<const std::uint64_t> ids,
+        std::span<const std::byte> embeddings,
+        std::uint64_t record_size);
     [[nodiscard]] static NativeReaderCapabilities reader_capabilities(
         std::uint32_t io_uring_queue_depth = 32,
         std::uint32_t io_uring_workers = 1);
@@ -384,8 +474,24 @@ public:
         std::uint64_t requested,
         std::uint64_t seed,
         std::uint64_t max_inspected_slots) const;
+    // Format 7 only. The cursor pins immutable resources and copies the
+    // bounded WAL overlay while briefly holding the collection state lock;
+    // iteration itself does not block mutation publication.
+    [[nodiscard]] std::unique_ptr<NativeIdScan> scan_ids() const;
     [[nodiscard]] std::vector<std::byte> get_bytes(
         std::span<const std::uint64_t> ids) const;
+    // Batch membership in one logical collection view. The output preserves
+    // input order and duplicates. Unlike get(), missing IDs are ordinary false
+    // values and no embedding payload is read from disk.
+    [[nodiscard]] std::vector<std::uint8_t> contains(
+        std::span<const std::uint64_t> ids) const;
+    [[nodiscard]] NativeCollectionIdentity identity() const;
+    // Match is returned only while the exact sequence remains in a retained
+    // WAL and its CRC-validated operations hash to expected. Lifecycle may
+    // make an older witness Unavailable; callers must fail closed.
+    [[nodiscard]] NativeMutationVerification verify_committed_mutation(
+        std::uint64_t sequence,
+        const NativeMutationFingerprint& expected) const;
 
     void insert(
         std::span<const std::uint64_t> ids,

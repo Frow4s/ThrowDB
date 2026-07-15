@@ -881,6 +881,46 @@ void test_calibration_handle_owns_exclusive_read_only_lease() {
             "calibration did not release its writer lease");
 }
 
+void test_contains_is_snapshot_consistent_without_reading_payloads() {
+    for (const std::uint32_t format_version : {6U, 7U}) {
+        TempDirectory temporary;
+        const auto store = temporary.path()
+                           / ("store-" + std::to_string(format_version));
+        constexpr std::uint32_t dimension = 2;
+        constexpr std::uint64_t record_size = dimension * 2;
+        throwdb::NativeBuilderOptions options;
+        options.format_version = format_version;
+        options.dimension = dimension;
+        options.segment_size_bytes = 2 * record_size;
+        const std::array<std::uint64_t, 3> base_ids{10, 20, 30};
+        const auto base = rows(base_ids.size(), record_size, 9);
+        auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+        builder->append(base_ids, base);
+        builder->finish();
+
+        auto collection = throwdb::NativeCollection::open(store, {}, true);
+        const std::array<std::uint64_t, 5> query{20, 999, 10, 20, 0};
+        require(
+            collection->contains(query)
+                == std::vector<std::uint8_t>({1, 0, 1, 1, 0}),
+            "base contains mask is wrong");
+        require(collection->contains(std::span<const std::uint64_t>{}).empty(),
+                "empty contains query is not empty");
+
+        const std::array<std::uint64_t, 1> inserted_id{40};
+        const auto inserted = rows(1, record_size, 31);
+        collection->insert(inserted_id, inserted);
+        const std::array<std::uint64_t, 1> deleted_id{20};
+        require(collection->erase(deleted_id) == std::vector<std::uint8_t>{1},
+                "contains fixture delete failed");
+        const std::array<std::uint64_t, 4> mutated_query{40, 20, 30, 40};
+        require(
+            collection->contains(mutated_query)
+                == std::vector<std::uint8_t>({1, 0, 1, 1}),
+            "mutation contains mask is wrong");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -925,6 +965,9 @@ int main() {
         TestCase{
             "calibration_handle_owns_exclusive_read_only_lease",
             test_calibration_handle_owns_exclusive_read_only_lease},
+        TestCase{
+            "contains_is_snapshot_consistent_without_reading_payloads",
+            test_contains_is_snapshot_consistent_without_reading_payloads},
     };
 
     std::size_t passed = 0;

@@ -523,6 +523,36 @@ void validate_distinct_ids(const std::span<const std::uint64_t> ids) {
     return header;
 }
 
+[[nodiscard]] NativeMutationVerification verify_wal_sequence(
+    const int fd,
+    const std::filesystem::path& path,
+    const detail::WalHeader& header,
+    const detail::MutationWalState state,
+    const std::uint64_t sequence,
+    const NativeMutationFingerprint& expected) {
+    std::optional<detail::WalMutationFingerprint> actual;
+    static_cast<void>(detail::scan_wal_file(
+        fd,
+        path,
+        detail::ExpectedWalIdentity::from_trusted_header(header),
+        state == detail::MutationWalState::Active
+            ? detail::WalScanMode::Active
+            : detail::WalScanMode::Frozen,
+        [&](const detail::RecoveredWalBatch& batch) {
+            if (batch.sequence == sequence) {
+                actual = detail::fingerprint_recovered_wal_batch(
+                    fd, path, batch, header.record_size);
+            }
+        }));
+    if (!actual.has_value()) {
+        throw CorruptionError(
+            "retained WAL sequence disappeared during verification");
+    }
+    return *actual == expected.bytes
+               ? NativeMutationVerification::Match
+               : NativeMutationVerification::Mismatch;
+}
+
 }  // namespace
 
 class NativeCollectionBuilder::Impl {
@@ -864,6 +894,29 @@ private:
     const pid_t owner_pid_{::getpid()};
 };
 
+class NativeIdScan::Impl {
+public:
+    explicit Impl(std::unique_ptr<detail::PartitionedIdScan> scan)
+        : scan_(std::move(scan)) {
+        if (scan_ == nullptr) {
+            throw InvalidArgumentError("native ID scan is null");
+        }
+    }
+
+    [[nodiscard]] const NativeIdScanMetadata& metadata() const noexcept {
+        return scan_->metadata();
+    }
+    [[nodiscard]] std::uint64_t read_into(
+        const std::span<std::uint64_t> ids,
+        const std::span<NativeIdLocation> locations) {
+        return scan_->read_into(ids, locations);
+    }
+    [[nodiscard]] bool done() const noexcept { return scan_->done(); }
+
+private:
+    std::unique_ptr<detail::PartitionedIdScan> scan_;
+};
+
 class NativeCollection::Impl {
 public:
     struct PartitionedTag {};
@@ -1081,6 +1134,15 @@ public:
         return sample;
     }
 
+    [[nodiscard]] std::unique_ptr<detail::PartitionedIdScan>
+    scan_ids() const {
+        if (partitioned_reader_ == nullptr) {
+            throw InvalidArgumentError(
+                "physical ID scan requires a format-7 collection");
+        }
+        return partitioned_reader_->scan_ids();
+    }
+
     [[nodiscard]] std::vector<std::byte> get_bytes(
         const std::span<const std::uint64_t> ids) const {
         ensure_owner_process();
@@ -1092,6 +1154,67 @@ public:
         std::vector<std::byte> output(static_cast<std::size_t>(bytes));
         get_into(ids, output);
         return output;
+    }
+
+    [[nodiscard]] std::vector<std::uint8_t> contains(
+        const std::span<const std::uint64_t> ids) const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->contains(ids);
+        }
+        ensure_healthy();
+        std::vector<std::uint8_t> result(ids.size(), 0);
+        const bool mutation_path =
+            mutation_read_path_active_.load(std::memory_order_acquire);
+        std::shared_lock state(state_mutex_, std::defer_lock);
+        if (mutation_path) {
+            state.lock();
+        }
+        for (std::size_t index = 0; index != ids.size(); ++index) {
+            result[index] = static_cast<std::uint8_t>(
+                mutation_path
+                    ? logical_lookup_unlocked(ids[index]).has_value()
+                    : base_contains(ids[index]));
+        }
+        return result;
+    }
+
+    [[nodiscard]] NativeCollectionIdentity identity() const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->identity();
+        }
+        ensure_healthy();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        return NativeCollectionIdentity{
+            manifest_.collection_id.low,
+            manifest_.collection_id.high,
+            catalog_managed_ ? catalog_.generation : 0,
+            next_sequence_ - 1};
+    }
+
+    [[nodiscard]] NativeMutationVerification verify_committed_mutation(
+        const std::uint64_t sequence,
+        const NativeMutationFingerprint& expected) const {
+        if (partitioned_reader_ != nullptr) {
+            return partitioned_reader_->verify_committed_mutation(
+                sequence, expected);
+        }
+        ensure_healthy();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        for (const auto& source : wal_resources_->sources) {
+            if (sequence >= source->header.first_sequence
+                && sequence < source->next_sequence) {
+                return verify_wal_sequence(
+                    source->fd.get(),
+                    source->path,
+                    source->header,
+                    source->entry.state,
+                    sequence,
+                    expected);
+            }
+        }
+        return NativeMutationVerification::Unavailable;
     }
 
     void put(
@@ -3123,6 +3246,50 @@ bool NativeCollectionBuilder::finished() const {
     return impl_->finished();
 }
 
+NativeMutationFingerprint NativeCollection::fingerprint_mutation(
+    const NativeMutationOperation operation,
+    const std::span<const std::uint64_t> ids,
+    const std::span<const std::byte> embeddings,
+    const std::uint64_t record_size) {
+    if (record_size == 0
+        || record_size > std::numeric_limits<std::size_t>::max()) {
+        throw InvalidArgumentError("mutation fingerprint record size is invalid");
+    }
+    if (ids.size() > std::numeric_limits<std::size_t>::max()
+                         / static_cast<std::size_t>(record_size)) {
+        throw InvalidArgumentError("mutation fingerprint payload size overflows");
+    }
+    const auto expected_bytes = ids.size()
+                                * static_cast<std::size_t>(record_size);
+    if ((operation == NativeMutationOperation::Put
+         && embeddings.size() != expected_bytes)
+        || (operation == NativeMutationOperation::Delete
+            && !embeddings.empty())) {
+        throw InvalidArgumentError(
+            "mutation fingerprint payload does not match its operation");
+    }
+    if (operation != NativeMutationOperation::Put
+        && operation != NativeMutationOperation::Delete) {
+        throw InvalidArgumentError("mutation fingerprint operation is invalid");
+    }
+    std::vector<detail::WalMutation> mutations;
+    mutations.reserve(ids.size());
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        mutations.push_back(detail::WalMutation{
+            ids[index],
+            operation == NativeMutationOperation::Put
+                ? detail::WalOperationKind::Put
+                : detail::WalOperationKind::Delete,
+            operation == NativeMutationOperation::Put
+                ? embeddings.subspan(
+                      index * static_cast<std::size_t>(record_size),
+                      static_cast<std::size_t>(record_size))
+                : std::span<const std::byte>{}});
+    }
+    return NativeMutationFingerprint{
+        detail::fingerprint_wal_mutations(record_size, mutations)};
+}
+
 NativeReaderCapabilities NativeCollection::reader_capabilities(
     const std::uint32_t io_uring_queue_depth,
     const std::uint32_t io_uring_workers) {
@@ -3374,6 +3541,19 @@ NativeReaderTrial::~NativeReaderTrial() {
     }
 }
 
+NativeIdScan::NativeIdScan(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+NativeIdScan::~NativeIdScan() = default;
+const NativeIdScanMetadata& NativeIdScan::metadata() const noexcept {
+    return impl_->metadata();
+}
+std::uint64_t NativeIdScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<NativeIdLocation> locations) {
+    return impl_->read_into(ids, locations);
+}
+bool NativeIdScan::done() const noexcept { return impl_->done(); }
+
 NativeCollection::NativeCollection(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 NativeCollection::~NativeCollection() {
@@ -3422,9 +3602,25 @@ NativeIdSample NativeCollection::sample_ids(
     const std::uint64_t max_inspected_slots) const {
     return impl_->sample_ids(requested, seed, max_inspected_slots);
 }
+std::unique_ptr<NativeIdScan> NativeCollection::scan_ids() const {
+    return std::unique_ptr<NativeIdScan>(new NativeIdScan(
+        std::make_unique<NativeIdScan::Impl>(impl_->scan_ids())));
+}
 std::vector<std::byte> NativeCollection::get_bytes(
     const std::span<const std::uint64_t> ids) const {
     return impl_->get_bytes(ids);
+}
+std::vector<std::uint8_t> NativeCollection::contains(
+    const std::span<const std::uint64_t> ids) const {
+    return impl_->contains(ids);
+}
+NativeCollectionIdentity NativeCollection::identity() const {
+    return impl_->identity();
+}
+NativeMutationVerification NativeCollection::verify_committed_mutation(
+    const std::uint64_t sequence,
+    const NativeMutationFingerprint& expected) const {
+    return impl_->verify_committed_mutation(sequence, expected);
 }
 void NativeCollection::insert(
     const std::span<const std::uint64_t> ids,

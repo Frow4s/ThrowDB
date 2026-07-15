@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <system_error>
@@ -393,6 +394,110 @@ void validate_distinct_ids(const std::span<const std::uint64_t> ids) {
         std::uint32_t{1} << (partition % 8));
     return byte < bitmap.size()
            && (std::to_integer<std::uint8_t>(bitmap[byte]) & mask) != 0;
+}
+
+[[nodiscard]] std::uint64_t checked_sum(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::string_view description);
+
+[[nodiscard]] std::vector<std::uint64_t> proportional_sample_quotas(
+    const std::span<const std::uint64_t> slots,
+    const std::uint64_t limit,
+    const std::uint64_t seed) {
+    std::uint64_t total = 0;
+    for (const std::uint64_t count : slots) {
+        total = checked_sum(total, count, "ID sample quota slots");
+    }
+    if (limit > total) {
+        throw CorruptionError("ID sample quota exceeds available slots");
+    }
+    std::vector<std::uint64_t> quotas(slots.size(), 0);
+    if (limit == 0) {
+        return quotas;
+    }
+
+    struct Remainder {
+        std::size_t index{0};
+        std::uint64_t value{0};
+        std::uint64_t tie_breaker{0};
+    };
+    std::vector<Remainder> remainders;
+    remainders.reserve(slots.size());
+    std::uint64_t allocated = 0;
+    for (std::size_t index = 0; index != slots.size(); ++index) {
+        using Wide = __uint128_t;
+        const Wide product = static_cast<Wide>(limit)
+                             * static_cast<Wide>(slots[index]);
+        quotas[index] = static_cast<std::uint64_t>(
+            product / static_cast<Wide>(total));
+        const std::uint64_t remainder = static_cast<std::uint64_t>(
+            product % static_cast<Wide>(total));
+        allocated = checked_sum(
+            allocated, quotas[index], "ID sample allocated quota");
+        remainders.push_back(Remainder{
+            index,
+            remainder,
+            hash_id(
+                static_cast<std::uint64_t>(index),
+                seed ^ 0x9e3779b97f4a7c15ULL)});
+    }
+    std::sort(
+        remainders.begin(), remainders.end(),
+        [](const Remainder& left, const Remainder& right) {
+            if (left.value != right.value) {
+                return left.value > right.value;
+            }
+            if (left.tie_breaker != right.tie_breaker) {
+                return left.tie_breaker < right.tie_breaker;
+            }
+            return left.index < right.index;
+        });
+    std::uint64_t remaining = limit - allocated;
+    for (const Remainder& remainder : remainders) {
+        if (remaining == 0) {
+            break;
+        }
+        if (quotas[remainder.index] == slots[remainder.index]) {
+            continue;
+        }
+        ++quotas[remainder.index];
+        --remaining;
+    }
+    if (remaining != 0) {
+        throw CorruptionError("ID sample quota remainder was not allocated");
+    }
+    return quotas;
+}
+
+template <typename Visitor>
+void visit_stratified_sample_positions(
+    const std::uint64_t total,
+    const std::uint64_t count,
+    const std::uint64_t seed,
+    Visitor&& visitor) {
+    if (count > total) {
+        throw CorruptionError("stratified ID sample exceeds its source");
+    }
+    if (count == 0) {
+        return;
+    }
+    using Wide = __uint128_t;
+    for (std::uint64_t index = 0; index != count; ++index) {
+        const std::uint64_t begin = static_cast<std::uint64_t>(
+            static_cast<Wide>(index) * static_cast<Wide>(total)
+            / static_cast<Wide>(count));
+        const std::uint64_t end = static_cast<std::uint64_t>(
+            static_cast<Wide>(index + 1) * static_cast<Wide>(total)
+            / static_cast<Wide>(count));
+        const std::uint64_t width = end - begin;
+        if (width == 0) {
+            throw CorruptionError("stratified ID sample cell is empty");
+        }
+        const std::uint64_t offset = hash_id(
+            index, seed ^ 0xd1b54a32d192ed03ULL) % width;
+        visitor(begin + offset);
+    }
 }
 
 [[nodiscard]] std::uint64_t choose_capacity(const std::uint64_t count) {
@@ -1199,115 +1304,298 @@ public:
         if (requested > std::numeric_limits<std::size_t>::max()) {
             throw InvalidArgumentError("requested sample does not fit memory");
         }
-        result.ids.reserve(static_cast<std::size_t>(requested));
         std::shared_lock state(state_mutex_);
         const std::shared_ptr<ResourceSet> resource_pin = resources_;
-        std::vector<std::pair<std::uint64_t, const VersionedMutationValue*>>
-            overlay_entries;
-        overlay_entries.reserve(overlay_.size());
-        for (const auto& [id, value] : overlay_) {
-            if (value.has_value()) {
-                overlay_entries.emplace_back(id, &*value);
-            }
+        std::vector<std::uint64_t> run_slot_counts;
+        run_slot_counts.reserve(resource_pin->runs.size());
+        std::uint64_t run_slots = 0;
+        for (const auto& run : resource_pin->runs) {
+            run_slots = checked_sum(
+                run_slots,
+                run.active_entry_count,
+                "partition run sample slots");
+            run_slot_counts.push_back(run.active_entry_count);
         }
-        std::sort(
-            overlay_entries.begin(), overlay_entries.end(),
-            [seed](const auto& left, const auto& right) {
-                const std::uint64_t left_hash = hash_id(left.first, seed);
-                const std::uint64_t right_hash = hash_id(right.first, seed);
-                return left_hash != right_hash ? left_hash < right_hash
-                                               : left.first < right.first;
-            });
-        std::unordered_set<std::uint64_t> seen;
-        seen.reserve(std::min<std::size_t>(
-            static_cast<std::size_t>(requested),
-            overlay_entries.size() + catalog_.runs.size()
-                + catalog_.snapshots.size()));
+
+        const std::size_t partitions = resource_pin->snapshots.size();
+        std::uint64_t snapshot_slots = 0;
+        for (std::size_t index = 0; index != partitions; ++index) {
+            const PartitionSnapshotDescriptor& descriptor =
+                resource_pin->snapshots[index]->header.descriptor;
+            snapshot_slots = checked_sum(
+                snapshot_slots, descriptor.capacity,
+                "partition sample capacity");
+        }
+
+        const std::array<std::uint64_t, 3> source_slots{
+            static_cast<std::uint64_t>(overlay_.size()),
+            run_slots,
+            snapshot_slots};
+        std::uint64_t total_slots = 0;
+        for (const std::uint64_t slots : source_slots) {
+            total_slots = checked_sum(
+                total_slots, slots, "logical ID sample source slots");
+        }
+        const std::uint64_t inspection_limit =
+            std::min(max_inspected_slots, total_slots);
+        std::array<std::uint64_t, 3> reserved_source_slots{};
+        std::array<std::uint64_t, 3> residual_source_slots = source_slots;
+        std::uint64_t residual_limit = inspection_limit;
+        // A very small calibration sample must still see the mutable layers
+        // before falling back to the immutable snapshot.  For larger samples
+        // this one-slot reservation is negligible, while it prevents a small
+        // delta from disappearing behind sparse snapshot capacity.
+        for (const std::size_t index : std::array<std::size_t, 3>{0, 1, 2}) {
+            if (residual_limit == 0 || residual_source_slots[index] == 0) {
+                continue;
+            }
+            reserved_source_slots[index] = 1;
+            --residual_source_slots[index];
+            --residual_limit;
+        }
+        const std::vector<std::uint64_t> residual_quotas =
+            proportional_sample_quotas(
+                std::span<const std::uint64_t>(residual_source_slots),
+                residual_limit, seed);
+        std::array<std::uint64_t, 3> quotas{};
+        for (std::size_t index = 0; index != quotas.size(); ++index) {
+            quotas[index] = reserved_source_slots[index]
+                            + residual_quotas[index];
+        }
+        const std::size_t unique_limit = static_cast<std::size_t>(
+            std::min(requested, inspection_limit));
+
+        using HashedId = std::pair<std::uint64_t, std::uint64_t>;
+        std::priority_queue<HashedId> selected;
+        std::unordered_set<std::uint64_t> selected_ids;
+        selected_ids.reserve(unique_limit);
         const auto inspect_id = [&](const std::uint64_t id) {
             ++result.inspected_slots;
-            if (!seen.insert(id).second) {
+            if (!logical_lookup_unlocked(id, *resource_pin).has_value()
+                || selected_ids.contains(id)) {
                 return;
             }
-            if (logical_lookup_unlocked(id, *resource_pin).has_value()) {
-                result.ids.push_back(id);
+            const HashedId candidate{hash_id(id, seed), id};
+            if (selected.size() != unique_limit) {
+                selected.push(candidate);
+                selected_ids.insert(id);
+            } else if (unique_limit != 0 && candidate < selected.top()) {
+                selected_ids.erase(selected.top().second);
+                selected.pop();
+                selected.push(candidate);
+                selected_ids.insert(id);
             }
         };
-        for (const auto& [id, value] : overlay_entries) {
+
+        std::uint64_t overlay_inspected = 0;
+        for (const auto& [id, value] : overlay_) {
             static_cast<void>(value);
-            if (result.inspected_slots == max_inspected_slots
-                || result.ids.size() == requested) {
+            if (overlay_inspected == quotas[0]) {
                 break;
             }
             inspect_id(id);
+            ++overlay_inspected;
         }
-        for (auto run = resource_pin->runs.rbegin();
-             run != resource_pin->runs.rend()
-             && result.inspected_slots != max_inspected_slots
-             && result.ids.size() != requested;
-             ++run) {
-            for (std::uint32_t partition = 0;
-                 partition != manifest_.partition_count
-                 && result.inspected_slots != max_inspected_slots
-                 && result.ids.size() != requested;
-                 ++partition) {
-                if (!partition_bitmap_contains(
-                        run->catalog.active_partitions, partition)) {
-                    continue;
+
+        const std::vector<std::uint64_t> run_quotas =
+            proportional_sample_quotas(
+                run_slot_counts, quotas[1],
+                seed ^ 0x94d049bb133111ebULL);
+        std::vector<PartitionRunTocEntry> active_sections;
+        active_sections.reserve(manifest_.partition_count);
+        for (std::size_t run_index = 0;
+             run_index != resource_pin->runs.size(); ++run_index) {
+            const RunView& run = resource_pin->runs[run_index];
+            const std::uint64_t run_quota = run_quotas[run_index];
+            if (run_quota == 0) {
+                continue;
+            }
+
+            active_sections.clear();
+            std::uint64_t active_entries = 0;
+            for (std::size_t byte_index = 0;
+                 byte_index != run.catalog.active_partitions.size();
+                 ++byte_index) {
+                unsigned int bits = std::to_integer<std::uint8_t>(
+                    run.catalog.active_partitions[byte_index]);
+                while (bits != 0) {
+                    const unsigned int bit = std::countr_zero(bits);
+                    const std::uint64_t partition =
+                        static_cast<std::uint64_t>(byte_index) * 8 + bit;
+                    if (partition >= manifest_.partition_count) {
+                        throw CorruptionError(
+                            "partition run active bitmap uses padding bits");
+                    }
+                    const PartitionRunTocEntry section =
+                        run.file->partition_records(
+                            static_cast<std::uint32_t>(partition));
+                    if (section.record_count == 0) {
+                        throw CorruptionError(
+                            "active partition run section is empty");
+                    }
+                    active_entries = checked_sum(
+                        active_entries, section.record_count,
+                        "sampled active partition run entries");
+                    active_sections.push_back(section);
+                    bits &= bits - 1;
                 }
-                const PartitionRunTocEntry section =
-                    run->file->partition_records(partition);
-                for (std::uint64_t offset = 0;
-                     offset != section.record_count
-                     && result.inspected_slots != max_inspected_slots
-                     && result.ids.size() != requested;
-                     ++offset) {
-                    inspect_id(run->file
+            }
+            if (active_entries != run.active_entry_count) {
+                throw CorruptionError(
+                    "partition run active entry count changed");
+            }
+
+            std::size_t section_index = 0;
+            std::uint64_t section_begin = 0;
+            std::uint64_t section_end = active_sections.front().record_count;
+            visit_stratified_sample_positions(
+                active_entries, run_quota,
+                hash_id(
+                    run.catalog.epoch,
+                    seed ^ static_cast<std::uint64_t>(run_index)),
+                [&](const std::uint64_t position) {
+                    while (position >= section_end) {
+                        section_begin = section_end;
+                        ++section_index;
+                        if (section_index == active_sections.size()) {
+                            throw CorruptionError(
+                                "run sample position exceeds active sections");
+                        }
+                        section_end = checked_sum(
+                            section_end,
+                            active_sections[section_index].record_count,
+                            "run sample section end");
+                    }
+                    const PartitionRunTocEntry& section =
+                        active_sections[section_index];
+                    inspect_id(run.file
                                    ->record_at(
-                                       section.first_record + offset)
+                                       section.first_record
+                                       + (position - section_begin))
                                    .id);
-                }
-            }
+                });
         }
-        const std::size_t partitions = resource_pin->snapshots.size();
-        std::vector<std::uint64_t> inspected(partitions, 0);
-        std::vector<std::uint64_t> starts(partitions, 0);
-        std::uint64_t total_capacity = 0;
-        for (std::size_t index = 0; index != partitions; ++index) {
-            const std::uint64_t capacity =
-                resource_pin->snapshots[index]->header.descriptor.capacity;
-            total_capacity = checked_sum(
-                total_capacity, capacity, "partition sample capacity");
-            starts[index] = hash_id(
-                seed ^ static_cast<std::uint64_t>(index),
-                0xd1b54a32d192ed03ULL) & (capacity - 1);
+
+        if (quotas[2] != 0) {
+            if (partitions == 0) {
+                throw CorruptionError(
+                    "snapshot sample has no partition snapshots");
+            }
+            std::size_t partition = 0;
+            std::uint64_t partition_begin = 0;
+            std::uint64_t partition_end = resource_pin->snapshots.front()
+                                                      ->header.descriptor
+                                                      .capacity;
+            visit_stratified_sample_positions(
+                snapshot_slots, quotas[2],
+                seed ^ 0x369dea0f31a53f85ULL,
+                [&](const std::uint64_t position) {
+                    while (position >= partition_end) {
+                        partition_begin = partition_end;
+                        ++partition;
+                        if (partition == partitions) {
+                            throw CorruptionError(
+                                "snapshot sample position exceeds capacity");
+                        }
+                        partition_end = checked_sum(
+                            partition_end,
+                            resource_pin->snapshots[partition]
+                                ->header.descriptor.capacity,
+                            "snapshot sample partition end");
+                    }
+                    const Snapshot& snapshot =
+                        *resource_pin->snapshots[partition];
+                    const std::uint64_t slot = position - partition_begin;
+                    if (control(snapshot, slot) == 1) {
+                        inspect_id(slot_id(snapshot, slot));
+                    } else {
+                        ++result.inspected_slots;
+                    }
+                });
         }
-        const std::uint64_t remaining_limit =
-            max_inspected_slots - result.inspected_slots;
-        const std::uint64_t limit = std::min(remaining_limit, total_capacity);
-        std::size_t partition = static_cast<std::size_t>(seed % partitions);
-        std::uint64_t base_inspected = 0;
-        while (base_inspected != limit
-               && result.ids.size() != requested) {
-            while (inspected[partition]
-                   == resource_pin->snapshots[partition]
-                          ->header.descriptor.capacity) {
-                partition = (partition + 1) % partitions;
-            }
-            const Snapshot& snapshot = *resource_pin->snapshots[partition];
-            const std::uint64_t slot =
-                (starts[partition] + inspected[partition])
-                & (snapshot.header.descriptor.capacity - 1);
-            ++inspected[partition];
-            ++base_inspected;
-            if (control(snapshot, slot) == 1) {
-                inspect_id(slot_id(snapshot, slot));
-            } else {
-                ++result.inspected_slots;
-            }
-            partition = (partition + 1) % partitions;
+        if (result.inspected_slots != inspection_limit) {
+            throw CorruptionError("ID sample inspection accounting changed");
+        }
+        selected_ids.clear();
+        selected_ids.rehash(0);
+        result.ids.resize(selected.size());
+        while (!selected.empty()) {
+            result.ids[selected.size() - 1] = selected.top().second;
+            selected.pop();
         }
         result.complete = result.ids.size() == requested;
         return result;
+    }
+
+    [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids() const;
+
+    [[nodiscard]] std::vector<std::uint8_t> contains(
+        const std::span<const std::uint64_t> ids) const {
+        ensure_healthy();
+        std::vector<std::uint8_t> result(ids.size(), 0);
+        std::shared_lock state(state_mutex_);
+        const std::shared_ptr<ResourceSet> resource_pin = resources_;
+        const bool zero_delta_fast_path =
+            resource_pin->runs.empty()
+            && !mutation_read_path_active_.load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index != ids.size(); ++index) {
+            result[index] = static_cast<std::uint8_t>(
+                zero_delta_fast_path
+                    ? snapshot_version(ids[index], *resource_pin).has_value()
+                    : logical_lookup_unlocked(
+                          ids[index], *resource_pin).has_value());
+        }
+        return result;
+    }
+
+    [[nodiscard]] NativeCollectionIdentity identity() const {
+        ensure_healthy();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        return NativeCollectionIdentity{
+            manifest_.collection_id.low,
+            manifest_.collection_id.high,
+            catalog_.generation,
+            next_sequence_ - 1};
+    }
+
+    [[nodiscard]] NativeMutationVerification verify_committed_mutation(
+        const std::uint64_t sequence,
+        const NativeMutationFingerprint& expected) const {
+        ensure_healthy();
+        std::lock_guard mutation(mutation_mutex_);
+        ensure_healthy();
+        for (const auto& source : resources_->sources) {
+            if (sequence < source->header.first_sequence
+                || sequence >= source->next_sequence) {
+                continue;
+            }
+            std::optional<WalMutationFingerprint> actual;
+            static_cast<void>(scan_wal_file(
+                source->fd.get(),
+                source->path,
+                ExpectedWalIdentity::from_trusted_header(source->header),
+                source->entry.state == MutationWalState::Active
+                    ? WalScanMode::Active
+                    : WalScanMode::Frozen,
+                [&](const RecoveredWalBatch& batch) {
+                    if (batch.sequence == sequence) {
+                        actual = fingerprint_recovered_wal_batch(
+                            source->fd.get(),
+                            source->path,
+                            batch,
+                            source->header.record_size);
+                    }
+                }));
+            if (!actual.has_value()) {
+                throw CorruptionError(
+                    "retained partitioned WAL sequence disappeared during verification");
+            }
+            return *actual == expected.bytes
+                       ? NativeMutationVerification::Match
+                       : NativeMutationVerification::Mismatch;
+        }
+        return NativeMutationVerification::Unavailable;
     }
 
     void put(
@@ -1867,7 +2155,9 @@ public:
             }
         }
         next_resources->runs.push_back(
-            RunView{std::move(opened_run), run_descriptor});
+            RunView{
+                std::move(opened_run), run_descriptor,
+                run_descriptor.entry_count});
         next_resources->source_indices.reserve(
             next_resources->sources.size());
         for (std::size_t index = 0;
@@ -2189,8 +2479,30 @@ public:
                     throw CorruptionError(
                         "folded catalog run has no pinned immutable view");
                 }
-                next_resources->runs.push_back(
-                    RunView{source->file, descriptor});
+                std::uint64_t active_entry_count =
+                    source->active_entry_count;
+                for (const PartitionFoldCandidate& candidate : selected) {
+                    const std::uint32_t partition = candidate.partition_id;
+                    if (partition_bitmap_contains(
+                            source->catalog.active_partitions, partition)
+                        && !partition_bitmap_contains(
+                            descriptor.active_partitions, partition)) {
+                        const std::uint64_t folded_entries =
+                            source->file->partition_records(partition)
+                                .record_count;
+                        if (folded_entries > active_entry_count) {
+                            throw CorruptionError(
+                                "folded run active entry count underflowed");
+                        }
+                        active_entry_count -= folded_entries;
+                    }
+                }
+                if (active_entry_count == 0) {
+                    throw CorruptionError(
+                        "retained folded run has no active entries");
+                }
+                next_resources->runs.push_back(RunView{
+                    source->file, descriptor, active_entry_count});
             }
         }
         const bool mutation_path_active =
@@ -2878,7 +3190,9 @@ public:
             }
         }
         next_resources->runs.push_back(
-            RunView{std::move(opened_run), output_run});
+            RunView{
+                std::move(opened_run), output_run,
+                output_run.entry_count});
         try {
             ScopedAdvisoryLock commit(
                 commit_lock_, FileLockMode::Exclusive);
@@ -2969,6 +3283,7 @@ private:
     struct RunView {
         std::shared_ptr<PartitionIndexRunReader> file;
         PartitionIndexRunDescriptor catalog;
+        std::uint64_t active_entry_count{0};
     };
     struct ResourceSet {
         std::vector<std::shared_ptr<Segment>> initial_segments;
@@ -2997,6 +3312,363 @@ private:
                        ? std::nullopt
                        : std::optional<RowRef>(RowRef::decode(value_raw));
         }
+    };
+    class IdScanState final : public PartitionedIdScanState {
+    public:
+        struct OverlayEntry {
+            std::uint64_t id;
+            VersionedMutationValue value;
+        };
+
+        IdScanState(
+            PartitionedManifestV2 manifest,
+            std::shared_ptr<ResourceSet> resources,
+            std::vector<OverlayEntry> overlay,
+            const NativeIdScanMetadata metadata)
+            : manifest_(std::move(manifest)),
+              resources_(std::move(resources)),
+              overlay_(std::move(overlay)),
+              metadata_(metadata) {
+            std::sort(
+                overlay_.begin(), overlay_.end(),
+                [](const OverlayEntry& left, const OverlayEntry& right) {
+                    return left.id < right.id;
+                });
+            overlay_put_order_.reserve(overlay_.size());
+            for (std::size_t index = 0; index != overlay_.size(); ++index) {
+                if (overlay_[index].value.is_put()) {
+                    overlay_put_order_.push_back(index);
+                }
+            }
+            std::sort(
+                overlay_put_order_.begin(), overlay_put_order_.end(),
+                [this](const std::size_t left, const std::size_t right) {
+                    const RowRef left_row =
+                        *overlay_[left].value.row_ref();
+                    const RowRef right_row =
+                        *overlay_[right].value.row_ref();
+                    return left_row.raw() < right_row.raw();
+                });
+
+            segments_.reserve(
+                resources_->initial_segments.size()
+                + resources_->materialized_segments.size()
+                + resources_->sources.size());
+            for (std::size_t index = 0;
+                 index != resources_->initial_segments.size(); ++index) {
+                const Segment& segment =
+                    *resources_->initial_segments[index];
+                segments_.push_back(SegmentView{
+                    segment.header.descriptor.row_ref_segment_id,
+                    SegmentKind::Initial,
+                    index,
+                    0,
+                    segment.header.descriptor.row_count});
+            }
+            for (std::size_t index = 0;
+                 index != resources_->materialized_segments.size(); ++index) {
+                const PartitionedSegmentDescriptor& descriptor =
+                    resources_->materialized_segments[index]->descriptor();
+                segments_.push_back(SegmentView{
+                    descriptor.row_ref_segment_id,
+                    SegmentKind::Materialized,
+                    index,
+                    0,
+                    descriptor.row_count});
+            }
+            std::size_t begin = 0;
+            while (begin != overlay_put_order_.size()) {
+                const std::uint32_t segment_id = overlay_row(begin)
+                                                     .segment_id()
+                                                     .value();
+                std::size_t end = begin + 1;
+                while (end != overlay_put_order_.size()
+                       && overlay_row(end).segment_id().value()
+                              == segment_id) {
+                    ++end;
+                }
+                segments_.push_back(SegmentView{
+                    segment_id,
+                    SegmentKind::Overlay,
+                    0,
+                    begin,
+                    static_cast<std::uint64_t>(end - begin)});
+                begin = end;
+            }
+            std::sort(
+                segments_.begin(), segments_.end(),
+                [](const SegmentView& left, const SegmentView& right) {
+                    return left.segment_id < right.segment_id;
+                });
+            for (std::size_t index = 1; index < segments_.size(); ++index) {
+                if (segments_[index - 1].segment_id
+                    == segments_[index].segment_id) {
+                    throw CorruptionError(
+                        "physical ID scan found a duplicated segment ID");
+                }
+            }
+            done_ = metadata_.live_count == 0;
+        }
+
+        [[nodiscard]] const NativeIdScanMetadata& metadata()
+            const noexcept override {
+            return metadata_;
+        }
+
+        [[nodiscard]] std::uint64_t read_into(
+            const std::span<std::uint64_t> ids,
+            const std::span<NativeIdLocation> locations) override {
+            if (::getpid() != owner_pid_) {
+                throw StorageError(
+                    "ID scan was inherited across fork; create a new scan "
+                    "in the child process");
+            }
+            if (!locations.empty() && locations.size() != ids.size()) {
+                throw InvalidArgumentError(
+                    "ID scan locations capacity must equal IDs capacity");
+            }
+            if (ids.empty() || done_) {
+                return 0;
+            }
+
+            std::uint64_t output_count = 0;
+            while (segment_position_ != segments_.size()) {
+                const SegmentView& segment = segments_[segment_position_];
+                while (row_position_ != segment.row_count) {
+                    const Candidate candidate = candidate_at(
+                        segment, row_position_++);
+                    if (!is_authoritative(candidate)) {
+                        continue;
+                    }
+                    ids[static_cast<std::size_t>(output_count)] =
+                        candidate.id;
+                    if (!locations.empty()) {
+                        locations[static_cast<std::size_t>(output_count)] =
+                            NativeIdLocation{
+                                candidate.row.segment_id().value(),
+                                candidate.row.row_index()};
+                    }
+                    ++output_count;
+                    ++emitted_count_;
+                    if (emitted_count_ > metadata_.live_count) {
+                        throw CorruptionError(
+                            "physical ID scan exceeded snapshot live count");
+                    }
+                    if (emitted_count_ == metadata_.live_count) {
+                        done_ = true;
+                        return output_count;
+                    }
+                    if (output_count == ids.size()) {
+                        return output_count;
+                    }
+                }
+                ++segment_position_;
+                row_position_ = 0;
+                // Preserve physical locality: a non-empty batch never spans
+                // two segment IDs, even if caller capacity remains.
+                if (output_count != 0) {
+                    return output_count;
+                }
+            }
+            if (emitted_count_ != metadata_.live_count) {
+                throw CorruptionError(
+                    "physical ID scan ended before snapshot live count");
+            }
+            done_ = true;
+            return 0;
+        }
+
+        [[nodiscard]] bool done() const noexcept override {
+            return done_;
+        }
+
+    private:
+        enum class SegmentKind : std::uint8_t {
+            Initial,
+            Materialized,
+            Overlay,
+        };
+        struct SegmentView {
+            std::uint32_t segment_id;
+            SegmentKind kind;
+            std::size_t resource_index;
+            std::size_t overlay_begin;
+            std::uint64_t row_count;
+        };
+        struct Candidate {
+            std::uint64_t id;
+            std::uint64_t sequence;
+            RowRef row;
+        };
+
+        [[nodiscard]] RowRef overlay_row(
+            const std::size_t ordered_position) const {
+            return *overlay_[overlay_put_order_[ordered_position]]
+                        .value.row_ref();
+        }
+
+        [[nodiscard]] Candidate candidate_at(
+            const SegmentView& segment,
+            const std::uint64_t row_position) const {
+            const RowRef row = RowRef::create(
+                segment.segment_id,
+                segment.kind == SegmentKind::Overlay
+                    ? overlay_row(
+                          segment.overlay_begin
+                          + static_cast<std::size_t>(row_position))
+                          .row_index()
+                    : row_position);
+            if (segment.kind == SegmentKind::Overlay) {
+                const OverlayEntry& entry = overlay_[overlay_put_order_[
+                    segment.overlay_begin
+                    + static_cast<std::size_t>(row_position)]];
+                return Candidate{entry.id, entry.value.sequence(), row};
+            }
+            if (segment.kind == SegmentKind::Materialized) {
+                const PartitionedSegmentIdEntry entry =
+                    resources_->materialized_segments[
+                        segment.resource_index]
+                        ->sidecar_at(row_position);
+                return Candidate{entry.id, entry.sequence, row};
+            }
+            const Segment& initial =
+                *resources_->initial_segments[segment.resource_index];
+            const std::size_t offset = static_cast<std::size_t>(
+                initial.ids_header.payload_offset
+                + row_position * kPartitionedSegmentIdEntrySize);
+            return Candidate{
+                get_u64(initial.ids_mapping.bytes(), offset),
+                get_u64(initial.ids_mapping.bytes(), offset + 8),
+                row};
+        }
+
+        [[nodiscard]] const OverlayEntry* overlay_entry(
+            const std::uint64_t id) const {
+            const auto position = std::lower_bound(
+                overlay_.begin(), overlay_.end(), id,
+                [](const OverlayEntry& entry, const std::uint64_t value) {
+                    return entry.id < value;
+                });
+            return position != overlay_.end() && position->id == id
+                       ? &*position
+                       : nullptr;
+        }
+
+        [[nodiscard]] std::optional<IndexedVersion> snapshot_version(
+            const std::uint64_t id) const {
+            const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
+            const std::uint64_t partition = partition_for_hash(
+                hash, manifest_.partition_bits);
+            const Snapshot& snapshot = *resources_->snapshots[
+                static_cast<std::size_t>(partition)];
+            const std::uint64_t mask =
+                snapshot.header.descriptor.capacity - 1;
+            std::uint64_t slot = hash & mask;
+            for (std::uint64_t probes = 0;
+                 probes != snapshot.header.descriptor.capacity; ++probes) {
+                if (Impl::control(snapshot, slot) == 0) {
+                    return std::nullopt;
+                }
+                if (Impl::slot_id(snapshot, slot) == id) {
+                    return IndexedVersion{
+                        Impl::slot_sequence(snapshot, slot),
+                        Impl::slot_value(snapshot, slot),
+                        snapshot.header.descriptor.epoch};
+                }
+                slot = (slot + 1) & mask;
+            }
+            throw CorruptionError(
+                "partition snapshot lookup has no empty slot");
+        }
+
+        [[nodiscard]] std::optional<IndexedVersion> indexed_version(
+            const std::uint64_t id) const {
+            std::optional<IndexedVersion> winner = snapshot_version(id);
+            const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
+            const auto partition = static_cast<std::uint32_t>(
+                partition_for_hash(hash, manifest_.partition_bits));
+            for (const RunView& run : resources_->runs) {
+                if (!partition_bitmap_contains(
+                        run.catalog.active_partitions, partition)) {
+                    continue;
+                }
+                if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
+                    || run.catalog.epoch
+                           <= resources_->snapshots[partition]
+                                  ->header.descriptor.epoch) {
+                    throw CorruptionError(
+                        "active partition run is incompatible with its "
+                        "authoritative snapshot");
+                }
+                const std::optional<PartitionRunRecord> record =
+                    run.file->lookup(partition, id);
+                if (!record.has_value()) {
+                    continue;
+                }
+                const IndexedVersion candidate{
+                    record->sequence, record->value_raw,
+                    run.catalog.epoch};
+                if (!winner.has_value()
+                    || candidate.sequence > winner->sequence) {
+                    winner = candidate;
+                    continue;
+                }
+                if (candidate.sequence < winner->sequence) {
+                    continue;
+                }
+                if (candidate.value_raw == winner->value_raw) {
+                    winner->source_epoch = std::max(
+                        winner->source_epoch, candidate.source_epoch);
+                    continue;
+                }
+                bool valid_cleaner_relocation = false;
+                if (run.catalog.kind == PartitionedRunKind::Cleaner
+                    && run.catalog.epoch > winner->source_epoch
+                    && candidate.value_raw != 0
+                    && winner->value_raw != 0) {
+                    const RowRef previous =
+                        RowRef::decode(winner->value_raw);
+                    valid_cleaner_relocation =
+                        previous.segment_id().value()
+                        == run.catalog.retired_row_ref_segment_id;
+                }
+                if (!valid_cleaner_relocation) {
+                    throw CorruptionError(
+                        "partitioned index has conflicting values at one "
+                        "sequence");
+                }
+                winner = candidate;
+            }
+            return winner;
+        }
+
+        [[nodiscard]] bool is_authoritative(
+            const Candidate& candidate) const {
+            const OverlayEntry* overlay = overlay_entry(candidate.id);
+            if (overlay != nullptr) {
+                return overlay->value.is_put()
+                       && overlay->value.sequence() == candidate.sequence
+                       && overlay->value.encoded_row_ref()
+                              == candidate.row.raw();
+            }
+            const std::optional<IndexedVersion> winner =
+                indexed_version(candidate.id);
+            return winner.has_value() && !winner->tombstone()
+                   && winner->sequence == candidate.sequence
+                   && winner->value_raw == candidate.row.raw();
+        }
+
+        PartitionedManifestV2 manifest_;
+        std::shared_ptr<ResourceSet> resources_;
+        std::vector<OverlayEntry> overlay_;
+        std::vector<std::size_t> overlay_put_order_;
+        std::vector<SegmentView> segments_;
+        NativeIdScanMetadata metadata_;
+        std::size_t segment_position_{0};
+        std::uint64_t row_position_{0};
+        std::uint64_t emitted_count_{0};
+        bool done_{false};
+        const pid_t owner_pid_{::getpid()};
     };
     struct CleanerPlanRecord {
         std::uint64_t id{0};
@@ -3344,25 +4016,37 @@ private:
                 throw CorruptionError(
                     "format-7 reader does not support legacy delta runs");
             }
+            auto run = std::make_shared<PartitionIndexRunReader>(
+                root_, manifest_.collection_id, manifest_.schema_id,
+                manifest_.partition_bits, manifest_.hash_seed, descriptor);
+            std::uint64_t active_entry_count = 0;
             for (std::uint32_t partition = 0;
                  partition != manifest_.partition_count; ++partition) {
-                if (partition_bitmap_contains(
-                        descriptor.active_partitions, partition)
-                    && descriptor.epoch
-                           <= catalog_.snapshots[partition].epoch) {
+                if (!partition_bitmap_contains(
+                        descriptor.active_partitions, partition)) {
+                    continue;
+                }
+                if (descriptor.epoch
+                    <= catalog_.snapshots[partition].epoch) {
                     throw CorruptionError(
                         "active partition run is not newer than its "
                         "snapshot");
                 }
+                active_entry_count = checked_sum(
+                    active_entry_count,
+                    run->partition_records(partition).record_count,
+                    "active partition run entries");
             }
-            auto run = std::make_shared<PartitionIndexRunReader>(
-                root_, manifest_.collection_id, manifest_.schema_id,
-                manifest_.partition_bits, manifest_.hash_seed, descriptor);
+            if (active_entry_count == 0
+                || active_entry_count > descriptor.entry_count) {
+                throw CorruptionError(
+                    "partition run active entry count is invalid");
+            }
             open_stats_.index_file_bytes = checked_sum(
                 open_stats_.index_file_bytes, descriptor.file_size,
                 "partition index run bytes");
             resources_->runs.push_back(RunView{
-                std::move(run), descriptor});
+                std::move(run), descriptor, active_entry_count});
         }
     }
 
@@ -4175,6 +4859,60 @@ private:
     const pid_t owner_pid_{::getpid()};
 };
 
+std::unique_ptr<PartitionedIdScan>
+PartitionedIndexReader::Impl::scan_ids() const {
+    ensure_healthy();
+    std::shared_ptr<ResourceSet> resource_pin;
+    std::vector<IdScanState::OverlayEntry> overlay;
+    NativeIdScanMetadata metadata;
+    {
+        std::shared_lock state(state_mutex_);
+        ensure_healthy();
+        resource_pin = resources_;
+        overlay.reserve(overlay_.size());
+        for (const auto& [id, value] : overlay_) {
+            // A null value is a preallocated publication node. It falls
+            // through to the indexed view and is not part of this snapshot.
+            if (value.has_value()) {
+                overlay.push_back(IdScanState::OverlayEntry{id, *value});
+            }
+        }
+        metadata.collection_id_low = manifest_.collection_id.low;
+        metadata.collection_id_high = manifest_.collection_id.high;
+        metadata.catalog_generation = catalog_.generation;
+        metadata.committed_sequence = next_sequence_ - 1;
+        metadata.live_count = live_count_.load(std::memory_order_relaxed);
+    }
+    return std::make_unique<PartitionedIdScan>(
+        std::make_unique<IdScanState>(
+            manifest_, std::move(resource_pin), std::move(overlay),
+            metadata));
+}
+
+PartitionedIdScan::PartitionedIdScan(
+    std::unique_ptr<PartitionedIdScanState> state)
+    : state_(std::move(state)) {
+    if (state_ == nullptr) {
+        throw InvalidArgumentError("partitioned ID scan state is null");
+    }
+}
+
+PartitionedIdScan::~PartitionedIdScan() = default;
+
+const NativeIdScanMetadata& PartitionedIdScan::metadata() const noexcept {
+    return state_->metadata();
+}
+
+std::uint64_t PartitionedIdScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<NativeIdLocation> locations) {
+    return state_->read_into(ids, locations);
+}
+
+bool PartitionedIdScan::done() const noexcept {
+    return state_->done();
+}
+
 PartitionedIndexBuilder::PartitionedIndexBuilder(
     std::filesystem::path store_path,
     NativeBuilderOptions options)
@@ -4229,6 +4967,21 @@ NativeIdSample PartitionedIndexReader::sample_ids(
     const std::uint64_t seed,
     const std::uint64_t max_inspected_slots) const {
     return impl_->sample_ids(requested, seed, max_inspected_slots);
+}
+std::unique_ptr<PartitionedIdScan> PartitionedIndexReader::scan_ids() const {
+    return impl_->scan_ids();
+}
+std::vector<std::uint8_t> PartitionedIndexReader::contains(
+    const std::span<const std::uint64_t> ids) const {
+    return impl_->contains(ids);
+}
+NativeCollectionIdentity PartitionedIndexReader::identity() const {
+    return impl_->identity();
+}
+NativeMutationVerification PartitionedIndexReader::verify_committed_mutation(
+    const std::uint64_t sequence,
+    const NativeMutationFingerprint& expected) const {
+    return impl_->verify_committed_mutation(sequence, expected);
 }
 void PartitionedIndexReader::put(
     const PartitionedPutMode mode,

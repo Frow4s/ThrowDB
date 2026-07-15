@@ -515,6 +515,62 @@ void validate_commit_marker(
 
 }  // namespace
 
+WalMutationFingerprintBuilder::WalMutationFingerprintBuilder(
+    const std::uint64_t record_size,
+    const std::uint64_t operation_count)
+    : record_size_(record_size), expected_count_(operation_count) {
+    require_value<InvalidArgumentError>(
+        record_size != 0, "WAL fingerprint record size is zero");
+    constexpr std::array<std::byte, 24> domain{
+        std::byte{'T'}, std::byte{'h'}, std::byte{'r'}, std::byte{'o'},
+        std::byte{'w'}, std::byte{'D'}, std::byte{'B'}, std::byte{'-'},
+        std::byte{'W'}, std::byte{'A'}, std::byte{'L'}, std::byte{'-'},
+        std::byte{'M'}, std::byte{'u'}, std::byte{'t'}, std::byte{'a'},
+        std::byte{'t'}, std::byte{'i'}, std::byte{'o'}, std::byte{'n'},
+        std::byte{'-'}, std::byte{'V'}, std::byte{'1'}, std::byte{0}};
+    hash_.update(domain);
+    std::array<std::byte, 16> geometry{};
+    put_u64(geometry, 0, record_size);
+    put_u64(geometry, 8, operation_count);
+    hash_.update(geometry);
+}
+
+void WalMutationFingerprintBuilder::add(
+    const WalOperationKind kind,
+    const std::uint64_t id,
+    const std::span<const std::byte> value) {
+    require_value<InvalidArgumentError>(
+        added_count_ < expected_count_,
+        "WAL fingerprint has too many operations");
+    require_value<InvalidArgumentError>(
+        (kind == WalOperationKind::Put && value.size() == record_size_)
+            || (kind == WalOperationKind::Delete && value.empty()),
+        "WAL fingerprint operation has invalid value geometry");
+    std::array<std::byte, 16> entry{};
+    entry[0] = static_cast<std::byte>(kind);
+    put_u64(entry, 8, id);
+    hash_.update(entry);
+    hash_.update(value);
+    ++added_count_;
+}
+
+WalMutationFingerprint WalMutationFingerprintBuilder::finish() {
+    require_value<InvalidArgumentError>(
+        added_count_ == expected_count_,
+        "WAL fingerprint operation count is incomplete");
+    return hash_.finish();
+}
+
+WalMutationFingerprint fingerprint_wal_mutations(
+    const std::uint64_t record_size,
+    const std::span<const WalMutation> operations) {
+    WalMutationFingerprintBuilder builder(record_size, operations.size());
+    for (const WalMutation& operation : operations) {
+        builder.add(operation.kind, operation.id, operation.value);
+    }
+    return builder.finish();
+}
+
 ExpectedWalIdentity ExpectedWalIdentity::from_trusted_header(
     const WalHeader& header) noexcept {
     return ExpectedWalIdentity{

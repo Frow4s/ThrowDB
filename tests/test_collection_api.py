@@ -894,6 +894,15 @@ def test_low_level_calibration_snapshot_reuses_index_for_reader_trials(
     assert sampled_ids.dtype == np.dtype(np.uint64)
     assert set(sampled_ids.tolist()) == set(ids.tolist())
 
+    default_v3_bound = calibration.sample_ids(
+        requested_count=1 << 22,
+        seed=123,
+        max_inspected_slots=1,
+    )
+    assert default_v3_bound["requested_count"] == 1 << 22
+    assert default_v3_bound["inspected_slots"] == 1
+    assert default_v3_bound["complete"] is False
+
     trial = calibration.reader_trial(io_workers=2, io_queue_capacity=4)
     output = np.empty_like(vectors)
     stats = trial.get_into_profiled(ids, output)

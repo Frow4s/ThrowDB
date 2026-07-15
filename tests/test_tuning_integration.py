@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 
 import throwdb
 import throwdb._calibration as calibration_module
+import throwdb._calibration_cache as calibration_cache_module
 import throwdb.collection as collection_module
 from throwdb._device import MediaIdentity, RuntimeIdentity, StorageProbeResult
 from throwdb._tuning import TuningRegistryError
@@ -132,6 +134,126 @@ def _unavailable_io_uring(
     }
 
 
+def _backing_storage_stability() -> dict[str, object]:
+    return {
+        "classification": "backing_storage",
+        "passed": True,
+        "persistence_safe": True,
+        "reason": "deterministic test fixture observed backing reads",
+        "telemetry": "/proc/self/io read_bytes",
+        "measurement_scope": "test_fixture",
+        "thresholds": {
+            "page_cache_max_backing_read_ratio": 0.10,
+            "backing_storage_min_backing_read_ratio": 0.50,
+        },
+        "screening": {"classification": "backing_storage", "passed": True},
+        "verification": {
+            "classification": "backing_storage",
+            "passed": True,
+        },
+        "observation_count": 2,
+        "useful_read_bytes": 2_048,
+        "storage_read_bytes": 4_096,
+        "backing_read_ratio": 2.0,
+        "observations": [],
+    }
+
+
+def _unsafe_storage_stability(classification: str) -> dict[str, object]:
+    report = _backing_storage_stability()
+    report.update(
+        {
+            "classification": classification,
+            "passed": False,
+            "persistence_safe": False,
+            "reason": f"synthetic {classification} measurement",
+        }
+    )
+    return report
+
+
+def _performed_cache_preparation() -> dict[str, object]:
+    return {
+        "status": "performed",
+        "method": "synthetic",
+        "supported": True,
+        "best_effort": True,
+        "candidate_file_count": 1,
+        "advised_file_count": 1,
+        "data_file_count": 1,
+        "wal_file_count": 0,
+        "advised_bytes": 4_096,
+        "scanned_entry_count": 1,
+        "elapsed_seconds": 0.0,
+        "error": None,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _use_in_process_calibration_test_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep monkeypatched calibration fixtures inside the test interpreter.
+
+    Production always uses a fresh ``exec`` worker.  These integration tests
+    intentionally exercise the publication boundary with synthetic native and
+    calibration objects, which cannot be transferred to that interpreter.
+    """
+
+    def execute(
+        native: object,
+        *,
+        path: object,
+        record_size: int,
+        current_options: object,
+        seed: int,
+        max_read_bytes: int,
+        max_memory_bytes: int,
+        deadline: float,
+        expected_root_identity: tuple[int, int],
+        progress: object,
+    ) -> dict[str, object]:
+        del expected_root_identity
+        measured = calibration_module.run_bounded_calibration(
+            native,
+            record_size=record_size,
+            current_options=current_options,
+            seed=seed,
+            max_read_bytes=max_read_bytes,
+            max_memory_bytes=max_memory_bytes,
+            deadline=deadline,
+            progress=progress,
+            cache_preparer=lambda: (
+                calibration_cache_module.prepare_cold_payload_cache(path)
+            ),
+        )
+        measured["measurement_process"] = {
+            "isolation": "subprocess_exec",
+            "status": "complete",
+            "pid": os.getpid() + 1_000_000,
+            "parent_verified": True,
+            "test_fixture": True,
+        }
+        storage_value = measured.get("storage_stability")
+        if isinstance(storage_value, dict):
+            storage_value["telemetry_scope"] = (
+                "isolated_calibration_process"
+            )
+            storage_value["process_isolation"] = {
+                "passed": True,
+                "method": "subprocess_exec",
+                "pid": os.getpid() + 1_000_000,
+                "parent_verified": True,
+            }
+        return measured
+
+    monkeypatch.setattr(
+        collection_module,
+        "_execute_reader_calibration",
+        execute,
+    )
+
+
 def _completed_calibration(*args: object, **kwargs: object) -> dict[str, object]:
     del args, kwargs
     return {
@@ -141,17 +263,451 @@ def _completed_calibration(*args: object, **kwargs: object) -> dict[str, object]
         "reason": "fixture completed",
         "candidate_discovery": {},
         "sample": {},
-        "workload": {},
+        "workload": {
+            "stage_cache_preparation": {
+                "screening": _performed_cache_preparation(),
+                "verification": _performed_cache_preparation(),
+            }
+        },
         "candidates": [],
         "stability": {"passed": True},
+        "resource_stability": {
+            "passed": True,
+            "ambient_cpu_core_limit": 0.25,
+            "contaminated_candidates": [],
+            "reason": None,
+        },
+        "storage_stability": _backing_storage_stability(),
         "selection": {
+            "policy": "balanced-v1",
+            "selection_valid": True,
             "winner": "sequential",
             "options": dict(calibration_module.READER_DEFAULTS),
             "score": 1.0,
             "reason": "fixture",
+            "objectives_used": ["performance", "cpu_efficiency"],
+            "pareto_frontier": ["sequential"],
+            "alternatives": {
+                "max_throughput": {"winner": "sequential", "score": 1.0},
+                "cpu_efficiency": {"winner": "sequential", "score": 1.0},
+            },
         },
         "planned_read_bytes": 0,
     }
+
+
+@pytest.mark.parametrize("selection_valid", [False, None], ids=["false", "missing"])
+def test_tune_never_persists_an_unverified_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection_valid: bool | None,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    selection = measured["selection"]
+    assert isinstance(selection, dict)
+    if selection_valid is None:
+        selection.pop("selection_valid")
+    else:
+        selection["selection_valid"] = selection_valid
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    def reject_publication(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("unverified selection attempted profile publication")
+
+    monkeypatch.setattr(collection_module, "upsert_profile", reject_publication)
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "selection_unverified"
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert report["selection"]["profile"] is None  # type: ignore[index]
+    assert "explicitly valid calibration selection" in str(report["reason"])
+    assert not (path / "tuning").exists()
+
+
+@pytest.mark.parametrize("guardrail", ["stability", "resource_stability"])
+def test_tune_never_persists_a_failed_matrix_guardrail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guardrail: str,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    value = measured[guardrail]
+    assert isinstance(value, dict)
+    value["passed"] = False
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    def reject_publication(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("failed matrix guardrail attempted publication")
+
+    monkeypatch.setattr(collection_module, "upsert_profile", reject_publication)
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "calibration_unverified"
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert "stability guardrails" in str(report["reason"])
+    assert not (path / "tuning").exists()
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_status"),
+    [
+        ("page_cache", "cache_unrepresentative"),
+        ("mixed", "cache_unrepresentative"),
+        ("unknown", "cache_unverified"),
+    ],
+)
+def test_tune_never_persists_a_non_backing_storage_measurement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    classification: str,
+    expected_status: str,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    measured["storage_stability"] = _unsafe_storage_stability(classification)
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+    publication_attempted = False
+
+    def reject_publication(*args: object, **kwargs: object) -> object:
+        nonlocal publication_attempted
+        del args, kwargs
+        publication_attempted = True
+        raise AssertionError("unsafe calibration attempted profile publication")
+
+    monkeypatch.setattr(collection_module, "upsert_profile", reject_publication)
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == expected_status
+    assert (
+        report["storage_stability"]["classification"] == classification  # type: ignore[index]
+    )
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert report["selection"]["profile"] is None  # type: ignore[index]
+    assert "backing-storage calibration" in str(report["reason"])
+    assert publication_attempted is False
+    assert not (path / "tuning").exists()
+
+
+def test_unsafe_repeat_tune_does_not_replace_an_existing_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    throwdb.Collection.save_tuning_profile(
+        path,
+        {"io_workers": 2, "io_queue_capacity": 4},
+    )
+    registry_path = path / "tuning" / "reader-profiles.json"
+    original_registry = registry_path.read_bytes()
+    measured = _completed_calibration()
+    measured["storage_stability"] = _unsafe_storage_stability("page_cache")
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unrepresentative"
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert registry_path.read_bytes() == original_registry
+    with throwdb.Collection.open(path, tuning="persisted") as reopened:
+        assert reopened.tuning is not None
+        assert reopened.tuning["io_workers"] == 2
+
+
+def test_backing_reads_without_successful_cache_preparation_are_not_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    measured["workload"] = {
+        "stage_cache_preparation": {
+            "screening": {
+                **_performed_cache_preparation(),
+                "status": "unsupported",
+            },
+            "verification": _performed_cache_preparation(),
+        }
+    }
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unverified"
+    storage = report["storage_stability"]
+    assert storage["classification"] == "backing_storage"  # type: ignore[index]
+    assert storage["backing_read_passed"] is True  # type: ignore[index]
+    assert storage["cache_preparation"]["passed"] is False  # type: ignore[index]
+    assert storage["persistence_safe"] is False  # type: ignore[index]
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert not (path / "tuning").exists()
+
+
+@pytest.mark.parametrize(
+    "adaptive_stage",
+    ["verification_backfill", "verification_recheck"],
+)
+def test_failed_adaptive_stage_cache_preparation_blocks_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adaptive_stage: str,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    workload = measured["workload"]
+    assert isinstance(workload, dict)
+    preparations = workload["stage_cache_preparation"]
+    assert isinstance(preparations, dict)
+    preparations[adaptive_stage] = {
+        **_performed_cache_preparation(),
+        "status": "failed",
+        "error": "synthetic adaptive-stage preparation failure",
+    }
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unverified"
+    storage = report["storage_stability"]
+    assert storage["cache_preparation"]["passed"] is False  # type: ignore[index]
+    assert storage["cache_preparation"]["statuses"][  # type: ignore[index]
+        adaptive_stage
+    ] == "failed"
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert not (path / "tuning").exists()
+
+
+@pytest.mark.parametrize(
+    ("adaptive_report", "malformed_value"),
+    [
+        ("verification_backfill", False),
+        ("stability_recheck", False),
+        ("verification_backfill", True),
+    ],
+)
+def test_missing_or_malformed_adaptive_cache_preparation_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adaptive_report: str,
+    malformed_value: bool,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    measured["candidate_discovery"] = {
+        adaptive_report: {"attempted": True}
+    }
+    if malformed_value:
+        workload = measured["workload"]
+        assert isinstance(workload, dict)
+        preparations = workload["stage_cache_preparation"]
+        assert isinstance(preparations, dict)
+        preparations["verification_backfill"] = None
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "run_bounded_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unverified"
+    preparation = report["storage_stability"][  # type: ignore[index]
+        "cache_preparation"
+    ]
+    assert preparation["passed"] is False
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert not (path / "tuning").exists()
+
+
+def test_backing_reads_without_process_isolation_are_not_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    # Override the autouse in-process test seam without adding its synthetic
+    # isolation marker. Even strong process-wide counters must fail closed.
+    monkeypatch.setattr(
+        collection_module,
+        "_execute_reader_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unverified"
+    storage = report["storage_stability"]
+    assert storage["classification"] == "backing_storage"  # type: ignore[index]
+    assert storage["process_isolation"]["passed"] is False  # type: ignore[index]
+    assert storage["persistence_safe"] is False  # type: ignore[index]
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert "dedicated calibration process" in str(report["reason"])
+    assert not (path / "tuning").exists()
+
+
+def test_current_process_cannot_claim_worker_isolation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "store"
+    _create_collection(path)
+    measured = _completed_calibration()
+    measured["measurement_process"] = {
+        "isolation": "subprocess_exec",
+        "status": "complete",
+        "pid": os.getpid(),
+        "parent_verified": True,
+    }
+    storage = measured["storage_stability"]
+    storage["telemetry_scope"] = "isolated_calibration_process"  # type: ignore[index]
+    storage["process_isolation"] = {  # type: ignore[index]
+        "passed": True,
+        "method": "subprocess_exec",
+        "pid": os.getpid(),
+        "parent_verified": True,
+    }
+    monkeypatch.setattr(
+        collection_module,
+        "probe_collection_storage",
+        lambda *args, **kwargs: _probe("a"),
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_reader_capabilities",
+        _unavailable_io_uring,
+    )
+    monkeypatch.setattr(
+        collection_module,
+        "_execute_reader_calibration",
+        lambda *args, **kwargs: measured,
+    )
+
+    report = throwdb.Collection.tune(path, max_seconds=30)
+
+    assert report["status"] == "cache_unverified"
+    assert report["storage_stability"]["process_isolation"][  # type: ignore[index]
+        "passed"
+    ] is False
+    assert report["selection"]["persisted"] is False  # type: ignore[index]
+    assert not (path / "tuning").exists()
 
 
 def test_bounded_tune_dry_run_then_persists_and_auto_reuses_profile(
@@ -195,6 +751,16 @@ def test_bounded_tune_dry_run_then_persists_and_auto_reuses_profile(
             "limit": 0.20,
         },
     )
+    monkeypatch.setattr(
+        calibration_module,
+        "_storage_stability_report",
+        lambda *args, **kwargs: _backing_storage_stability(),
+    )
+    monkeypatch.setattr(
+        calibration_cache_module,
+        "prepare_cold_payload_cache",
+        lambda *args, **kwargs: _performed_cache_preparation(),
+    )
 
     dry = throwdb.Collection.tune(
         path,
@@ -220,13 +786,54 @@ def test_bounded_tune_dry_run_then_persists_and_auto_reuses_profile(
         seed=17,
     )
     assert saved["status"] == "saved"
-    assert saved["configuration"]["matrix_version"] == 2  # type: ignore[index]
+    assert saved["configuration"]["matrix_version"] == 3  # type: ignore[index]
     selection = saved["selection"]
     assert isinstance(selection, dict)
+    assert selection["policy"] == "balanced-v1"
+    assert "performance" in selection["objectives_used"]
+    assert set(selection["cpu_resource_coverage"]) == {
+        "requested_scenarios",
+        "used_scenarios",
+        "dropped_scenarios",
+        "mode",
+    }
+    assert selection["pareto_frontier"]
+    assert set(selection["alternatives"]) == {
+        "max_throughput",
+        "eligible_max_throughput",
+        "observed_max_throughput",
+        "cpu_efficiency",
+    }
     assert selection["persisted"] is True
-    assert selection["profile"]["source"] == "calibrated-v2"
+    assert selection["profile"]["source"] == "calibrated-v3"
+    cache_preparation = saved["workload"][  # type: ignore[index]
+        "stage_cache_preparation"
+    ]
+    assert {"screening", "verification"}.issubset(cache_preparation)
+    assert all(
+        value["status"]
+        in {"performed", "unsupported", "failed", "no_payload_files"}
+        for value in cache_preparation.values()
+    )
+    assert (
+        saved["storage_stability"]["classification"]  # type: ignore[index]
+        == "backing_storage"
+    )
+    resource_stability = saved["resource_stability"]
+    assert resource_stability["passed"] is True  # type: ignore[index]
+    assert "ambient_cpu_core_limit" in resource_stability  # type: ignore[operator]
+    assert "contaminated_candidates" in resource_stability  # type: ignore[operator]
+    baseline = next(
+        item
+        for item in saved["candidates"]  # type: ignore[index]
+        if item["name"] == "sequential"
+    )
+    mixed_fairness = baseline["guardrails"]["mixed_fairness"]
+    assert mixed_fairness["evaluated"] is True
+    assert mixed_fairness["enforced"] is False
+    assert mixed_fairness["small_completed_calls"] >= 10
     assert saved["budget"]["planned_read_bytes"] <= 16 << 20  # type: ignore[index]
-    assert saved["sample"]["inspected_slots"] <= 8_388_608  # type: ignore[index]
+    assert saved["sample"]["inspected_slots"] <= 33_554_432  # type: ignore[index]
     assert saved["target"]["open_stats"]["index_file_bytes"] > 0  # type: ignore[index]
     json.dumps(saved, allow_nan=False)
 
@@ -234,7 +841,7 @@ def test_bounded_tune_dry_run_then_persists_and_auto_reuses_profile(
         assert reopened.tuning is not None
         assert reopened.tuning["source"] == "persisted"
         assert reopened.tuning["match_level"] == "exact"
-        assert reopened.tuning["profile_origin"] == "calibrated-v2"
+        assert reopened.tuning["profile_origin"] == "calibrated-v3"
         np.testing.assert_array_equal(reopened.get([33, 11]), expected[[2, 0]])
 
 
@@ -436,6 +1043,7 @@ def test_tune_does_not_publish_when_target_identity_changes(
             "workload": {},
             "candidates": [],
             "stability": {"passed": True},
+            "storage_stability": _backing_storage_stability(),
             "selection": {
                 "winner": "sequential",
                 "options": dict(calibration_module.READER_DEFAULTS),
@@ -481,6 +1089,7 @@ def test_tune_skips_final_probes_and_publication_after_deadline(
             "workload": {},
             "candidates": [],
             "stability": {"passed": True},
+            "storage_stability": _backing_storage_stability(),
             "selection": {
                 "winner": "sequential",
                 "options": dict(calibration_module.READER_DEFAULTS),

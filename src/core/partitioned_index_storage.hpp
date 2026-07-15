@@ -19,6 +19,39 @@ enum class PartitionedPutMode : std::uint8_t {
     Upsert,
 };
 
+class PartitionedIdScanState {
+public:
+    virtual ~PartitionedIdScanState() = default;
+    [[nodiscard]] virtual const NativeIdScanMetadata& metadata()
+        const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<NativeIdLocation> locations) = 0;
+    [[nodiscard]] virtual bool done() const noexcept = 0;
+};
+
+// Internal type-erased bridge. The concrete state owns a pinned format-7
+// ResourceSet and an immutable overlay copy, so this cursor remains valid even
+// after its PartitionedIndexReader is destroyed.
+class PartitionedIdScan {
+public:
+    explicit PartitionedIdScan(
+        std::unique_ptr<PartitionedIdScanState> state);
+    ~PartitionedIdScan();
+
+    PartitionedIdScan(const PartitionedIdScan&) = delete;
+    PartitionedIdScan& operator=(const PartitionedIdScan&) = delete;
+
+    [[nodiscard]] const NativeIdScanMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<NativeIdLocation> locations = {});
+    [[nodiscard]] bool done() const noexcept;
+
+private:
+    std::unique_ptr<PartitionedIdScanState> state_;
+};
+
 // Reads only the manifest discriminator, without following a substituted
 // symlink or blocking on a non-regular file. A false result means that the
 // existing format-6 path should perform its normal validation.
@@ -80,6 +113,13 @@ public:
         std::uint64_t requested,
         std::uint64_t seed,
         std::uint64_t max_inspected_slots) const;
+    [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids() const;
+    [[nodiscard]] std::vector<std::uint8_t> contains(
+        std::span<const std::uint64_t> ids) const;
+    [[nodiscard]] NativeCollectionIdentity identity() const;
+    [[nodiscard]] NativeMutationVerification verify_committed_mutation(
+        std::uint64_t sequence,
+        const NativeMutationFingerprint& expected) const;
     void put(
         PartitionedPutMode mode,
         std::span<const std::uint64_t> ids,

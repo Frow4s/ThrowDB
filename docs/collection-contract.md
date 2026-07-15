@@ -122,6 +122,36 @@ row-major local backend performs only `N * item_size` bytes of physical I/O.
 Filesystem page size can dominate random prefix reads. The same API can later
 use a prefix-optimized physical layout without changing callers.
 
+### ID enumeration and physical locations
+
+Format 7 exposes the authoritative live ID set through a snapshot cursor:
+
+```python
+with collection.scan_ids(
+    batch_rows=65_536,
+    with_locations=True,
+) as scan:
+    for batch in scan:
+        consume(batch.ids, batch.locations)
+
+all_ids = collection.list_ids()
+```
+
+`scan_ids()` is the bounded interface. It pins one collection view for the
+cursor lifetime, emits each live ID exactly once, omits tombstones and retired
+rows, and preserves physical `(segment_id, row_index)` order within that view.
+When requested, locations expose separate native `uint32` `segment_id` and
+`row_index` fields. They are snapshot-scoped optimization hints, not stable
+logical row numbers: maintenance may relocate a row without changing its ID or
+embedding. A caller must not combine locations from one scan snapshot with IDs
+or collection metadata from another.
+
+`list_ids()` deliberately materializes the same stream into one NumPy array and
+does not impose a client-memory guard. Callers that cannot bound the complete
+population in RAM must use `scan_ids()` instead. Enumeration order is physical
+storage order rather than insertion order, numeric sort order, or lookup-request
+order.
+
 ## Write contract
 
 The initial Python surface is intended to be:

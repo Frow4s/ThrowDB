@@ -22,19 +22,36 @@ The numeric version-2 binary representation is specified in
 ## Install
 
 Release CI is configured to build precompiled CPython 3.10-3.14 wheels for
-Linux x86_64 on the `manylinux_2_28` baseline. Install a downloaded artifact
-without a compiler:
+Linux x86_64 on the `manylinux_2_28` baseline. Each official wheel contains
+the embedded C++ extension, the synchronous Python gRPC client, and the native
+`throwdbd` command. Install a downloaded artifact without a compiler:
 
 ```bash
 python -m pip install throwdb-0.1.0-cp311-cp311-manylinux_2_28_x86_64.whl
 throwdb --help
+throwdbd --help
 ```
 
-Installing directly from a source checkout builds the C++20 extension locally:
+For a complete source build without root privileges, first build the pinned
+gRPC/Protobuf toolchain once. The exported ThrowDB-specific prefix is consumed
+directly by both the bootstrap and the CMake build launched by pip:
 
 ```bash
+export THROWDB_GRPC_PREFIX="$HOME/.local/throwdb/grpc-1.81.0"
+./tools/bootstrap_grpc.sh
 python -m pip install .
 ```
+
+For an editable complete-server checkout, use the same exported prefix:
+
+```bash
+python -m pip install -e '.[test]'
+```
+
+The bootstrap requires outbound GitHub access, Git, CMake, a C++ compiler,
+Make, Perl, and Python 3. It never uses `sudo`. See
+[`docs/grpc-server.md`](docs/grpc-server.md) for the reproducible server build
+and core-only developer configuration.
 
 The optional C++ SDK is experimental and source-compatible within this MVP,
 not a stable binary ABI. Recompile C++ consumers against the exact installed
@@ -44,11 +61,14 @@ compatible across releases.
 ## Install for development
 
 ThrowDB requires a C++20 compiler, CMake, Python 3.10+, NumPy and pybind11.
+The fast local-only loop deliberately skips the daemon; the dedicated gRPC CI
+job builds the complete server with the pinned native dependencies.
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[test]'
+CMAKE_ARGS="-DTHROWDB_BUILD_SERVER=OFF -DTHROWDB_BUILD_GRPC_SERVER=OFF" \
+  python -m pip install -e '.[test]'
 pytest -q
 ```
 
@@ -108,6 +128,47 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     maintenance = collection.maintain(dry_run=False)
 ```
 
+## Single-collection gRPC server
+
+`throwdbd` opens exactly one format-7 collection. It binds loopback by
+default, shares one in-memory index across clients, and exposes typed Health,
+Describe, Get, Insert, Update, Upsert, Delete, and server-streaming ScanIds.
+The same Python package provides `RemoteCollection`:
+
+```bash
+throwdbd \
+  --storage /data/example \
+  --listen 127.0.0.1:50051
+```
+
+```python
+import throwdb
+
+with throwdb.RemoteCollection.connect("127.0.0.1:50051") as collection:
+    prefixes = collection.get([42, 100], prefix_dimensions=128)
+    full_vector = collection.get([42])
+    collection.upsert([200], full_vector, operation_id=None)
+
+    # Materializes all IDs and can intentionally exhaust client RAM.
+    ids = collection.list_ids()
+
+    # The streaming form is bounded and preserves physical disk order.
+    with collection.scan_ids(batch_rows=65_536, with_locations=True) as scan:
+        for batch in scan:
+            print(batch.ids, batch.locations["segment_id"])
+```
+
+Public mutations always carry a nonzero UUID operation ID. Supplying one
+explicitly lets a caller repeat an ambiguous request after reconnect/restart;
+the durable server journal replays the original result only when the complete
+request digest matches. `RemoteCollection` creates an ID automatically when
+none is supplied and exposes it on `AmbiguousCommitError` if the outcome is
+unknown. Ambient HTTP proxies are disabled by default for internal embedding
+traffic; opt in explicitly with `use_http_proxy=True`. The MVP transport is
+plaintext and intended for loopback or a trusted network boundary—TLS,
+authentication, quotas, and multi-collection routing remain later server
+stages.
+
 For diagnostics that do not otherwise need an open collection, use
 `Collection.inspect_orphans("/data/example", min_age_seconds=3600)`. This
 lightweight path validates the selected catalog and scans mutation namespaces
@@ -153,9 +214,60 @@ report = throwdb.Collection.tune(
 print(report["status"], report["selection"])
 ```
 
-The bounded calibrator loads the index once, samples IDs internally, verifies
-every candidate bit-for-bit, runs one charged but unmeasured warm-up pass, and
-saves only a stable winner. It does not need the original NumPy ID file. Pass
+The bounded matrix-v3.1 calibrator runs its complete decision-bearing matrix in
+a fresh Python process, samples IDs internally, verifies every candidate
+bit-for-bit, screens the bounded topology matrix, and runs a longer
+verification stage for at most five finalists. The parent keeps a stable
+read-only calibration handle open while the worker owns all measured I/O; the
+worker opens the index once and never reopens it per candidate. If
+the initial verification would retain the sequential baseline, one
+pre-budgeted backfill verifies the best screening-eligible candidate that was
+left out, interleaved with a fresh sequential control. The candidate stores
+that control in its top-level `pairing_reference`, so paired ratios never use
+an older baseline epoch. A candidate whose only failure is 10-20%
+throughput/paired-gain CV, with every paired gain at least 5%, gets one
+pre-budgeted paired recheck before the final decision. The read bound reserves
+both the backfill candidate and its sequential control. These optional slots
+are included in
+`workload.requested_read_bound_bytes`; actual
+`budget.planned_read_bytes` is lower when they are not used.
+
+The calibrator collects best-effort process CPU, cgroup throttling/pressure,
+and storage-I/O telemetry alongside throughput and sample-rich P99 latency.
+Before each screening or verification stage on supported POSIX platforms it
+uses per-file `POSIX_FADV_DONTNEED` for the collection's embedding payloads and
+WALs; it never drops the machine-wide page cache. Separate ambient-disjoint ID
+pools avoid candidate and cross-stage warming when the sample is large enough.
+The report exposes every attempt under
+`workload.stage_cache_preparation`. Mixed-request starvation requires both a
+greater than 2x P99
+slowdown against the candidate's own standalone small requests and a greater
+than 1.25x absolute P99 regression against the baseline mixed workload. The
+persisted `balanced-v1` winner must pass correctness, stability, tail,
+fairness, attributable-throttling, and physical-storage guardrails. CPU and
+cgroup counters may degrade cleanly to the throughput policy, but automatic
+profile persistence requires reliable `/proc/self/io:read_bytes` backing-read
+evidence from every non-hot scenario in both screening and authoritative
+verification, plus successful file-scoped cache preparation for every executed
+stage. The fresh-process boundary keeps Jupyter, Airflow, and application
+background I/O out of those process-wide counters. Buffered/thread-pool reads
+must also keep each repetition's `/proc/self/io:rchar` volume within the
+expected payload range. Some kernels do not charge `io_uring` completions to
+`rchar`; only inside the exec-isolated worker may a present `rchar` no greater
+than 0.10x of the payload use the calibrator's exact profiled request bytes
+instead. The parent verifies the worker PID and protocol before persistence.
+Missing or ambiguously partial `rchar`, physical `read_bytes` below the backing
+threshold, and over-reporting still fail closed. There is deliberately no
+in-process fallback. A
+page-cache-dominated, mixed, unisolated, or unobservable run remains report-only
+with `cache_unrepresentative` or `cache_unverified` status. Present but
+low-confidence cgroup attribution also makes the
+calibration inconclusive. The selection report
+distinguishes observed from guardrail-eligible maximum throughput and explains
+which objectives actually participated, including topology cost. Revision 2
+selection reports expose `selection_valid`, the verified candidate set, and
+the final guardrail-eligible comparison set. The calibrator does not need the
+original NumPy ID file. Pass
 `dry_run=True` (or CLI `--dry-run`) to measure without saving. A stable
 OverlayFS access path is reusable at the `compatible` level even though its
 local or network backing is hidden. Its report contains
@@ -473,10 +585,15 @@ can interrupt cleanup.
   bounded frozen-WAL materialization, and explicit deterministic `maintain()`;
 - fair DRR scheduling and one shared I/O budget for mixed-size concurrent reads
   whenever the thread-pool or io_uring parallel coordinator is enabled;
-- no UTF-8 IDs, payload scrub command, direct prefix-only physical layout, or
-  network service yet. The lifecycle currently relies on local POSIX rename,
-  `fsync`, open-file, and unlink semantics; network filesystems are outside
-  this durability contract.
+- a public C++ gRPC service for one existing format-7 collection, including
+  numeric CRUD, prefix reads, physical-order ID streaming, health checks, and
+  durable mutation replay;
+- no UTF-8 IDs, payload scrub command, or direct prefix-only physical layout.
+  The collection lifecycle and the server's backing store currently rely on
+  local POSIX rename, `fsync`, open-file, and unlink semantics; network
+  filesystems are outside this durability contract. TLS/authentication,
+  multi-collection routing, and server-side automatic maintenance remain
+  later stages.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and
@@ -496,6 +613,12 @@ Use `--io-ranges-per-task` to record and compare executor task granularity; see
 the benchmark plan for the remote `1/4/8/16` sweep. On cgroup v2 systems the
 report also records the effective CPU quota and per-scenario `cpu.stat` deltas,
 including throttled periods and time.
+
+For an end-to-end test of the profile selected by `throwdb tune`, pass
+`--tuning persisted`. Native collections then require a matching saved profile
+instead of silently falling back, and `report.json` records the complete
+effective `collection.tuning` selection. The default `--tuning explicit` keeps
+the existing `--io-*` comparison workflow.
 
 The on-disk format is versioned but still experimental. Format-v1 compatibility
 is covered by a byte-level golden test; format v2 may still evolve before its

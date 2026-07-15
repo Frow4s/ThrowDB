@@ -114,6 +114,92 @@ def test_optional_storage_open_stats_are_normalized_to_a_dict() -> None:
     assert BENCHMARK.storage_open_stats(SimpleNamespace()) is None
 
 
+def test_native_benchmark_can_require_persisted_reader_tuning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "manifest.bin").write_bytes(b"TDBNMNF2")
+    calls: list[tuple[Path, dict[str, object]]] = []
+    handle = object()
+
+    class FakeCollection:
+        @staticmethod
+        def open(path: Path, **kwargs: object) -> object:
+            calls.append((path, kwargs))
+            return handle
+
+    monkeypatch.setattr(
+        BENCHMARK,
+        "throwdb",
+        SimpleNamespace(Collection=FakeCollection),
+    )
+
+    actual, store_format = BENCHMARK.open_benchmark_storage(
+        tmp_path,
+        io_workers=0,
+        io_queue_capacity=0,
+        io_ranges_per_task=8,
+        io_backend="thread_pool",
+        io_uring_workers=1,
+        io_uring_queue_depth=32,
+        tuning_mode="persisted",
+    )
+
+    assert actual is handle
+    assert store_format == "native_mutable"
+    assert calls == [(tmp_path, {"mode": "r", "tuning": "persisted"})]
+
+
+def test_legacy_benchmark_rejects_saved_reader_tuning(tmp_path: Path) -> None:
+    (tmp_path / "manifest.bin").write_bytes(b"THROWDBM")
+
+    with pytest.raises(ValueError, match="only by native collections"):
+        BENCHMARK.open_benchmark_storage(
+            tmp_path,
+            io_workers=0,
+            io_queue_capacity=0,
+            io_ranges_per_task=8,
+            io_backend="thread_pool",
+            io_uring_workers=1,
+            io_uring_queue_depth=32,
+            tuning_mode="persisted",
+        )
+
+
+def test_actual_storage_tuning_is_normalized_to_a_copy() -> None:
+    selected = {
+        "source": "persisted",
+        "status": "selected",
+        "io_backend": "io_uring",
+        "io_uring_workers": 1,
+        "io_uring_queue_depth": 64,
+    }
+
+    observed = BENCHMARK.storage_tuning(SimpleNamespace(tuning=selected))
+
+    assert observed == selected
+    assert observed is not selected
+    assert BENCHMARK.storage_tuning(SimpleNamespace()) is None
+
+
+def test_benchmark_parser_accepts_strict_persisted_tuning() -> None:
+    args = BENCHMARK.build_parser().parse_args(["--tuning", "persisted"])
+
+    assert args.tuning == "persisted"
+
+
+def test_registry_tuning_rejects_manual_reader_overrides() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        BENCHMARK.main(
+            [
+                "--tuning",
+                "persisted",
+                "--io-uring-queue-depth",
+                "64",
+            ]
+        )
+
+
 def test_float32_correctness_and_throughput_use_the_store_dtype(
     tmp_path: Path,
 ) -> None:

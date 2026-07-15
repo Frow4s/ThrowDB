@@ -123,7 +123,17 @@ def test_tune_command_has_bounded_defaults_and_writes_optional_report(
         "format": "throwdb-reader-calibration",
         "version": 1,
         "status": "dry_run",
-        "selection": {"winner": "sequential", "persisted": False},
+        "configuration": {"matrix_version": 3},
+        "resource_stability": {
+            "passed": True,
+            "contaminated_candidates": [],
+        },
+        "selection": {
+            "policy": "balanced-v1",
+            "winner": "sequential",
+            "persisted": False,
+            "pareto_frontier": ["sequential"],
+        },
     }
     observed: dict[str, object] = {}
 

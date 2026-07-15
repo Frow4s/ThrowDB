@@ -11,6 +11,14 @@ jobs:
   python:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-24.04
+    env:
+      # The Python matrix validates the local extension and the always-present
+      # gRPC client. The dedicated native gRPC job below builds the daemon once
+      # with its pinned C++ toolchain instead of compiling gRPC five times.
+      CMAKE_ARGS: >-
+        -DTHROWDB_BUILD_SERVER=OFF
+        -DTHROWDB_BUILD_GRPC_SERVER=OFF
+      THROWDB_WHEEL_SMOKE_REQUIRE_SERVER: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +35,26 @@ jobs:
         run: python -m pytest -q
       - name: Run installed-package smoke test
         run: python tools/wheel_smoke.py
+
+  grpc-server:
+    name: Pinned C++ gRPC server
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build pinned userspace gRPC and Protobuf
+        env:
+          THROWDB_GRPC_JOBS: "2"
+          THROWDB_GRPC_PREFIX: ${{ runner.temp }}/throwdb-grpc
+          THROWDB_GRPC_WORK_DIR: ${{ runner.temp }}/throwdb-grpc-work
+        run: ./tools/bootstrap_grpc.sh
+      - name: Configure
+        env:
+          THROWDB_GRPC_PREFIX: ${{ runner.temp }}/throwdb-grpc
+        run: cmake --preset server-release
+      - name: Build
+        run: cmake --build --preset server-release
+      - name: Test
+        run: ctest --preset server-release
 
   native:
     name: Native C++20 / Werror
