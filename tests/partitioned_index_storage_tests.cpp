@@ -467,6 +467,9 @@ void test_physical_id_scan_order_locations_and_snapshot_isolation() {
     writer->upsert(
         std::array<std::uint64_t, 1>{50}, rows(1, 4));
 
+    require_throws<std::length_error>(
+        [&] { static_cast<void>(writer->scan_ids(4500)); },
+        "bounded physical ID scan allocated an overlay beyond its budget");
     auto old_scan = writer->scan_ids();
     const throwdb::NativeIdScanMetadata old_metadata = old_scan->metadata();
     require(
@@ -563,6 +566,66 @@ void test_physical_id_scan_order_locations_and_snapshot_isolation() {
     require(
         detached_ids == current_ids,
         "physical ID scan borrowed a destroyed collection handle");
+}
+
+void test_physical_id_scan_cooperative_cancellation() {
+    TemporaryDirectory temporary("physical-id-scan-cancellation");
+    constexpr std::size_t row_count = 8193;
+    constexpr std::size_t first_live_row = 256;
+    std::vector<std::uint64_t> ids(row_count);
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        ids[index] = 10'000 + static_cast<std::uint64_t>(index);
+    }
+    build_collection(
+        temporary.path(), ids, rows(ids.size(), 4),
+        throwdb::DType::Float16, 2, ids.size() * 4, 1);
+
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    std::vector<std::uint64_t> deleted;
+    deleted.reserve(ids.size() - 2);
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        if (index != first_live_row && index + 1 != ids.size()) {
+            deleted.push_back(ids[index]);
+        }
+    }
+    const std::vector<std::uint8_t> erased = writer->erase(deleted);
+    require(
+        std::all_of(erased.begin(), erased.end(), [](const std::uint8_t value) {
+            return value == 1;
+        }),
+        "cooperative ID scan fixture did not delete its stale rows");
+
+    auto scan = writer->scan_ids();
+    require(scan->metadata().live_count == 2,
+            "cooperative ID scan captured the wrong live count");
+    std::array<std::uint64_t, 2> output{};
+    std::array<throwdb::NativeIdLocation, 2> locations{};
+    std::uint64_t stop_polls = 0;
+    const std::uint64_t produced = scan->read_into(
+        output, locations,
+        [&stop_polls] { return ++stop_polls == 10; });
+    require(stop_polls == 10,
+            "physical ID scan did not poll cancellation at bounded cadence");
+    require(produced == 1 && !scan->done(),
+            "cooperative cancellation did not return its partial batch");
+    require(output[0] == ids[first_live_row]
+                && locations[0]
+                       == throwdb::NativeIdLocation{1, first_live_row},
+            "cooperative cancellation changed physical scan order/location");
+
+    // The original embedded overload remains non-cancellable and resumes the
+    // same snapshot after the cooperatively stopped call. It must traverse the
+    // remaining large stale/deleted physical tail and find the final live row.
+    const std::uint64_t resumed = scan->read_into(output, locations);
+    require(resumed == 1 && scan->done(),
+            "embedded ID scan did not resume after cooperative cancellation");
+    require(output[0] == ids.back()
+                && locations[0]
+                       == throwdb::NativeIdLocation{
+                           1,
+                           static_cast<std::uint32_t>(ids.size() - 1)},
+            "resumed physical ID scan returned the wrong final row");
 }
 
 void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
@@ -1066,7 +1129,7 @@ void test_active_wal_tail_recovery_and_frozen_corruption() {
 
 void test_materialization_budget_and_tombstone_only_run() {
     TemporaryDirectory temporary("materialize-tombstone");
-    const std::array<std::uint64_t, 2> ids{17, 29};
+    const std::array<std::uint64_t, 3> ids{17, 29, 41};
     const std::vector<std::byte> embeddings = rows(ids.size(), 4);
     build_collection(
         temporary.path(), ids, embeddings, throwdb::DType::Float16,
@@ -1074,8 +1137,8 @@ void test_materialization_budget_and_tombstone_only_run() {
     auto writer = throwdb::NativeCollection::open(
         temporary.path(), {}, true);
     require(
-        writer->erase(std::array<std::uint64_t, 1>{17})
-            == std::vector<std::uint8_t>({1}),
+        writer->erase(std::array<std::uint64_t, 2>{17, 29})
+            == std::vector<std::uint8_t>({1, 1}),
         "format-7 tombstone setup failed");
     static_cast<void>(writer->rotate_wal());
     const throwdb::detail::PartitionedCatalogV3 before =
@@ -1089,15 +1152,36 @@ void test_materialization_budget_and_tombstone_only_run() {
             && blocked.frozen_wal_count == 1,
         "format-7 materialization did not honor its input-byte budget");
 
+    const throwdb::NativeMutationLogStats entry_blocked =
+        writer->materialize_frozen_wals(1, sealed, 1);
+    require(
+        !entry_blocked.materialized
+            && entry_blocked.materialization_budget_blocked
+            && entry_blocked.materialization_entry_budget_blocked
+            && !entry_blocked.materialization_memory_budget_blocked,
+        "format-7 materialization did not honor its operation budget");
+    const throwdb::NativeMutationLogStats memory_blocked =
+        writer->materialize_frozen_wals(1, sealed, 2, 1);
+    require(
+        !memory_blocked.materialized
+            && memory_blocked.materialization_budget_blocked
+            && !memory_blocked.materialization_entry_budget_blocked
+            && memory_blocked.materialization_memory_budget_blocked,
+        "format-7 materialization did not honor its peak-memory budget");
+
     const throwdb::NativeMutationLogStats materialized =
-        writer->materialize_frozen_wals(1, sealed);
+        writer->materialize_frozen_wals(1, sealed, 2, 1ULL << 30);
     require(
         materialized.materialized
             && !materialized.materialization_budget_blocked
             && materialized.materialized_sequence == 1
             && materialized.delta_run_count == 1
-            && materialized.delta_entry_count == 1
+            && materialized.delta_entry_count == 2
             && materialized.delta_put_rows == 0
+            && materialized.materialized_wal_input_entries == 2
+            && materialized.materialization_estimated_peak_memory_bytes != 0
+            && materialized.materialization_estimated_peak_memory_bytes
+                   <= (1ULL << 30)
             && materialized.total_delta_segment_bytes == 0
             && materialized.total_delta_run_bytes != 0,
         "format-7 tombstone-only materialization stats changed");
@@ -1109,10 +1193,10 @@ void test_materialization_budget_and_tombstone_only_run() {
         },
         "materialized tombstone fell through to the initial snapshot");
     require(
-        writer->get_bytes(std::array<std::uint64_t, 1>{29})
+        writer->get_bytes(std::array<std::uint64_t, 1>{41})
             == expected_rows(
                 ids, embeddings, 4,
-                std::array<std::uint64_t, 1>{29}),
+                std::array<std::uint64_t, 1>{41}),
         "tombstone-only run changed an unrelated ID");
     writer.reset();
 
@@ -2318,6 +2402,90 @@ void test_checksummed_post_initial_catalog_fails_closed() {
         "format-7 reader accepted a catalog whose run resource is missing");
 }
 
+void test_mutable_open_limits_and_pending_fence_fail_closed() {
+    {
+        TemporaryDirectory live("bounded-live-write");
+        const std::array<std::uint64_t, 2> live_ids{3, 5};
+        const std::vector<std::byte> live_embeddings =
+            rows(live_ids.size(), 4);
+        build_collection(
+            live.path(), live_ids, live_embeddings,
+            throwdb::DType::Float16, 2, 8, 1);
+        throwdb::NativeOpenOptions live_bound;
+        live_bound.max_overlay_entries = 1;
+        auto bounded_writer = throwdb::NativeCollection::open(
+            live.path(), {}, true, false, live_bound);
+        require_throws<throwdb::StorageError>(
+            [&] { bounded_writer->update(live_ids, live_embeddings); },
+            "live mutation exceeded its exact overlay entry bound");
+        const auto after = bounded_writer->mutation_log_stats();
+        require(
+            after.committed_sequence == 0
+                && after.total_wal_operation_count == 0
+                && after.overlay_entry_count == 0,
+            "live overlay rejection happened after WAL publication");
+    }
+
+    TemporaryDirectory temporary("bounded-open");
+    const std::array<std::uint64_t, 2> ids{7, 11};
+    const std::vector<std::byte> embeddings = rows(ids.size(), 4);
+    build_collection(
+        temporary.path(), ids, embeddings, throwdb::DType::Float16,
+        2, 8, 1);
+    {
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        const std::vector<std::byte> replacements = rows(ids.size(), 4);
+        writer->update(ids, replacements);
+        const auto stats = writer->mutation_log_stats();
+        require(
+            stats.total_wal_operation_count == 2
+                && stats.overlay_entry_count == 2
+                && stats.estimated_overlay_bytes >= 2 * 64,
+            "format-7 retained-mutation diagnostics are incomplete");
+    }
+
+    throwdb::NativeOpenOptions operation_bound;
+    operation_bound.max_wal_operations = 1;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                temporary.path(), {}, true, false, operation_bound));
+        },
+        "writable open replay exceeded its WAL operation bound");
+
+    throwdb::NativeOpenOptions overlay_bound;
+    overlay_bound.max_overlay_entries = 1;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                temporary.path(), {}, true, false, overlay_bound));
+        },
+        "writable open replay exceeded its overlay entry bound");
+
+    std::filesystem::create_directories(temporary.path() / "server");
+    {
+        std::ofstream fence(
+            temporary.path() / "server" / "pending-mutation-v1",
+            std::ios::binary | std::ios::trunc);
+        require(fence.good(), "cannot create pending-mutation test fence");
+        fence << "prepared\n";
+    }
+    // Read-only diagnostics remain available, but an ordinary writer cannot
+    // bypass the durable server's unresolved PREPARE marker.
+    static_cast<void>(throwdb::NativeCollection::open(temporary.path()));
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                temporary.path(), {}, true));
+        },
+        "ordinary writable open crossed a pending-mutation fence");
+    throwdb::NativeOpenOptions recovery;
+    recovery.allow_pending_mutation_recovery = true;
+    static_cast<void>(throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, recovery));
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -2326,12 +2494,14 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 25> tests{{
+    const std::array<TestCase, 27> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
         {"physical_id_scan_order_locations_and_snapshot_isolation",
          test_physical_id_scan_order_locations_and_snapshot_isolation},
+        {"physical_id_scan_cooperative_cancellation",
+         test_physical_id_scan_cooperative_cancellation},
         {"writable_crud_reopen_rotation_and_snapshot_isolation",
          test_writable_crud_reopen_rotation_and_snapshot_isolation},
         {"sampler_sparse_snapshot_and_overlay_quotas",
@@ -2375,6 +2545,8 @@ int main() {
          test_forked_builder_and_reader_lifecycle},
         {"checksummed_post_initial_catalog_fails_closed",
          test_checksummed_post_initial_catalog_fails_closed},
+        {"mutable_open_limits_and_pending_fence_fail_closed",
+         test_mutable_open_limits_and_pending_fence_fail_closed},
     }};
 
     std::size_t failures = 0;

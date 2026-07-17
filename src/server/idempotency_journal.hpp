@@ -14,6 +14,21 @@
 
 namespace throwdb::server::detail {
 
+enum class IdempotencyJournalTestHookPoint : std::uint8_t {
+    PrepareSynced = 1,
+    CompleteSynced = 2,
+    AbortSynced = 3,
+    FenceRemove = 4,
+    CheckpointPublished = 5,
+};
+
+using IdempotencyJournalTestHook = void (*)(
+    IdempotencyJournalTestHookPoint point);
+
+// Internal deterministic fault seam. Production code leaves the hook null.
+void set_idempotency_journal_test_hook(
+    IdempotencyJournalTestHook hook) noexcept;
+
 using PayloadDigest = std::array<std::byte, 32>;
 
 struct JournalPreparedOperation {
@@ -35,12 +50,29 @@ struct OperationIdHash {
     [[nodiscard]] std::size_t operator()(OperationId value) const noexcept;
 };
 
+struct IdempotencyJournalLimits {
+    std::uint64_t max_bytes = 4ULL << 30;
+    std::uint64_t max_operations = 1'000'000;
+};
+
+struct IdempotencyJournalStats {
+    bool pending = false;
+    std::uint64_t bytes = 0;
+    std::uint64_t completed_operations = 0;
+    std::uint64_t aborted_operations = 0;
+    std::uint64_t max_bytes = 0;
+    std::uint64_t max_operations = 0;
+    OperationId domain;
+    std::uint64_t generation = 0;
+};
+
 class IdempotencyJournal {
 public:
     static std::unique_ptr<IdempotencyJournal> open(
         const std::filesystem::path& collection_path,
         std::uint64_t collection_id_low,
-        std::uint64_t collection_id_high);
+        std::uint64_t collection_id_high,
+        IdempotencyJournalLimits limits = {});
 
     ~IdempotencyJournal();
     IdempotencyJournal(const IdempotencyJournal&) = delete;
@@ -51,6 +83,16 @@ public:
     [[nodiscard]] const JournalPreparedOperation* pending() const noexcept;
     [[nodiscard]] const JournalPreparedOperation* aborted(
         OperationId operation_id) const noexcept;
+    [[nodiscard]] OperationId domain() const noexcept;
+    [[nodiscard]] IdempotencyJournalStats stats() const noexcept;
+    void reconcile_fence();
+
+    // Atomically starts a fresh replay domain and retires the complete prior
+    // operation history. Requests carrying the old domain are rejected by
+    // the transport before mutation, so an expired operation ID can never be
+    // applied a second time merely because its detailed result was retired.
+    // A checkpoint is legal only with no PREPARE in flight.
+    [[nodiscard]] OperationId checkpoint();
 
     void prepare(const JournalPreparedOperation& operation);
     JournalCompletedOperation complete(

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -140,6 +141,12 @@ struct WalScanResult {
     std::uint64_t next_sequence{1};
     std::uint64_t ignored_tail_bytes{0};
     std::uint64_t committed_batch_count{0};
+    std::uint64_t committed_operation_count{0};
+};
+
+struct WalScanLimits {
+    std::uint64_t max_committed_operations =
+        std::numeric_limits<std::uint64_t>::max();
 };
 
 [[nodiscard]] std::array<std::byte, kWalFileHeaderSize> encode_wal_header(
@@ -166,6 +173,7 @@ struct WalScanResult {
     std::span<const std::byte> image,
     const ExpectedWalIdentity& expected,
     WalScanMode mode,
-    const WalRecoveryVisitor& visitor = {});
+    const WalRecoveryVisitor& visitor = {},
+    WalScanLimits limits = {});
 
 }  // namespace throwdb::detail

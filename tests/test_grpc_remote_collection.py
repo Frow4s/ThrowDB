@@ -11,7 +11,13 @@ import grpc
 import numpy as np
 import pytest
 
-from throwdb.remote import LocatedIdBatch, LocatedIds, RemoteCollection
+from throwdb.remote import (
+    AmbiguousCommitError,
+    LocatedIdBatch,
+    LocatedIds,
+    RemoteCollection,
+    RemoteProtocolError,
+)
 from throwdb.v1 import throwdb_pb2, throwdb_pb2_grpc
 
 
@@ -70,7 +76,7 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
         return throwdb_pb2.HealthResponse(
             status=throwdb_pb2.HealthResponse.SERVING_STATUS_SERVING,
             protocol_major=1,
-            protocol_minor=0,
+            protocol_minor=1,
         )
 
     def Describe(
@@ -95,6 +101,66 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
                 prefix_get=True,
                 scan_locations=True,
                 durable_idempotency=False,
+            ),
+            reader=throwdb_pb2.ReaderConfiguration(
+                max_read_range_bytes=1 << 20,
+                max_gap_bytes=0,
+                io_workers=0,
+                io_queue_capacity=0,
+                io_ranges_per_task=8,
+                io_backend=throwdb_pb2.READER_BACKEND_THREAD_POOL,
+                io_uring_queue_depth=32,
+                io_uring_workers=1,
+            ),
+            tuning=throwdb_pb2.TuningSelection(
+                mode="auto",
+                source="fallback",
+                status="registry_missing",
+                reuse_level="fallback",
+                explicit_overrides=False,
+            ),
+            availability=throwdb_pb2.AvailabilityConfiguration(
+                max_concurrent_calls=32,
+                max_concurrent_scans=2,
+                max_unary_inflight_bytes=256 << 20,
+                max_scan_inflight_bytes=128 << 20,
+                max_grpc_memory_bytes=512 << 20,
+                scan_max_duration_millis=3_600_000,
+                scan_idle_timeout_millis=60_000,
+                shutdown_grace_millis=30_000,
+                shutdown_hard_timeout_millis=60_000,
+            ),
+            admission_stats=throwdb_pb2.AdmissionStatistics(
+                active_unary_calls=1,
+                active_scans=1,
+                unary_estimated_bytes=1 << 20,
+                scan_estimated_bytes=2 << 20,
+                admitted_unary_calls=12,
+                rejected_unary_calls=3,
+                admitted_scans=4,
+                rejected_scans=2,
+                admission_closed=False,
+                draining=False,
+                terminal_faulted=False,
+            ),
+            engine_stats=throwdb_pb2.EngineStatistics(
+                catalog_generation=7,
+                committed_sequence=11,
+                materialized_sequence=9,
+                active_wal_bytes=4096,
+                active_wal_transactions=2,
+                active_wal_operations=3,
+                frozen_wal_count=1,
+                frozen_wal_bytes=8192,
+                total_wal_bytes=12288,
+                total_wal_operations=5,
+                overlay_entries=4,
+                estimated_overlay_bytes=256,
+                delta_run_count=2,
+                total_delta_run_bytes=1024,
+                total_delta_segment_bytes=2048,
+                filesystem_available_bytes=100 << 20,
+                mutation_disk_reserve_bytes=10 << 20,
             ),
         )
 
@@ -268,9 +334,57 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
             offset += len(chunk)
 
 
+class _OldGrpcService(_FakeGrpcService):
+    """A production-like writable v1.0 server predating replay domains."""
+
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.capabilities.durable_idempotency = True
+        response.ClearField("idempotency_domain")
+        response.ClearField("reader")
+        response.ClearField("tuning")
+        response.ClearField("availability")
+        response.ClearField("admission_stats")
+        response.ClearField("engine_stats")
+        return response
+
+    def Health(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Health(request, context)
+        response.protocol_minor = 0
+        return response
+
+
+class _MissingReplayDomainService(_FakeGrpcService):
+    """A malformed v1.1 server advertising durability without a domain."""
+
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.capabilities.durable_idempotency = True
+        response.ClearField("idempotency_domain")
+        return response
+
+
+class _ResourceExhaustedMutationService(_FakeGrpcService):
+    """Model an allocation failure whose commit point is not observable."""
+
+    def Insert(self, request, context):  # type: ignore[no-untyped-def]
+        del request
+        context.abort(
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+            "allocation failed after mutation admission",
+        )
+
+
+class _IncompatibleProtocolService(_FakeGrpcService):
+    def Health(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Health(request, context)
+        response.protocol_major = 2
+        return response
+
+
 class _RunningGrpcServer:
-    def __init__(self) -> None:
-        self.service = _FakeGrpcService()
+    def __init__(self, service: _FakeGrpcService | None = None) -> None:
+        self.service = service if service is not None else _FakeGrpcService()
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         throwdb_pb2_grpc.add_ThrowDBServicer_to_server(
             self.service, self.server
@@ -307,10 +421,56 @@ def test_public_grpc_client_get_crud_scan_and_list(tmp_path: Path) -> None:
         assert collection.health() == {
             "serving": True,
             "protocol_major": 1,
-            "protocol_minor": 0,
+            "protocol_minor": 1,
         }
         assert collection.dimension == 5
         assert collection.dtype == "float16"
+        assert collection.reader is not None
+        assert collection.reader.as_dict() == {
+            "max_read_range_bytes": 1 << 20,
+            "max_gap_bytes": 0,
+            "io_workers": 0,
+            "io_queue_capacity": 0,
+            "io_ranges_per_task": 8,
+            "io_backend": "thread_pool",
+            "io_uring_queue_depth": 32,
+            "io_uring_workers": 1,
+        }
+        assert collection.tuning is not None
+        assert collection.tuning.mode == "auto"
+        assert collection.tuning.source == "fallback"
+        assert collection.tuning.status == "registry_missing"
+        assert collection.availability is not None
+        assert collection.availability.as_dict() == {
+            "max_concurrent_calls": 32,
+            "max_concurrent_scans": 2,
+            "max_unary_inflight_bytes": 256 << 20,
+            "max_scan_inflight_bytes": 128 << 20,
+            "max_grpc_memory_bytes": 512 << 20,
+            "scan_max_duration_millis": 3_600_000,
+            "scan_idle_timeout_millis": 60_000,
+            "shutdown_grace_millis": 30_000,
+            "shutdown_hard_timeout_millis": 60_000,
+        }
+        assert collection.admission_stats is not None
+        assert collection.admission_stats.as_dict() == {
+            "active_unary_calls": 1,
+            "active_scans": 1,
+            "unary_estimated_bytes": 1 << 20,
+            "scan_estimated_bytes": 2 << 20,
+            "admitted_unary_calls": 12,
+            "rejected_unary_calls": 3,
+            "admitted_scans": 4,
+            "rejected_scans": 2,
+            "admission_closed": False,
+            "draining": False,
+            "terminal_faulted": False,
+        }
+        assert collection.engine_stats is not None
+        assert collection.engine_stats.catalog_generation == 7
+        assert collection.engine_stats.committed_sequence == 11
+        assert collection.engine_stats.total_wal_bytes == 12288
+        assert collection.engine_stats.filesystem_available_bytes == 100 << 20
         assert collection.count == 3
 
         original = _vectors(3, 5, salt=1)
@@ -404,3 +564,50 @@ def test_http_proxy_requires_explicit_opt_in(
 def test_use_http_proxy_must_be_bool() -> None:
     with pytest.raises(TypeError, match="use_http_proxy must be a bool"):
         RemoteCollection.connect("localhost:1", use_http_proxy=1)  # type: ignore[arg-type]
+
+
+def test_resource_exhausted_mutation_is_ambiguous() -> None:
+    operation_id = uuid.UUID("12345678-1234-5678-9abc-def012345678")
+    with _RunningGrpcServer(
+        _ResourceExhaustedMutationService()
+    ) as server, RemoteCollection.connect(server.endpoint, timeout=2) as collection:
+        with pytest.raises(AmbiguousCommitError) as raised:
+            collection.insert(
+                [40],
+                _vectors(1, 5, salt=401),
+                operation_id=operation_id,
+            )
+
+    assert raised.value.operation_id == operation_id
+    assert raised.value.code == "RESOURCE_EXHAUSTED"
+
+
+def test_protocol_v1_server_without_tuning_diagnostics_is_compatible() -> None:
+    with _RunningGrpcServer(_OldGrpcService()) as server, RemoteCollection.connect(
+        server.endpoint,
+        timeout=2,
+    ) as collection:
+        assert collection.durable_idempotency is True
+        assert collection.idempotency_domain is None
+        assert collection.reader is None
+        assert collection.tuning is None
+        assert collection.availability is None
+        assert collection.admission_stats is None
+        assert collection.engine_stats is None
+        collection.insert([40], _vectors(1, 5, salt=404))
+        np.testing.assert_array_equal(
+            collection.get([40]),
+            _vectors(1, 5, salt=404),
+        )
+
+
+def test_protocol_v1_1_durable_server_without_replay_domain_is_rejected() -> None:
+    with _RunningGrpcServer(_MissingReplayDomainService()) as server:
+        with pytest.raises(RemoteProtocolError, match="omitted.*replay domain"):
+            RemoteCollection.connect(server.endpoint, timeout=2)
+
+
+def test_protocol_major_mismatch_fails_during_connect() -> None:
+    with _RunningGrpcServer(_IncompatibleProtocolService()) as server:
+        with pytest.raises(RemoteProtocolError, match="protocol major"):
+            RemoteCollection.connect(server.endpoint, timeout=2)

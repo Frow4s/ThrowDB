@@ -111,12 +111,117 @@ message CollectionSchema {
   uint32 dimension = 3;
 }
 
+enum ReaderBackend {
+  READER_BACKEND_UNSPECIFIED = 0;
+  READER_BACKEND_THREAD_POOL = 1;
+  READER_BACKEND_IO_URING = 2;
+}
+
+// The complete effective native reader configuration. These are the values
+// used by the C++ data plane after persisted selection and explicit overrides
+// have both been resolved by the one-shot startup control plane.
+message ReaderConfiguration {
+  uint64 max_read_range_bytes = 1;
+  uint64 max_gap_bytes = 2;
+  uint32 io_workers = 3;
+  uint32 io_queue_capacity = 4;
+  uint32 io_ranges_per_task = 5;
+  ReaderBackend io_backend = 6;
+  uint32 io_uring_queue_depth = 7;
+  uint32 io_uring_workers = 8;
+}
+
+message TuningSelection {
+  // auto, persisted, conservative, or the effective manual outcome produced
+  // when explicit reader options bypass the profile registry.
+  string mode = 1;
+  // persisted, fallback, or manual.
+  string source = 2;
+  // Stable machine-readable outcome such as selected, registry_missing, or
+  // explicit. No mode performs calibration during server startup.
+  string status = 3;
+  // exact, compatible, fallback, or manual.
+  string reuse_level = 4;
+  bool explicit_overrides = 5;
+}
+
+// Effective process-wide availability bounds. Unary and streaming memory are
+// intentionally disjoint so a slow ScanIds consumer cannot starve Get/CRUD.
+message AvailabilityConfiguration {
+  uint32 max_concurrent_calls = 1;
+  uint32 max_concurrent_scans = 2;
+  uint64 max_unary_inflight_bytes = 3;
+  uint64 max_scan_inflight_bytes = 4;
+  uint64 max_grpc_memory_bytes = 5;
+  uint32 scan_max_duration_millis = 6;
+  uint32 scan_idle_timeout_millis = 7;
+  uint32 shutdown_grace_millis = 8;
+  uint32 shutdown_hard_timeout_millis = 9;
+}
+
+// A point-in-time view of application-level admission. Counters cover only
+// requests that reached the admission gate; validation failures before that
+// point are reported as ordinary RPC errors and are not included here.
+message AdmissionStatistics {
+  uint32 active_unary_calls = 1;
+  uint32 active_scans = 2;
+  uint64 unary_estimated_bytes = 3;
+  uint64 scan_estimated_bytes = 4;
+  uint64 admitted_unary_calls = 5;
+  uint64 rejected_unary_calls = 6;
+  uint64 admitted_scans = 7;
+  uint64 rejected_scans = 8;
+  bool admission_closed = 9;
+  bool draining = 10;
+  bool terminal_faulted = 11;
+}
+
+// Bounded operational state needed by alerting and capacity automation. These
+// values are a point-in-time snapshot; counters may change immediately after
+// Describe returns.
+message EngineStatistics {
+  uint64 catalog_generation = 1;
+  uint64 committed_sequence = 2;
+  uint64 materialized_sequence = 3;
+  uint64 active_wal_bytes = 4;
+  uint64 active_wal_transactions = 5;
+  uint64 active_wal_operations = 6;
+  uint64 frozen_wal_count = 7;
+  uint64 frozen_wal_bytes = 8;
+  uint64 total_wal_bytes = 9;
+  uint64 total_wal_operations = 10;
+  uint64 overlay_entries = 11;
+  uint64 estimated_overlay_bytes = 12;
+  uint64 delta_run_count = 13;
+  uint64 total_delta_run_bytes = 14;
+  uint64 total_delta_segment_bytes = 15;
+  uint64 idempotency_journal_bytes = 16;
+  uint64 idempotency_completed_operations = 17;
+  uint64 idempotency_aborted_operations = 18;
+  uint64 idempotency_max_bytes = 19;
+  uint64 idempotency_max_operations = 20;
+  uint64 idempotency_generation = 21;
+  uint64 filesystem_available_bytes = 22;
+  uint64 mutation_disk_reserve_bytes = 23;
+  bool maintenance_active = 24;
+}
+
 message DescribeResponse {
   uint32 format_version = 1;
   CollectionSchema schema = 2;
   uint64 record_size = 3;
   uint64 count = 4;
   Capabilities capabilities = 5;
+  ReaderConfiguration reader = 6;
+  TuningSelection tuning = 7;
+  AvailabilityConfiguration availability = 8;
+  // Required when a protocol-minor >= 1 server advertises durable idempotency.
+  // Protocol v1.0 predates this field and may omit it during rolling upgrades.
+  // A v1.1+ journal checkpoint changes the domain so delayed retries from the
+  // previous replay history fail closed.
+  OperationId idempotency_domain = 9;
+  AdmissionStatistics admission_stats = 10;
+  EngineStatistics engine_stats = 11;
 }
 
 message GetRequest {
@@ -136,6 +241,9 @@ message MutationRequest {
   OperationId operation_id = 1;
   IdBatch ids = 2;
   EmbeddingBatch embeddings = 3;
+  // Must match Describe.idempotency_domain for a durable v1.1+ server. It is
+  // absent when talking to a legacy protocol-v1.0 server.
+  OperationId idempotency_domain = 4;
 }
 
 message MutationResponse {
@@ -146,6 +254,9 @@ message MutationResponse {
 message DeleteRequest {
   OperationId operation_id = 1;
   IdBatch ids = 2;
+  // Must match Describe.idempotency_domain for a durable v1.1+ server. It is
+  // absent when talking to a legacy protocol-v1.0 server.
+  OperationId idempotency_domain = 3;
 }
 
 message DeleteResponse {

@@ -31,7 +31,9 @@ def throwdb_server_binary(pytestconfig: pytest.Config) -> Path:
         candidates.append(Path(environment))
     repository = Path(__file__).resolve().parents[2]
     installed_binary = (
-        Path(throwdb.__file__).resolve().parent / "bin" / "throwdbd"
+        Path(throwdb.__file__).resolve().parent
+        / "libexec"
+        / "_throwdbd_native"
     )
     candidates.extend(
         [

@@ -16,6 +16,10 @@ option(
     THROWDB_GRPC_ENABLE_REFLECTION
     "Expose the gRPC server reflection service for grpcurl/diagnostics"
     ON)
+option(
+    THROWDB_PACKAGE_NATIVE_SERVER
+    "Install the gRPC daemon as an internal Python-package executable"
+    OFF)
 set(
     THROWDB_GRPC_PREFIX
     "$ENV{THROWDB_GRPC_PREFIX}"
@@ -199,7 +203,9 @@ if(THROWDB_BUILD_GRPC_SERVER)
         throwdb_grpc_proto PROPERTIES POSITION_INDEPENDENT_CODE ON)
     throwdb_enable_warnings(throwdb_grpc_proto)
 
-    add_library(throwdb_grpc_transport STATIC src/server/grpc_server.cpp)
+    add_library(throwdb_grpc_transport STATIC
+        src/server/grpc_admission.cpp
+        src/server/grpc_server.cpp)
     add_library(throwdb::grpc_transport ALIAS throwdb_grpc_transport)
     target_link_libraries(throwdb_grpc_transport
         PUBLIC throwdb::server
@@ -225,6 +231,12 @@ if(THROWDB_BUILD_GRPC_SERVER)
     # intentionally named throwdbd-tcp so clients cannot mistake its endpoint
     # for gRPC.
     add_executable(throwdbd src/server/grpc_main.cpp)
+    if(THROWDB_PACKAGE_NATIVE_SERVER)
+        # The wheel's PATH-level `throwdbd` is the one-shot Python resolver.
+        # A distinct internal filename prevents recursive launcher execution.
+        set_target_properties(
+            throwdbd PROPERTIES OUTPUT_NAME _throwdbd_native)
+    endif()
     target_link_libraries(throwdbd PRIVATE throwdb::grpc_transport)
     target_compile_features(throwdbd PRIVATE cxx_std_20)
     throwdb_enable_warnings(throwdbd)
@@ -538,6 +550,19 @@ if(THROWDB_BUILD_TESTS)
     endif()
 
     if(THROWDB_BUILD_GRPC_SERVER)
+        # A distinct, non-installed daemon carries deterministic subprocess
+        # lifecycle seams. The production throwdbd target never contains
+        # test-only environment variables or branches, even in test builds.
+        add_executable(
+            throwdbd_test_hooks src/server/grpc_main.cpp)
+        target_link_libraries(
+            throwdbd_test_hooks PRIVATE throwdb::grpc_transport)
+        target_compile_features(
+            throwdbd_test_hooks PRIVATE cxx_std_20)
+        target_compile_definitions(
+            throwdbd_test_hooks PRIVATE THROWDB_GRPC_TEST_HOOKS=1)
+        throwdb_enable_warnings(throwdbd_test_hooks)
+
         add_executable(
             throwdb_grpc_server_tests tests/grpc_server_tests.cpp)
         target_link_libraries(throwdb_grpc_server_tests
@@ -548,10 +573,27 @@ if(THROWDB_BUILD_TESTS)
             target_compile_definitions(throwdb_grpc_server_tests
                 PRIVATE THROWDB_TEST_GRPC_REFLECTION=1)
         endif()
+        target_compile_definitions(throwdb_grpc_server_tests
+            PRIVATE
+                THROWDB_TEST_GRPC_DAEMON_PATH="$<TARGET_FILE:throwdbd_test_hooks>")
+        add_dependencies(throwdb_grpc_server_tests throwdbd_test_hooks)
         throwdb_enable_warnings(throwdb_grpc_server_tests)
         add_test(
             NAME throwdb_grpc_server_tests
             COMMAND throwdb_grpc_server_tests)
+
+        add_executable(
+            throwdb_grpc_admission_tests tests/grpc_admission_tests.cpp)
+        target_link_libraries(throwdb_grpc_admission_tests
+            PRIVATE throwdb::grpc_transport)
+        target_include_directories(throwdb_grpc_admission_tests
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/server)
+        target_compile_features(
+            throwdb_grpc_admission_tests PRIVATE cxx_std_20)
+        throwdb_enable_warnings(throwdb_grpc_admission_tests)
+        add_test(
+            NAME throwdb_grpc_admission_tests
+            COMMAND throwdb_grpc_admission_tests)
     endif()
 endif()
 
@@ -582,14 +624,14 @@ if(THROWDB_INSTALL_CPP_SDK)
 endif()
 
 if(THROWDB_BUILD_GRPC_SERVER)
-    # scikit-build-core exposes the wheel scripts tree explicitly. Installing
-    # there makes `throwdbd` a real PATH command after pip install instead of
-    # hiding an executable inside site-packages. A standalone CMake install
-    # follows the usual GNU bin/share layout.
-    if(DEFINED SKBUILD_SCRIPTS_DIR AND DEFINED SKBUILD_PLATLIB_DIR)
+    # A wheel exposes a PATH-level Python launcher. The native process stays
+    # private and is only reached after tune resolution. Standalone CMake
+    # installs retain the conventional native bin/throwdbd entry point.
+    if(THROWDB_PACKAGE_NATIVE_SERVER AND DEFINED SKBUILD_PLATLIB_DIR)
         install(
             TARGETS throwdbd
-            RUNTIME DESTINATION "${SKBUILD_SCRIPTS_DIR}")
+            RUNTIME DESTINATION
+                "${SKBUILD_PLATLIB_DIR}/throwdb/libexec")
         install(
             FILES proto/throwdb/v1/throwdb.proto
             DESTINATION

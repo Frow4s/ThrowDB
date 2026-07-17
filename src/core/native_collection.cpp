@@ -13,6 +13,7 @@
 #include "native_collection_test_hooks.hpp"
 #include "partitioned_index_format.hpp"
 #include "partitioned_index_storage.hpp"
+#include "pending_mutation_fence.hpp"
 #include "partitioned_resource_inventory.hpp"
 #include "physical_reader.hpp"
 #include "wal_file.hpp"
@@ -34,6 +35,7 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -50,7 +52,30 @@ constexpr std::uint32_t kCatalogPublicNativeFormatVersion = 5;
 constexpr std::uint32_t kCurrentPublicNativeFormatVersion = 4;
 constexpr std::uint32_t kLegacyPublicNativeFormatVersion = 3;
 constexpr std::uint64_t kMaximumDeltaCompactionRuns = 64;
+// Keep the legacy flat-overlay estimate aligned with format 7. A node retains
+// the ID, optional version/RowRef, hash linkage, and bucket load; 64 bytes is a
+// deliberately conservative LP64 estimate rather than an allocator promise.
+constexpr std::uint64_t kEstimatedOverlayBytesPerEntry = 64;
 using SteadyClock = std::chrono::steady_clock;
+
+[[nodiscard]] std::uint64_t saturating_product(
+    const std::uint64_t left,
+    const std::uint64_t right) noexcept {
+    return left != 0
+                   && right > std::numeric_limits<std::uint64_t>::max() / left
+               ? std::numeric_limits<std::uint64_t>::max()
+               : left * right;
+}
+
+[[nodiscard]] std::uint64_t estimated_overlay_bytes(
+    const std::uint64_t entries) noexcept {
+    return saturating_product(entries, kEstimatedOverlayBytesPerEntry);
+}
+
+void ensure_lifecycle_not_fenced(const std::filesystem::path& root) {
+    detail::ensure_pending_mutation_fence_absent(
+        root, "destructive collection maintenance");
+}
 
 [[nodiscard]] double elapsed_seconds(
     const SteadyClock::time_point started) noexcept {
@@ -911,6 +936,12 @@ public:
         const std::span<NativeIdLocation> locations) {
         return scan_->read_into(ids, locations);
     }
+    [[nodiscard]] std::uint64_t read_into(
+        const std::span<std::uint64_t> ids,
+        const std::span<NativeIdLocation> locations,
+        const NativeIdScan::StopPredicate& stop_requested) {
+        return scan_->read_into(ids, locations, stop_requested);
+    }
     [[nodiscard]] bool done() const noexcept { return scan_->done(); }
 
 private:
@@ -926,9 +957,11 @@ public:
         const ReaderOptions& reader_options,
         const bool writable,
         const bool calibration,
+        const NativeOpenOptions& open_options,
         const SteadyClock::time_point open_started)
         : path_(std::move(path)),
           manifest_(read_manifest_timed(path_, open_stats_)),
+          open_options_(open_options),
           physical_reader_(reader_options),
           writer_lock_(detail::AdvisoryLockFile::open_existing(
               writer_lock_path(path_), writable || calibration)),
@@ -948,6 +981,10 @@ public:
             // handle remains read-only but owns the same exclusive lifecycle
             // lease for the duration of its stable snapshot.
             writer_lock_.lock(detail::FileLockMode::Exclusive, true);
+        }
+        if (writable_ && !open_options.allow_pending_mutation_recovery) {
+            detail::ensure_pending_mutation_fence_absent(
+                path_, "writable collection open");
         }
         detail::NativeIndexReadStats index_stats;
         auto phase_started = SteadyClock::now();
@@ -1005,12 +1042,14 @@ public:
         const ReaderOptions& reader_options,
         const bool writable,
         const bool calibration,
+        const NativeOpenOptions& open_options,
         PartitionedTag)
         : path_(std::move(path)),
           physical_reader_(reader_options),
           partitioned_reader_(
               std::make_unique<detail::PartitionedIndexReader>(
-                  path_, reader_options, writable, calibration)) {
+                  path_, reader_options, writable, calibration,
+                  open_options)) {
         open_stats_ = partitioned_reader_->open_stats();
     }
 
@@ -1135,12 +1174,12 @@ public:
     }
 
     [[nodiscard]] std::unique_ptr<detail::PartitionedIdScan>
-    scan_ids() const {
+    scan_ids(const std::uint64_t max_snapshot_bytes) const {
         if (partitioned_reader_ == nullptr) {
             throw InvalidArgumentError(
                 "physical ID scan requires a format-7 collection");
         }
-        return partitioned_reader_->scan_ids();
+        return partitioned_reader_->scan_ids(max_snapshot_bytes);
     }
 
     [[nodiscard]] std::vector<std::byte> get_bytes(
@@ -1243,6 +1282,7 @@ public:
         ensure_healthy();
         std::vector<bool> existed(ids.size(), false);
         std::uint64_t resulting_count = live_count_.load();
+        std::size_t additional_overlay_entries = 0;
         {
             std::unique_lock lock(state_mutex_);
             for (std::size_t index = 0; index != ids.size(); ++index) {
@@ -1259,24 +1299,11 @@ public:
                     }
                     ++resulting_count;
                 }
+                if (!overlay_.contains(ids[index])) {
+                    ++additional_overlay_entries;
+                }
             }
-        }
-
-        if (ids.size() > detail::RowRef::kMaximumRowsPerSegment
-                             - active_wal().payload_offsets.size()) {
-            if (!catalog_managed_ || !rotate_wal_locked()) {
-                throw InvalidArgumentError(
-                    "active WAL exceeds the 2^32 PUT-row limit");
-            }
-        }
-        const std::uint64_t original_wal_rows =
-            active_wal().payload_offsets.size();
-        {
-            std::unique_lock lock(state_mutex_);
-            prepare_publication_capacity(ids.size(), ids.size());
-            for (const std::uint64_t id : ids) {
-                prime_overlay_node_unlocked(id);
-            }
+            ensure_overlay_growth_unlocked(additional_overlay_entries);
         }
 
         std::vector<detail::WalMutation> operations;
@@ -1288,6 +1315,44 @@ public:
                     index * static_cast<std::size_t>(manifest_.record_size),
                     static_cast<std::size_t>(manifest_.record_size))});
         }
+
+        if (ids.size() > detail::RowRef::kMaximumRowsPerSegment
+                             - active_wal().payload_offsets.size()) {
+            if (!catalog_managed_) {
+                throw InvalidArgumentError(
+                    "active WAL exceeds the 2^32 PUT-row limit");
+            }
+            // The automatic rotation is a durable lifecycle write. Probe the
+            // exact first transaction size for a successor WAL and charge both
+            // it and the retained 4096-byte header before publishing anything.
+            ensure_wal_growth_locked(
+                detail::kWalFileHeaderSize,
+                static_cast<std::uint64_t>(operations.size()));
+            const detail::WalHeader probe_header = wal_header_for(
+                manifest_, make_uuid(), active_wal().entry.wal_id,
+                next_sequence_ - 1);
+            const detail::EncodedWalTransaction probe_transaction =
+                detail::encode_wal_transaction(
+                    probe_header, next_sequence_, detail::kWalFileHeaderSize,
+                    operations);
+            const std::uint64_t probe_bytes =
+                static_cast<std::uint64_t>(probe_transaction.bytes.size());
+            if (probe_bytes
+                > std::numeric_limits<std::uint64_t>::max()
+                      - detail::kWalFileHeaderSize) {
+                throw StorageError(
+                    "format-6 rotated WAL transaction size overflows uint64");
+            }
+            ensure_wal_growth_locked(
+                detail::kWalFileHeaderSize + probe_bytes,
+                static_cast<std::uint64_t>(operations.size()));
+            if (!rotate_wal_locked()) {
+                throw CorruptionError(
+                    "non-empty format-6 WAL rotation unexpectedly did not run");
+            }
+        }
+        const std::uint64_t original_wal_rows =
+            active_wal().payload_offsets.size();
         commit_operations(operations, original_wal_rows, resulting_count);
     }
 
@@ -1308,6 +1373,7 @@ public:
         std::vector<detail::WalMutation> operations;
         operations.reserve(ids.size());
         std::uint64_t resulting_count = live_count_.load();
+        std::size_t additional_overlay_entries = 0;
         {
             std::unique_lock lock(state_mutex_);
             for (std::size_t index = 0; index != ids.size(); ++index) {
@@ -1318,12 +1384,12 @@ public:
                 --resulting_count;
                 operations.push_back(detail::WalMutation{
                     ids[index], detail::WalOperationKind::Delete, {}});
-            }
-            if (!operations.empty()) {
-                prepare_publication_capacity(operations.size(), 0);
-                for (const detail::WalMutation& operation : operations) {
-                    prime_overlay_node_unlocked(operation.id);
+                if (!overlay_.contains(ids[index])) {
+                    ++additional_overlay_entries;
                 }
+            }
+            if (additional_overlay_entries != 0) {
+                ensure_overlay_growth_unlocked(additional_overlay_entries);
             }
         }
         if (operations.empty()) {
@@ -1376,6 +1442,7 @@ public:
 
     [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
         NativeOrphanCollectionOptions options) {
+        ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             options = normalized_orphan_options(options);
             return public_orphan_result(
@@ -1433,10 +1500,22 @@ public:
 
     [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
         const std::uint64_t max_wals,
-        const std::uint64_t max_input_bytes) {
+        const std::uint64_t max_input_bytes,
+        const std::uint64_t max_input_entries,
+        const std::uint64_t max_memory_bytes) {
+        ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->materialize_frozen_wals(
-                physical_reader_, max_wals, max_input_bytes);
+                physical_reader_, max_wals, max_input_bytes,
+                max_input_entries, max_memory_bytes);
+        }
+        if (max_input_entries
+                != std::numeric_limits<std::uint64_t>::max()
+            || max_memory_bytes
+                   != std::numeric_limits<std::uint64_t>::max()) {
+            throw InvalidArgumentError(
+                "entry and memory bounded WAL materialization requires a "
+                "format-7 collection");
         }
         ensure_mutable();
         if (max_wals == 0 || max_input_bytes == 0) {
@@ -1450,6 +1529,7 @@ public:
         detail::MutationDeltaBuildSpec build_spec;
         std::uint64_t reservation_generation = 0;
         std::uint64_t selected_input_bytes = 0;
+        std::uint64_t selected_input_operations = 0;
         {
             std::lock_guard mutation(mutation_mutex_);
             ensure_healthy();
@@ -1469,7 +1549,16 @@ public:
                 if (bytes > max_input_bytes - selected_input_bytes) {
                     break;
                 }
+                const std::uint64_t operations =
+                    wal_resources_->sources[frozen_count]->operation_count;
+                if (operations
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - selected_input_operations) {
+                    throw CorruptionError(
+                        "materialized WAL operation count overflows uint64");
+                }
                 selected_input_bytes += bytes;
+                selected_input_operations += operations;
                 ++frozen_count;
             }
             if (frozen_count == 0) {
@@ -1586,7 +1675,9 @@ public:
                 || scan.ignored_tail_bytes != 0
                 || scan.next_sequence == 0
                 || scan.next_sequence - 1 != entry.last_sequence
-                || put_index != entry.put_count) {
+                || put_index != entry.put_count
+                || scan.committed_operation_count
+                       != source->operation_count) {
                 throw CorruptionError(
                     "frozen WAL changed during materialization");
             }
@@ -1809,13 +1900,14 @@ public:
             false, true, reclaimed_wal_count, reclaimed_wal_bytes,
             reclamation_complete,
             static_cast<std::uint64_t>(selected_wals.size()),
-            selected_input_bytes, false);
+            selected_input_bytes, false, selected_input_operations);
     }
 
     [[nodiscard]] NativeMutationLogStats compact_delta_runs(
         const std::uint64_t max_runs,
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
+        ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->fold_partitions(
                 max_runs, max_input_bytes, max_input_entries);
@@ -2295,6 +2387,9 @@ public:
             throw InvalidArgumentError(
                 "selective segment cleaning requires a format-7 collection");
         }
+        if (!options.dry_run) {
+            ensure_lifecycle_not_fenced(path_);
+        }
         return partitioned_reader_->clean_segments(
             physical_reader_, options);
     }
@@ -2397,6 +2492,7 @@ private:
         std::vector<std::uint64_t> payload_offsets;
         std::uint64_t valid_end{detail::kWalFileHeaderSize};
         std::uint64_t next_sequence{1};
+        std::uint64_t operation_count{0};
     };
 
     struct DeltaSource {
@@ -2570,6 +2666,8 @@ private:
 
     void open_mutation_logs() {
         wal_resources_ = std::make_shared<WalResourceSet>();
+        std::uint64_t replayed_wal_bytes = 0;
+        std::uint64_t replayed_wal_operations = 0;
         if (catalog_managed_) {
             catalog_ = detail::read_current_mutation_catalog(path_, manifest_);
             if (!delta_managed_ && !catalog_.delta_entries.empty()) {
@@ -2588,7 +2686,8 @@ private:
             wal_resources_->source_indices.reserve(
                 catalog_.wal_entries.size());
             for (const detail::MutationWalEntry& entry : catalog_.wal_entries) {
-                open_catalog_wal(entry);
+                open_catalog_wal(
+                    entry, replayed_wal_bytes, replayed_wal_operations);
             }
         } else {
             detail::MutationWalEntry entry;
@@ -2598,7 +2697,8 @@ private:
             entry.previous_sequence = 0;
             entry.first_sequence = 1;
             open_wal_source(
-                entry, detail::native_active_wal_path(path_), true);
+                entry, detail::native_active_wal_path(path_), true,
+                replayed_wal_bytes, replayed_wal_operations);
         }
 
         if (wal_resources_->sources.empty()
@@ -2614,6 +2714,17 @@ private:
 
     void open_delta_source(
         const detail::MutationDeltaDescriptor& descriptor) {
+        // open_mutation_delta() allocates one decoded record vector before we
+        // can collapse it into the retained overlay. Bound that temporary by
+        // the same conservative per-entry budget as the resulting overlay.
+        if (descriptor.entry_count > open_options_.max_overlay_entries
+            || estimated_overlay_bytes(descriptor.entry_count)
+                   > open_options_.max_overlay_bytes) {
+            throw StorageError(
+                "format-6 mutation delta exceeds the configured open "
+                "memory limit before replay; run bounded offline "
+                "maintenance or raise the explicit limit");
+        }
         detail::OpenMutationDelta opened = detail::open_mutation_delta(
             path_, manifest_, descriptor);
         auto source = std::make_shared<DeltaSource>();
@@ -2636,16 +2747,22 @@ private:
         }
     }
 
-    void open_catalog_wal(const detail::MutationWalEntry& entry) {
+    void open_catalog_wal(
+        const detail::MutationWalEntry& entry,
+        std::uint64_t& replayed_wal_bytes,
+        std::uint64_t& replayed_wal_operations) {
         open_wal_source(
             entry, detail::mutation_wal_path(path_, entry.wal_id),
-            entry.state == detail::MutationWalState::Active);
+            entry.state == detail::MutationWalState::Active,
+            replayed_wal_bytes, replayed_wal_operations);
     }
 
     void open_wal_source(
         const detail::MutationWalEntry& entry,
         const std::filesystem::path& wal_path,
-        const bool active) {
+        const bool active,
+        std::uint64_t& replayed_wal_bytes,
+        std::uint64_t& replayed_wal_operations) {
         auto source = std::make_shared<WalSource>();
         source->entry = entry;
         source->header = wal_header_for(
@@ -2656,14 +2773,24 @@ private:
                          ? detail::open_read_write(wal_path)
                          : detail::open_read_only(wal_path);
 
+        const std::uint64_t source_file_size = detail::file_size(
+            source->fd.get(), source->path);
         if (!active) {
-            const std::uint64_t actual_size = detail::file_size(
-                source->fd.get(), source->path);
-            if (actual_size != entry.sealed_file_size) {
+            if (source_file_size != entry.sealed_file_size) {
                 throw CorruptionError(
                     "frozen WAL size does not match its catalog entry");
             }
         }
+        if (source_file_size
+            > open_options_.max_wal_bytes - replayed_wal_bytes) {
+            throw StorageError(
+                "format-6 WAL backlog exceeds the configured open byte "
+                "limit; run bounded offline maintenance or raise the "
+                "explicit limit");
+        }
+        replayed_wal_bytes += source_file_size;
+        const std::uint64_t remaining_operations =
+            open_options_.max_wal_operations - replayed_wal_operations;
 
         const detail::ExpectedWalIdentity expected =
             detail::ExpectedWalIdentity::from_trusted_header(source->header);
@@ -2673,9 +2800,12 @@ private:
                    : detail::WalScanMode::Frozen,
             [this, &source](const detail::RecoveredWalBatch& batch) {
                 apply_recovered_batch(*source, batch);
-            });
+            },
+            detail::WalScanLimits{remaining_operations});
         source->valid_end = scan.valid_end;
         source->next_sequence = scan.next_sequence;
+        source->operation_count = scan.committed_operation_count;
+        replayed_wal_operations += scan.committed_operation_count;
 
         if (!active) {
             if (scan.ignored_tail_bytes != 0
@@ -2784,6 +2914,75 @@ private:
             output_index};
     }
 
+    void ensure_overlay_growth_unlocked(
+        const std::size_t additional_entries) const {
+        if (additional_entries
+            > std::numeric_limits<std::size_t>::max() - overlay_.size()) {
+            throw InvalidArgumentError("mutation overlay size overflows");
+        }
+        const std::size_t prospective =
+            overlay_.size() + additional_entries;
+        if (prospective > open_options_.max_overlay_entries
+            || estimated_overlay_bytes(
+                   static_cast<std::uint64_t>(prospective))
+                   > open_options_.max_overlay_bytes) {
+            throw StorageError(
+                "format-6 mutation overlay exceeds the configured memory "
+                "limit; run bounded maintenance or raise the explicit "
+                "limit");
+        }
+    }
+
+    [[nodiscard]] std::uint64_t total_wal_bytes_locked() const {
+        std::uint64_t total = 0;
+        for (const auto& source : wal_resources_->sources) {
+            if (source->valid_end
+                > std::numeric_limits<std::uint64_t>::max() - total) {
+                throw StorageError(
+                    "format-6 retained WAL byte count overflows uint64");
+            }
+            total += source->valid_end;
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t total_wal_operations_locked() const {
+        std::uint64_t total = 0;
+        for (const auto& source : wal_resources_->sources) {
+            if (source->operation_count
+                > std::numeric_limits<std::uint64_t>::max() - total) {
+                throw StorageError(
+                    "format-6 retained WAL operation count overflows uint64");
+            }
+            total += source->operation_count;
+        }
+        return total;
+    }
+
+    void ensure_wal_growth_locked(
+        const std::uint64_t additional_bytes,
+        const std::uint64_t additional_operations) const {
+        const std::uint64_t current_bytes = total_wal_bytes_locked();
+        if (current_bytes > open_options_.max_wal_bytes
+            || additional_bytes
+                   > open_options_.max_wal_bytes - current_bytes) {
+            throw StorageError(
+                "format-6 mutation would exceed the configured total WAL "
+                "byte limit before durable append; run bounded maintenance "
+                "or raise the explicit limit");
+        }
+        const std::uint64_t current_operations =
+            total_wal_operations_locked();
+        if (current_operations > open_options_.max_wal_operations
+            || additional_operations
+                   > open_options_.max_wal_operations - current_operations) {
+            throw StorageError(
+                "format-6 mutation would exceed the configured total WAL "
+                "operation limit before durable append; run bounded "
+                "maintenance or raise the explicit limit");
+        }
+    }
+
     void apply_recovered_delta(
         const detail::MutationDeltaVersionRecord& record) {
         const auto existing = overlay_.find(record.id);
@@ -2791,6 +2990,9 @@ private:
             && existing->second->sequence() >= record.value.sequence()) {
             throw CorruptionError(
                 "mutation delta versions are not strictly chronological");
+        }
+        if (existing == overlay_.end()) {
+            ensure_overlay_growth_unlocked(1);
         }
         const bool existed =
             existing != overlay_.end() && existing->second.has_value()
@@ -2813,6 +3015,9 @@ private:
                 && prior->second->sequence() >= batch.sequence) {
                 throw CorruptionError(
                     "WAL versions are not strictly chronological");
+            }
+            if (prior == overlay_.end()) {
+                ensure_overlay_growth_unlocked(1);
             }
             const bool existed = [&] {
                 const auto overlay = overlay_.find(operation.id);
@@ -2858,7 +3063,8 @@ private:
         const bool reclamation_complete = true,
         const std::uint64_t materialized_wal_count = 0,
         const std::uint64_t materialized_wal_input_bytes = 0,
-        const bool materialization_budget_blocked = false) const {
+        const bool materialization_budget_blocked = false,
+        const std::uint64_t materialized_wal_input_entries = 0) const {
         NativeMutationLogStats stats;
         stats.catalog_managed = catalog_managed_;
         stats.delta_managed = delta_managed_;
@@ -2868,8 +3074,13 @@ private:
             catalog_managed_ ? catalog_.materialized_sequence : 0;
         stats.active_wal_bytes = append_offset_;
         stats.active_wal_put_rows = active_wal().payload_offsets.size();
+        stats.active_wal_operation_count = active_wal().operation_count;
         stats.active_wal_transaction_count =
             next_sequence_ - active_wal().header.first_sequence;
+        stats.overlay_entry_count =
+            static_cast<std::uint64_t>(overlay_.size());
+        stats.estimated_overlay_bytes =
+            estimated_overlay_bytes(stats.overlay_entry_count);
         stats.rotated = rotated;
         stats.materialized = materialized;
         stats.reclaimed_wal_count = reclaimed_wal_count;
@@ -2877,19 +3088,37 @@ private:
         stats.materialized_wal_count = materialized_wal_count;
         stats.materialized_wal_input_bytes =
             materialized_wal_input_bytes;
+        stats.materialized_wal_input_entries =
+            materialized_wal_input_entries;
         stats.materialization_budget_blocked =
             materialization_budget_blocked;
         stats.reclamation_complete = reclamation_complete;
         for (const auto& source : wal_resources_->sources) {
             if (source->entry.state == detail::MutationWalState::Frozen) {
                 ++stats.frozen_wal_count;
+                if (stats.frozen_wal_bytes
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - source->valid_end
+                    || stats.frozen_wal_operation_count
+                           > std::numeric_limits<std::uint64_t>::max()
+                                 - source->operation_count) {
+                    throw CorruptionError(
+                        "frozen mutation WAL statistics overflow uint64");
+                }
+                stats.frozen_wal_bytes += source->valid_end;
+                stats.frozen_wal_operation_count += source->operation_count;
             }
             if (stats.total_wal_bytes
                 > std::numeric_limits<std::uint64_t>::max()
-                      - source->valid_end) {
-                throw CorruptionError("mutation WAL byte count overflows uint64");
+                      - source->valid_end
+                || stats.total_wal_operation_count
+                       > std::numeric_limits<std::uint64_t>::max()
+                             - source->operation_count) {
+                throw CorruptionError(
+                    "mutation WAL statistics overflow uint64");
             }
             stats.total_wal_bytes += source->valid_end;
+            stats.total_wal_operation_count += source->operation_count;
         }
         for (const auto& source : wal_resources_->delta_sources) {
             ++stats.delta_run_count;
@@ -2937,6 +3166,9 @@ private:
         if (next_sequence_ == old_active.header.first_sequence) {
             return false;
         }
+        // Rotation retains the frozen predecessor and adds one complete WAL
+        // header. Account for that durable growth before creating the file.
+        ensure_wal_growth_locked(detail::kWalFileHeaderSize, 0);
         if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
             throw StorageError("mutation catalog generation is exhausted");
         }
@@ -3080,10 +3312,26 @@ private:
         const std::span<const detail::WalMutation> operations,
         const std::uint64_t original_wal_rows,
         const std::uint64_t resulting_count) {
+        if (next_sequence_
+            > detail::VersionedMutationValue::kMaximumCommitSequence) {
+            throw StorageError("mutation commit sequence space is exhausted");
+        }
         WalSource& active = active_wal();
+        const std::uint64_t operation_count =
+            static_cast<std::uint64_t>(operations.size());
+        if (operation_count
+            > std::numeric_limits<std::uint64_t>::max()
+                  - active.operation_count) {
+            throw StorageError("active WAL operation count overflows uint64");
+        }
+        const std::uint64_t new_operation_count =
+            active.operation_count + operation_count;
         const detail::EncodedWalTransaction transaction =
             detail::encode_wal_transaction(
                 active.header, next_sequence_, append_offset_, operations);
+        ensure_wal_growth_locked(
+            static_cast<std::uint64_t>(transaction.bytes.size()),
+            operation_count);
         const std::uint64_t relative_payload_offset = detail::get_u64(
             std::span<const std::byte>(transaction.bytes), 64);
         std::uint64_t payload_cursor = append_offset_ + relative_payload_offset;
@@ -3094,6 +3342,25 @@ private:
             if (operation.kind == detail::WalOperationKind::Put) {
                 put_offsets.push_back(payload_cursor);
                 payload_cursor += manifest_.record_size;
+            }
+        }
+
+        // Exact backlog limits are known before publication nodes are added.
+        // Reserve and prime every node before the durable append so the
+        // acknowledged transaction can be installed without allocation.
+        {
+            std::unique_lock lock(state_mutex_);
+            std::size_t additional_overlay_entries = 0;
+            for (const detail::WalMutation& operation : operations) {
+                if (!overlay_.contains(operation.id)) {
+                    ++additional_overlay_entries;
+                }
+            }
+            ensure_overlay_growth_unlocked(additional_overlay_entries);
+            prepare_publication_capacity(
+                additional_overlay_entries, put_offsets.size());
+            for (const detail::WalMutation& operation : operations) {
+                prime_overlay_node_unlocked(operation.id);
             }
         }
 
@@ -3131,6 +3398,7 @@ private:
                 ++next_sequence_;
                 active.valid_end = append_offset_;
                 active.next_sequence = next_sequence_;
+                active.operation_count = new_operation_count;
                 // Publish only after every overlay and WAL RowRef update is
                 // complete. A reader that still observes false is concurrent
                 // with this first commit and may linearize immediately before
@@ -3150,6 +3418,7 @@ private:
     std::filesystem::path path_;
     NativeOpenStats open_stats_;
     detail::NativeManifest manifest_;
+    NativeOpenOptions open_options_;
     detail::IndexData index_;
     detail::PhysicalReader physical_reader_;
     std::unique_ptr<detail::PartitionedIndexReader> partitioned_reader_;
@@ -3461,6 +3730,7 @@ NativeOrphanCollectionResult NativeCollection::reclaim_orphans(
             writer_lock_path(path), true);
     detail::ScopedAdvisoryLock writer_lease(
         writer, detail::FileLockMode::Exclusive, true);
+    ensure_lifecycle_not_fenced(path);
     if (detail::is_partitioned_index_store(path)) {
         detail::AdvisoryLockFile commit =
             detail::AdvisoryLockFile::open_existing(
@@ -3508,13 +3778,21 @@ std::unique_ptr<NativeCollection> NativeCollection::open(
     const std::filesystem::path& path,
     const ReaderOptions reader_options,
     const bool writable,
-    const bool calibration) {
+    const bool calibration,
+    const NativeOpenOptions open_options) {
     if (path.empty()) {
         throw InvalidArgumentError("storage path must not be empty");
     }
     if (writable && calibration) {
         throw InvalidArgumentError(
             "calibration handles must be read-only");
+    }
+    if (open_options.max_wal_bytes == 0
+        || open_options.max_wal_operations == 0
+        || open_options.max_overlay_entries == 0
+        || open_options.max_overlay_bytes == 0) {
+        throw InvalidArgumentError(
+            "native mutable-open safety limits must be positive");
     }
     if (std::endian::native != std::endian::little) {
         throw InvalidArgumentError(
@@ -3524,11 +3802,13 @@ std::unique_ptr<NativeCollection> NativeCollection::open(
         return std::unique_ptr<NativeCollection>(new NativeCollection(
             std::make_unique<Impl>(
                 path, reader_options, writable, calibration,
+                open_options,
                 Impl::PartitionedTag{})));
     }
     return std::unique_ptr<NativeCollection>(new NativeCollection(
         std::make_unique<Impl>(
             path, reader_options, writable, calibration,
+            open_options,
             SteadyClock::now())));
 }
 
@@ -3551,6 +3831,12 @@ std::uint64_t NativeIdScan::read_into(
     const std::span<std::uint64_t> ids,
     const std::span<NativeIdLocation> locations) {
     return impl_->read_into(ids, locations);
+}
+std::uint64_t NativeIdScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<NativeIdLocation> locations,
+    const StopPredicate& stop_requested) {
+    return impl_->read_into(ids, locations, stop_requested);
 }
 bool NativeIdScan::done() const noexcept { return impl_->done(); }
 
@@ -3602,9 +3888,11 @@ NativeIdSample NativeCollection::sample_ids(
     const std::uint64_t max_inspected_slots) const {
     return impl_->sample_ids(requested, seed, max_inspected_slots);
 }
-std::unique_ptr<NativeIdScan> NativeCollection::scan_ids() const {
+std::unique_ptr<NativeIdScan> NativeCollection::scan_ids(
+    const std::uint64_t max_snapshot_bytes) const {
     return std::unique_ptr<NativeIdScan>(new NativeIdScan(
-        std::make_unique<NativeIdScan::Impl>(impl_->scan_ids())));
+        std::make_unique<NativeIdScan::Impl>(
+            impl_->scan_ids(max_snapshot_bytes))));
 }
 std::vector<std::byte> NativeCollection::get_bytes(
     const std::span<const std::uint64_t> ids) const {
@@ -3649,8 +3937,11 @@ NativeMutationLogStats NativeCollection::rotate_wal() {
 }
 NativeMutationLogStats NativeCollection::materialize_frozen_wals(
     const std::uint64_t max_wals,
-    const std::uint64_t max_input_bytes) {
-    return impl_->materialize_frozen_wals(max_wals, max_input_bytes);
+    const std::uint64_t max_input_bytes,
+    const std::uint64_t max_input_entries,
+    const std::uint64_t max_memory_bytes) {
+    return impl_->materialize_frozen_wals(
+        max_wals, max_input_bytes, max_input_entries, max_memory_bytes);
 }
 NativeMutationLogStats NativeCollection::compact_delta_runs() {
     constexpr std::uint64_t format6_default_max_runs = 8;

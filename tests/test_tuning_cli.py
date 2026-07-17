@@ -379,6 +379,8 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
     assert defaults.max_actions == 5
     assert defaults.compact_min_runs is None
     assert defaults.compact_max_runs is None
+    assert defaults.materialize_max_input_entries is None
+    assert defaults.materialize_max_memory_bytes is None
     limits = parser.parse_args(
         [
             "maintain", "--storage", "/tmp/store", "--dry-run",
@@ -425,6 +427,8 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
             "--rotate-wal-bytes", "10",
             "--materialize-max-wals", "3",
             "--materialize-max-input-bytes", "20",
+            "--materialize-max-input-entries", "21",
+            "--materialize-max-memory-bytes", "22",
             "--compact-min-runs", "4", "--compact-max-runs", "5",
             "--compact-max-input-bytes", "30",
             "--compact-max-input-entries", "40",
@@ -450,6 +454,8 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
         "rotate_wal_bytes": 10,
         "materialize_max_wals": 3,
         "materialize_max_input_bytes": 20,
+        "materialize_max_input_entries": 21,
+        "materialize_max_memory_bytes": 22,
         "compact_min_runs": 4,
         "compact_max_runs": 5,
         "compact_max_input_bytes": 30,

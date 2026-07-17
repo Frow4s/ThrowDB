@@ -71,7 +71,13 @@ _DEFAULT_MAINTAIN_MAX_ACTIONS: Final = 5
 _DEFAULT_MAINTAIN_ROTATE_WAL_BYTES: Final = 1 << 30
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS: Final = 8
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES: Final = 8 << 30
+_DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES: Final = 2_000_000
+_DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES: Final = 1 << 30
 _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS: Final = 8
+_DEFAULT_MAX_WAL_BACKLOG_BYTES: Final = 16 << 30
+_DEFAULT_MAX_WAL_BACKLOG_OPERATIONS: Final = 4_000_000
+_DEFAULT_MAX_OVERLAY_ENTRIES: Final = 4_000_000
+_DEFAULT_MAX_OVERLAY_MEMORY_BYTES: Final = 256 << 20
 
 _ORPHAN_INVENTORY_CLASS_NAMES: Final = (
     "reachable",
@@ -1609,6 +1615,10 @@ class Collection:
         mode: str = "r",
         tuning: str | Mapping[str, object] = "auto",
         verify_index: bool = False,
+        max_wal_backlog_bytes: int = _DEFAULT_MAX_WAL_BACKLOG_BYTES,
+        max_wal_backlog_operations: int = _DEFAULT_MAX_WAL_BACKLOG_OPERATIONS,
+        max_overlay_entries: int = _DEFAULT_MAX_OVERLAY_ENTRIES,
+        max_overlay_memory_bytes: int = _DEFAULT_MAX_OVERLAY_MEMORY_BYTES,
     ) -> Collection:
         if not isinstance(mode, str):
             raise TypeError("mode must be a string")
@@ -1616,12 +1626,28 @@ class Collection:
             raise ValueError("mode must be 'r' or 'r+'")
         if not isinstance(verify_index, bool):
             raise TypeError("verify_index must be a bool")
+        open_bounds = {
+            "max_wal_bytes": _validate_delta_compaction_limit(
+                max_wal_backlog_bytes, name="max_wal_backlog_bytes"
+            ),
+            "max_wal_operations": _validate_delta_compaction_limit(
+                max_wal_backlog_operations,
+                name="max_wal_backlog_operations",
+            ),
+            "max_overlay_entries": _validate_delta_compaction_limit(
+                max_overlay_entries, name="max_overlay_entries"
+            ),
+            "max_overlay_bytes": _validate_delta_compaction_limit(
+                max_overlay_memory_bytes, name="max_overlay_memory_bytes"
+            ),
+        }
         options, profile = _resolve_tuning(path, tuning)
         try:
             native = NativeCollection.open(
                 path,
                 mode=mode,
                 verify_native_index=verify_index,
+                **open_bounds,
                 **options,
             )
         except ReaderBackendError as error:
@@ -1654,6 +1680,7 @@ class Collection:
                 path,
                 mode=mode,
                 verify_native_index=verify_index,
+                **open_bounds,
             )
         schema = CollectionSchema(
             id_type="uint64",
@@ -2885,6 +2912,8 @@ class Collection:
         *,
         max_wals: int | None = None,
         max_input_bytes: int | None = None,
+        max_input_entries: int | None = None,
+        max_memory_bytes: int | None = None,
     ) -> dict[str, object]:
         """Replace the frozen WAL prefix with an immutable delta run.
 
@@ -2907,9 +2936,25 @@ class Collection:
                 max_input_bytes, name="max_input_bytes"
             )
         )
+        validated_max_input_entries = (
+            _UINT64_MAX
+            if max_input_entries is None
+            else _validate_delta_compaction_limit(
+                max_input_entries, name="max_input_entries"
+            )
+        )
+        validated_max_memory_bytes = (
+            _UINT64_MAX
+            if max_memory_bytes is None
+            else _validate_delta_compaction_limit(
+                max_memory_bytes, name="max_memory_bytes"
+            )
+        )
         stats = native.materialize_frozen_wals(
             validated_max_wals,
             validated_max_input_bytes,
+            validated_max_input_entries,
+            validated_max_memory_bytes,
         )
         if not isinstance(stats, dict):
             raise RuntimeError(
@@ -3021,6 +3066,8 @@ class Collection:
         materialize_max_input_bytes: int = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES
         ),
+        materialize_max_input_entries: int | None = None,
+        materialize_max_memory_bytes: int | None = None,
         compact_min_runs: int | None = None,
         compact_max_runs: int | None = None,
         compact_max_input_bytes: int = (
@@ -3078,6 +3125,36 @@ class Collection:
         validated_materialize_bytes = _validate_delta_compaction_limit(
             materialize_max_input_bytes,
             name="materialize_max_input_bytes",
+        )
+        if self._format_version != 7 and (
+            materialize_max_input_entries is not None
+            or materialize_max_memory_bytes is not None
+        ):
+            raise ValueError(
+                "materialize entry and memory budgets require a format-7 "
+                "collection"
+            )
+        validated_materialize_entries = (
+            _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES
+            if self._format_version == 7
+            and materialize_max_input_entries is None
+            else _UINT64_MAX
+            if materialize_max_input_entries is None
+            else _validate_delta_compaction_limit(
+                materialize_max_input_entries,
+                name="materialize_max_input_entries",
+            )
+        )
+        validated_materialize_memory = (
+            _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES
+            if self._format_version == 7
+            and materialize_max_memory_bytes is None
+            else _UINT64_MAX
+            if materialize_max_memory_bytes is None
+            else _validate_delta_compaction_limit(
+                materialize_max_memory_bytes,
+                name="materialize_max_memory_bytes",
+            )
         )
         validated_compact_min_runs = _validate_delta_compaction_limit(
             (
@@ -3166,6 +3243,8 @@ class Collection:
             "rotate_wal_bytes": validated_rotate_bytes,
             "materialize_max_wals": validated_materialize_wals,
             "materialize_max_input_bytes": validated_materialize_bytes,
+            "materialize_max_input_entries": validated_materialize_entries,
+            "materialize_max_memory_bytes": validated_materialize_memory,
             "compact_min_runs": validated_compact_min_runs,
             "compact_max_runs": validated_compact_max_runs,
             "compact_max_input_bytes": validated_compact_bytes,
@@ -3270,6 +3349,8 @@ class Collection:
             result = self.materialize_frozen_wals(
                 max_wals=validated_materialize_wals,
                 max_input_bytes=validated_materialize_bytes,
+                max_input_entries=validated_materialize_entries,
+                max_memory_bytes=validated_materialize_memory,
             )
             performed = bool(result.get("materialized"))
             actions_performed += int(performed)

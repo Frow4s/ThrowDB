@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import throwdb
 
@@ -102,6 +103,16 @@ def test_maintain_executes_rotate_then_bounded_materialization(
     assert collect["attempted"] is True
     assert report["after"]["frozen_wal_count"] == 0
     assert report["after"]["delta_run_count"] == 1
+
+
+def test_format6_maintain_rejects_format7_only_materialization_bounds(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "format6-materialization-bounds"
+    _build(store)
+    with throwdb.Collection.open(store, mode="r+") as collection:
+        with pytest.raises(ValueError, match="require a format-7 collection"):
+            collection.maintain(materialize_max_input_entries=10)
 
 
 def test_maintain_hard_action_and_cooperative_time_budgets(

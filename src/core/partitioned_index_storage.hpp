@@ -26,7 +26,8 @@ public:
         const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t read_into(
         std::span<std::uint64_t> ids,
-        std::span<NativeIdLocation> locations) = 0;
+        std::span<NativeIdLocation> locations,
+        const NativeIdScan::StopPredicate& stop_requested) = 0;
     [[nodiscard]] virtual bool done() const noexcept = 0;
 };
 
@@ -46,6 +47,10 @@ public:
     [[nodiscard]] std::uint64_t read_into(
         std::span<std::uint64_t> ids,
         std::span<NativeIdLocation> locations = {});
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<NativeIdLocation> locations,
+        const NativeIdScan::StopPredicate& stop_requested);
     [[nodiscard]] bool done() const noexcept;
 
 private:
@@ -95,7 +100,8 @@ public:
         std::filesystem::path store_path,
         const ReaderOptions& reader_options,
         bool writable,
-        bool calibration = false);
+        bool calibration = false,
+        NativeOpenOptions open_options = {});
     ~PartitionedIndexReader();
 
     PartitionedIndexReader(const PartitionedIndexReader&) = delete;
@@ -113,7 +119,8 @@ public:
         std::uint64_t requested,
         std::uint64_t seed,
         std::uint64_t max_inspected_slots) const;
-    [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids() const;
+    [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids(
+        std::uint64_t max_snapshot_bytes) const;
     [[nodiscard]] std::vector<std::uint8_t> contains(
         std::span<const std::uint64_t> ids) const;
     [[nodiscard]] NativeCollectionIdentity identity() const;
@@ -131,7 +138,9 @@ public:
     [[nodiscard]] NativeMutationLogStats materialize_frozen_wals(
         const PhysicalReader& physical_reader,
         std::uint64_t max_wals,
-        std::uint64_t max_input_bytes);
+        std::uint64_t max_input_bytes,
+        std::uint64_t max_input_entries,
+        std::uint64_t max_memory_bytes);
     [[nodiscard]] NativeMutationLogStats fold_partitions(
         std::uint64_t max_runs,
         std::uint64_t max_input_bytes,

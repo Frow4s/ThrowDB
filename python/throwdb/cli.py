@@ -15,6 +15,8 @@ import numpy as np
 from ._calibration import CalibrationError
 from ._tuning import TuningRegistryError
 from .collection import Collection, CollectionSchema, _normalize_numeric_ids
+from .s3_backup import S3BackupError, backup_to_s3, restore_from_s3
+from .server import add_server_arguments, run_server
 
 
 DEFAULT_SHARD_SIZE_GIB = 16
@@ -38,6 +40,8 @@ DEFAULT_MAINTAIN_MAX_ACTIONS = 5
 DEFAULT_MAINTAIN_ROTATE_WAL_BYTES = 1 << 30
 DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS = 8
 DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES = 8 << 30
+DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES = 2_000_000
+DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES = 1 << 30
 MAX_IO_RANGES_PER_TASK = 1 << 20
 MAX_IO_URING_WORKERS = 64
 MAX_IO_URING_QUEUE_DEPTH = 4096
@@ -271,6 +275,8 @@ def _materialize(args: argparse.Namespace) -> None:
                 collection.materialize_frozen_wals(
                     max_wals=args.max_wals,
                     max_input_bytes=args.max_input_bytes,
+                    max_input_entries=args.max_input_entries,
+                    max_memory_bytes=args.max_memory_bytes,
                 ),
                 indent=2,
                 sort_keys=True,
@@ -342,6 +348,10 @@ def _maintain(args: argparse.Namespace) -> None:
             rotate_wal_bytes=args.rotate_wal_bytes,
             materialize_max_wals=args.materialize_max_wals,
             materialize_max_input_bytes=args.materialize_max_input_bytes,
+            materialize_max_input_entries=(
+                args.materialize_max_input_entries
+            ),
+            materialize_max_memory_bytes=args.materialize_max_memory_bytes,
             compact_min_runs=args.compact_min_runs,
             compact_max_runs=args.compact_max_runs,
             compact_max_input_bytes=args.compact_max_input_bytes,
@@ -481,6 +491,36 @@ def _reader_tuning(
             )
         return options
     return mode
+
+
+def _serve(args: argparse.Namespace) -> None:
+    run_server(args)
+
+
+def _backup_s3(args: argparse.Namespace) -> None:
+    report = backup_to_s3(
+        args.storage,
+        args.destination,
+        aws_executable=args.aws_executable,
+        dry_run=args.dry_run,
+        unsafe_allow_unversioned=args.unsafe_allow_unversioned,
+        if_older_than_hours=args.if_older_than_hours,
+        metadata_timeout_seconds=args.metadata_timeout_seconds,
+        max_seconds=args.max_seconds,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
+
+
+def _restore_s3(args: argparse.Namespace) -> None:
+    report = restore_from_s3(
+        args.source,
+        args.storage,
+        aws_executable=args.aws_executable,
+        expected_backup_id=args.expected_backup_id,
+        metadata_timeout_seconds=args.metadata_timeout_seconds,
+        max_seconds=args.max_seconds,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
 
 
 def _tuning_show(args: argparse.Namespace) -> None:
@@ -629,6 +669,108 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     inspect.set_defaults(handler=_inspect)
 
+    serve = subparsers.add_parser(
+        "serve",
+        help="resolve reader tuning once and exec the native gRPC server",
+    )
+    add_server_arguments(serve)
+    serve.set_defaults(handler=_serve)
+
+    backup = subparsers.add_parser(
+        "backup",
+        help="create and publish a quiesced collection backup",
+    )
+    backup_commands = backup.add_subparsers(
+        dest="backup_command",
+        required=True,
+    )
+    backup_s3 = backup_commands.add_parser(
+        "s3",
+        help="sync the inactive A/B mirror slot and atomically publish LATEST",
+    )
+    backup_s3.add_argument("--storage", type=Path, required=True)
+    backup_s3.add_argument(
+        "--destination",
+        required=True,
+        help="backup root in the form s3://bucket[/prefix]",
+    )
+    backup_s3.add_argument(
+        "--aws-executable",
+        default="aws",
+        help="AWS CLI executable name or path (default: aws)",
+    )
+    backup_s3.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run sync planning without changing either S3 slot or LATEST",
+    )
+    backup_s3.add_argument(
+        "--unsafe-allow-unversioned",
+        dest="unsafe_allow_unversioned",
+        action="store_true",
+        help=(
+            "deprecated compatibility flag; hardened v2 checkpoints still "
+            "fail closed unless bucket Versioning is enabled"
+        ),
+    )
+    backup_s3.add_argument(
+        "--if-older-than-hours",
+        type=_nonnegative_float,
+        default=0.0,
+        help="skip when the latest backup is younger (0 always runs)",
+    )
+    backup_s3.add_argument(
+        "--metadata-timeout-seconds",
+        type=_positive_float,
+        default=60.0,
+        help="timeout for bounded AWS metadata operations (default: 60)",
+    )
+    backup_s3.add_argument(
+        "--max-seconds",
+        type=_positive_float,
+        default=12 * 60 * 60.0,
+        help="hard deadline for hashing and publication (default: 43200)",
+    )
+    backup_s3.set_defaults(handler=_backup_s3)
+
+    restore = subparsers.add_parser(
+        "restore",
+        help="restore and verify a published collection checkpoint",
+    )
+    restore_commands = restore.add_subparsers(
+        dest="restore_command",
+        required=True,
+    )
+    restore_s3 = restore_commands.add_parser(
+        "s3",
+        help="restore a version-pinned S3 slot into an atomic local directory",
+    )
+    restore_s3.add_argument("--source", required=True)
+    restore_s3.add_argument("--storage", type=Path, required=True)
+    restore_s3.add_argument(
+        "--aws-executable",
+        default="aws",
+        help="AWS CLI executable name or path (default: aws)",
+    )
+    restore_s3.add_argument(
+        "--expected-backup-id",
+        default=None,
+        help="fail unless LATEST names this 32-character backup ID",
+    )
+    restore_s3.add_argument(
+        "--metadata-timeout-seconds",
+        type=_positive_float,
+        default=60.0,
+        help="timeout for bounded AWS metadata operations (default: 60)",
+    )
+    restore_s3.add_argument(
+        "--max-seconds",
+        type=_positive_float,
+        default=12 * 60 * 60.0,
+        help="hard deadline for download and verification (default: 43200)",
+    )
+    restore_s3.set_defaults(handler=_restore_s3)
+
     rotate_wal = subparsers.add_parser(
         "rotate-wal",
         help="seal a non-empty mutation WAL and publish its successor",
@@ -652,6 +794,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="maximum selected WAL bytes (default: unlimited)",
+    )
+    materialize.add_argument(
+        "--max-input-entries",
+        type=_positive_int,
+        default=None,
+        help="maximum committed WAL operations (default: unlimited)",
+    )
+    materialize.add_argument(
+        "--max-memory-bytes",
+        type=_positive_int,
+        default=None,
+        help="maximum estimated peak working memory (default: unlimited)",
     )
     materialize.set_defaults(handler=_materialize)
 
@@ -796,6 +950,22 @@ def _build_parser() -> argparse.ArgumentParser:
     maintain.add_argument(
         "--materialize-max-input-bytes", type=_positive_int,
         default=DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES,
+    )
+    maintain.add_argument(
+        "--materialize-max-input-entries", type=_positive_int,
+        default=None,
+        help=(
+            "format-7 committed-operation budget "
+            f"(default: {DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES})"
+        ),
+    )
+    maintain.add_argument(
+        "--materialize-max-memory-bytes", type=_positive_int,
+        default=None,
+        help=(
+            "format-7 estimated peak-memory budget "
+            f"(default: {DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES})"
+        ),
     )
     maintain.add_argument(
         "--compact-min-runs", type=_partitioned_compaction_min_runs,
@@ -957,6 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.handler(args)
     except (
         CalibrationError,
+        S3BackupError,
         TuningRegistryError,
         NotImplementedError,
         TypeError,

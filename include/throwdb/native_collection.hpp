@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <span>
@@ -44,6 +45,27 @@ struct NativeOpenStats {
     bool index_body_checksum_present = false;
     bool index_body_checksum_verified = false;
     bool index_structural_validation_performed = false;
+};
+
+// Native-only safety bounds applied while opening and replaying mutable state.
+// Format 6 also applies finite values to live overlay growth, committed WAL
+// operations/bytes, and the extra header retained by rotation. Defaults
+// preserve the historical unbounded embedded-open behaviour. Servers should
+// provide finite values so a valid but unexpectedly large WAL backlog fails
+// closed before rebuilding an unbounded in-memory overlay.
+struct NativeOpenOptions {
+    std::uint64_t max_wal_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_wal_operations =
+        std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_overlay_entries =
+        std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_overlay_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    // A durable server must open the native writer before it can reconcile its
+    // PREPARE journal. Ordinary embedded writers leave this false and refuse to
+    // cross an existing server/pending-mutation-v1 fence.
+    bool allow_pending_mutation_recovery = false;
 };
 
 // Lightweight immutable layout metadata used to select reader policies before
@@ -200,6 +222,18 @@ struct NativeMutationLogStats {
     // is non-zero for a delete-only transaction stream.
     std::uint64_t active_wal_transaction_count = 0;
     bool compaction_budget_blocked = false;
+    // Format-6/7 retained-memory/backlog diagnostics. Appended for native ABI
+    // compatibility with callers compiled against the original stats prefix.
+    std::uint64_t overlay_entry_count = 0;
+    std::uint64_t estimated_overlay_bytes = 0;
+    std::uint64_t active_wal_operation_count = 0;
+    std::uint64_t frozen_wal_operation_count = 0;
+    std::uint64_t total_wal_operation_count = 0;
+    std::uint64_t frozen_wal_bytes = 0;
+    std::uint64_t materialized_wal_input_entries = 0;
+    std::uint64_t materialization_estimated_peak_memory_bytes = 0;
+    bool materialization_entry_budget_blocked = false;
+    bool materialization_memory_budget_blocked = false;
 };
 
 // One bounded, deterministic selective-segment cleaning pass. The cleaner
@@ -373,6 +407,8 @@ class NativeCollection;
 // output; otherwise it must have exactly the same capacity as ids.
 class NativeIdScan {
 public:
+    using StopPredicate = std::function<bool()>;
+
     ~NativeIdScan();
 
     NativeIdScan(const NativeIdScan&) = delete;
@@ -384,6 +420,14 @@ public:
     [[nodiscard]] std::uint64_t read_into(
         std::span<std::uint64_t> ids,
         std::span<NativeIdLocation> locations = {});
+    // Cooperative server-side variant. A true predicate returns the rows
+    // already produced by this call (possibly zero) without marking the
+    // snapshot done. Candidate traversal is interruptible at a fixed bounded
+    // cadence. The original overload deliberately remains non-cancellable.
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<NativeIdLocation> locations,
+        const StopPredicate& stop_requested);
     [[nodiscard]] bool done() const noexcept;
 
 private:
@@ -445,7 +489,8 @@ public:
         const std::filesystem::path& path,
         ReaderOptions reader_options = {},
         bool writable = false,
-        bool calibration = false);
+        bool calibration = false,
+        NativeOpenOptions open_options = {});
 
     ~NativeCollection();
 
@@ -474,10 +519,14 @@ public:
         std::uint64_t requested,
         std::uint64_t seed,
         std::uint64_t max_inspected_slots) const;
-    // Format 7 only. The cursor pins immutable resources and copies the
-    // bounded WAL overlay while briefly holding the collection state lock;
-    // iteration itself does not block mutation publication.
-    [[nodiscard]] std::unique_ptr<NativeIdScan> scan_ids() const;
+    // Format 7 only. The cursor pins immutable resources and copies the WAL
+    // overlay while briefly holding the collection state lock; iteration
+    // itself does not block mutation publication. max_snapshot_bytes is
+    // checked under that same state lock before any overlay-sized allocation,
+    // allowing servers to bind cursor memory to their admission lease.
+    [[nodiscard]] std::unique_ptr<NativeIdScan> scan_ids(
+        std::uint64_t max_snapshot_bytes =
+            std::numeric_limits<std::uint64_t>::max()) const;
     [[nodiscard]] std::vector<std::byte> get_bytes(
         std::span<const std::uint64_t> ids) const;
     // Batch membership in one logical collection view. The output preserves
@@ -511,6 +560,10 @@ public:
         std::uint64_t max_wals =
             std::numeric_limits<std::uint64_t>::max(),
         std::uint64_t max_input_bytes =
+            std::numeric_limits<std::uint64_t>::max(),
+        std::uint64_t max_input_entries =
+            std::numeric_limits<std::uint64_t>::max(),
+        std::uint64_t max_memory_bytes =
             std::numeric_limits<std::uint64_t>::max());
     // Format 6 merges the oldest contiguous DeltaV1 prefix. Format 7 folds
     // complete active run sections into selected authoritative partitions.

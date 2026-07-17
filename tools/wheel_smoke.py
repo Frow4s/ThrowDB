@@ -8,6 +8,7 @@ mutation lifecycle were all packaged together correctly.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import queue
@@ -295,6 +296,24 @@ def main() -> None:
         if "usage: throwdbd" not in server_help.stdout:
             raise AssertionError(
                 "packaged throwdbd is not the expected gRPC daemon"
+            )
+        # An editable install imports the Python package from the source tree,
+        # while scikit-build installs compiled artifacts into site-packages.
+        # Distribution metadata is therefore the authoritative wheel/editable
+        # layout; ``throwdb.__file__`` is only reliable for a regular wheel.
+        distribution = importlib.metadata.distribution("throwdb")
+        native_server = Path(
+            distribution.locate_file(
+                "throwdb/libexec/_throwdbd_native"
+            )
+        ).resolve()
+        if not native_server.is_file():
+            raise AssertionError(
+                "wheel did not include the internal native gRPC daemon"
+            )
+        if server.resolve() == native_server.resolve():
+            raise AssertionError(
+                "public throwdbd unexpectedly bypasses the tuning launcher"
             )
         _assert_grpc_server(server, store, expected)
 

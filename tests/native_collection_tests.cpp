@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <exception>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -881,6 +882,221 @@ void test_calibration_handle_owns_exclusive_read_only_lease() {
             "calibration did not release its writer lease");
 }
 
+void test_format6_startup_replay_bounds_and_exact_stats() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint64_t record_size = 4;
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 6;
+    builder_options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->finish();
+
+    const std::array<std::uint64_t, 2> ids{10, 20};
+    const auto embeddings = rows(ids.size(), record_size, 17);
+    auto writer = throwdb::NativeCollection::open(store, {}, true);
+    writer->insert(ids, embeddings);
+    const throwdb::NativeMutationLogStats expected =
+        writer->mutation_log_stats();
+    require(expected.overlay_entry_count == 2,
+            "format-6 stats did not count retained overlay IDs");
+    require(expected.estimated_overlay_bytes == 128,
+            "format-6 overlay memory estimate is not conservative/exact");
+    require(expected.active_wal_operation_count == 2
+                && expected.frozen_wal_operation_count == 0
+                && expected.total_wal_operation_count == 2,
+            "format-6 stats did not count committed WAL operations");
+    require(expected.total_wal_bytes == expected.active_wal_bytes,
+            "single format-6 WAL byte totals disagree");
+    writer.reset();
+
+    throwdb::NativeOpenOptions limits;
+    limits.max_wal_bytes = expected.total_wal_bytes;
+    limits.max_wal_operations = expected.total_wal_operation_count;
+    limits.max_overlay_entries = expected.overlay_entry_count;
+    limits.max_overlay_bytes = expected.estimated_overlay_bytes;
+    auto exact = throwdb::NativeCollection::open(
+        store, {}, false, false, limits);
+    require_equal(
+        exact->get_bytes(ids), embeddings,
+        "format-6 exact-bound replay changed committed rows");
+    const throwdb::NativeMutationLogStats exact_stats =
+        exact->mutation_log_stats();
+    require(exact_stats.total_wal_bytes == expected.total_wal_bytes
+                && exact_stats.total_wal_operation_count
+                       == expected.total_wal_operation_count
+                && exact_stats.overlay_entry_count
+                       == expected.overlay_entry_count,
+            "format-6 exact-bound replay stats changed after reopen");
+    exact.reset();
+
+    throwdb::NativeOpenOptions operation_limited = limits;
+    operation_limited.max_wal_operations = 1;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, false, operation_limited));
+        },
+        "format-6 replay exceeded its committed-operation limit");
+
+    throwdb::NativeOpenOptions byte_limited = limits;
+    byte_limited.max_wal_bytes = expected.total_wal_bytes - 1;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, false, byte_limited));
+        },
+        "format-6 replay exceeded its raw WAL-byte limit");
+
+    throwdb::NativeOpenOptions entry_limited = limits;
+    entry_limited.max_overlay_entries = 1;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, false, entry_limited));
+        },
+        "format-6 replay exceeded its unique-overlay-entry limit");
+
+    throwdb::NativeOpenOptions memory_limited = limits;
+    memory_limited.max_overlay_bytes = 127;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, false, memory_limited));
+        },
+        "format-6 replay exceeded its estimated-overlay-memory limit");
+}
+
+void test_format6_live_bounds_fail_before_durable_growth() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint64_t record_size = 4;
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 6;
+    builder_options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->finish();
+
+    const std::array<std::uint64_t, 1> id{10};
+    const auto first = rows(1, record_size, 11);
+    auto seed_writer = throwdb::NativeCollection::open(store, {}, true);
+    seed_writer->insert(id, first);
+    const throwdb::NativeMutationLogStats baseline =
+        seed_writer->mutation_log_stats();
+    require(baseline.overlay_entry_count == 1
+                && baseline.active_wal_operation_count == 1
+                && baseline.total_wal_operation_count == 1,
+            "format-6 live-bound fixture stats are not exact");
+    seed_writer.reset();
+
+    throwdb::NativeOpenOptions limits;
+    limits.max_wal_bytes = baseline.total_wal_bytes;
+    limits.max_wal_operations = baseline.total_wal_operation_count;
+    limits.max_overlay_entries = baseline.overlay_entry_count;
+    limits.max_overlay_bytes = baseline.estimated_overlay_bytes;
+    const auto replacement = rows(1, record_size, 31);
+
+    auto operation_limited = throwdb::NativeCollection::open(
+        store, {}, true, false, limits);
+    require_throws<throwdb::StorageError>(
+        [&] { operation_limited->update(id, replacement); },
+        "format-6 live update exceeded the total WAL-operation limit");
+    require(operation_limited->mutation_log_stats().total_wal_bytes
+                == baseline.total_wal_bytes,
+            "operation-bound rejection appended durable WAL bytes");
+    operation_limited.reset();
+
+    throwdb::NativeOpenOptions byte_limits = limits;
+    byte_limits.max_wal_operations = 2;
+    auto byte_limited = throwdb::NativeCollection::open(
+        store, {}, true, false, byte_limits);
+    require_throws<throwdb::StorageError>(
+        [&] { byte_limited->update(id, replacement); },
+        "format-6 live update exceeded the total WAL-byte limit");
+    const throwdb::NativeMutationLogStats after_byte_rejection =
+        byte_limited->mutation_log_stats();
+    require(after_byte_rejection.total_wal_bytes == baseline.total_wal_bytes
+                && after_byte_rejection.total_wal_operation_count
+                       == baseline.total_wal_operation_count
+                && after_byte_rejection.overlay_entry_count
+                       == baseline.overlay_entry_count,
+            "byte-bound rejection changed format-6 durable/logical stats");
+    byte_limited.reset();
+
+    throwdb::NativeOpenOptions overlay_limits = limits;
+    overlay_limits.max_wal_bytes =
+        std::numeric_limits<std::uint64_t>::max();
+    overlay_limits.max_wal_operations = 2;
+    auto overlay_limited = throwdb::NativeCollection::open(
+        store, {}, true, false, overlay_limits);
+    const std::array<std::uint64_t, 1> new_id{20};
+    require_throws<throwdb::StorageError>(
+        [&] { overlay_limited->insert(new_id, replacement); },
+        "format-6 live insert exceeded the unique overlay limit");
+    require(overlay_limited->mutation_log_stats().total_wal_bytes
+                == baseline.total_wal_bytes,
+            "overlay-bound rejection appended durable WAL bytes");
+    overlay_limited.reset();
+
+    throwdb::NativeOpenOptions rotation_limits = limits;
+    rotation_limits.max_wal_operations = 2;
+    auto rotation_limited = throwdb::NativeCollection::open(
+        store, {}, true, false, rotation_limits);
+    require_throws<throwdb::StorageError>(
+        [&] { static_cast<void>(rotation_limited->rotate_wal()); },
+        "format-6 rotation exceeded the total WAL-byte limit");
+    const throwdb::NativeMutationLogStats after_rotation_rejection =
+        rotation_limited->mutation_log_stats();
+    require(after_rotation_rejection.generation == baseline.generation
+                && after_rotation_rejection.frozen_wal_count == 0
+                && after_rotation_rejection.total_wal_bytes
+                       == baseline.total_wal_bytes,
+            "rotation-header rejection published a catalog/WAL change");
+}
+
+void test_format6_delta_replay_is_preflight_bounded() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint64_t record_size = 4;
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 6;
+    builder_options.dimension = 2;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->finish();
+
+    const std::array<std::uint64_t, 2> ids{10, 20};
+    const auto embeddings = rows(ids.size(), record_size, 47);
+    auto writer = throwdb::NativeCollection::open(store, {}, true);
+    writer->insert(ids, embeddings);
+    const throwdb::NativeMutationLogStats rotated = writer->rotate_wal();
+    require(rotated.rotated && rotated.frozen_wal_count == 1
+                && rotated.active_wal_operation_count == 0
+                && rotated.frozen_wal_operation_count == 2
+                && rotated.total_wal_operation_count == 2
+                && rotated.frozen_wal_bytes + rotated.active_wal_bytes
+                       == rotated.total_wal_bytes,
+            "format-6 frozen/active WAL stats are not exact after rotation");
+    const throwdb::NativeMutationLogStats materialized =
+        writer->materialize_frozen_wals();
+    require(materialized.materialized && materialized.delta_entry_count == 2
+                && materialized.materialized_wal_input_entries == 2,
+            "format-6 delta-bound fixture was not materialized exactly");
+    writer.reset();
+
+    throwdb::NativeOpenOptions limits;
+    limits.max_overlay_entries = 1;
+    limits.max_overlay_bytes = 64;
+    require_throws<throwdb::StorageError>(
+        [&] {
+            static_cast<void>(throwdb::NativeCollection::open(
+                store, {}, false, false, limits));
+        },
+        "format-6 delta decoded an over-limit replay vector");
+}
+
 void test_contains_is_snapshot_consistent_without_reading_payloads() {
     for (const std::uint32_t format_version : {6U, 7U}) {
         TempDirectory temporary;
@@ -965,6 +1181,15 @@ int main() {
         TestCase{
             "calibration_handle_owns_exclusive_read_only_lease",
             test_calibration_handle_owns_exclusive_read_only_lease},
+        TestCase{
+            "format6_startup_replay_bounds_and_exact_stats",
+            test_format6_startup_replay_bounds_and_exact_stats},
+        TestCase{
+            "format6_live_bounds_fail_before_durable_growth",
+            test_format6_live_bounds_fail_before_durable_growth},
+        TestCase{
+            "format6_delta_replay_is_preflight_bounded",
+            test_format6_delta_replay_is_preflight_bounded},
         TestCase{
             "contains_is_snapshot_consistent_without_reading_payloads",
             test_contains_is_snapshot_consistent_without_reading_payloads},

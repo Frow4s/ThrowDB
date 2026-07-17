@@ -5,13 +5,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <grpc/impl/channel_arg_names.h>
 #include <grpcpp/grpcpp.h>
@@ -57,6 +66,132 @@ void require(const bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+[[nodiscard]] std::string read_text_file(
+    const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return std::string(
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>());
+}
+
+struct DaemonResult {
+    int exit_code = -1;
+    std::string stdout_text;
+    std::string stderr_text;
+};
+
+[[nodiscard]] DaemonResult run_terminal_daemon(
+    const std::filesystem::path& store,
+    const std::filesystem::path& output_directory,
+    const bool block_after_drain) {
+    const auto stdout_path = output_directory / "daemon.stdout";
+    const auto stderr_path = output_directory / "daemon.stderr";
+    const pid_t child = ::fork();
+    if (child < 0) {
+        throw std::runtime_error("cannot fork terminal-daemon regression");
+    }
+    if (child == 0) {
+        const int stdout_fd = ::open(
+            stdout_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int stderr_fd = ::open(
+            stderr_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (stdout_fd < 0 || stderr_fd < 0
+            || ::dup2(stdout_fd, STDOUT_FILENO) < 0
+            || ::dup2(stderr_fd, STDERR_FILENO) < 0) {
+            ::_exit(126);
+        }
+        static_cast<void>(::close(stdout_fd));
+        static_cast<void>(::close(stderr_fd));
+        static_cast<void>(::setenv(
+            "THROWDB_TEST_TERMINAL_AFTER_READY", "1", 1));
+        if (block_after_drain) {
+            static_cast<void>(::setenv(
+                "THROWDB_TEST_BLOCK_AFTER_DRAIN", "1", 1));
+        } else {
+            static_cast<void>(::unsetenv(
+                "THROWDB_TEST_BLOCK_AFTER_DRAIN"));
+        }
+        const std::string daemon = THROWDB_TEST_GRPC_DAEMON_PATH;
+        const std::string storage = store.string();
+        const char* const hard_timeout = block_after_drain ? "100" : "5000";
+        ::execl(
+            daemon.c_str(), daemon.c_str(),
+            "--storage", storage.c_str(),
+            "--listen", "127.0.0.1:0",
+            "--read-only", "--no-auto-maintenance",
+            "--shutdown-grace-ms", "1",
+            "--shutdown-hard-timeout-ms", hard_timeout,
+            static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+
+    int status = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        const pid_t waited = ::waitpid(child, &status, WNOHANG);
+        if (waited == child) {
+            break;
+        }
+        if (waited < 0) {
+            static_cast<void>(::kill(child, SIGKILL));
+            static_cast<void>(::waitpid(child, &status, 0));
+            throw std::runtime_error("cannot wait for terminal daemon");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            static_cast<void>(::kill(child, SIGKILL));
+            static_cast<void>(::waitpid(child, &status, 0));
+            throw std::runtime_error("terminal daemon exceeded test deadline");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return DaemonResult{
+        exit_code,
+        read_text_file(stdout_path),
+        read_text_file(stderr_path)};
+}
+
+void test_daemon_terminal_exit_and_hard_shutdown_watchdog() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    std::filesystem::create_directories(temporary.path());
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = 1;
+    builder_options.dtype = throwdb::DType::Float16;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    const std::array<std::uint64_t, 1> ids{1};
+    const std::array<std::byte, 2> embedding{};
+    builder->append(ids, embedding);
+    builder->finish();
+
+    const auto terminal = run_terminal_daemon(
+        store, temporary.path(), false);
+    require(
+        terminal.exit_code == EXIT_FAILURE
+            && terminal.stdout_text.find("\"event\":\"ready\"")
+                   != std::string::npos,
+        "terminal storage state did not make the daemon exit nonzero after "
+        "publishing readiness; exit=" + std::to_string(terminal.exit_code)
+            + " stdout=" + terminal.stdout_text
+            + " stderr=" + terminal.stderr_text);
+
+    const auto bounded = run_terminal_daemon(
+        store, temporary.path(), true);
+    require(
+        bounded.exit_code == EXIT_FAILURE
+            && bounded.stdout_text.find("\"event\":\"ready\"")
+                   != std::string::npos
+            && bounded.stderr_text.find("test_shutdown_block_entered")
+                   != std::string::npos,
+        "hard shutdown watchdog did not terminate a daemon blocked after "
+        "drain began; exit=" + std::to_string(bounded.exit_code)
+            + " stdout=" + bounded.stdout_text
+            + " stderr=" + bounded.stderr_text);
 }
 
 void append_u64_le(std::string& output, const std::uint64_t value) {
@@ -232,13 +367,29 @@ void test_grpc_crud_and_scan() {
     builder->append(base_ids, base_rows);
     builder->finish();
 
-    auto collection = throwdb::NativeCollection::open(store, {}, true);
-    throwdb::server::SingleCollectionEngine engine(*collection, store);
+    throwdb::ReaderOptions reader_options;
+    reader_options.max_read_range_bytes = 4ULL << 20;
+    reader_options.max_gap_bytes = 64;
+    reader_options.io_workers = 2;
+    reader_options.io_queue_capacity = 6;
+    reader_options.io_ranges_per_task = 3;
+    throwdb::server::EngineOptions engine_options;
+    engine_options.reader = reader_options;
+    engine_options.tuning.mode = "auto";
+    engine_options.tuning.source = "persisted";
+    engine_options.tuning.status = "selected";
+    engine_options.tuning.reuse_level = "compatible";
+    auto collection = throwdb::NativeCollection::open(
+        store, reader_options, true);
+    throwdb::server::SingleCollectionEngine engine(
+        *collection, store, engine_options);
     throwdb::server::ServiceLimits limits;
     limits.max_request_bytes = 64ULL << 20;
     limits.max_response_bytes = 64ULL << 20;
     throwdb::server::GrpcServerOptions grpc_options;
     grpc_options.max_worker_threads = 8;
+    grpc_options.max_concurrent_calls = 4;
+    grpc_options.defer_serving_until_ready = true;
     throwdb::server::GrpcServer server(engine, limits, grpc_options);
     const auto endpoint = server.start();
 
@@ -256,6 +407,26 @@ void test_grpc_crud_and_scan() {
             std::chrono::system_clock::now() + std::chrono::seconds(5)),
         "gRPC channel did not become ready");
     auto stub = wire::ThrowDB::NewStub(channel);
+
+    const auto [starting_health_status, starting_health_response] =
+        generic_unary(
+            channel, "/grpc.health.v1.Health/Check", std::string{});
+    require(
+        starting_health_status.ok()
+            && starting_health_response == std::string{"\x08\x02", 2},
+        "deferred gRPC server advertised readiness before its startup barrier");
+    wire::GetRequest starting_get_request;
+    set_ids(
+        *starting_get_request.mutable_ids(),
+        std::span<const std::uint64_t>(base_ids).first<1>());
+    wire::GetResponse starting_get_response;
+    grpc::ClientContext starting_get_context;
+    const grpc::Status starting_get_status = stub->Get(
+        &starting_get_context, starting_get_request, &starting_get_response);
+    require(
+        starting_get_status.error_code() == grpc::StatusCode::UNAVAILABLE,
+        "deferred gRPC server admitted data work before readiness");
+    server.mark_serving();
 
     const auto [standard_health_status, standard_health_response] =
         generic_unary(
@@ -296,7 +467,8 @@ void test_grpc_crud_and_scan() {
     require(
         status.ok()
             && health_response.status()
-                   == wire::HealthResponse::SERVING_STATUS_SERVING,
+                   == wire::HealthResponse::SERVING_STATUS_SERVING
+            && health_response.protocol_minor() == 2,
         "typed gRPC Health failed");
 
     grpc::ClientContext describe_context;
@@ -309,12 +481,57 @@ void test_grpc_crud_and_scan() {
             && describe_response.schema().dimension() == dimension
             && describe_response.count() == base_ids.size()
             && describe_response.capabilities().writable()
-            && describe_response.capabilities().durable_idempotency(),
+            && describe_response.capabilities().durable_idempotency()
+            && (describe_response.idempotency_domain().high() != 0
+                || describe_response.idempotency_domain().low() != 0)
+            && describe_response.reader().max_read_range_bytes()
+                   == reader_options.max_read_range_bytes
+            && describe_response.reader().max_gap_bytes()
+                   == reader_options.max_gap_bytes
+            && describe_response.reader().io_workers()
+                   == reader_options.io_workers
+            && describe_response.reader().io_queue_capacity()
+                   == reader_options.io_queue_capacity
+            && describe_response.reader().io_ranges_per_task()
+                   == reader_options.io_ranges_per_task
+            && describe_response.reader().io_backend()
+                   == wire::READER_BACKEND_THREAD_POOL
+            && describe_response.tuning().mode() == "auto"
+            && describe_response.tuning().source() == "persisted"
+            && describe_response.tuning().status() == "selected"
+            && describe_response.tuning().reuse_level() == "compatible"
+            && !describe_response.tuning().explicit_overrides()
+            && describe_response.availability().max_concurrent_calls()
+                   == grpc_options.max_concurrent_calls
+            && describe_response.availability().max_concurrent_scans()
+                   == grpc_options.max_concurrent_scans
+            && describe_response.availability().max_unary_inflight_bytes()
+                   == grpc_options.max_inflight_bytes
+            && describe_response.availability().max_scan_inflight_bytes()
+                   == grpc_options.max_scan_inflight_bytes
+            && describe_response.availability().scan_max_duration_millis()
+                   == grpc_options.scan_max_duration_millis
+            && describe_response.availability().scan_idle_timeout_millis()
+                   == grpc_options.scan_idle_timeout_millis
+            && describe_response.availability().shutdown_hard_timeout_millis()
+                   == grpc_options.shutdown_hard_timeout_millis
+            && describe_response.admission_stats().active_unary_calls() == 0
+            && describe_response.admission_stats().active_scans() == 0
+            && describe_response.admission_stats().admitted_unary_calls() == 0
+            && describe_response.admission_stats().admitted_scans() == 0
+            && !describe_response.admission_stats().admission_closed()
+            && !describe_response.admission_stats().draining()
+            && !describe_response.admission_stats().terminal_faulted()
+            && describe_response.engine_stats().catalog_generation() != 0
+            && describe_response.engine_stats().mutation_disk_reserve_bytes()
+                   == engine_options.mutation_disk_reserve_bytes,
         "gRPC Describe returned wrong collection metadata");
 
     wire::MutationRequest insert_request;
     insert_request.mutable_operation_id()->set_high(1);
     insert_request.mutable_operation_id()->set_low(2);
+    insert_request.mutable_idempotency_domain()->CopyFrom(
+        describe_response.idempotency_domain());
     const std::array<std::uint64_t, 1> insert_ids{50};
     set_ids(*insert_request.mutable_ids(), insert_ids);
     const auto inserted_row = rows(1, record_size, 91);
@@ -326,6 +543,20 @@ void test_grpc_crud_and_scan() {
     insert_embeddings->set_values_le(
         reinterpret_cast<const char*>(inserted_row.data()),
         inserted_row.size());
+    wire::MutationRequest stale_domain_request = insert_request;
+    stale_domain_request.mutable_operation_id()->set_high(8);
+    stale_domain_request.mutable_operation_id()->set_low(9);
+    stale_domain_request.mutable_idempotency_domain()->set_low(
+        stale_domain_request.idempotency_domain().low() ^ 1U);
+    grpc::ClientContext stale_domain_context;
+    wire::MutationResponse stale_domain_response;
+    status = stub->Insert(
+        &stale_domain_context,
+        stale_domain_request,
+        &stale_domain_response);
+    require(
+        status.error_code() == grpc::StatusCode::FAILED_PRECONDITION,
+        "gRPC Insert accepted an expired idempotency replay domain");
     grpc::ClientContext insert_context;
     wire::MutationResponse insert_response;
     status = stub->Insert(
@@ -338,6 +569,8 @@ void test_grpc_crud_and_scan() {
     wire::DeleteRequest delete_request;
     delete_request.mutable_operation_id()->set_high(3);
     delete_request.mutable_operation_id()->set_low(4);
+    delete_request.mutable_idempotency_domain()->CopyFrom(
+        describe_response.idempotency_domain());
     const std::array<std::uint64_t, 2> delete_ids{30, 999};
     set_ids(*delete_request.mutable_ids(), delete_ids);
     grpc::ClientContext delete_context;
@@ -396,7 +629,341 @@ void test_grpc_crud_and_scan() {
             && scanned == std::set<std::uint64_t>({10, 20, 40, 50}),
         "gRPC ScanIds returned wrong live IDs");
 
+    const throwdb::server::GrpcAdmissionStats running_stats =
+        server.admission_stats();
+    require(
+        running_stats.active_unary_calls == 0
+            && running_stats.active_scans == 0
+            && running_stats.unary_estimated_bytes == 0
+            && running_stats.scan_estimated_bytes == 0
+            && running_stats.admitted_unary_calls == 3
+            && running_stats.rejected_unary_calls == 0
+            && running_stats.admitted_scans == 1
+            && running_stats.rejected_scans == 0
+            && !running_stats.admission_closed
+            && !running_stats.draining
+            && !running_stats.terminal_faulted,
+        "public gRPC admission statistics were inconsistent after CRUD/scan");
+
+    server.begin_draining();
+    const throwdb::server::GrpcAdmissionStats draining_stats =
+        server.admission_stats();
+    require(
+        draining_stats.admission_closed && draining_stats.draining
+            && !draining_stats.terminal_faulted,
+        "public gRPC admission statistics did not expose draining");
+    grpc::ClientContext draining_describe_context;
+    wire::DescribeResponse draining_describe_response;
+    status = stub->Describe(
+        &draining_describe_context,
+        describe_request,
+        &draining_describe_response);
+    require(
+        status.ok()
+            && draining_describe_response.admission_stats()
+                   .admission_closed()
+            && draining_describe_response.admission_stats().draining()
+            && !draining_describe_response.admission_stats()
+                    .terminal_faulted(),
+        "gRPC Describe did not expose draining admission state");
+    grpc::ClientContext draining_health_context;
+    wire::HealthResponse draining_health_response;
+    status = stub->Health(
+        &draining_health_context,
+        health_request,
+        &draining_health_response);
+    require(
+        status.ok()
+            && draining_health_response.status()
+                   == wire::HealthResponse::SERVING_STATUS_NOT_SERVING,
+        "typed gRPC Health did not become NOT_SERVING while draining");
+    const auto [draining_standard_status, draining_standard_response] =
+        generic_unary(
+            channel, "/grpc.health.v1.Health/Check", std::string{});
+    require(
+        draining_standard_status.ok()
+            && draining_standard_response
+                   == std::string{"\x08\x02", 2},
+        "standard grpc.health.v1.Health did not become NOT_SERVING while "
+        "draining");
+
+    grpc::ClientContext draining_insert_context;
+    wire::MutationResponse draining_insert_response;
+    status = stub->Insert(
+        &draining_insert_context, insert_request, &draining_insert_response);
+    require(
+        status.error_code() == grpc::StatusCode::UNAVAILABLE,
+        "gRPC data plane accepted a mutation after draining began");
+
     server.shutdown();
+}
+
+void test_stalled_scan_is_cancelled_and_releases_admission() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint64_t row_count = 524'288;
+    std::vector<std::uint64_t> ids(static_cast<std::size_t>(row_count));
+    for (std::uint64_t index = 0; index != row_count; ++index) {
+        ids[static_cast<std::size_t>(index)] = index + 1;
+    }
+    std::vector<std::byte> embeddings(
+        static_cast<std::size_t>(row_count) * 2);
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = 1;
+    builder_options.dtype = throwdb::DType::Float16;
+    builder_options.segment_size_bytes = 8ULL << 20;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store);
+    throwdb::server::SingleCollectionEngine engine(*collection, store);
+    throwdb::server::ServiceLimits limits;
+    limits.max_response_bytes = 2ULL << 20;
+    limits.max_scan_batch_rows = 65'536;
+    throwdb::server::GrpcServerOptions options;
+    options.max_worker_threads = 4;
+    options.max_concurrent_calls = 2;
+    options.max_concurrent_scans = 1;
+    options.max_scan_inflight_bytes = 8ULL << 20;
+    options.max_grpc_memory_bytes = 8ULL << 20;
+    options.scan_max_duration_millis = 250;
+    options.scan_idle_timeout_millis = 250;
+    throwdb::server::GrpcServer server(engine, limits, options);
+    const auto endpoint = server.start();
+
+    grpc::ChannelArguments channel_options;
+    channel_options.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+    channel_options.SetMaxReceiveMessageSize(2 << 20);
+    auto channel = grpc::CreateCustomChannel(
+        endpoint.to_string(), grpc::InsecureChannelCredentials(),
+        channel_options);
+    require(
+        channel->WaitForConnected(
+            std::chrono::system_clock::now() + std::chrono::seconds(5)),
+        "stalled-scan channel did not become ready");
+    auto stub = wire::ThrowDB::NewStub(channel);
+
+    const auto wait_for_stats = [&](const auto& predicate,
+                                    const std::string& message) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto stats = server.admission_stats();
+            if (predicate(stats)) {
+                return stats;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        throw std::runtime_error(message);
+    };
+
+    wire::ScanIdsRequest request;
+    request.set_batch_rows(65'536);
+    request.set_include_locations(true);
+    {
+        grpc::ClientContext context;
+        context.set_deadline(
+            std::chrono::system_clock::now() + std::chrono::seconds(5));
+        auto reader = stub->ScanIds(&context, request);
+        static_cast<void>(wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 1
+                       && stats.admitted_scans == 1;
+            },
+            "ScanIds never acquired its admission lease"));
+        // Deliberately do not call Read while the server fills the client's
+        // bounded transport quota. The server watchdog must cancel the real
+        // HTTP/2 stream and unwind the synchronous handler.
+        const auto released = wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 0
+                       && stats.scan_estimated_bytes == 0;
+            },
+            "stalled ScanIds retained admission after its server deadline");
+        require(
+            released.admitted_scans == 1 && released.rejected_scans == 0,
+            "stalled ScanIds corrupted admission counters");
+        wire::ScanIdsResponse discarded;
+        while (reader->Read(&discarded)) {
+        }
+        const grpc::Status status = reader->Finish();
+        require(
+            status.error_code() == grpc::StatusCode::CANCELLED
+                && status.error_message().find("server side")
+                       != std::string::npos,
+            "stalled ScanIds was not cancelled by the server watchdog; "
+            "code=" + std::to_string(status.error_code())
+                + " message=" + status.error_message());
+    }
+
+    {
+        grpc::ClientContext context;
+        context.set_deadline(
+            std::chrono::system_clock::now() + std::chrono::seconds(5));
+        auto reader = stub->ScanIds(&context, request);
+        wire::ScanIdsResponse first;
+        require(
+            reader->Read(&first),
+            "a new ScanIds call was not admitted after stalled-stream cleanup");
+        context.TryCancel();
+        while (reader->Read(&first)) {
+        }
+        static_cast<void>(reader->Finish());
+    }
+    const auto final_stats = wait_for_stats(
+        [](const throwdb::server::GrpcAdmissionStats& stats) {
+            return stats.active_scans == 0 && stats.admitted_scans == 2
+                   && stats.scan_estimated_bytes == 0;
+        },
+        "replacement ScanIds did not release its admission lease");
+    require(
+        final_stats.rejected_scans == 0,
+        "released ScanIds capacity was not reusable");
+    server.shutdown();
+}
+
+void test_non_loopback_transport_is_fail_closed() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::uint64_t record_size = 8;
+    const std::array<std::uint64_t, 1> ids{10};
+    const std::vector<std::byte> embeddings = rows(1, record_size, 9);
+
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = dimension;
+    builder_options.dtype = throwdb::DType::Float16;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store, {}, false);
+    throwdb::server::SingleCollectionEngine engine(*collection, store);
+
+    throwdb::server::GrpcServerOptions insecure;
+    insecure.listen_address = "0.0.0.0:0";
+    bool rejected = false;
+    try {
+        throwdb::server::GrpcServer server(engine, {}, insecure);
+    } catch (const throwdb::InvalidArgumentError& error) {
+        rejected = std::string(error.what()).find("non-loopback")
+                   != std::string::npos;
+    }
+    require(
+        rejected,
+        "gRPC server accepted an implicit insecure non-loopback endpoint");
+
+    insecure.listen_address = "localhost:0";
+    rejected = false;
+    try {
+        throwdb::server::GrpcServer server(engine, {}, insecure);
+    } catch (const throwdb::InvalidArgumentError& error) {
+        rejected = std::string(error.what()).find("non-loopback")
+                   != std::string::npos;
+    }
+    require(
+        rejected,
+        "gRPC server trusted a hostname as plaintext loopback");
+
+    insecure.listen_address = "[::1]suffix:0";
+    rejected = false;
+    try {
+        throwdb::server::GrpcServer server(engine, {}, insecure);
+    } catch (const throwdb::InvalidArgumentError& error) {
+        rejected = std::string(error.what()).find("strict HOST:PORT")
+                   != std::string::npos;
+    }
+    require(rejected, "gRPC server accepted a malformed IPv6 endpoint");
+
+    insecure.listen_address = "0.0.0.0:0";
+    insecure.allow_insecure_non_loopback = true;
+    throwdb::server::GrpcServer explicitly_allowed(engine, {}, insecure);
+
+    throwdb::server::GrpcServerOptions incomplete_tls;
+    incomplete_tls.tls_certificate_path = "server.pem";
+    rejected = false;
+    try {
+        throwdb::server::GrpcServer server(engine, {}, incomplete_tls);
+    } catch (const throwdb::InvalidArgumentError& error) {
+        rejected = std::string(error.what()).find("--tls-cert")
+                   != std::string::npos;
+    }
+    require(
+        rejected,
+        "gRPC server accepted a certificate without a private key");
+
+    throwdb::server::GrpcServerOptions mutual_tls;
+    mutual_tls.listen_address = "0.0.0.0:0";
+    mutual_tls.tls_certificate_path = "server.pem";
+    mutual_tls.tls_private_key_path = "server.key";
+    mutual_tls.tls_client_ca_path = "clients.pem";
+    throwdb::server::GrpcServer mtls_allowed(engine, {}, mutual_tls);
+
+    throwdb::server::GrpcServer health_server(engine);
+    const auto endpoint = health_server.start();
+    grpc::ChannelArguments channel_options;
+    channel_options.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+    auto channel = grpc::CreateCustomChannel(
+        endpoint.to_string(),
+        grpc::InsecureChannelCredentials(),
+        channel_options);
+    require(
+        channel->WaitForConnected(
+            std::chrono::system_clock::now() + std::chrono::seconds(5)),
+        "terminal-health test channel did not become ready");
+    auto stub = wire::ThrowDB::NewStub(channel);
+    health_server.report_terminal_fault();
+    require(
+        health_server.terminal_faulted(),
+        "terminal storage fault was not exposed to the process lifecycle");
+    const throwdb::server::GrpcAdmissionStats terminal_stats =
+        health_server.admission_stats();
+    require(
+        terminal_stats.admission_closed && !terminal_stats.draining
+            && terminal_stats.terminal_faulted,
+        "public gRPC admission statistics did not expose terminal fault");
+    grpc::ClientContext describe_context;
+    wire::DescribeRequest describe_request;
+    wire::DescribeResponse describe_response;
+    const grpc::Status describe_status = stub->Describe(
+        &describe_context, describe_request, &describe_response);
+    require(
+        describe_status.ok()
+            && describe_response.admission_stats().admission_closed()
+            && !describe_response.admission_stats().draining()
+            && describe_response.admission_stats().terminal_faulted(),
+        "gRPC Describe did not expose terminal admission state");
+    grpc::ClientContext context;
+    wire::HealthRequest request;
+    wire::HealthResponse response;
+    const grpc::Status health_status = stub->Health(
+        &context, request, &response);
+    require(
+        health_status.ok()
+            && response.status()
+                   == wire::HealthResponse::SERVING_STATUS_NOT_SERVING,
+        "typed Health remained SERVING after a terminal storage fault");
+    const auto [standard_status, standard_response] = generic_unary(
+        channel, "/grpc.health.v1.Health/Check", std::string{});
+    require(
+        standard_status.ok()
+            && standard_response == std::string{"\x08\x02", 2},
+        "standard Health remained SERVING after a terminal storage fault");
+    grpc::ClientContext failed_get_context;
+    wire::GetRequest failed_get_request;
+    set_ids(*failed_get_request.mutable_ids(), ids);
+    wire::GetResponse failed_get_response;
+    const grpc::Status failed_get_status = stub->Get(
+        &failed_get_context, failed_get_request, &failed_get_response);
+    require(
+        failed_get_status.error_code() == grpc::StatusCode::UNAVAILABLE,
+        "gRPC data plane accepted a read after a terminal storage fault");
+    health_server.shutdown();
 }
 
 void test_grpc_rejects_legacy_storage_format() {
@@ -434,11 +1001,109 @@ void test_grpc_rejects_legacy_storage_format() {
         "gRPC server did not reject a legacy storage format clearly");
 }
 
+void test_get_is_rejected_before_native_read_or_allocation() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::uint64_t record_size = 8;
+    const std::array<std::uint64_t, 1> ids{10};
+    const std::vector<std::byte> embeddings = rows(1, record_size, 9);
+
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = dimension;
+    builder_options.dtype = throwdb::DType::Float16;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store, {}, false);
+    throwdb::server::SingleCollectionEngine engine(*collection, store);
+
+    const auto call_get = [&](const throwdb::server::ServiceLimits limits,
+                              const throwdb::server::GrpcServerOptions options,
+                              const std::span<const std::uint64_t> requested) {
+        throwdb::server::GrpcServer server(engine, limits, options);
+        const auto endpoint = server.start();
+        grpc::ChannelArguments channel_options;
+        channel_options.SetMaxSendMessageSize(1 << 20);
+        channel_options.SetMaxReceiveMessageSize(1 << 20);
+        channel_options.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+        auto channel = grpc::CreateCustomChannel(
+            endpoint.to_string(), grpc::InsecureChannelCredentials(),
+            channel_options);
+        require(
+            channel->WaitForConnected(
+                std::chrono::system_clock::now()
+                + std::chrono::seconds(5)),
+            "preflight test channel did not become ready");
+        auto stub = wire::ThrowDB::NewStub(channel);
+        wire::GetRequest request;
+        set_ids(*request.mutable_ids(), requested);
+        wire::GetResponse response;
+        grpc::ClientContext context;
+        const grpc::Status status = stub->Get(
+            &context, request, &response);
+        server.shutdown();
+        return status;
+    };
+
+    throwdb::server::ServiceLimits response_limits;
+    // float16[4] serializes to an 18-byte GetResponse. A missing ID would
+    // produce NOT_FOUND if the native lookup happened before the preflight.
+    response_limits.max_response_bytes = 17;
+    const std::array<std::uint64_t, 1> missing_id{999};
+    const grpc::Status response_status = call_get(
+        response_limits, throwdb::server::GrpcServerOptions{}, missing_id);
+    require(
+        response_status.error_code()
+                == grpc::StatusCode::RESOURCE_EXHAUSTED
+            && response_status.error_message().find("before native read")
+                   != std::string::npos,
+        "Get response budget was not checked before native lookup");
+
+    throwdb::server::ServiceLimits admission_limits;
+    throwdb::server::GrpcServerOptions admission_options;
+    admission_options.max_inflight_bytes = 1;
+    const std::array<std::uint64_t, 1> present_id{10};
+    const grpc::Status admission_status = call_get(
+        admission_limits, admission_options, present_id);
+    require(
+        admission_status.error_code()
+                == grpc::StatusCode::RESOURCE_EXHAUSTED
+            && admission_status.error_message().find("admission exhausted")
+                   != std::string::npos,
+        "Get peak-memory estimate bypassed server-wide admission");
+
+    // Tiny rows make the output payload look cheap, but the native lookup and
+    // physical-read planner retain several O(ID-count) vectors. This request
+    // would fit a payload-only estimate and must still be rejected before the
+    // native lookup starts.
+    std::vector<std::uint64_t> repeated_ids(10'000, 10);
+    throwdb::server::GrpcServerOptions scratch_options;
+    scratch_options.max_inflight_bytes = 512ULL << 10;
+    const grpc::Status scratch_status = call_get(
+        admission_limits, scratch_options, repeated_ids);
+    require(
+        scratch_status.error_code()
+                == grpc::StatusCode::RESOURCE_EXHAUSTED
+            && scratch_status.error_message().find("admission exhausted")
+                   != std::string::npos,
+        "Get native planner scratch bypassed server-wide admission");
+}
+
 }  // namespace
 
 int main() {
     try {
+        // Fork/exec lifecycle coverage must run before this process initializes
+        // any gRPC worker threads.
+        test_daemon_terminal_exit_and_hard_shutdown_watchdog();
         test_grpc_rejects_legacy_storage_format();
+        test_non_loopback_transport_is_fail_closed();
+        test_get_is_rejected_before_native_read_or_allocation();
+        test_stalled_scan_is_cancelled_and_releases_admission();
         test_grpc_crud_and_scan();
         std::cout << "gRPC server tests passed\n";
         return 0;

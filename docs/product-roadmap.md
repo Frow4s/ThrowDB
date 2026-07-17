@@ -81,18 +81,26 @@ Run one long-lived collection per server process. The first functional slice
 now includes the versioned dense-bytes gRPC contract, C++ daemon, Python
 client, CRUD, prefix Get, physical-order ID streaming, bounded messages and
 threads, health/reflection, graceful shutdown, writer fencing, and durable
-`operation_id` replay. Remaining Stage 2 hardening includes:
+`operation_id` replay. It also includes tune-aware one-shot startup that selects
+a compatible persisted profile without implicit calibration, plus a dedicated
+bounded local-loopback/external-endpoint benchmark for correctness,
+client-visible latency, concurrency, mixed request sizes, ScanIds, and opt-in
+CRUD. Launch hardening now also includes read-only default access, numeric-
+loopback-only plaintext, non-loopback mTLS, terminal/draining data-plane
+closure, process-wide call/scan/estimated-byte admission, a gRPC memory quota,
+disk-reserved mutations, durable pending-operation fencing, bounded replay
+journal checkpointing with explicit replay domains, bounded automatic
+rotation/materialization/folding/cleaning/orphan work, and a quiesced,
+version-pinned two-slot S3 backup/restore workflow. Remaining Stage 2 hardening
+includes:
 
-- a dedicated local-loopback/remote server benchmark that separates collection
-  I/O from protobuf/gRPC copies, queue delay, and client-visible latency;
-- tune-aware startup that selects a compatible persisted profile without
-  running calibration implicitly; explicit `--io-*` settings remain the
-  override;
-- complete queue/admission metrics on top of the implemented deadlines,
-  cancellation, bounded worker pool, message limits, and local fair scheduler;
-- server-wide admission, priorities, deadlines, and optional batching on top
-  of the local fair scheduler;
-- metrics and a minimal trusted-network authentication model, followed by TLS.
+- complete queue/admission and lifecycle metrics on top of transport RPC
+  deadlines, cancellation checks before Get/CRUD work and between ScanIds
+  batches, the bounded worker pool, message limits, and local fair scheduler;
+- priorities, deadline-aware scheduling, optional batching, and fewer unary
+  payload copies;
+- application authorization/certificate rotation, full payload scrubbing,
+  long-duration production acceptance, and reduced-copy large responses.
 
 Local NVMe remains the first media backend. Network filesystem or object-store
 reads are added through the backend interface, with their own concurrency,
@@ -189,7 +197,11 @@ product sequence is:
    reports on production-size local NVMe collections.
 2. Preserve explicit calibration profiles and add request-policy explanation
    around the implemented fair scheduler.
-3. Harden the implemented single-collection gRPC server: tune-aware startup,
-   metrics, admission, TLS/auth, journal retention, and fewer unary copies.
+3. Continue hardening the tune-aware single-collection gRPC server: metrics
+   export, priorities, application authorization, scheduled restore drills,
+   payload scrubbing, and fewer unary copies. Admission, mTLS, safe access
+   defaults, bounded automatic maintenance and journal checkpointing, live
+   engine diagnostics, and lineage-safe S3 backup/restore are already
+   implemented.
 4. Add compact UTF-8 ID storage, collision-verified lookup, and string CRUD as
    an extension of the stable numeric lifecycle.

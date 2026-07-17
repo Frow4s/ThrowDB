@@ -21,6 +21,12 @@ class ServerProcess:
     process: subprocess.Popen[str]
     endpoint: str
     writable: bool
+    readiness: dict[str, object]
+    security: dict[str, object]
+    mutation_safety: dict[str, object]
+    maintenance: dict[str, object]
+    reader: dict[str, object]
+    tuning: dict[str, object]
     stdout_lines: list[str] = field(default_factory=list)
     stderr_lines: list[str] = field(default_factory=list)
     _stdout_thread: threading.Thread | None = None
@@ -34,9 +40,11 @@ class ServerProcess:
         *,
         timeout: float = 15.0,
         extra_args: tuple[str, ...] = (),
+        command_prefix: tuple[str, ...] = (),
     ) -> ServerProcess:
         command = [
             str(executable),
+            *command_prefix,
             "--storage",
             str(storage),
             "--listen",
@@ -142,14 +150,38 @@ class ServerProcess:
             )
         endpoint = ready.get("endpoint")
         writable = ready.get("writable")
-        if not isinstance(endpoint, str) or not isinstance(writable, bool):
+        readiness = ready.get("readiness")
+        security = ready.get("security")
+        mutation_safety = ready.get("mutation_safety")
+        maintenance = ready.get("maintenance")
+        reader_options = ready.get("reader")
+        tuning = ready.get("tuning")
+        if (
+            not isinstance(endpoint, str)
+            or not isinstance(writable, bool)
+            or not isinstance(readiness, dict)
+            or not isinstance(security, dict)
+            or not isinstance(mutation_safety, dict)
+            or not isinstance(maintenance, dict)
+            or not isinstance(reader_options, dict)
+            or not isinstance(tuning, dict)
+        ):
             process.terminate()
             process.wait(timeout=2)
-            raise ServerStartError("server ready event is missing endpoint/writable")
+            raise ServerStartError(
+                "server ready event is missing endpoint/access/security/"
+                "mutation/reader/tuning diagnostics"
+            )
         return cls(
             process=process,
             endpoint=endpoint,
             writable=writable,
+            readiness=readiness,
+            security=security,
+            mutation_safety=mutation_safety,
+            maintenance=maintenance,
+            reader=reader_options,
+            tuning=tuning,
             stdout_lines=stdout_lines,
             stderr_lines=stderr_lines,
             _stdout_thread=stdout_thread,

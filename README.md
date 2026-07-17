@@ -23,8 +23,10 @@ The numeric version-2 binary representation is specified in
 
 Release CI is configured to build precompiled CPython 3.10-3.14 wheels for
 Linux x86_64 on the `manylinux_2_28` baseline. Each official wheel contains
-the embedded C++ extension, the synchronous Python gRPC client, and the native
-`throwdbd` command. Install a downloaded artifact without a compiler:
+the embedded C++ extension, the synchronous Python gRPC client, a tune-aware
+`throwdbd` launcher, and its private native C++ daemon. The launcher resolves
+startup settings once and then replaces itself with the daemon, so Python is
+not in the RPC data path. Install a downloaded artifact without a compiler:
 
 ```bash
 python -m pip install throwdb-0.1.0-cp311-cp311-manylinux_2_28_x86_64.whl
@@ -128,18 +130,42 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     maintenance = collection.maintain(dry_run=False)
 ```
 
+High-level opens fail closed when retained mutable state exceeds safe defaults:
+16 GiB or 4,000,000 WAL operations, and 4,000,000 entries or an estimated
+256 MiB RAM overlay. The four `max_wal_backlog_*` / `max_overlay_*` arguments
+make larger provisioning explicit. Format-7 materialization also has separate
+input-entry and estimated-peak-memory budgets, so a lifecycle pass cannot turn
+an unexpectedly dense WAL prefix into an unbounded allocation.
+
 ## Single-collection gRPC server
 
-`throwdbd` opens exactly one format-7 collection. It binds loopback by
-default, shares one in-memory index across clients, and exposes typed Health,
-Describe, Get, Insert, Update, Upsert, Delete, and server-streaming ScanIds.
-The same Python package provides `RemoteCollection`:
+`throwdbd` (equivalently `throwdb serve`) resolves a saved reader profile and
+then starts the native daemon for exactly one format-7 collection. It binds
+loopback by default, shares one in-memory index across clients, and exposes
+typed Health, Describe, Get, Insert, Update, Upsert, Delete, and
+server-streaming ScanIds. Startup never calibrates: `--tuning auto` reuses a
+safe profile or reports a conservative fallback, `persisted` fails closed on a
+miss, and `conservative` bypasses the registry. The same Python package
+provides `RemoteCollection`:
 
 ```bash
 throwdbd \
   --storage /data/example \
-  --listen 127.0.0.1:50051
+  --listen 127.0.0.1:50051 \
+  --writable
 ```
+
+Both the ready record and `RemoteCollection.describe()` report the complete
+effective reader/tuning selection and separate unary/scan availability bounds.
+`Describe` additionally reports live per-pool gauges, saturating admit/reject
+counters, and drain/terminal state through `admission_stats`.
+Scan streams have configurable server lifetime and idle-progress deadlines, so
+abandoned scans cannot retain admission capacity indefinitely. A raw source-build
+`./build/server-release/throwdbd` bypasses the registry; exercise the normal
+startup path with
+`throwdbd --native-binary "$PWD/build/server-release/throwdbd" ...`. See
+[`docs/grpc-server.md`](docs/grpc-server.md) for manual overrides, dry-run, and
+fallback semantics.
 
 ```python
 import throwdb
@@ -165,9 +191,12 @@ request digest matches. `RemoteCollection` creates an ID automatically when
 none is supplied and exposes it on `AmbiguousCommitError` if the outcome is
 unknown. Ambient HTTP proxies are disabled by default for internal embedding
 traffic; opt in explicitly with `use_http_proxy=True`. The MVP transport is
-plaintext and intended for loopback or a trusted network boundary—TLS,
-authentication, quotas, and multi-collection routing remain later server
-stages.
+plaintext only on a numeric loopback endpoint. A non-loopback bind requires
+server certificate, private key, and client CA (mTLS), unless the operator uses
+the explicit unsafe trusted-network override. The daemon is read-only unless
+`--writable` is passed and bounds gRPC parser memory, admitted calls, scans, and
+estimated in-flight bytes. Application authorization and multi-collection
+routing remain later server stages.
 
 For diagnostics that do not otherwise need an open collection, use
 `Collection.inspect_orphans("/data/example", min_age_seconds=3600)`. This
@@ -436,6 +465,40 @@ I/O, and scatter copies because those operations overlap in parallel backends.
 The value is intended for diagnosis, not for instrumentation of every
 production request.
 
+## S3 disaster-recovery checkpoint
+
+The recovery workflow hashes and verifies a quiesced format-7 collection,
+mirrors it to alternating slots in a versioned S3 bucket, and publishes
+`LATEST` with an S3 compare-and-swap. Every completion records the SHA-256,
+ETag, and immutable VersionId of every file:
+
+```bash
+throwdb backup s3 \
+  --storage /nvme/throwdb/collection \
+  --destination s3://my-versioned-bucket/throwdb/collection
+```
+
+The command fails while a writable server or embedded writer holds the
+collection lease, when a different host owns the remote publisher lease, or
+when the local lineage is stale relative to S3. A daily scheduler should force
+one run as shown; `--if-older-than-hours` is intended only for more frequent
+jobs and must be paired with backup-age monitoring. `--dry-run` performs all
+read-only source/lineage checks and computes the exact inactive-slot plan.
+
+A restore always targets a new local path. It pins the current slot to the
+completion's VersionId/ETag map before and after transfer, validates every
+SHA-256 and the complete native index, then atomically renames the staging
+directory:
+
+```bash
+throwdb restore s3 \
+  --source s3://my-versioned-bucket/throwdb/collection \
+  --storage /nvme/throwdb/restored \
+  --expected-backup-id <32-character-id-from-monitoring>
+```
+
+See [the S3 backup policy and restore drill](docs/grpc-server.md#initial-s3-disaster-recovery-policy).
+
 ## CLI
 
 ```bash
@@ -505,7 +568,8 @@ snapshots, and index runs. A half still named by CURRENT remains reachable and
 is never a candidate. Reachable files, symlinks, and unknown entries are never
 removed.
 
-`maintain` is an explicit one-pass policy, not a background thread. Format 7
+Embedded `Collection.maintain()` and the CLI command below are explicit
+one-pass policies, not library-created background threads. Format 7
 uses the fixed order rotate WAL, materialize a bounded frozen prefix, fold
 selected partitions, clean at most one segment, then collect bounded orphans.
 Format 6 omits the cleaner and keeps its oldest-prefix DeltaV1 merge. Its
@@ -518,8 +582,8 @@ A practical local format-7 lifecycle is:
 throwdb create --storage /nvme/catalog \
   --ids ids.npy --embeddings embeddings.npy --format-version 7
 
-# Application processes use Collection.open(...), CRUD, and get/get_into.
-# Run maintenance explicitly from one operator process.
+# Embedded applications use Collection.open(...), CRUD, and get/get_into.
+# Run embedded/CLI maintenance explicitly from one operator process.
 throwdb maintain --storage /nvme/catalog --dry-run
 throwdb maintain --storage /nvme/catalog --execute
 
@@ -570,9 +634,13 @@ can interrupt cleanup.
   captured when opened and must be reopened to observe another process's later
   commits;
 - buffered `pread` and experimental Linux `io_uring` backends;
-- crash-safe manual WAL rotation through immutable catalogs; automatic
-  rotation is currently only the hard safety valve before a WAL would exceed
-  the 32-bit `RowRef` row limit;
+- crash-safe manual WAL rotation through immutable catalogs; the bounded
+  writable-server worker also performs replay-journal checkpointing, WAL
+  rotation/materialization, partition folding, selective segment cleaning, and
+  orphan reclamation. A post-commit byte-threshold valve limits polling
+  overshoot; before PREPARE, a commit that would cross the materialization
+  budget rotates the prior WAL, while one frame that cannot fit is rejected. A
+  pre-existing oversized WAL requires a larger explicit limit;
 - format-7 frozen-WAL-prefix materialization into immutable embedding segments
   and a partitioned mutation run, with concurrent commits outside the two short
   catalog publications;
@@ -587,13 +655,21 @@ can interrupt cleanup.
   whenever the thread-pool or io_uring parallel coordinator is enabled;
 - a public C++ gRPC service for one existing format-7 collection, including
   numeric CRUD, prefix reads, physical-order ID streaming, health checks, and
-  durable mutation replay;
+  bounded durable mutation replay with explicit replay domains; it starts
+  read-only, restricts plaintext to numeric loopback, supports mTLS, closes its
+  data plane on drain/terminal storage faults, reserves independent unary/scan
+  admission pools, bounds abandoned streams, exports live engine/admission
+  state, and enforces a process-level hard shutdown deadline;
+- a quiesced, checksummed, version-pinned S3 A/B backup and atomic restore
+  workflow with lineage, publisher lease, compare-and-swap publication, and
+  complete post-download validation;
 - no UTF-8 IDs, payload scrub command, or direct prefix-only physical layout.
   The collection lifecycle and the server's backing store currently rely on
   local POSIX rename, `fsync`, open-file, and unlink semantics; network
-  filesystems are outside this durability contract. TLS/authentication,
-  multi-collection routing, and server-side automatic maintenance remain
-  later stages.
+  filesystems are outside this durability contract. Automatic cleaning is
+  conservative and bounded rather than a full storage optimizer; application
+  authorization, multi-collection routing, full payload scrubbing, and
+  reduced-copy large RPCs remain later stages.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and

@@ -25,6 +25,7 @@ test = [
 
 [project.scripts]
 throwdb = "throwdb.cli:main"
+throwdbd = "throwdb.server:main"
 
 [tool.scikit-build]
 cmake.build-type = "Release"
@@ -41,6 +42,7 @@ THROWDB_INSTALL_CPP_SDK = "OFF"
 THROWDB_BUILD_SERVER = "ON"
 THROWDB_BUILD_GRPC_SERVER = "ON"
 THROWDB_GRPC_ENABLE_REFLECTION = "OFF"
+THROWDB_PACKAGE_NATIVE_SERVER = "ON"
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"

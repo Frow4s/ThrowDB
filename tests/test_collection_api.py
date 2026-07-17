@@ -264,6 +264,13 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
 
     with pytest.raises(TypeError, match="verify_index must be a bool"):
         throwdb.Collection.open(path, verify_index=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_wal_backlog_bytes"):
+        throwdb.Collection.open(path, max_wal_backlog_bytes=0)
+    with pytest.raises(TypeError, match="max_overlay_entries"):
+        throwdb.Collection.open(
+            path,
+            max_overlay_entries=True,  # type: ignore[arg-type]
+        )
 
     order = np.array([3, 0, 3, 2, 1], dtype=np.intp)
     query = ids[order].astype(np.int64)
@@ -835,6 +842,10 @@ def test_low_level_native_metadata_and_range_options(
         )
     with pytest.raises(ValueError, match="max_gap_bytes.*2\\*\\*64-1"):
         NativeCollection.open(path, max_gap_bytes=-1)
+    with pytest.raises(ValueError, match="max_wal_operations.*greater than zero"):
+        NativeCollection.open(path, max_wal_operations=0)
+    with pytest.raises(ValueError, match="max_overlay_bytes.*2\\*\\*64-1"):
+        NativeCollection.open(path, max_overlay_bytes=-1)
 
 
 def test_low_level_reader_capability_probe_is_bounded_and_observable() -> None:

@@ -69,10 +69,11 @@ WalScanResult scan_wal_file(
     const std::filesystem::path& path,
     const ExpectedWalIdentity& expected,
     const WalScanMode mode,
-    const WalRecoveryVisitor& visitor) {
+    const WalRecoveryVisitor& visitor,
+    const WalScanLimits limits) {
     const std::uint64_t size = file_size(fd, path);
     ReadOnlyMapping mapping(fd, size, path);
-    return scan_wal(mapping.bytes(), expected, mode, visitor);
+    return scan_wal(mapping.bytes(), expected, mode, visitor, limits);
 }
 
 WalMutationFingerprint fingerprint_recovered_wal_batch(

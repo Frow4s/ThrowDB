@@ -209,6 +209,10 @@ class NativeCollection:
         max_read_range_bytes: int = 1_048_576,
         max_gap_bytes: int = 0,
         calibration: bool = False,
+        max_wal_bytes: int = 17_179_869_184,
+        max_wal_operations: int = 4_000_000,
+        max_overlay_entries: int = 4_000_000,
+        max_overlay_bytes: int = 268_435_456,
     ) -> NativeCollection: ...
 
     @property
@@ -301,6 +305,8 @@ class NativeCollection:
         self,
         max_wals: int = 18_446_744_073_709_551_615,
         max_input_bytes: int = 18_446_744_073_709_551_615,
+        max_input_entries: int = 18_446_744_073_709_551_615,
+        max_memory_bytes: int = 18_446_744_073_709_551_615,
     ) -> dict[str, object]: ...
     def compact_delta_runs(
         self,

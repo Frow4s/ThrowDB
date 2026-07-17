@@ -805,7 +805,8 @@ WalScanResult scan_wal(
     const std::span<const std::byte> image,
     const ExpectedWalIdentity& expected,
     const WalScanMode mode,
-    const WalRecoveryVisitor& visitor) {
+    const WalRecoveryVisitor& visitor,
+    const WalScanLimits limits) {
     require_value<InvalidArgumentError>(
         mode == WalScanMode::Active || mode == WalScanMode::Frozen,
         "WAL scan mode is invalid");
@@ -887,6 +888,15 @@ WalScanResult scan_wal(
         require_value<CorruptionError>(
             batch.sequence == result.next_sequence,
             "WAL commit sequence is duplicated, missing, or out of order");
+
+        if (batch.operation_count
+            > limits.max_committed_operations
+                  - result.committed_operation_count) {
+            throw StorageError(
+                "WAL committed operation count exceeds the configured "
+                "replay limit");
+        }
+        result.committed_operation_count += batch.operation_count;
 
         // Validate operation semantics now, but defer callbacks until every
         // committed transaction in this stable image has passed validation.

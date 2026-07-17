@@ -219,6 +219,19 @@ Mutation rules:
 - the default durability mode acknowledges only after the commit record is
   synced; a future explicit relaxed mode may acknowledge earlier.
 
+`Collection.open()` applies fail-closed startup defaults to retained mutable
+state: 16 GiB/4,000,000 WAL operations and a 4,000,000-entry, 256 MiB estimated
+overlay. Override `max_wal_backlog_bytes`, `max_wal_backlog_operations`,
+`max_overlay_entries`, or `max_overlay_memory_bytes` only after provisioning the
+corresponding disk/RAM. Format-7 materialization is independently bounded by
+selected WAL count, bytes, committed operations, and estimated peak memory.
+Format 6 applies the same open bounds to both retained WALs and the unique
+overlay rebuilt from WAL/DeltaV1 records. A writable format-6 handle also
+checks projected total WAL bytes and committed-operation count before each
+append, unique overlay growth before publication, and the additional 4096-byte
+WAL header before rotation. These bounds reject work before the corresponding
+durable write; they never silently truncate durable history.
+
 Each handle currently captures one committed collection view when it opens; a
 read-write handle also sees its own later commits. Reopen a different process's
 already-open handle to observe later commits. Within a handle, each read
@@ -334,12 +347,14 @@ more than 65,536. This is the local MVP's hard scan-memory/lock-time guard;
 resumable streaming with an opaque performance cursor remains a later
 extension.
 
-`maintain(dry_run=True)` explains one deterministic pass. For format 7,
+`maintain(dry_run=True)` explains one deterministic embedded pass. For format 7,
 explicit execution considers, in order: WAL rotation, bounded materialization,
 selective partition folding, one selective segment clean, and orphan
 collection. Format 6 omits cleaning and keeps oldest-prefix DeltaV1 compaction.
-No background thread invokes maintenance. `max_actions` is hard and
-`max_seconds` is cooperative between complete durable actions.
+The embedded library creates no background thread. A writable single-collection
+server may run bounded rotate/materialize/fold/orphan calls, but does not invoke
+the selective cleaner. `max_actions` is hard and `max_seconds` is cooperative
+between complete durable actions.
 
 `max_input_bytes` bounds the selected source-file footprint, not aggregate
 physical I/O: integrity scans, copying winning rows, and replacement readback

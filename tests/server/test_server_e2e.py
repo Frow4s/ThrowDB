@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
 
+import grpc
 import numpy as np
 import pytest
 
 import throwdb
+from throwdb.v1 import throwdb_pb2, throwdb_pb2_grpc
 from throwdb.remote import (
     LocatedIds,
     RemoteAlreadyExistsError,
@@ -50,6 +57,125 @@ def _assert_locations_are_in_physical_order(located: LocatedIds) -> None:
     assert len(pairs) == len(set(pairs))
 
 
+def _create_test_mtls_credentials(path: Path) -> dict[str, Path]:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is required for the mTLS server smoke test")
+    path.mkdir()
+    files = {
+        name: path / name
+        for name in (
+            "ca.key",
+            "ca.crt",
+            "server.key",
+            "server.csr",
+            "server.crt",
+            "server.ext",
+            "client.key",
+            "client.csr",
+            "client.crt",
+            "client.ext",
+        )
+    }
+
+    def run(*arguments: str) -> None:
+        subprocess.run(
+            [openssl, *arguments],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    run(
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-days",
+        "1",
+        "-subj",
+        "/CN=ThrowDB Test CA",
+        "-keyout",
+        str(files["ca.key"]),
+        "-out",
+        str(files["ca.crt"]),
+    )
+    run(
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-keyout",
+        str(files["server.key"]),
+        "-out",
+        str(files["server.csr"]),
+    )
+    files["server.ext"].write_text(
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n"
+        "subjectAltName=IP:127.0.0.1,DNS:localhost\n",
+        encoding="ascii",
+    )
+    run(
+        "x509",
+        "-req",
+        "-days",
+        "1",
+        "-in",
+        str(files["server.csr"]),
+        "-CA",
+        str(files["ca.crt"]),
+        "-CAkey",
+        str(files["ca.key"]),
+        "-CAcreateserial",
+        "-extfile",
+        str(files["server.ext"]),
+        "-out",
+        str(files["server.crt"]),
+    )
+    run(
+        "req",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-subj",
+        "/CN=throwdb-test-client",
+        "-keyout",
+        str(files["client.key"]),
+        "-out",
+        str(files["client.csr"]),
+    )
+    files["client.ext"].write_text(
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=digitalSignature\n"
+        "extendedKeyUsage=clientAuth\n",
+        encoding="ascii",
+    )
+    run(
+        "x509",
+        "-req",
+        "-days",
+        "1",
+        "-in",
+        str(files["client.csr"]),
+        "-CA",
+        str(files["ca.crt"]),
+        "-CAkey",
+        str(files["ca.key"]),
+        "-CAcreateserial",
+        "-extfile",
+        str(files["client.ext"]),
+        "-out",
+        str(files["client.crt"]),
+    )
+    return files
+
+
 def test_server_crud_scan_and_restart(
     tmp_path: Path,
     server_process_factory: Callable[..., ServerProcess],
@@ -61,7 +187,8 @@ def test_server_crud_scan_and_restart(
     upserted = _vectors(2, 7, salt=301)
     insert_operation = uuid.UUID("f58bb52c-c427-4ba7-bd5a-8d721f74b73c")
 
-    first = server_process_factory(store)
+    first = server_process_factory(store, extra_args=("--writable",))
+    assert first.maintenance["enabled"] is True
     with RemoteCollection.connect(first.endpoint) as remote:
         assert remote.health()["serving"] is True
         assert remote.count == 3
@@ -88,7 +215,7 @@ def test_server_crud_scan_and_restart(
     first.close()
     assert first.process.returncode == 0, first.diagnostics
 
-    second = server_process_factory(store)
+    second = server_process_factory(store, extra_args=("--writable",))
     with RemoteCollection.connect(second.endpoint) as reopened:
         assert reopened.count == 5
         # A response may be lost after the WAL commit. Reusing the caller's
@@ -108,15 +235,77 @@ def test_server_crud_scan_and_restart(
         _assert_locations_are_in_physical_order(located)
 
 
+def test_writable_server_runs_bounded_automatic_maintenance(
+    tmp_path: Path,
+    server_process_factory: Callable[..., ServerProcess],
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    server = server_process_factory(
+        store,
+        extra_args=(
+            "--writable",
+            "--maintenance-interval-seconds",
+            "1",
+            "--rotate-wal-transactions",
+            "1",
+            "--orphan-min-age-seconds",
+            "0",
+        ),
+    )
+    inserted = _vectors(1, 7, salt=701)
+    with RemoteCollection.connect(server.endpoint) as remote:
+        remote.insert([70], inserted)
+        deadline = time.monotonic() + 8
+        event: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            for line in list(server.stderr_lines):
+                try:
+                    candidate = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("event") == "maintenance"
+                    and candidate.get("rotated") is True
+                ):
+                    event = candidate
+                    break
+            if event is not None:
+                break
+            time.sleep(0.05)
+        assert event is not None, server.diagnostics
+        assert event["status"] == "ok"
+        assert event["materialized"] is True
+        np.testing.assert_array_equal(
+            remote.get([70]).view(np.uint16), inserted.view(np.uint16)
+        )
+
+
 def test_read_only_server_keeps_reads_available_and_rejects_mutations(
     tmp_path: Path,
     server_process_factory: Callable[..., ServerProcess],
 ) -> None:
     store = tmp_path / "store"
     base = _build_store(store)
-    server = server_process_factory(store, extra_args=("--read-only",))
+    server = server_process_factory(store)
 
     assert server.writable is False
+    assert server.readiness == {"status": "SERVING"}
+    assert server.security == {
+        "transport": "insecure",
+        "client_certificate_required": False,
+        "insecure_non_loopback_override": False,
+    }
+    assert server.mutation_safety["disk_reserve_bytes"] == 1 << 30
+    assert (
+        server.mutation_safety["idempotency_journal_max_bytes"] == 4 << 30
+    )
+    assert (
+        server.mutation_safety["idempotency_journal_max_operations"]
+        == 1_000_000
+    )
+    assert server.maintenance["enabled"] is False
     with RemoteCollection.connect(server.endpoint) as remote:
         assert remote.mode == "read"
         np.testing.assert_array_equal(
@@ -125,6 +314,82 @@ def test_read_only_server_keeps_reads_available_and_rejects_mutations(
         )
         with pytest.raises(RuntimeError, match="read-only"):
             remote.insert([40], _vectors(1, 7, salt=41))
+
+
+def test_non_loopback_bind_requires_mtls_or_explicit_override(
+    tmp_path: Path,
+    throwdb_server_binary: Path,
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+
+    with pytest.raises(ServerStartError, match="non-loopback.*mTLS"):
+        ServerProcess.start(
+            throwdb_server_binary,
+            store,
+            timeout=3,
+            extra_args=("--listen", "0.0.0.0:0"),
+        )
+
+
+def test_mtls_server_requires_and_verifies_client_certificate(
+    tmp_path: Path,
+    server_process_factory: Callable[..., ServerProcess],
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    certificates = _create_test_mtls_credentials(tmp_path / "certificates")
+    server = server_process_factory(
+        store,
+        extra_args=(
+            "--tls-cert",
+            str(certificates["server.crt"]),
+            "--tls-key",
+            str(certificates["server.key"]),
+            "--tls-client-ca",
+            str(certificates["ca.crt"]),
+        ),
+    )
+    assert server.security == {
+        "transport": "mtls",
+        "client_certificate_required": True,
+        "insecure_non_loopback_override": False,
+    }
+
+    root = certificates["ca.crt"].read_bytes()
+    credentials = grpc.ssl_channel_credentials(
+        root_certificates=root,
+        private_key=certificates["client.key"].read_bytes(),
+        certificate_chain=certificates["client.crt"].read_bytes(),
+    )
+    channel = grpc.secure_channel(
+        server.endpoint,
+        credentials,
+        options=(("grpc.enable_http_proxy", 0),),
+    )
+    try:
+        response = throwdb_pb2_grpc.ThrowDBStub(channel).Health(
+            throwdb_pb2.HealthRequest(), timeout=5
+        )
+        assert (
+            response.status
+            == throwdb_pb2.HealthResponse.SERVING_STATUS_SERVING
+        )
+    finally:
+        channel.close()
+
+    unauthenticated = grpc.secure_channel(
+        server.endpoint,
+        grpc.ssl_channel_credentials(root_certificates=root),
+        options=(("grpc.enable_http_proxy", 0),),
+    )
+    try:
+        with pytest.raises(grpc.RpcError):
+            throwdb_pb2_grpc.ThrowDBStub(unauthenticated).Health(
+                throwdb_pb2.HealthRequest(), timeout=2
+            )
+    finally:
+        unauthenticated.close()
 
 
 def test_grpc_requests_and_responses_larger_than_four_mib(
@@ -152,7 +417,7 @@ def test_grpc_requests_and_responses_larger_than_four_mib(
     ) as builder:
         builder.add(ids, original)
 
-    server = server_process_factory(store)
+    server = server_process_factory(store, extra_args=("--writable",))
     with RemoteCollection.connect(server.endpoint, timeout=30) as remote:
         received = remote.get(ids)
         np.testing.assert_array_equal(
@@ -176,15 +441,128 @@ def test_second_writable_server_is_fenced(
 ) -> None:
     store = tmp_path / "store"
     _build_store(store)
-    first = server_process_factory(store)
+    first = server_process_factory(store, extra_args=("--writable",))
 
     with pytest.raises(ServerStartError, match="(?i)writer|lock|lease|already"):
         ServerProcess.start(
             throwdb_server_binary,
             store,
             timeout=3,
+            extra_args=("--writable",),
         )
 
     assert first.process.poll() is None, first.diagnostics
     with RemoteCollection.connect(first.endpoint, timeout=3) as remote:
         assert remote.health()["serving"] is True
+
+
+def test_tune_aware_launcher_auto_fallback_and_manual_override(
+    tmp_path: Path,
+    throwdb_server_binary: Path,
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    launcher = (
+        "-m",
+        "throwdb.server",
+        "--native-binary",
+        str(throwdb_server_binary),
+    )
+
+    with ServerProcess.start(
+        Path(sys.executable),
+        store,
+        command_prefix=launcher,
+    ) as fallback:
+        assert fallback.tuning == {
+            "mode": "auto",
+            "source": "fallback",
+            "status": "registry_missing",
+            "reuse_level": "fallback",
+            "explicit_overrides": False,
+        }
+        with RemoteCollection.connect(fallback.endpoint) as remote:
+            description = remote.describe()
+            assert description.tuning is not None
+            assert description.tuning.status == "registry_missing"
+            assert description.reader is not None
+            assert description.reader.io_workers == 0
+
+    with ServerProcess.start(
+        Path(sys.executable),
+        store,
+        command_prefix=(*launcher, "--io-workers", "3"),
+    ) as manual:
+        assert manual.reader["io_workers"] == 3
+        assert manual.tuning == {
+            "mode": "manual",
+            "source": "manual",
+            "status": "explicit",
+            "reuse_level": "manual",
+            "explicit_overrides": True,
+        }
+        with RemoteCollection.connect(manual.endpoint) as remote:
+            description = remote.describe()
+            assert description.reader is not None
+            assert description.reader.io_workers == 3
+            assert description.tuning is not None
+            assert description.tuning.mode == "manual"
+
+
+def test_tune_aware_launcher_persisted_miss_fails_before_bind(
+    tmp_path: Path,
+    throwdb_server_binary: Path,
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+
+    with pytest.raises(ServerStartError, match="no reader profiles"):
+        ServerProcess.start(
+            Path(sys.executable),
+            store,
+            timeout=5,
+            command_prefix=(
+                "-m",
+                "throwdb.server",
+                "--native-binary",
+                str(throwdb_server_binary),
+                "--tuning",
+                "persisted",
+            ),
+        )
+
+
+def test_selected_tuning_diagnostics_round_trip(
+    tmp_path: Path,
+    server_process_factory: Callable[..., ServerProcess],
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    server = server_process_factory(
+        store,
+        extra_args=(
+            "--io-workers",
+            "2",
+            "--resolved-tuning-mode",
+            "auto",
+            "--resolved-tuning-source",
+            "persisted",
+            "--resolved-tuning-status",
+            "selected",
+            "--resolved-tuning-reuse-level",
+            "exact",
+            "--resolved-tuning-explicit-overrides",
+            "0",
+        ),
+    )
+
+    assert server.reader["io_workers"] == 2
+    assert server.tuning["source"] == "persisted"
+    with RemoteCollection.connect(server.endpoint) as remote:
+        description = remote.describe()
+        assert description.reader is not None
+        assert description.reader.io_workers == 2
+        assert description.tuning is not None
+        assert description.tuning.source == "persisted"
+        assert description.tuning.status == "selected"
+        assert description.tuning.reuse_level == "exact"

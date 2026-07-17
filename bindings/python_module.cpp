@@ -41,6 +41,10 @@ constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
 constexpr std::uint64_t kDefaultOrphanMaxFiles = 1024;
 constexpr std::uint64_t kDefaultOrphanMaxBytes = 8ULL << 30;
+constexpr std::uint64_t kDefaultMaxWalBacklogBytes = 16ULL << 30;
+constexpr std::uint64_t kDefaultMaxWalBacklogOperations = 4'000'000;
+constexpr std::uint64_t kDefaultMaxOverlayEntries = 4'000'000;
+constexpr std::uint64_t kDefaultMaxOverlayBytes = 256ULL << 20;
 
 struct DTypeInfo {
     const char* name;
@@ -85,6 +89,15 @@ struct DTypeInfo {
     result["active_wal_transaction_count"] =
         stats.active_wal_transaction_count;
     result["total_wal_bytes"] = stats.total_wal_bytes;
+    result["overlay_entry_count"] = stats.overlay_entry_count;
+    result["estimated_overlay_bytes"] = stats.estimated_overlay_bytes;
+    result["active_wal_operation_count"] =
+        stats.active_wal_operation_count;
+    result["frozen_wal_operation_count"] =
+        stats.frozen_wal_operation_count;
+    result["total_wal_operation_count"] =
+        stats.total_wal_operation_count;
+    result["frozen_wal_bytes"] = stats.frozen_wal_bytes;
     result["delta_run_count"] = stats.delta_run_count;
     result["delta_entry_count"] = stats.delta_entry_count;
     result["delta_put_rows"] = stats.delta_put_rows;
@@ -97,6 +110,10 @@ struct DTypeInfo {
     result["materialized_wal_count"] = stats.materialized_wal_count;
     result["materialized_wal_input_bytes"] =
         stats.materialized_wal_input_bytes;
+    result["materialized_wal_input_entries"] =
+        stats.materialized_wal_input_entries;
+    result["materialization_estimated_peak_memory_bytes"] =
+        stats.materialization_estimated_peak_memory_bytes;
     result["compacted_delta_run_count"] =
         stats.compacted_delta_run_count;
     result["compacted_delta_input_entries"] =
@@ -122,6 +139,10 @@ struct DTypeInfo {
     result["materialized"] = stats.materialized;
     result["materialization_budget_blocked"] =
         stats.materialization_budget_blocked;
+    result["materialization_entry_budget_blocked"] =
+        stats.materialization_entry_budget_blocked;
+    result["materialization_memory_budget_blocked"] =
+        stats.materialization_memory_budget_blocked;
     result["compacted"] = stats.compacted;
     result["compaction_budget_blocked"] =
         stats.compaction_budget_blocked;
@@ -1189,7 +1210,11 @@ public:
         const py::object& verify_native_index,
         const py::object& max_read_range_bytes,
         const py::object& max_gap_bytes,
-        const py::object& calibration) {
+        const py::object& calibration,
+        const py::object& max_wal_bytes,
+        const py::object& max_wal_operations,
+        const py::object& max_overlay_entries,
+        const py::object& max_overlay_bytes) {
         bool writable = false;
         if (mode == "r") {
             writable = false;
@@ -1220,12 +1245,22 @@ public:
                 verify_native_index, "verify_native_index"),
             checked_max_read_range_bytes,
             checked_max_gap_bytes);
+        throwdb::NativeOpenOptions open_options;
+        open_options.max_wal_bytes = checked_uint64_option(
+            max_wal_bytes, "max_wal_bytes", false);
+        open_options.max_wal_operations = checked_uint64_option(
+            max_wal_operations, "max_wal_operations", false);
+        open_options.max_overlay_entries = checked_uint64_option(
+            max_overlay_entries, "max_overlay_entries", false);
+        open_options.max_overlay_bytes = checked_uint64_option(
+            max_overlay_bytes, "max_overlay_bytes", false);
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::NativeCollection> collection;
         {
             py::gil_scoped_release release;
             collection = throwdb::NativeCollection::open(
-                native_path, options, writable, checked_calibration);
+                native_path, options, writable, checked_calibration,
+                open_options);
         }
         return std::unique_ptr<PyNativeCollection>(
             new PyNativeCollection(std::move(collection)));
@@ -1434,17 +1469,26 @@ public:
 
     [[nodiscard]] py::dict materialize_frozen_wals(
         const py::object& max_wals,
-        const py::object& max_input_bytes) {
+        const py::object& max_input_bytes,
+        const py::object& max_input_entries,
+        const py::object& max_memory_bytes) {
         const std::uint64_t checked_max_wals = checked_uint64_option(
             max_wals, "max_wals", false);
         const std::uint64_t checked_max_input_bytes = checked_uint64_option(
             max_input_bytes, "max_input_bytes", false);
+        const std::uint64_t checked_max_input_entries = checked_uint64_option(
+            max_input_entries, "max_input_entries", false);
+        const std::uint64_t checked_max_memory_bytes = checked_uint64_option(
+            max_memory_bytes, "max_memory_bytes", false);
         const auto collection = acquire_collection();
         throwdb::NativeMutationLogStats stats;
         {
             py::gil_scoped_release release;
             stats = collection->materialize_frozen_wals(
-                checked_max_wals, checked_max_input_bytes);
+                checked_max_wals,
+                checked_max_input_bytes,
+                checked_max_input_entries,
+                checked_max_memory_bytes);
         }
         return mutation_log_stats_dict(stats);
     }
@@ -1793,7 +1837,12 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("verify_native_index") = false,
             py::arg("max_read_range_bytes") = kDefaultMaxReadRangeBytes,
             py::arg("max_gap_bytes") = kDefaultMaxGapBytes,
-            py::arg("calibration") = false)
+            py::arg("calibration") = false,
+            py::arg("max_wal_bytes") = kDefaultMaxWalBacklogBytes,
+            py::arg("max_wal_operations") =
+                kDefaultMaxWalBacklogOperations,
+            py::arg("max_overlay_entries") = kDefaultMaxOverlayEntries,
+            py::arg("max_overlay_bytes") = kDefaultMaxOverlayBytes)
         .def_property_readonly("dimension", &PyNativeCollection::dimension)
         .def_property_readonly("count", &PyNativeCollection::count)
         .def_property_readonly("dtype", &PyNativeCollection::dtype)
@@ -1862,6 +1911,10 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("max_wals") =
                 std::numeric_limits<std::uint64_t>::max(),
             py::arg("max_input_bytes") =
+                std::numeric_limits<std::uint64_t>::max(),
+            py::arg("max_input_entries") =
+                std::numeric_limits<std::uint64_t>::max(),
+            py::arg("max_memory_bytes") =
                 std::numeric_limits<std::uint64_t>::max())
         .def(
             "compact_delta_runs",

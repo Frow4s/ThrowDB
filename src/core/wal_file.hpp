@@ -15,7 +15,8 @@ void create_wal_file(
     const std::filesystem::path& path,
     const ExpectedWalIdentity& expected,
     WalScanMode mode,
-    const WalRecoveryVisitor& visitor = {});
+    const WalRecoveryVisitor& visitor = {},
+    WalScanLimits limits = {});
 
 [[nodiscard]] WalMutationFingerprint fingerprint_recovered_wal_batch(
     int fd,

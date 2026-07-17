@@ -3,9 +3,11 @@
 This document defines the implemented selective-cleaning mutation layer for a
 logical ThrowDB collection. It deliberately does **not** require periodically
 copying the whole collection. New writes become bounded immutable resources,
-and an explicit cleaner pass rewrites at most one selected segment whose
-garbage and reclaimable-byte thresholds justify the work. No background thread
-invokes lifecycle maintenance.
+and one cleaner pass rewrites at most one selected segment whose garbage and
+reclaimable-byte thresholds justify the work. The embedded library does not
+create a background thread. A writable `throwdbd` invokes the same bounded pass
+from its maintenance worker, with conservative thresholds and a minimum scan
+interval so sidecar inspection cannot become continuous background I/O.
 
 The fresh native numeric MVP now implements:
 
@@ -181,8 +183,8 @@ The contract assumes a trusted local POSIX collection directory: POSIX has no
 conditional unlink-by-inode primitive that could defeat a hostile process
 renaming pathnames outside ThrowDB's locks.
 
-`maintain(dry_run=...)` is an explicit deterministic pass, not a background
-thread. Format 7 considers, in order, rotation of a non-empty active WAL,
+Embedded `maintain(dry_run=...)` is an explicit deterministic pass, not a
+library-created background thread. Format 7 considers, in order, rotation of a non-empty active WAL,
 bounded materialization of the oldest frozen prefix, selective partition
 folding, cleaning of at most one segment, and bounded orphan collection. Each
 action is attempted at most once. Format 6 uses the older four-action sequence
@@ -502,10 +504,11 @@ Thus materialization is not a base compaction: it bounds the selected mutation
 history without copying any base embedding or flat-index entry.
 
 `materialize_frozen_wals(max_wals=..., max_input_bytes=...)` may select only
-the oldest contiguous frozen prefix fitting both limits. The legacy no-argument
-call remains unlimited. If the oldest frozen WAL does not fit, the operation is
-a no-op with `materialization_budget_blocked=true`; it never silently exceeds a
-maintenance budget.
+the oldest contiguous frozen prefix fitting both format-6 limits. The legacy
+no-argument call remains unlimited. If the oldest frozen WAL does not fit, the
+operation is a no-op with `materialization_budget_blocked=true`; it never
+silently exceeds a maintenance budget. Entry-count and estimated-memory limits
+are format-7-only because format 6 retains its compatibility implementation.
 
 Format 6 also exposes `compact_deltas()` (CLI: `throwdb compact-deltas`). It
 selects the oldest contiguous prefix of at least two DeltaV1 runs subject to
@@ -535,11 +538,26 @@ work without reading or copying the immutable base. It deliberately cannot
 discard tombstones while the flat base index remains a fallback and therefore
 cannot reclaim garbage inside base segments. Format 7, described below,
 provides the authoritative partitioned RowRef index and selective cleaner.
-Explicit `maintain()` supplies deterministic triggers; there is intentionally
-no background invocation.
+Explicit embedded `maintain()` supplies deterministic triggers. The optional
+writable-server worker uses the same bounded lifecycle primitives and also
+attempts format-7 selective cleaning conservatively: at most one candidate is
+rewritten per pass, after threshold and minimum-interval checks.
 
 ### Format-6 DeltaV1 limits
 
+- Finite `NativeOpenOptions` are enforced before mapping each retained WAL and
+  before allocating each decoded DeltaV1 record vector. WAL committed-operation
+  limits are passed into the validating scanner; the retained overlay is then
+  bounded by exact unique ID count and a conservative 64-byte-per-entry
+  estimate across all deltas and WALs.
+- The same handle limits remain active after recovery. A mutation checks exact
+  projected total retained WAL bytes/operations and exact unique overlay growth
+  before its durable append. Rotation charges its additional 4096-byte active
+  WAL header while retaining the frozen predecessor. A limit error neither
+  appends a transaction nor publishes a rotation.
+- `mutation_log_stats()` reports exact active/frozen/total WAL operation counts,
+  exact active/frozen/total logical WAL bytes, and exact overlay cardinality;
+  `estimated_overlay_bytes` uses the same conservative estimator as admission.
 - Delta version records still populate the full mutation overlay in RAM when a
   collection opens; `.idx` is durable metadata, not yet an on-demand or
   partitioned lookup structure.
@@ -562,9 +580,10 @@ no background invocation.
 
 Format 7 uses the same active/frozen WAL protocol but a different immutable
 destination. `materialize_frozen_wals()` selects the oldest contiguous frozen
-prefix fitting its WAL-count and input-byte budgets. It collapses each ID to
-the greatest sequence in that prefix, orders winning PUT payload reads by their
-source `RowRef`, and streams the bit-exact rows into one or more
+prefix fitting its WAL-count, input-byte, committed-operation, and estimated
+peak-memory budgets. It collapses each ID to the greatest sequence in that
+prefix, orders winning PUT payload reads by their source `RowRef`, and streams
+the bit-exact rows into one or more
 `segment-<uuid>.dat/.ids` pairs. The sidecar stores `{id, original sequence}`
 for every dense row. A single immutable mutation run stores ID-sorted
 `{id, sequence, PUT RowRef/DELETE}` records grouped by partition.
