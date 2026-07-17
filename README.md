@@ -19,6 +19,13 @@ semantics and staged product plan are documented in
 The numeric version-2 binary representation is specified in
 [`docs/storage-format-v2.md`](docs/storage-format-v2.md).
 
+For a complete product handoff, start with the
+[repository review](docs/repository-review.md),
+[end-user guide](docs/user-guide.md),
+[Kubernetes runbook](docs/kubernetes-deployment.md),
+[wheel/release guide](docs/release-packaging.md), or the
+[documentation index](docs/README.md).
+
 ## Install
 
 Release CI is configured to build precompiled CPython 3.10-3.14 wheels for
@@ -33,6 +40,13 @@ python -m pip install throwdb-0.1.0-cp311-cp311-manylinux_2_28_x86_64.whl
 throwdb --help
 throwdbd --help
 ```
+
+There is currently no PyPI publication, GitHub Release, tag, or checked-in
+Linux wheel for this reviewed revision. The only locally verified ready wheel
+is a temporary CPython 3.10/macOS ARM64 artifact and cannot be used in Linux or
+Kubernetes. Trigger/download the `Linux wheels` Actions artifact or build the
+manylinux wheel before deployment; exact locations and commands are in
+[`docs/release-packaging.md`](docs/release-packaging.md).
 
 For a complete source build without root privileges, first build the pinned
 gRPC/Protobuf toolchain once. The exported ThrowDB-specific prefix is consumed

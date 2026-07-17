@@ -1,0 +1,8 @@
+**
+!wheelhouse/
+!wheelhouse/throwdb.whl
+!deploy/
+!deploy/docker/
+!deploy/docker/Dockerfile
+!deploy/kubernetes/
+!deploy/kubernetes/healthcheck.py

@@ -1,0 +1,197 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: throwdb
+  namespace: throwdb
+  labels:
+    app.kubernetes.io/name: throwdb
+spec:
+  serviceName: throwdb-internal
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: throwdb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: throwdb
+    spec:
+      serviceAccountName: throwdb-server
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: throwdb
+          image: throwdb:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - throwdbd
+          args:
+            - --storage
+            - $(THROWDB_COLLECTION_PATH)
+            - --listen
+            - 0.0.0.0:50051
+            - --writable
+            - --tuning
+            - auto
+            - --tls-cert
+            - /etc/throwdb/tls/server/tls.crt
+            - --tls-key
+            - /etc/throwdb/tls/server/tls.key
+            - --tls-client-ca
+            - /etc/throwdb/tls/server/client-ca.crt
+            - --max-worker-threads
+            - "64"
+            - --max-concurrent-calls
+            - "32"
+            - --max-concurrent-scans
+            - "2"
+            - --max-inflight-mib
+            - "256"
+            - --max-scan-inflight-mib
+            - "128"
+            - --max-grpc-memory-mib
+            - "512"
+            - --max-request-mib
+            - "64"
+            - --max-response-mib
+            - "64"
+            - --mutation-disk-reserve-mib
+            - "102400"
+            - --shutdown-grace-ms
+            - "30000"
+            - --shutdown-hard-timeout-ms
+            - "60000"
+          env:
+            - name: THROWDB_COLLECTION_PATH
+              value: /var/lib/throwdb/collection
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          startupProbe:
+            exec:
+              command:
+                - python
+                - /opt/throwdb/healthcheck.py
+                - --endpoint
+                - 127.0.0.1:50051
+                - --root-ca
+                - /etc/throwdb/tls/probe/ca.crt
+                - --client-cert
+                - /etc/throwdb/tls/probe/tls.crt
+                - --client-key
+                - /etc/throwdb/tls/probe/tls.key
+                - --server-name
+                - throwdb.throwdb.svc.cluster.local
+                - --require-serving
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - /opt/throwdb/healthcheck.py
+                - --endpoint
+                - 127.0.0.1:50051
+                - --root-ca
+                - /etc/throwdb/tls/probe/ca.crt
+                - --client-cert
+                - /etc/throwdb/tls/probe/tls.crt
+                - --client-key
+                - /etc/throwdb/tls/probe/tls.key
+                - --server-name
+                - throwdb.throwdb.svc.cluster.local
+                - --require-serving
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - /opt/throwdb/healthcheck.py
+                - --endpoint
+                - 127.0.0.1:50051
+                - --root-ca
+                - /etc/throwdb/tls/probe/ca.crt
+                - --client-cert
+                - /etc/throwdb/tls/probe/tls.crt
+                - --client-key
+                - /etc/throwdb/tls/probe/tls.key
+                - --server-name
+                - throwdb.throwdb.svc.cluster.local
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "16"
+              memory: 64Gi
+            limits:
+              cpu: "16"
+              memory: 64Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/throwdb
+            - name: tls
+              mountPath: /etc/throwdb/tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: throwdb-data
+        - name: tls
+          projected:
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: throwdb-server-tls
+                  items:
+                    - key: tls.crt
+                      path: server/tls.crt
+                    - key: tls.key
+                      path: server/tls.key
+                    - key: ca.crt
+                      path: server/client-ca.crt
+              - secret:
+                  name: throwdb-probe-client-tls
+                  items:
+                    - key: ca.crt
+                      path: probe/ca.crt
+                    - key: tls.crt
+                      path: probe/tls.crt
+                    - key: tls.key
+                      path: probe/tls.key
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

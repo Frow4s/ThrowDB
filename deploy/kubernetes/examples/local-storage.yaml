@@ -1,0 +1,34 @@
+# Cluster-scoped example. Replace the node hostname and local path before use.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: throwdb-local-nvme
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: throwdb-collection
+  labels:
+    throwdb.io/collection: collection
+spec:
+  capacity:
+    storage: 3Ti
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: throwdb-local-nvme
+  local:
+    path: /mnt/nvme/throwdb-collection
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - REPLACE_WITH_NVME_NODE

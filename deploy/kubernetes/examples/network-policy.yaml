@@ -1,0 +1,23 @@
+# Optional defense in depth. Adapt the allowed namespace/pod labels first.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: throwdb
+  namespace: throwdb
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: throwdb
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: embedding-apps
+          podSelector:
+            matchLabels:
+              throwdb.io/client: "true"
+      ports:
+        - protocol: TCP
+          port: 50051

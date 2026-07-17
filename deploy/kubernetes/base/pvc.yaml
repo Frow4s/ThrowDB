@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: throwdb-data
+  namespace: throwdb
+  labels:
+    app.kubernetes.io/name: throwdb
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: throwdb-local-nvme
+  resources:
+    requests:
+      storage: 3Ti
