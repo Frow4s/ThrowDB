@@ -34,6 +34,8 @@ _UINT64_MAX: Final = (1 << 64) - 1
 _TUNING_DIRECTORY_NAME: Final = "tuning"
 _REGISTRY_FILENAME: Final = "reader-profiles.json"
 _LOCK_FILENAME: Final = "reader-profiles.lock"
+_COLLECTION_LOCK_DIRECTORY: Final = "locks"
+_CHECKPOINT_LOCK_FILENAME: Final = "tuning.lock"
 
 READER_DEFAULTS: Final[dict[str, object]] = {
     "max_read_range_bytes": 1 << 20,
@@ -653,6 +655,226 @@ def _open_collection_directory(store: Path) -> int:
     return descriptor
 
 
+def _open_lock_directory(store_descriptor: int) -> int:
+    """Open the collection lock directory without following a replacement.
+
+    Real collections already contain ``locks/``.  Creating it here retains the
+    historical property that the low-level registry helpers also work against
+    an otherwise empty directory in tests and tooling.  The coordination file
+    lives outside ``tuning/`` so a checkpoint of a collection with no tuning
+    metadata does not bootstrap an advisory registry accidentally.
+    """
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | nofollow
+    )
+    created = False
+    try:
+        os.mkdir(_COLLECTION_LOCK_DIRECTORY, mode=0o755, dir_fd=store_descriptor)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise TuningRegistryError(
+            f"cannot create collection lock directory: {error}"
+        ) from error
+    try:
+        descriptor = os.open(
+            _COLLECTION_LOCK_DIRECTORY,
+            flags,
+            dir_fd=store_descriptor,
+        )
+    except OSError as error:
+        try:
+            current = os.stat(
+                _COLLECTION_LOCK_DIRECTORY,
+                dir_fd=store_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            current = None
+        if current is not None and not stat.S_ISDIR(current.st_mode):
+            raise TuningRegistryError(
+                "collection lock path is not a real directory"
+            ) from error
+        raise TuningRegistryError(
+            f"cannot open collection lock directory: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise TuningRegistryError(
+                "collection lock path is not a real directory"
+            )
+        if not nofollow:
+            current = os.stat(
+                _COLLECTION_LOCK_DIRECTORY,
+                dir_fd=store_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise TuningRegistryError(
+                    "collection lock path is not a real directory"
+                )
+        if created:
+            os.fsync(store_descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_or_create_lock_file(directory_descriptor: int, name: str) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | nofollow
+    descriptor = -1
+    created = False
+    open_error: OSError | None = None
+    # O_CREAT without O_EXCL can transiently return ENOENT when several
+    # threads race to create the same dirfd-relative file on some POSIX
+    # filesystems (including APFS). Split create/open and tolerate the narrow
+    # winner-removal race instead.
+    for _ in range(4):
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=directory_descriptor,
+            )
+            created = True
+            break
+        except FileExistsError:
+            try:
+                descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+                break
+            except FileNotFoundError as error:
+                open_error = error
+                continue
+            except OSError as error:
+                open_error = error
+                break
+        except FileNotFoundError as error:
+            open_error = error
+            continue
+        except OSError as error:
+            open_error = error
+            break
+    if descriptor < 0:
+        assert open_error is not None
+        raise TuningRegistryError(
+            f"cannot open tuning registry lock: {open_error}"
+        ) from open_error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise TuningRegistryError(
+                "tuning registry lock is not a regular file"
+            )
+        if not nofollow:
+            current = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise TuningRegistryError(
+                    "tuning registry lock is not a regular file"
+                )
+        if created:
+            os.fsync(directory_descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+@contextmanager
+def tuning_checkpoint_lock(
+    store_path: object,
+    *,
+    expected_store_identity: tuple[int, int] | None = None,
+    fail_if_locked: bool = False,
+) -> Iterator[tuple[int, int]]:
+    """Serialize registry mutations with complete-collection checkpoints.
+
+    The global order is ``writer.lock`` (when a lifecycle owner has one), then
+    ``locks/tuning.lock``, then ``tuning/reader-profiles.lock``.  Registry-only
+    callers never acquire ``writer.lock`` after either tuning lock, so a backup
+    that already owns the writer lease cannot form a lock cycle.
+
+    The checkpoint barrier is deliberately stored under the existing lock
+    namespace rather than ``tuning/``.  Acquiring it therefore does not create
+    a registry directory or registry payload when optional tuning metadata is
+    absent.
+    """
+
+    if expected_store_identity is not None:
+        expected_store_identity = _store_identity(expected_store_identity)
+    if not isinstance(fail_if_locked, bool):
+        raise TypeError("fail_if_locked must be a bool")
+    store = _path(store_path)
+    store_descriptor = -1
+    locks_descriptor = -1
+    lock_descriptor = -1
+    locked = False
+    try:
+        store_descriptor = _open_collection_directory(store)
+        opened_store = os.fstat(store_descriptor)
+        locked_store_identity = (opened_store.st_dev, opened_store.st_ino)
+        if (
+            expected_store_identity is not None
+            and locked_store_identity != expected_store_identity
+        ):
+            raise TuningRegistryError(
+                "collection root changed while preparing the tuning registry; "
+                "refusing to publish the profile"
+            )
+        locks_descriptor = _open_lock_directory(store_descriptor)
+        lock_descriptor = _open_or_create_lock_file(
+            locks_descriptor, _CHECKPOINT_LOCK_FILENAME
+        )
+        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if fail_if_locked else 0)
+        try:
+            fcntl.flock(lock_descriptor, operation)
+        except BlockingIOError as error:
+            raise TuningRegistryError(
+                "tuning registry is busy; retry calibration later"
+            ) from error
+        locked = True
+        yield locked_store_identity
+    except TuningRegistryError:
+        raise
+    except OSError as error:
+        raise TuningRegistryError(
+            f"cannot acquire tuning checkpoint lock: {error}"
+        ) from error
+    finally:
+        try:
+            if locked:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            for descriptor in (
+                lock_descriptor,
+                locks_descriptor,
+                store_descriptor,
+            ):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+
 def _store_identity(value: object) -> tuple[int, int]:
     if (
         not isinstance(value, tuple)
@@ -805,89 +1027,44 @@ def _exclusive_writer(
     expected_store_identity: tuple[int, int] | None = None,
     fail_if_locked: bool = False,
 ) -> Iterator[int]:
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | nofollow
-    with _opened_tuning_directory(
+    # Every mutation takes the collection-level checkpoint barrier first.
+    # A backup already owns writer.lock before taking that barrier; calibration
+    # also owns writer.lock before publication.  No registry-only path takes
+    # writer.lock after either tuning lock, preserving the documented order.
+    with tuning_checkpoint_lock(
         store_path,
-        create=True,
         expected_store_identity=expected_store_identity,
-    ) as tuning:
-        descriptor = -1
-        open_error: OSError | None = None
-        # O_CREAT without O_EXCL can transiently return ENOENT when several
-        # threads race to create the same dirfd-relative file on some POSIX
-        # filesystems (including APFS). Split create/open and tolerate the
-        # narrow winner-removal race instead.
-        for _ in range(4):
+        fail_if_locked=fail_if_locked,
+    ) as locked_store_identity:
+        with _opened_tuning_directory(
+            store_path,
+            create=True,
+            # Reopening the user-supplied path must still reach the root whose
+            # anchored locks/tuning.lock inode we own.  This closes a rename +
+            # symlink swap between the two dirfd-based namespaces even when a
+            # caller did not provide an optimistic identity explicitly.
+            expected_store_identity=locked_store_identity,
+        ) as tuning:
+            descriptor = _open_or_create_lock_file(tuning, _LOCK_FILENAME)
+            locked = False
             try:
-                descriptor = os.open(
-                    _LOCK_FILENAME,
-                    flags | os.O_CREAT | os.O_EXCL,
-                    0o644,
-                    dir_fd=tuning,
+                operation = fcntl.LOCK_EX | (
+                    fcntl.LOCK_NB if fail_if_locked else 0
                 )
-                break
-            except FileExistsError:
                 try:
-                    descriptor = os.open(
-                        _LOCK_FILENAME,
-                        flags,
-                        dir_fd=tuning,
-                    )
-                    break
-                except FileNotFoundError as error:
-                    open_error = error
-                    continue
-                except OSError as error:
-                    open_error = error
-                    break
-            except FileNotFoundError as error:
-                open_error = error
-                continue
-            except OSError as error:
-                open_error = error
-                break
-        if descriptor < 0:
-            assert open_error is not None
-            raise TuningRegistryError(
-                f"cannot open tuning registry lock: {open_error}"
-            ) from open_error
-        locked = False
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise TuningRegistryError(
-                    "tuning registry lock is not a regular file"
-                )
-            if not nofollow:
-                current = os.stat(
-                    _LOCK_FILENAME,
-                    dir_fd=tuning,
-                    follow_symlinks=False,
-                )
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or (current.st_dev, current.st_ino)
-                    != (opened.st_dev, opened.st_ino)
-                ):
+                    fcntl.flock(descriptor, operation)
+                except BlockingIOError as error:
                     raise TuningRegistryError(
-                        "tuning registry lock is not a regular file"
-                    )
-            flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if fail_if_locked else 0)
-            try:
-                fcntl.flock(descriptor, flags)
-            except BlockingIOError as error:
-                raise TuningRegistryError(
-                    "tuning registry is busy; retry calibration later"
-                ) from error
-            locked = True
-            yield tuning
-        finally:
-            try:
-                if locked:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                        "tuning registry is busy; retry calibration later"
+                    ) from error
+                locked = True
+                yield tuning
             finally:
-                os.close(descriptor)
+                try:
+                    if locked:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
 
 
 def _publish_registry(tuning: int, registry: TuningRegistry) -> None:

@@ -364,6 +364,21 @@ reads available; an actual lifecycle storage/durability failure makes Health
 `NOT_SERVING`, starts daemon drain, and exits nonzero so a process supervisor
 can replace the lease-owning instance.
 
+Maintenance does not hold the server mutation lane for a complete lifecycle
+build. Journal reconciliation/checkpoint and WAL rotation remain serialized
+with `PREPARE -> native commit -> COMPLETE`, because they can change the replay
+domain or freeze the WAL required for recovery. Expensive processing of an
+already selected frozen WAL, delta-run prefix, or segment runs outside that
+lane, so unrelated mutations can continue; native publication is still
+serialized internally. Format-7 orphan GC likewise performs its complete
+filesystem inventory, classification, and bounded selection without the
+mutation lane, then briefly reacquires the native mutation/commit/view locks to
+re-read `CURRENT`, revoke candidates that became reachable, revalidate file
+identities, unlink, and fsync. If a durable pending-mutation fence appears just
+before lifecycle admission, the action makes no destructive progress and the
+pass reports a transient `pending_mutation_deferred`. The worker retries on a
+later cycle instead of treating that condition as a terminal storage fault.
+
 Automatic cleaning is deliberately conservative. By default it scans at most
 eight candidate sidecars once per hour, rewrites at most one segment, requires
 at least 512 MiB and a 30% garbage ratio to be reclaimable, and obeys explicit
@@ -388,6 +403,18 @@ rejected. `RemoteCollection` copies the domain advertised by `Describe` into
 every mutation. If the capability is explicitly disabled, clients must not
 automatically retry an ambiguous mutation because its WAL commit may already be
 durable.
+
+The server reserves mutation `ABORTED` for an admission failure before the
+current request enters durable `PREPARE`; the current request therefore
+definitely did not commit. The Python client maps it to `RemoteAbortedError`, a
+typed retry signal carrying `operation` and `operation_id`, with
+`definitely_not_committed = true`. This remains distinct from an unknown
+transport outcome and is safe to retry even without durable idempotency. A
+caller may apply bounded backoff, but must replay the identical request with
+the same operation ID. Allocating a new operation ID would turn one logical
+mutation into a second operation. For catch compatibility,
+`RemoteAbortedError` is also an `AmbiguousCommitError`; catch the typed subclass
+first. The client never retries mutations automatically.
 
 Durable replay metadata lives at `server/idempotency-v1.log` inside the
 collection. A backup, filesystem snapshot, or offline copy that is expected to
@@ -470,6 +497,19 @@ another local backup owns the collection. A conditional
 `_throwdb_backup/LEASE.json` additionally serializes independent hosts using
 one S3 prefix. Stop the writable daemon first; a read-only daemon may remain
 online. The AWS subprocess never inherits the writer-lock descriptor.
+
+After `writer.lock`, backup also takes `locks/tuning.lock` for that complete
+window. Every tuning-registry create/save/remove/reset takes the same barrier
+before `tuning/reader-profiles.lock`, so registry bytes cannot change between
+inventory and `LATEST`. Backup fails fast if a registry publication is already
+active; a later registry mutation waits. This fixed order prevents a lock
+cycle, and a collection with no optional tuning metadata does not gain a
+`tuning/` directory merely because it was checkpointed.
+
+This coordination requires every process touching backup or tuning metadata to
+understand `locks/tuning.lock`. During a ThrowDB upgrade, quiesce checkpoints
+and tuning create/save/remove/reset operations until all such workers use the
+new wheel; concurrent mixed-version operation is not supported.
 
 For the simplest daily cron or Airflow task, omit the age guard so scheduler
 jitter cannot silently skip a day. If the task is launched every six hours,

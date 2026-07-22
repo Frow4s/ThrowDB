@@ -1442,6 +1442,9 @@ public:
 
     [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
         NativeOrphanCollectionOptions options) {
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::BeforeLifecycleFenceCheck,
+            detail::NativeCollectionTestOperation::CollectOrphans});
         ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             options = normalized_orphan_options(options);
@@ -1503,6 +1506,9 @@ public:
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries,
         const std::uint64_t max_memory_bytes) {
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::BeforeLifecycleFenceCheck,
+            detail::NativeCollectionTestOperation::MaterializeFrozenWals});
         ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->materialize_frozen_wals(
@@ -1629,6 +1635,13 @@ public:
                 throw;
             }
         }
+
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::LifecycleBuildUnlocked,
+            detail::NativeCollectionTestOperation::MaterializeFrozenWals,
+            detail::NativeCollectionTestResourceKind::None,
+            reservation_generation,
+            0});
 
         std::unordered_map<std::uint64_t, detail::VersionedMutationValue>
             collapsed;
@@ -1907,6 +1920,9 @@ public:
         const std::uint64_t max_runs,
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
+        detail::invoke_native_collection_test_hook({
+            detail::NativeCollectionTestHookPoint::BeforeLifecycleFenceCheck,
+            detail::NativeCollectionTestOperation::CompactDeltaRuns});
         ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->fold_partitions(
@@ -2388,6 +2404,10 @@ public:
                 "selective segment cleaning requires a format-7 collection");
         }
         if (!options.dry_run) {
+            detail::invoke_native_collection_test_hook({
+                detail::NativeCollectionTestHookPoint::
+                    BeforeLifecycleFenceCheck,
+                detail::NativeCollectionTestOperation::CleanSegment});
             ensure_lifecycle_not_fenced(path_);
         }
         return partitioned_reader_->clean_segments(

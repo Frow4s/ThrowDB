@@ -1811,14 +1811,29 @@ public:
         const PartitionedOrphanCollectionOptions options) {
         ensure_mutable();
         std::unique_lock lifecycle(lifecycle_mutex_);
+        // Directory inventory and candidate selection can scale with retained
+        // and stray files. Build that advisory plan without the mutation or
+        // publication barriers; the apply phase below re-reads CURRENT and
+        // revokes every path that became reachable in the meantime.
+        PartitionedOrphanCollectionPlan plan = plan_partitioned_orphans(
+            root_, options);
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::BeforeOrphanRevalidation,
+            NativeCollectionTestOperation::CollectOrphans});
         std::lock_guard mutation(mutation_mutex_);
         ensure_healthy();
+        // PREPARE may have appeared while the unlocked inventory walked the
+        // filesystem. Recheck after entering the native mutation lane so an
+        // already-durable ambiguous operation defers this apply phase.
+        ensure_pending_mutation_fence_absent(
+            root_, "format-7 orphan reclamation");
         ScopedAdvisoryLock commit(
             commit_lock_, FileLockMode::Exclusive);
         ScopedAdvisoryLock view(
             view_lock_, FileLockMode::Exclusive);
-        return collect_partitioned_orphans(
-            root_, catalog_.generation, catalog_.catalog_id, options);
+        return apply_partitioned_orphan_plan(
+            root_, catalog_.generation, catalog_.catalog_id,
+            std::move(plan));
     }
 
     [[nodiscard]] NativeMutationLogStats rotate_wal() {
@@ -2086,6 +2101,13 @@ public:
                 throw;
             }
         }
+
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::LifecycleBuildUnlocked,
+            NativeCollectionTestOperation::MaterializeFrozenWals,
+            NativeCollectionTestResourceKind::None,
+            reservation_generation,
+            0});
 
         std::vector<CollapsedRecord*> put_records;
         put_records.reserve(static_cast<std::size_t>(final_put_count));

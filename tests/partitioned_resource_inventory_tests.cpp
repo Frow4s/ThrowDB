@@ -747,6 +747,74 @@ void test_expected_current_and_identity_revalidation() {
         "identity replacement was not rejected");
 }
 
+void test_two_phase_plan_never_removes_a_newly_reachable_catalog() {
+    TemporaryDirectory temporary("two-phase-reachable");
+    build_store(temporary.path());
+
+    const auto manifest = throwdb::detail::decode_partitioned_manifest_v2(
+        read_file(temporary.path() / "manifest.bin"));
+    const auto current = throwdb::detail::decode_partitioned_current_v1(
+        read_file(temporary.path() / "CURRENT"), manifest);
+    const auto current_catalog_path =
+        temporary.path() / "catalogs"
+        / ("catalog-" + uuid_token(current.catalog_id) + ".bin");
+    auto next_catalog = throwdb::detail::decode_partitioned_catalog_v3(
+        read_file(current_catalog_path));
+    next_catalog.generation = current.generation + 1;
+    next_catalog.previous_catalog_id = current.catalog_id;
+    next_catalog.catalog_id = uuid(450);
+    const auto next_catalog_bytes =
+        throwdb::detail::encode_partitioned_catalog_v3(next_catalog);
+    const auto next_catalog_path =
+        temporary.path() / "catalogs"
+        / ("catalog-" + uuid_token(next_catalog.catalog_id) + ".bin");
+    write_file(next_catalog_path, next_catalog_bytes);
+    const std::string next_catalog_relative =
+        "catalogs/" + next_catalog_path.filename().string();
+
+    auto plan = throwdb::detail::plan_partitioned_orphans(
+        temporary.path(), permissive_options());
+    const auto planned = std::find_if(
+        plan.result.entries.begin(), plan.result.entries.end(),
+        [&next_catalog_relative](const auto& entry) {
+            return entry.file.relative_path == next_catalog_relative;
+        });
+    require(
+        planned != plan.result.entries.end() && planned->eligible
+            && planned->selected,
+        "phase-one plan did not select the not-yet-current catalog");
+
+    const throwdb::detail::PartitionedCurrentV1 next_current{
+        manifest.collection_id,
+        manifest.schema_id,
+        next_catalog.generation,
+        next_catalog.catalog_id,
+        static_cast<std::uint64_t>(next_catalog_bytes.size()),
+        throwdb::detail::crc32c(next_catalog_bytes)};
+    const auto next_current_bytes =
+        throwdb::detail::encode_partitioned_current_v1(
+            manifest, next_current);
+    write_file(temporary.path() / "CURRENT", next_current_bytes);
+
+    const auto result = throwdb::detail::apply_partitioned_orphan_plan(
+        temporary.path(), next_catalog.generation, next_catalog.catalog_id,
+        std::move(plan));
+    const auto applied = std::find_if(
+        result.entries.begin(), result.entries.end(),
+        [&next_catalog_relative](const auto& entry) {
+            return entry.file.relative_path == next_catalog_relative;
+        });
+    require(
+        std::filesystem::exists(next_catalog_path),
+        "phase-two revalidation removed the newly reachable catalog");
+    require(
+        applied != result.entries.end() && !applied->selected
+            && !applied->removed
+            && applied->disposition
+                   == PartitionedOrphanDisposition::NotCandidate,
+        "phase-two result did not revoke newly reachable deletion authority");
+}
+
 void test_all_owned_candidate_namespaces_are_collected() {
     TemporaryDirectory temporary("namespaces");
     build_store(temporary.path());
@@ -989,7 +1057,7 @@ void test_native_collection_public_surface() {
 
 int main() {
     using Test = std::pair<const char*, void (*)()>;
-    const std::array<Test, 9> tests{
+    const std::array<Test, 10> tests{
         Test{"reachability_and_strict_filename_classification",
              &test_reachability_and_strict_filename_classification},
         Test{"authoritative_validation_and_catalog_cap",
@@ -1002,6 +1070,8 @@ int main() {
              &test_pair_budgets_age_fsync_and_idempotence},
         Test{"expected_current_and_identity_revalidation",
              &test_expected_current_and_identity_revalidation},
+        Test{"two_phase_plan_never_removes_a_newly_reachable_catalog",
+             &test_two_phase_plan_never_removes_a_newly_reachable_catalog},
         Test{"all_owned_candidate_namespaces_are_collected",
              &test_all_owned_candidate_namespaces_are_collected},
         Test{"inventory_scan_limit_is_fail_closed",

@@ -30,6 +30,8 @@ from pathlib import Path, PurePosixPath
 from typing import Iterator, Literal, Mapping, Sequence, TypedDict, cast
 from urllib.parse import urlsplit
 
+from ._tuning import TuningRegistryError, tuning_checkpoint_lock
+
 
 _BACKUP_FORMAT = "throwdb-s3-backup"
 _LATEST_FORMAT = "throwdb-s3-backup-latest"
@@ -1236,6 +1238,28 @@ def _writer_lease(root: Path) -> Iterator[None]:
                 pass
 
 
+@contextlib.contextmanager
+def _tuning_checkpoint_lease(root: Path) -> Iterator[None]:
+    """Fence tuning mutations after the collection writer lease.
+
+    The cross-subsystem order is always ``writer.lock`` followed by
+    ``locks/tuning.lock``.  Registry mutation helpers take the latter before
+    ``tuning/reader-profiles.lock`` and never try to acquire ``writer.lock``,
+    so waiting for an in-flight registry publication cannot form a cycle.
+    """
+
+    try:
+        # The checkpoint's max_seconds budget must not be bypassed by an
+        # unbounded local flock wait.  Registry publications are short; if one
+        # already owns the barrier, fail closed and let the scheduler retry.
+        with tuning_checkpoint_lock(root, fail_if_locked=True):
+            yield
+    except TuningRegistryError as error:
+        raise S3BackupError(
+            f"cannot acquire the tuning checkpoint lease: {error}"
+        ) from error
+
+
 def _destination_identity(target: _S3Target) -> str:
     return target.uri(directory=True)
 
@@ -2142,7 +2166,11 @@ def backup_to_s3(
     deadline = _Deadline(maximum_seconds)
     latest_key = target.key("_throwdb_backup", "LATEST.json")
 
-    with _writer_lease(root):
+    # Keep both local leases until the source inventory, payload upload,
+    # completion/LATEST publication, and local lineage cursor are complete.
+    # The writer lease is deliberately acquired first; see
+    # _tuning_checkpoint_lease for the process-wide lock order.
+    with _writer_lease(root), _tuning_checkpoint_lease(root):
         inventory = _inventory(root, deadline)
         source = _verified_source_state(root, inventory)
         versioning_status, require_version = _bucket_versioning(

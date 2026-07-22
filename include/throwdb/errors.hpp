@@ -21,6 +21,14 @@ public:
     using StorageError::StorageError;
 };
 
+// A destructive lifecycle action observed the durable server PREPARE fence.
+// This is a transient coordination outcome, not evidence of storage damage:
+// the server may defer the action while the mutation lane resolves the fence.
+class PendingMutationFenceError : public StorageError {
+public:
+    using StorageError::StorageError;
+};
+
 // Resource/runtime-policy failure while constructing a reader backend, or a
 // backend operation unsupported by the current storage target. Collection
 // metadata, ordinary I/O failures, and data corruption use distinct exception

@@ -5,12 +5,16 @@ import hashlib
 import json
 import os
 import shutil
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 import throwdb.s3_backup as s3_backup_module
+from throwdb._tuning import tuning_checkpoint_lock, upsert_profile
 from throwdb.cli import _build_parser, main
 from throwdb.collection import Collection, CollectionSchema
 from throwdb.s3_backup import (
@@ -27,6 +31,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -259,6 +264,16 @@ if args[:2] == ["s3", "sync"]:
         raise SystemExit(0)
     source = Path(args[2])
     bucket, destination_prefix = remote(args[3])
+    pause_started = os.environ.get("FAKE_AWS_SYNC_STARTED")
+    pause_release = os.environ.get("FAKE_AWS_SYNC_RELEASE")
+    if pause_started and pause_release:
+        Path(pause_started).write_text("started")
+        deadline = time.monotonic() + 10.0
+        while not Path(pause_release).exists():
+            if time.monotonic() >= deadline:
+                print("timed out waiting for fake sync release", file=sys.stderr)
+                raise SystemExit(25)
+            time.sleep(0.01)
     source_files = {
         path.relative_to(source).as_posix(): path
         for path in source.rglob("*")
@@ -388,6 +403,149 @@ def test_backup_publishes_versioned_checksum_inventory_and_alternates_slots(
         and call[call.index("--key") + 1].endswith("LATEST.json")
         for call in puts
     )
+
+
+def test_backup_fences_tuning_registry_mutation_for_complete_publication_window(
+    tmp_path: Path,
+    fake_aws: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, remote, _ = fake_aws
+    storage = _collection(tmp_path / "collection")
+    identity = {
+        "device": {"kind": "test", "identity": "disk-one"},
+        "runtime": {"abi": "test-v1", "cpus": 2},
+        "layout": {"format": 7, "dimension": 2},
+    }
+    upsert_profile(
+        storage,
+        **identity,
+        options={"io_workers": 1},
+        source="s3-concurrency-test",
+        timestamp_ns=100,
+    )
+    registry_path = storage / "tuning/reader-profiles.json"
+    registry_before = registry_path.read_bytes()
+    registry_sha256 = hashlib.sha256(registry_before).hexdigest()
+
+    sync_started = tmp_path / "sync-started"
+    sync_release = tmp_path / "sync-release"
+    monkeypatch.setenv("FAKE_AWS_SYNC_STARTED", str(sync_started))
+    monkeypatch.setenv("FAKE_AWS_SYNC_RELEASE", str(sync_release))
+    mutation_started = threading.Event()
+
+    def mutate_registry() -> object:
+        mutation_started.set()
+        return upsert_profile(
+            storage,
+            **identity,
+            options={"io_workers": 2},
+            source="s3-concurrency-test",
+            timestamp_ns=200,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        backup = executor.submit(
+            backup_to_s3,
+            storage,
+            "s3://bucket/backups",
+            aws_executable=executable,
+        )
+        wait_deadline = time.monotonic() + 10.0
+        while not sync_started.exists() and time.monotonic() < wait_deadline:
+            time.sleep(0.01)
+        assert sync_started.exists(), "backup did not reach the paused payload upload"
+
+        mutation = executor.submit(mutate_registry)
+        assert mutation_started.wait(timeout=2.0)
+        try:
+            with pytest.raises(TimeoutError):
+                # The fake sync remains paused, so a generous watchdog checks
+                # the lock contract without depending on sub-second scheduler
+                # latency under loaded CI/cgroups.
+                mutation.result(timeout=2.0)
+            assert registry_path.read_bytes() == registry_before
+        finally:
+            sync_release.write_text("release")
+
+        report = backup.result(timeout=10.0)
+        mutation.result(timeout=2.0)
+
+    latest = _latest(remote)
+    completion = _completion(remote, latest)
+    registry_object = next(
+        item
+        for item in completion["objects"]
+        if item["path"] == "tuning/reader-profiles.json"
+    )
+    uploaded = (
+        remote
+        / "bucket/backups"
+        / str(report["target_slot"])
+        / "tuning/reader-profiles.json"
+    ).read_bytes()
+    assert registry_object["sha256"] == registry_sha256
+    assert hashlib.sha256(uploaded).hexdigest() == registry_sha256
+    assert registry_path.read_bytes() != registry_before
+
+
+def test_backup_checkpoint_lock_does_not_create_optional_tuning_metadata(
+    tmp_path: Path, fake_aws: tuple[Path, Path, Path]
+) -> None:
+    executable, _, _ = fake_aws
+    storage = _collection(tmp_path / "collection")
+    shutil.rmtree(storage / "tuning")
+
+    backup_to_s3(
+        storage,
+        "s3://bucket/backups",
+        aws_executable=executable,
+        dry_run=True,
+    )
+
+    assert not (storage / "tuning").exists()
+    assert (storage / "locks/tuning.lock").is_file()
+
+
+def test_backup_fails_fast_when_tuning_registry_mutation_is_active(
+    tmp_path: Path, fake_aws: tuple[Path, Path, Path]
+) -> None:
+    executable, remote, _ = fake_aws
+    storage = _collection(tmp_path / "collection")
+
+    with tuning_checkpoint_lock(storage):
+        started = time.monotonic()
+        with pytest.raises(S3BackupError, match="tuning checkpoint lease"):
+            backup_to_s3(
+                storage,
+                "s3://bucket/backups",
+                aws_executable=executable,
+                max_seconds=1.0,
+            )
+        assert time.monotonic() - started < 0.5
+
+    assert not (remote / "bucket/backups/_throwdb_backup/LATEST.json").exists()
+
+
+def test_backup_checkpoint_lock_never_follows_a_symlink(
+    tmp_path: Path, fake_aws: tuple[Path, Path, Path]
+) -> None:
+    executable, remote, _ = fake_aws
+    storage = _collection(tmp_path / "collection")
+    outside = tmp_path / "outside.lock"
+    outside.write_bytes(b"outside-sentinel")
+    checkpoint_lock = storage / "locks/tuning.lock"
+    checkpoint_lock.symlink_to(outside)
+
+    with pytest.raises(S3BackupError, match="tuning checkpoint lease"):
+        backup_to_s3(
+            storage,
+            "s3://bucket/backups",
+            aws_executable=executable,
+        )
+
+    assert outside.read_bytes() == b"outside-sentinel"
+    assert not (remote / "bucket/backups/_throwdb_backup/LATEST.json").exists()
 
 
 def test_same_size_older_mtime_change_is_not_skipped(

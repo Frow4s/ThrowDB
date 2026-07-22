@@ -244,7 +244,7 @@ public:
     } catch (const IdempotencyDomainError& error) {
         return {grpc::StatusCode::FAILED_PRECONDITION,
                 bounded_message(error.what(), limits)};
-    } catch (const PendingOperationError& error) {
+    } catch (const MutationAbortedError& error) {
         return {grpc::StatusCode::ABORTED,
                 bounded_message(error.what(), limits)};
     } catch (const UnsupportedIdTypeError& error) {

@@ -30,7 +30,7 @@ inline void ensure_pending_mutation_fence_absent(
     if (status.type() == std::filesystem::file_type::not_found) {
         return;
     }
-    throw StorageError(
+    throw PendingMutationFenceError(
         std::string(action)
         + " is blocked by a durable idempotency PREPARE; reopen the durable "
           "writable server to resolve the pending operation first");

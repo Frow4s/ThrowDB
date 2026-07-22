@@ -7,6 +7,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -59,6 +60,10 @@ public:
 
 std::atomic<bool> lifecycle_hook_entered{false};
 std::atomic<bool> release_lifecycle_hook{false};
+std::atomic<bool> lifecycle_fence_hook_entered{false};
+std::atomic<bool> release_lifecycle_fence_hook{false};
+std::atomic<bool> orphan_plan_hook_entered{false};
+std::atomic<bool> release_orphan_plan_hook{false};
 
 void blocking_materialization_hook(
     const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
@@ -66,7 +71,7 @@ void blocking_materialization_hook(
     if (context.operation
             != NativeCollectionTestOperation::MaterializeFrozenWals
         || context.point
-               != NativeCollectionTestHookPoint::MutationReservationDurable) {
+               != NativeCollectionTestHookPoint::LifecycleBuildUnlocked) {
         return;
     }
     lifecycle_hook_entered.store(true, std::memory_order_release);
@@ -74,6 +79,71 @@ void blocking_materialization_hook(
         std::this_thread::yield();
     }
 }
+
+void blocking_before_lifecycle_fence_hook(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    using namespace throwdb::detail;
+    if (context.operation
+            != NativeCollectionTestOperation::MaterializeFrozenWals
+        || context.point
+               != NativeCollectionTestHookPoint::BeforeLifecycleFenceCheck) {
+        return;
+    }
+    lifecycle_fence_hook_entered.store(true, std::memory_order_release);
+    while (!release_lifecycle_fence_hook.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+void blocking_orphan_plan_hook(
+    const throwdb::detail::NativeCollectionTestHookContext context) noexcept {
+    using namespace throwdb::detail;
+    if (context.operation != NativeCollectionTestOperation::CollectOrphans
+        || context.point
+               != NativeCollectionTestHookPoint::BeforeOrphanRevalidation) {
+        return;
+    }
+    orphan_plan_hook_entered.store(true, std::memory_order_release);
+    while (!release_orphan_plan_hook.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+}
+
+class BlockingNativeHookThreadGuard {
+public:
+    BlockingNativeHookThreadGuard(
+        std::atomic<bool>& release,
+        const throwdb::detail::NativeCollectionTestHook hook,
+        std::thread& worker) noexcept
+        : release_(release), worker_(worker) {
+        release_.store(false, std::memory_order_relaxed);
+        throwdb::detail::set_native_collection_test_hook(hook);
+    }
+
+    ~BlockingNativeHookThreadGuard() {
+        release_and_join();
+    }
+
+    BlockingNativeHookThreadGuard(const BlockingNativeHookThreadGuard&) = delete;
+    BlockingNativeHookThreadGuard& operator=(
+        const BlockingNativeHookThreadGuard&) = delete;
+
+    void release_and_join() noexcept {
+        release_.store(true, std::memory_order_release);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        if (active_) {
+            throwdb::detail::set_native_collection_test_hook(nullptr);
+            active_ = false;
+        }
+    }
+
+private:
+    std::atomic<bool>& release_;
+    std::thread& worker_;
+    bool active_{true};
+};
 
 class TempDirectory {
 public:
@@ -738,11 +808,11 @@ void test_operational_stats_are_nonblocking_during_maintenance() {
             "nonblocking-stats fixture did not freeze a WAL");
 
     lifecycle_hook_entered.store(false, std::memory_order_relaxed);
-    release_lifecycle_hook.store(false, std::memory_order_relaxed);
-    throwdb::detail::set_native_collection_test_hook(
-        &blocking_materialization_hook);
     std::exception_ptr maintenance_failure;
-    std::thread maintenance([&] {
+    std::thread maintenance;
+    BlockingNativeHookThreadGuard hook_guard(
+        release_lifecycle_hook, &blocking_materialization_hook, maintenance);
+    maintenance = std::thread([&] {
         try {
             server::EngineMaintenanceOptions options;
             options.max_actions = 1;
@@ -761,9 +831,6 @@ void test_operational_stats_are_nonblocking_during_maintenance() {
         std::this_thread::yield();
     }
     if (!lifecycle_hook_entered.load(std::memory_order_acquire)) {
-        release_lifecycle_hook.store(true, std::memory_order_release);
-        maintenance.join();
-        throwdb::detail::set_native_collection_test_hook(nullptr);
         throw std::runtime_error(
             "maintenance did not reach the blocking lifecycle hook");
     }
@@ -774,10 +841,8 @@ void test_operational_stats_are_nonblocking_during_maintenance() {
     const bool returned_promptly =
         stats_future.wait_for(std::chrono::milliseconds(500))
         == std::future_status::ready;
-    release_lifecycle_hook.store(true, std::memory_order_release);
+    hook_guard.release_and_join();
     const auto stats = stats_future.get();
-    maintenance.join();
-    throwdb::detail::set_native_collection_test_hook(nullptr);
     if (maintenance_failure != nullptr) {
         std::rethrow_exception(maintenance_failure);
     }
@@ -787,6 +852,485 @@ void test_operational_stats_are_nonblocking_during_maintenance() {
     require(
         stats.maintenance_active,
         "cached operational stats hid active maintenance");
+}
+
+void test_mutations_continue_during_materialization_and_pending_survives_reopen() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    auto collection = make_store(store);
+    auto engine = std::make_unique<server::SingleCollectionEngine>(
+        *collection, store);
+
+    const std::array<std::uint64_t, 1> frozen_ids{201};
+    const auto frozen_embeddings = row(201);
+    static_cast<void>(engine->mutate(
+        server::MutationKind::Insert,
+        server::OperationId{0x201, 0x202},
+        frozen_ids,
+        frozen_embeddings));
+    require(
+        collection->rotate_wal().rotated,
+        "concurrent-maintenance fixture did not freeze its source WAL");
+
+    lifecycle_hook_entered.store(false, std::memory_order_relaxed);
+    server::EngineMaintenanceResult maintenance_result;
+    std::exception_ptr maintenance_failure;
+    std::thread maintenance;
+    BlockingNativeHookThreadGuard hook_guard(
+        release_lifecycle_hook, &blocking_materialization_hook, maintenance);
+    maintenance = std::thread([&] {
+        try {
+            server::EngineMaintenanceOptions options;
+            options.max_actions = 1;
+            options.clean_segments = false;
+            options.reclaim_orphans = false;
+            maintenance_result = engine->maintain_once(options);
+        } catch (...) {
+            maintenance_failure = std::current_exception();
+        }
+    });
+
+    const auto hook_deadline = std::chrono::steady_clock::now()
+                               + std::chrono::seconds(5);
+    while (!lifecycle_hook_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < hook_deadline) {
+        std::this_thread::yield();
+    }
+    if (!lifecycle_hook_entered.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "materialization did not reach its durable reservation hook");
+    }
+
+    const std::array<std::uint64_t, 1> live_ids{202};
+    const auto live_embeddings = row(202);
+    std::atomic<bool> live_mutation_started{false};
+    std::atomic<bool> live_mutation_completed{false};
+    server::MutationResult live_mutation_result;
+    std::exception_ptr live_mutation_failure;
+    std::thread live_mutation([&] {
+        live_mutation_started.store(true, std::memory_order_release);
+        try {
+            live_mutation_result = engine->mutate(
+                server::MutationKind::Insert,
+                server::OperationId{0x203, 0x204},
+                live_ids,
+                live_embeddings);
+        } catch (...) {
+            live_mutation_failure = std::current_exception();
+        }
+        live_mutation_completed.store(true, std::memory_order_release);
+    });
+    const auto mutation_deadline = std::chrono::steady_clock::now()
+                                   + std::chrono::seconds(5);
+    while (!live_mutation_completed.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < mutation_deadline) {
+        std::this_thread::yield();
+    }
+    const bool mutation_completed_while_paused =
+        live_mutation_completed.load(std::memory_order_acquire);
+    if (!mutation_completed_while_paused) {
+        release_lifecycle_hook.store(true, std::memory_order_release);
+    }
+    live_mutation.join();
+    if (!mutation_completed_while_paused || live_mutation_failure != nullptr) {
+        if (live_mutation_failure != nullptr) {
+            std::rethrow_exception(live_mutation_failure);
+        }
+        throw std::runtime_error(
+            "mutation blocked behind paused materialization");
+    }
+    require(
+        live_mutation_started.load(std::memory_order_acquire)
+            && !live_mutation_result.replayed
+            && live_mutation_result.commit_sequence != 0,
+        "mutation concurrent with materialization was not committed");
+    require(
+        collection->get_bytes(live_ids) == live_embeddings,
+        "concurrent mutation was not visible before materialization publish");
+
+    // Leave a durable COMPLETE whose fence cleanup is ambiguous while the
+    // older frozen prefix is still being materialized.  The selected prefix
+    // must remain independent of this active-WAL transaction, and recovery
+    // must still be able to verify it after a full native reopen.
+    constexpr server::OperationId pending_operation{0x205, 0x206};
+    const std::array<std::uint64_t, 1> pending_ids{203};
+    const auto pending_embeddings = row(203);
+    {
+        JournalHookGuard fault(
+            journal_detail::IdempotencyJournalTestHookPoint::CompleteSynced);
+        require_throws<throwdb::StorageError>(
+            [&] {
+                static_cast<void>(engine->mutate(
+                    server::MutationKind::Insert,
+                    pending_operation,
+                    pending_ids,
+                    pending_embeddings));
+            },
+            "pending fixture did not fail after its durable COMPLETE");
+    }
+    require(
+        std::filesystem::exists(store / "server" / kPendingFenceName),
+        "ambiguous concurrent mutation did not retain its lifecycle fence");
+    require(
+        collection->get_bytes(pending_ids) == pending_embeddings,
+        "ambiguous concurrent mutation lost its durable WAL value");
+
+    hook_guard.release_and_join();
+    if (maintenance_failure != nullptr) {
+        std::rethrow_exception(maintenance_failure);
+    }
+    require(
+        maintenance_result.materialized,
+        "paused maintenance did not publish its selected frozen WAL");
+
+    engine.reset();
+    collection.reset();
+    throwdb::NativeOpenOptions recovery_options;
+    recovery_options.allow_pending_mutation_recovery = true;
+    auto reopened_collection = throwdb::NativeCollection::open(
+        store, {}, true, false, recovery_options);
+    server::SingleCollectionEngine recovered(*reopened_collection, store);
+    require(
+        !std::filesystem::exists(store / "server" / kPendingFenceName),
+        "reopen did not reconcile the concurrent pending mutation fence");
+    const auto replay = recovered.mutate(
+        server::MutationKind::Insert,
+        pending_operation,
+        pending_ids,
+        pending_embeddings);
+    require(
+        replay.replayed,
+        "concurrent pending mutation was not exactly-once replayable after reopen");
+    require(
+        reopened_collection->get_bytes(frozen_ids) == frozen_embeddings
+            && reopened_collection->get_bytes(live_ids) == live_embeddings
+            && reopened_collection->get_bytes(pending_ids)
+                   == pending_embeddings,
+        "concurrent mutations did not survive native collection reopen");
+}
+
+void test_mutation_continues_while_orphan_inventory_is_paused() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    auto collection = make_store(store);
+    auto engine = std::make_unique<server::SingleCollectionEngine>(
+        *collection, store);
+    const auto orphan =
+        store / "index" / "runs"
+        / "run-00000000000000010000000000000002.idx";
+    {
+        std::ofstream output(orphan, std::ios::binary | std::ios::trunc);
+        output << "orphan";
+        require(output.good(), "cannot create orphan inventory fixture");
+    }
+
+    orphan_plan_hook_entered.store(false, std::memory_order_relaxed);
+    server::EngineMaintenanceResult maintenance_result;
+    std::exception_ptr maintenance_failure;
+    std::thread maintenance;
+    BlockingNativeHookThreadGuard hook_guard(
+        release_orphan_plan_hook, &blocking_orphan_plan_hook, maintenance);
+    maintenance = std::thread([&] {
+        try {
+            server::EngineMaintenanceOptions options;
+            options.max_actions = 1;
+            options.checkpoint_idempotency = false;
+            options.clean_segments = false;
+            options.reclaim_orphans = true;
+            options.orphan_min_age_ns = 0;
+            maintenance_result = engine->maintain_once(options);
+        } catch (...) {
+            maintenance_failure = std::current_exception();
+        }
+    });
+
+    const auto hook_deadline = std::chrono::steady_clock::now()
+                               + std::chrono::seconds(5);
+    while (!orphan_plan_hook_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < hook_deadline) {
+        std::this_thread::yield();
+    }
+    if (!orphan_plan_hook_entered.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "orphan maintenance did not pause after its unlocked inventory");
+    }
+
+    const std::array<std::uint64_t, 1> ids{204};
+    const auto embeddings = row(204);
+    server::MutationResult mutation_result;
+    std::exception_ptr mutation_failure;
+    std::atomic<bool> mutation_completed{false};
+    std::thread mutation([&] {
+        try {
+            mutation_result = engine->mutate(
+                server::MutationKind::Insert,
+                server::OperationId{0x207, 0x208}, ids, embeddings);
+        } catch (...) {
+            mutation_failure = std::current_exception();
+        }
+        mutation_completed.store(true, std::memory_order_release);
+    });
+    const auto mutation_deadline = std::chrono::steady_clock::now()
+                                   + std::chrono::seconds(5);
+    while (!mutation_completed.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < mutation_deadline) {
+        std::this_thread::yield();
+    }
+    const bool completed_while_inventory_paused =
+        mutation_completed.load(std::memory_order_acquire);
+    if (!completed_while_inventory_paused) {
+        release_orphan_plan_hook.store(true, std::memory_order_release);
+    }
+    mutation.join();
+    if (!completed_while_inventory_paused || mutation_failure != nullptr) {
+        if (mutation_failure != nullptr) {
+            std::rethrow_exception(mutation_failure);
+        }
+        throw std::runtime_error(
+            "mutation blocked behind unlocked orphan inventory");
+    }
+    require(
+        mutation_result.commit_sequence != 0 && !mutation_result.replayed,
+        "mutation concurrent with orphan inventory did not commit");
+
+    hook_guard.release_and_join();
+    if (maintenance_failure != nullptr) {
+        std::rethrow_exception(maintenance_failure);
+    }
+    require(
+        maintenance_result.orphan_reclaim_attempted
+            && maintenance_result.orphan_removed_files == 1
+            && !std::filesystem::exists(orphan),
+        "two-phase orphan maintenance did not reclaim its planned file");
+
+    engine.reset();
+    collection.reset();
+    auto reopened = throwdb::NativeCollection::open(store, {}, true);
+    require(
+        reopened->get_bytes(ids) == embeddings,
+        "mutation concurrent with orphan inventory did not survive reopen");
+}
+
+void test_orphan_apply_defers_when_prepare_appears_after_plan() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    auto collection = make_store(store);
+    auto engine = std::make_unique<server::SingleCollectionEngine>(
+        *collection, store);
+    const auto orphan =
+        store / "index" / "runs"
+        / "run-00000000000000030000000000000004.idx";
+    {
+        std::ofstream output(orphan, std::ios::binary | std::ios::trunc);
+        output << "orphan-fence-race";
+        require(output.good(), "cannot create orphan fence-race fixture");
+    }
+
+    orphan_plan_hook_entered.store(false, std::memory_order_relaxed);
+    server::EngineMaintenanceResult maintenance_result;
+    std::exception_ptr maintenance_failure;
+    std::thread maintenance;
+    BlockingNativeHookThreadGuard hook_guard(
+        release_orphan_plan_hook, &blocking_orphan_plan_hook, maintenance);
+    maintenance = std::thread([&] {
+        try {
+            server::EngineMaintenanceOptions options;
+            options.max_actions = 1;
+            options.checkpoint_idempotency = false;
+            options.clean_segments = false;
+            options.reclaim_orphans = true;
+            options.orphan_min_age_ns = 0;
+            maintenance_result = engine->maintain_once(options);
+        } catch (...) {
+            maintenance_failure = std::current_exception();
+        }
+    });
+
+    const auto hook_deadline = std::chrono::steady_clock::now()
+                               + std::chrono::seconds(5);
+    while (!orphan_plan_hook_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < hook_deadline) {
+        std::this_thread::yield();
+    }
+    require(
+        orphan_plan_hook_entered.load(std::memory_order_acquire),
+        "orphan maintenance did not pause before its second fence check");
+
+    constexpr server::OperationId pending_operation{0x209, 0x20a};
+    const std::array<std::uint64_t, 1> pending_ids{205};
+    const auto pending_embeddings = row(205);
+    {
+        JournalHookGuard fault(
+            journal_detail::IdempotencyJournalTestHookPoint::PrepareSynced);
+        require_throws<throwdb::StorageError>(
+            [&] {
+                static_cast<void>(engine->mutate(
+                    server::MutationKind::Insert,
+                    pending_operation,
+                    pending_ids,
+                    pending_embeddings));
+            },
+            "orphan fence-race fixture did not retain a durable PREPARE");
+    }
+    require(
+        std::filesystem::exists(store / "server" / kPendingFenceName),
+        "durable PREPARE fence was not visible before orphan apply");
+
+    hook_guard.release_and_join();
+    if (maintenance_failure != nullptr) {
+        std::rethrow_exception(maintenance_failure);
+    }
+    require(
+        maintenance_result.pending_mutation_deferred
+            && maintenance_result.orphan_reclaim_attempted
+            && maintenance_result.actions_attempted == 1
+            && maintenance_result.actions_performed == 0
+            && maintenance_result.orphan_removed_files == 0
+            && std::filesystem::exists(orphan),
+        "orphan apply crossed a PREPARE created after its unlocked plan");
+
+    engine.reset();
+    collection.reset();
+    throwdb::NativeOpenOptions recovery_options;
+    recovery_options.allow_pending_mutation_recovery = true;
+    auto reopened_collection = throwdb::NativeCollection::open(
+        store, {}, true, false, recovery_options);
+    server::SingleCollectionEngine recovered(*reopened_collection, store);
+    require(
+        !std::filesystem::exists(store / "server" / kPendingFenceName),
+        "reopen did not resolve the PREPARE that deferred orphan apply");
+
+    server::EngineMaintenanceOptions retry_options;
+    retry_options.max_actions = 1;
+    retry_options.checkpoint_idempotency = false;
+    retry_options.clean_segments = false;
+    retry_options.reclaim_orphans = true;
+    retry_options.orphan_min_age_ns = 0;
+    const auto retry = recovered.maintain_once(retry_options);
+    require(
+        !retry.pending_mutation_deferred
+            && retry.orphan_reclaim_attempted
+            && retry.actions_performed == 1
+            && retry.orphan_removed_files == 1
+            && !std::filesystem::exists(orphan),
+        "orphan maintenance did not reclaim the file after fence recovery");
+}
+
+void test_pending_fence_admission_race_defers_maintenance() {
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    auto collection = make_store(store);
+    auto engine = std::make_unique<server::SingleCollectionEngine>(
+        *collection, store);
+
+    const std::array<std::uint64_t, 1> frozen_ids{211};
+    const auto frozen_embeddings = row(211);
+    static_cast<void>(engine->mutate(
+        server::MutationKind::Insert,
+        server::OperationId{0x211, 0x212},
+        frozen_ids,
+        frozen_embeddings));
+    require(
+        collection->rotate_wal().rotated,
+        "fence-admission fixture did not freeze a WAL");
+    const auto before = collection->mutation_log_stats();
+
+    lifecycle_fence_hook_entered.store(false, std::memory_order_relaxed);
+    server::EngineMaintenanceResult maintenance_result;
+    std::exception_ptr maintenance_failure;
+    std::thread maintenance;
+    BlockingNativeHookThreadGuard hook_guard(
+        release_lifecycle_fence_hook,
+        &blocking_before_lifecycle_fence_hook,
+        maintenance);
+    maintenance = std::thread([&] {
+        try {
+            server::EngineMaintenanceOptions options;
+            options.max_actions = 1;
+            options.clean_segments = false;
+            options.reclaim_orphans = false;
+            maintenance_result = engine->maintain_once(options);
+        } catch (...) {
+            maintenance_failure = std::current_exception();
+        }
+    });
+
+    const auto hook_deadline = std::chrono::steady_clock::now()
+                               + std::chrono::seconds(5);
+    while (!lifecycle_fence_hook_entered.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < hook_deadline) {
+        std::this_thread::yield();
+    }
+    if (!lifecycle_fence_hook_entered.load(std::memory_order_acquire)) {
+        throw std::runtime_error(
+            "maintenance did not pause before its lifecycle fence check");
+    }
+
+    constexpr server::OperationId pending_operation{0x213, 0x214};
+    const std::array<std::uint64_t, 1> pending_ids{212};
+    const auto pending_embeddings = row(212);
+    {
+        JournalHookGuard fault(
+            journal_detail::IdempotencyJournalTestHookPoint::PrepareSynced);
+        require_throws<throwdb::StorageError>(
+            [&] {
+                static_cast<void>(engine->mutate(
+                    server::MutationKind::Insert,
+                    pending_operation,
+                    pending_ids,
+                    pending_embeddings));
+            },
+            "fence-admission fixture did not retain an ambiguous PREPARE");
+    }
+    require(
+        std::filesystem::exists(store / "server" / kPendingFenceName),
+        "ambiguous PREPARE did not appear in the lifecycle admission window");
+
+    hook_guard.release_and_join();
+    if (maintenance_failure != nullptr) {
+        std::rethrow_exception(maintenance_failure);
+    }
+    const auto after = collection->mutation_log_stats();
+    require(
+        maintenance_result.pending_mutation_deferred
+            && maintenance_result.actions_attempted == 1
+            && maintenance_result.actions_performed == 0
+            && !maintenance_result.materialized,
+        "pending fence admission was not reported as a transient deferral");
+    require(
+        after.generation == before.generation
+            && after.frozen_wal_count == before.frozen_wal_count,
+        "deferred lifecycle action changed the frozen WAL snapshot");
+
+    engine.reset();
+    collection.reset();
+    throwdb::NativeOpenOptions recovery_options;
+    recovery_options.allow_pending_mutation_recovery = true;
+    auto reopened_collection = throwdb::NativeCollection::open(
+        store, {}, true, false, recovery_options);
+    server::SingleCollectionEngine recovered(*reopened_collection, store);
+    require(
+        !std::filesystem::exists(store / "server" / kPendingFenceName),
+        "reopen did not resolve the PREPARE that deferred maintenance");
+
+    server::EngineMaintenanceOptions retry_options;
+    retry_options.max_actions = 1;
+    retry_options.clean_segments = false;
+    retry_options.reclaim_orphans = false;
+    const auto retry = recovered.maintain_once(retry_options);
+    require(
+        retry.materialized && !retry.pending_mutation_deferred,
+        "maintenance did not make progress after pending-fence recovery");
+    const auto committed = recovered.mutate(
+        server::MutationKind::Insert,
+        pending_operation,
+        pending_ids,
+        pending_embeddings);
+    require(
+        !committed.replayed
+            && reopened_collection->get_bytes(pending_ids)
+                   == pending_embeddings,
+        "PREPARE-only operation was not retryable after deferred maintenance");
 }
 
 void test_engine_maintenance_actions_are_bounded_across_passes() {
@@ -1204,6 +1748,18 @@ int main() {
         std::pair{
             "operational_stats_are_nonblocking_during_maintenance",
             &test_operational_stats_are_nonblocking_during_maintenance},
+        std::pair{
+            "mutations_continue_during_materialization_and_pending_survives_reopen",
+            &test_mutations_continue_during_materialization_and_pending_survives_reopen},
+        std::pair{
+            "mutation_continues_while_orphan_inventory_is_paused",
+            &test_mutation_continues_while_orphan_inventory_is_paused},
+        std::pair{
+            "orphan_apply_defers_when_prepare_appears_after_plan",
+            &test_orphan_apply_defers_when_prepare_appears_after_plan},
+        std::pair{
+            "pending_fence_admission_race_defers_maintenance",
+            &test_pending_fence_admission_race_defers_maintenance},
         std::pair{
             "engine_maintenance_actions_are_bounded_across_passes",
             &test_engine_maintenance_actions_are_bounded_across_passes},

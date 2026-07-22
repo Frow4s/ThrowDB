@@ -727,9 +727,13 @@ private:
                 aggregate.orphan_durability_complete
                 && result.orphan_durability_complete;
             aggregate.orphan_failed_files += result.orphan_failed_files;
+            aggregate.pending_mutation_deferred =
+                aggregate.pending_mutation_deferred
+                || result.pending_mutation_deferred;
 
             if (result.actions_attempted == 0
                 || result.orphan_reclaim_attempted
+                || result.pending_mutation_deferred
                 || result.materialization_budget_blocked
                 || result.materialization_entry_budget_blocked
                 || result.materialization_memory_budget_blocked
@@ -810,6 +814,9 @@ private:
                             ? "true" : "false")
                     << ",\"orphan_failed_files\":"
                     << result.orphan_failed_files
+                    << ",\"pending_mutation_deferred\":"
+                    << (result.pending_mutation_deferred
+                            ? "true" : "false")
                     << ",\"active_wal_bytes\":"
                     << result.after.active_wal_bytes
                     << ",\"active_wal_transactions\":"

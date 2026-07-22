@@ -372,6 +372,29 @@ except throwdb.AmbiguousCommitError as error:
     remote.upsert(ids, vectors, operation_id=operation_id)
 ```
 
+An explicit gRPC mutation `ABORTED` response is exposed as
+`RemoteAbortedError`. ThrowDB reserves this status for an admission rejection
+before the current request entered durable `PREPARE`, so that request
+definitely did not commit. It is safe to retry even when the server does not
+advertise durable idempotency, but replay only the identical method, IDs, and
+embedding bytes with the error's operation ID and bounded backoff:
+
+```python
+try:
+    remote.upsert(ids, vectors, operation_id=operation_id)
+except throwdb.RemoteAbortedError as error:
+    # Apply bounded backoff, then replay the exact logical operation.
+    remote.upsert(ids, vectors, operation_id=error.operation_id)
+```
+
+`RemoteAbortedError` remains a subclass of `AmbiguousCommitError` for backward
+compatibility, despite its stronger definite-rejection guarantee. Catch it
+first when admission conflicts and genuinely unknown transport outcomes need
+different policies. ThrowDB does not automatically retry mutations. The error
+exposes `retryable = True`, `same_operation_id_required = True`, and
+`definitely_not_committed = True`; these flags describe this narrow contract
+and are not permission to change the request payload.
+
 Never create a new operation ID merely because the previous outcome is
 unknown. If the server reports that the replay domain expired, refresh
 `Describe`; an old ambiguous operation can no longer be safely attached to the

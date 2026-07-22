@@ -127,6 +127,14 @@ struct PartitionedOrphanCollectionHooks {
         kPartitionedInventoryMaximumUncatalogedEntries};
 };
 
+// Phase-one result for an open writer. Inventory, classification, age checks,
+// and budget selection are intentionally advisory: CURRENT may advance while
+// this plan is built. apply_partitioned_orphan_plan() must re-read the current
+// authoritative view and reject every selected path which became reachable.
+struct PartitionedOrphanCollectionPlan {
+    PartitionedOrphanCollectionResult result;
+};
+
 // Validates manifest.bin, CURRENT and exactly the catalog selected by CURRENT
 // (including its size and CRC) before scanning the product-owned mutable
 // namespaces. Directory entries are inspected with lstat and never followed.
@@ -136,6 +144,26 @@ struct PartitionedOrphanCollectionHooks {
     const std::filesystem::path& store_path,
     std::uint64_t maximum_uncataloged_entries =
         kPartitionedInventoryMaximumUncatalogedEntries);
+
+// Performs the unbounded-by-selected-count directory scan and bounded
+// candidate selection without deleting files. An open writer may call this
+// while holding only its lifecycle lease, leaving the mutation lane available.
+[[nodiscard]] PartitionedOrphanCollectionPlan plan_partitioned_orphans(
+    const std::filesystem::path& store_path,
+    PartitionedOrphanCollectionOptions options,
+    const PartitionedOrphanCollectionHooks& hooks = {});
+
+// Re-reads CURRENT/catalog and applies a phase-one plan. The caller must hold
+// writer.lock, commit.lock and view.lock exclusively and must prevent its
+// in-memory catalog from changing for the duration. Only selected identities
+// still unreachable from this fresh authoritative view can be unlinked.
+[[nodiscard]] PartitionedOrphanCollectionResult
+apply_partitioned_orphan_plan(
+    const std::filesystem::path& store_path,
+    std::uint64_t expected_generation,
+    Uuid128 expected_catalog_id,
+    PartitionedOrphanCollectionPlan plan,
+    const PartitionedOrphanCollectionHooks& hooks = {});
 
 // The caller must already hold writer.lock, commit.lock and view.lock
 // exclusively. The executor always performs one fresh inventory, checks any

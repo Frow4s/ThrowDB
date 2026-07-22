@@ -105,7 +105,9 @@ still reads a complete row before returning its prefix.
 - WAL rotation and bounded frozen-prefix materialization.
 - Format-7 partition-selective index folding without rewriting all payloads.
 - Selective cleaning of one qualifying high-garbage segment per action.
-- Locked, age- and budget-bounded orphan collection.
+- Age- and budget-bounded orphan collection; format 7 builds the unbounded
+  inventory/selection plan outside the mutation lane and revalidates
+  authoritative reachability plus file identity under short apply locks.
 - Explicit `maintain()` for embedded/CLI users and a bounded background worker
   for writable `throwdbd`.
 - Disk reserve checks before new mutation and large maintenance output.
@@ -196,20 +198,19 @@ Linux Kubernetes pod. The configured Actions workflow can build
 new release channel constitutes a deployable Linux artifact. See
 [`release-packaging.md`](release-packaging.md).
 
-### P1: tuning metadata can race a long S3 checkpoint
+### Resolved: tuning metadata is fenced during S3 checkpoint publication
 
-The S3 checkpoint holds the collection writer lease, but tuning profile
-publication uses a separate `tuning/reader-profiles.lock`. The checkpoint
-builds its file inventory before a potentially long `aws s3 sync`; a concurrent
-save/remove/reset of a tuning profile can therefore make the uploaded tuning
-file differ from the completion's earlier SHA-256. Restore will fail closed on
-the mismatch, so this does not silently restore corrupted embeddings, but it
-can publish an unusable checkpoint and consume the RPO window.
-
-Until the implementation also serializes tuning publication or repeats the
-inventory before `LATEST`, production backup orchestration must prohibit every
-`throwdb tune` and tuning-registry mutation for the complete checkpoint window.
-The Kubernetes runbook enforces one exclusive offline operation at a time.
+Every tuning-registry mutation and S3 checkpoint now shares
+`locks/tuning.lock`. Backup acquires it after the collection writer lease and
+retains it from source inventory through slot upload, completion/`LATEST`
+publication, and local-cursor fsync. An already-running registry mutation makes
+backup fail fast; one that starts during backup waits before changing the
+registry. A deterministic paused-upload test verifies that the completion SHA
+and uploaded registry bytes remain identical. The barrier uses anchored,
+no-follow opens and does not create `tuning/` or a registry payload when
+optional tuning metadata is absent. The protocol requires coordinated upgrades:
+backup and tuning mutation must be quiesced until every process accessing the
+collection understands the new barrier; mixed old/new operation is unsupported.
 
 ### P1: release/legal metadata is incomplete
 

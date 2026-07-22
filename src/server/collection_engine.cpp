@@ -451,20 +451,16 @@ public:
         const bool require_replay_domain,
         const std::span<const std::uint64_t> ids,
         const std::span<const std::byte> embeddings) {
-        std::unique_lock mutation(mutation_mutex_, std::defer_lock);
-        if (!mutation.try_lock()) {
-            if (maintenance_active_.load(std::memory_order_acquire)) {
-                throw PendingOperationError(
-                    "automatic maintenance is active; retry the mutation with "
-                    "the same operation_id");
-            }
-            mutation.lock();
-        }
-        if (maintenance_active_.load(std::memory_order_acquire)) {
-            throw PendingOperationError(
-                "automatic maintenance is active; retry the mutation with the "
-                "same operation_id");
-        }
+        // The native lifecycle is two-phase: it reserves an immutable input
+        // prefix under its mutation lane, performs the expensive build without
+        // that lane, and publishes under the lane again.  Serializing the
+        // complete lifecycle pass here would therefore turn a bounded native
+        // publication barrier into a seconds- or minutes-long write blackout.
+        // Keep only the journal PREPARE -> native commit -> COMPLETE sequence
+        // serialized at the server layer.  Maintenance serializes its journal
+        // checkpoint and WAL rotation with this same mutex, while long
+        // materialization/fold/clean/orphan work runs outside it.
+        std::lock_guard mutation(mutation_mutex_);
         if (require_replay_domain) {
             if (journal_ == nullptr) {
                 if (!replay_domain.empty()) {
@@ -738,12 +734,28 @@ public:
     }
 
     [[nodiscard]] EngineOperationalStats operational_stats() const {
+        if (maintenance_active_.load(std::memory_order_acquire)) {
+            // A native lifecycle reservation/publication may briefly own its
+            // internal mutation lane even though the server journal lane is
+            // intentionally free. Never turn diagnostics into a waiter on
+            // that native barrier; mutations refresh this cache on commit.
+            std::lock_guard cache(operational_cache_mutex_);
+            EngineOperationalStats result = operational_cache_;
+            result.maintenance_active = true;
+            return result;
+        }
         std::unique_lock mutation(mutation_mutex_, std::try_to_lock);
         if (!mutation.owns_lock()) {
             std::lock_guard cache(operational_cache_mutex_);
             EngineOperationalStats result = operational_cache_;
             result.maintenance_active =
                 maintenance_active_.load(std::memory_order_acquire);
+            return result;
+        }
+        if (maintenance_active_.load(std::memory_order_acquire)) {
+            std::lock_guard cache(operational_cache_mutex_);
+            EngineOperationalStats result = operational_cache_;
+            result.maintenance_active = true;
             return result;
         }
         EngineOperationalStats result = fresh_operational_stats_unlocked();
@@ -791,20 +803,8 @@ public:
                 "engine maintenance requires a writable collection");
         }
         MaintenanceActivityGuard activity(maintenance_active_);
-        std::lock_guard mutation(mutation_mutex_);
-        resolve_live_pending();
 
         EngineMaintenanceResult result;
-        result.before = collection_.mutation_log_stats();
-        if (journal_ != nullptr) {
-            const auto stats = journal_->stats();
-            result.idempotency_before = IdempotencyStats{
-                true, stats.pending, stats.bytes,
-                stats.completed_operations, stats.aborted_operations,
-                stats.max_bytes, stats.max_operations, stats.domain,
-                stats.generation};
-        }
-        NativeMutationLogStats current = result.before;
         bool lifecycle_disk_budget_blocked = false;
         const auto may_attempt = [&]() {
             if (result.actions_attempted >= options.max_actions) {
@@ -815,18 +815,58 @@ public:
             return true;
         };
 
-        if (journal_ != nullptr && options.checkpoint_idempotency) {
+        bool checkpoint_due = false;
+        {
+            // Journal reconciliation and stats are protected by the same lane
+            // as PREPARE/COMPLETE.  No native lifecycle work is performed in
+            // this critical section.
+            std::lock_guard mutation(mutation_mutex_);
+            resolve_live_pending();
+            result.before = collection_.mutation_log_stats();
+            if (journal_ != nullptr) {
+                const auto stats = journal_->stats();
+                result.idempotency_before = IdempotencyStats{
+                    true, stats.pending, stats.bytes,
+                    stats.completed_operations, stats.aborted_operations,
+                    stats.max_bytes, stats.max_operations, stats.domain,
+                    stats.generation};
+            }
+            if (journal_ != nullptr && options.checkpoint_idempotency) {
+                const auto stats = journal_->stats();
+                const std::uint64_t operations = checked_add_bytes(
+                    stats.completed_operations, stats.aborted_operations,
+                    "idempotency operation count");
+                checkpoint_due = percentage_reached(
+                        stats.bytes, stats.max_bytes,
+                        options.idempotency_checkpoint_trigger_percent)
+                    || percentage_reached(
+                        operations, stats.max_operations,
+                        options.idempotency_checkpoint_trigger_percent);
+            }
+        }
+        NativeMutationLogStats current = result.before;
+
+        if (checkpoint_due && may_attempt()) {
+            // Checkpoint replaces the advertised replay domain and must never
+            // cross a PREPARE/COMPLETE sequence.  It is bounded journal I/O,
+            // so holding the server mutation lane here is intentional.
+            std::lock_guard mutation(mutation_mutex_);
+            resolve_live_pending();
+            if (journal_ == nullptr) {
+                throw StorageError(
+                    "idempotency journal disappeared during maintenance");
+            }
             const auto stats = journal_->stats();
             const std::uint64_t operations = checked_add_bytes(
                 stats.completed_operations, stats.aborted_operations,
                 "idempotency operation count");
-            const bool checkpoint_due = percentage_reached(
+            const bool still_due = percentage_reached(
                     stats.bytes, stats.max_bytes,
                     options.idempotency_checkpoint_trigger_percent)
                 || percentage_reached(
                     operations, stats.max_operations,
                     options.idempotency_checkpoint_trigger_percent);
-            if (checkpoint_due && may_attempt()) {
+            if (still_due) {
                 static_cast<void>(journal_->checkpoint());
                 result.idempotency_checkpointed = true;
                 ++result.actions_performed;
@@ -839,11 +879,25 @@ public:
                 || current.active_wal_transaction_count
                        >= options.rotate_wal_transactions);
         if (rotation_due && may_attempt()) {
-            require_rotation_capacity(current, capacity_options_);
-            current = collection_.rotate_wal();
-            result.rotated = current.rotated;
-            result.actions_performed += static_cast<std::uint64_t>(
-                result.rotated);
+            // Rotation can freeze the WAL needed to resolve an ambiguous
+            // PREPARE.  Keep this short publication serialized with the full
+            // journal transaction; long lifecycle consumers of already-frozen
+            // inputs run below without the server mutex.
+            std::lock_guard mutation(mutation_mutex_);
+            resolve_live_pending();
+            current = collection_.mutation_log_stats();
+            const bool still_due =
+                current.active_wal_transaction_count != 0
+                && (current.active_wal_bytes >= options.rotate_wal_bytes
+                    || current.active_wal_transaction_count
+                           >= options.rotate_wal_transactions);
+            if (still_due) {
+                require_rotation_capacity(current, capacity_options_);
+                current = collection_.rotate_wal();
+                result.rotated = current.rotated;
+                result.actions_performed += static_cast<std::uint64_t>(
+                    result.rotated);
+            }
         }
 
         if (current.frozen_wal_count != 0 && may_attempt()) {
@@ -874,6 +928,12 @@ public:
                     current.materialization_memory_budget_blocked;
                 result.actions_performed += static_cast<std::uint64_t>(
                     result.materialized);
+            } catch (const PendingMutationFenceError&) {
+                // PREPARE won the admission race after the short journal
+                // snapshot above. Native lifecycle refused to cross it before
+                // selecting destructive inputs, so this is a safe transient
+                // deferral rather than a terminal storage fault.
+                result.pending_mutation_deferred = true;
             } catch (const InsufficientStorageError&) {
                 result.materialization_disk_budget_blocked = true;
                 lifecycle_disk_budget_blocked = true;
@@ -883,7 +943,8 @@ public:
         const bool fold_due =
             collection_.format_version() == 7
             && current.delta_run_count >= options.fold_min_runs;
-        if (!lifecycle_disk_budget_blocked && fold_due && may_attempt()) {
+        if (!result.pending_mutation_deferred
+            && !lifecycle_disk_budget_blocked && fold_due && may_attempt()) {
             try {
                 require_mutation_disk_capacity(
                     storage_path_,
@@ -900,6 +961,8 @@ public:
                     current.compaction_budget_blocked;
                 result.actions_performed += static_cast<std::uint64_t>(
                     result.folded);
+            } catch (const PendingMutationFenceError&) {
+                result.pending_mutation_deferred = true;
             } catch (const InsufficientStorageError&) {
                 result.fold_disk_budget_blocked = true;
                 lifecycle_disk_budget_blocked = true;
@@ -913,7 +976,8 @@ public:
             || now - last_cleaner_attempt_
                    >= std::chrono::seconds(
                        options.cleaner_min_interval_seconds);
-        if (!lifecycle_disk_budget_blocked && options.clean_segments
+        if (!result.pending_mutation_deferred
+            && !lifecycle_disk_budget_blocked && options.clean_segments
             && collection_.format_version() == 7
             && cleaner_interval_due && may_attempt()) {
             result.cleaner_attempted = true;
@@ -959,6 +1023,9 @@ public:
                     if (result.cleaner.cleaned) {
                         current = collection_.mutation_log_stats();
                     }
+                } catch (const PendingMutationFenceError&) {
+                    result.pending_mutation_deferred = true;
+                    last_cleaner_attempt_ = {};
                 } catch (const InsufficientStorageError&) {
                     // Low free space is an observable policy outcome, not a
                     // terminal storage fault. Keep the cursor on this
@@ -972,7 +1039,7 @@ public:
         }
 
         bool orphan_slot = false;
-        if (options.reclaim_orphans) {
+        if (!result.pending_mutation_deferred && options.reclaim_orphans) {
             if (result.actions_attempted < options.max_actions) {
                 orphan_slot = may_attempt();
             } else if (lifecycle_disk_budget_blocked
@@ -988,56 +1055,67 @@ public:
         }
         if (orphan_slot) {
             result.orphan_reclaim_attempted = true;
-            NativeOrphanCollectionOptions orphan_options;
-            orphan_options.min_age_ns = options.orphan_min_age_ns;
-            orphan_options.max_files = options.orphan_max_files;
-            orphan_options.max_bytes = options.orphan_max_bytes;
-            const auto reclaimed =
-                collection_.reclaim_orphans(orphan_options);
-            result.orphan_durability_complete =
-                reclaimed.durability_complete;
-            for (const auto& entry : reclaimed.entries) {
-                if (!entry.removed) {
-                    if (entry.selected
-                        && entry.disposition
-                               == NativeOrphanDisposition::UnlinkFailed) {
-                        ++result.orphan_failed_files;
+            try {
+                NativeOrphanCollectionOptions orphan_options;
+                orphan_options.min_age_ns = options.orphan_min_age_ns;
+                orphan_options.max_files = options.orphan_max_files;
+                orphan_options.max_bytes = options.orphan_max_bytes;
+                const auto reclaimed =
+                    collection_.reclaim_orphans(orphan_options);
+                result.orphan_durability_complete =
+                    reclaimed.durability_complete;
+                for (const auto& entry : reclaimed.entries) {
+                    if (!entry.removed) {
+                        if (entry.selected
+                            && entry.disposition
+                                   == NativeOrphanDisposition::UnlinkFailed) {
+                            ++result.orphan_failed_files;
+                        }
+                        continue;
                     }
-                    continue;
+                    if (result.orphan_removed_files
+                            == std::numeric_limits<std::uint64_t>::max()
+                        || entry.file.bytes
+                               > std::numeric_limits<std::uint64_t>::max()
+                                     - result.orphan_removed_bytes) {
+                        throw CorruptionError(
+                            "engine maintenance orphan result overflows uint64");
+                    }
+                    ++result.orphan_removed_files;
+                    result.orphan_removed_bytes += entry.file.bytes;
                 }
-                if (result.orphan_removed_files
-                        == std::numeric_limits<std::uint64_t>::max()
-                    || entry.file.bytes
-                           > std::numeric_limits<std::uint64_t>::max()
-                                 - result.orphan_removed_bytes) {
-                    throw CorruptionError(
-                        "engine maintenance orphan result overflows uint64");
+                result.actions_performed += static_cast<std::uint64_t>(
+                    result.orphan_removed_files != 0);
+                if (!result.orphan_durability_complete
+                    || result.orphan_failed_files != 0) {
+                    throw StorageError(
+                        "engine maintenance orphan reclamation was incomplete: "
+                        + std::to_string(result.orphan_failed_files)
+                        + " selected files failed and durability_complete="
+                        + (result.orphan_durability_complete
+                               ? "true" : "false"));
                 }
-                ++result.orphan_removed_files;
-                result.orphan_removed_bytes += entry.file.bytes;
-            }
-            result.actions_performed += static_cast<std::uint64_t>(
-                result.orphan_removed_files != 0);
-            if (!result.orphan_durability_complete
-                || result.orphan_failed_files != 0) {
-                throw StorageError(
-                    "engine maintenance orphan reclamation was incomplete: "
-                    + std::to_string(result.orphan_failed_files)
-                    + " selected files failed and durability_complete="
-                    + (result.orphan_durability_complete ? "true" : "false"));
+            } catch (const PendingMutationFenceError&) {
+                result.pending_mutation_deferred = true;
             }
         }
 
-        result.after = collection_.mutation_log_stats();
-        if (journal_ != nullptr) {
-            const auto stats = journal_->stats();
-            result.idempotency_after = IdempotencyStats{
-                true, stats.pending, stats.bytes,
-                stats.completed_operations, stats.aborted_operations,
-                stats.max_bytes, stats.max_operations, stats.domain,
-                stats.generation};
+        {
+            // Return one coherent post-pass journal/native snapshot and refresh
+            // the nonblocking operational cache.  A mutation may have completed
+            // during the long build and is deliberately included here.
+            std::lock_guard mutation(mutation_mutex_);
+            result.after = collection_.mutation_log_stats();
+            if (journal_ != nullptr) {
+                const auto stats = journal_->stats();
+                result.idempotency_after = IdempotencyStats{
+                    true, stats.pending, stats.bytes,
+                    stats.completed_operations, stats.aborted_operations,
+                    stats.max_bytes, stats.max_operations, stats.domain,
+                    stats.generation};
+            }
+            refresh_operational_cache_unlocked_noexcept();
         }
-        refresh_operational_cache_unlocked_noexcept();
         return result;
     }
 
@@ -1124,7 +1202,7 @@ private:
         const auto sequence = collection_.identity().committed_sequence;
         resolve_recovered_pending(sequence);
         if (journal_->pending() != nullptr) {
-            throw PendingOperationError(
+            throw MutationAbortedError(
                 "an ambiguous operation must be resolved before another mutation");
         }
     }

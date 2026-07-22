@@ -156,6 +156,8 @@ void SingleCollectionService::handle(
         emit_error(StatusCode::ProtocolError, error.what());
     } catch (const IdempotencyConflictError& error) {
         emit_error(StatusCode::FailedPrecondition, error.what());
+    } catch (const MutationAbortedError& error) {
+        emit_error(StatusCode::FailedPrecondition, error.what());
     } catch (const PendingOperationError& error) {
         emit_error(StatusCode::FailedPrecondition, error.what());
     } catch (const InvalidArgumentError& error) {

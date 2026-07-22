@@ -449,14 +449,20 @@ writer, calibration, tuning-registry mutation, or maintenance can run. Use
 `concurrencyPolicy: Forbid`, `backoffLimit: 0`, a deadline, and backup-age
 alerts. A mere schedule is not evidence that a checkpoint succeeded.
 
-### Current tuning-metadata race
+### Tuning metadata during backup
 
-The reviewed backup serializes collection writes but not the independent
-tuning-registry lock. A tuning-profile change during the long sync can publish
-a completion whose recorded tuning-file checksum differs from the uploaded
-version. Restore then fails closed. Until code-level serialization is added,
-the backup window must be exclusive with respect to every tuning command and
-profile-registry mutation.
+Backup now holds `locks/tuning.lock` for the complete inventory, upload,
+completion/`LATEST`, and local-cursor window. A tuning mutation already in
+progress makes backup fail fast so the Job can retry; a mutation that starts
+after backup owns the barrier waits without changing registry bytes. Keep the
+operational one-job-at-a-time rule: it remains useful for resource isolation
+and clear ownership even though the checksum race is closed in code.
+
+The lock is an advisory protocol shared by the wheel and backup command. When
+upgrading ThrowDB, suspend backup Jobs and tuning mutations until every worker
+that can reach the collection has been upgraded; an older process does not
+know about `locks/tuning.lock`, so mixed-version checkpoint/tuning concurrency
+is intentionally unsupported.
 
 ## 11. Restore and failover to a new path
 

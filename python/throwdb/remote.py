@@ -157,6 +157,42 @@ class AmbiguousCommitError(RemoteError, ConnectionError):
         )
 
 
+class RemoteAbortedError(AmbiguousCommitError):
+    """The server asked the client to retry or reconcile a mutation.
+
+    ThrowDB reserves mutation ``ABORTED`` for rejection before the current
+    request entered durable PREPARE, so that request definitely did not
+    commit.  A retry must still replay the identical mutation with
+    ``operation_id`` and bounded backoff; it must never allocate a new
+    operation ID for the same logical mutation.  The class remains an
+    :class:`AmbiguousCommitError` subclass so existing handlers keep catching
+    the status, while the explicit flag below exposes the stronger wire
+    guarantee.
+    """
+
+    retryable: Final = True
+    same_operation_id_required: Final = True
+    definitely_not_committed: Final = True
+
+    def __init__(
+        self,
+        operation_id: uuid.UUID,
+        operation: str,
+        *,
+        details: str,
+    ) -> None:
+        self.operation_id = operation_id
+        self.operation = operation
+        RemoteError.__init__(
+            self,
+            "ABORTED",
+            f"remote {operation} was rejected before durable PREPARE; "
+            f"operation_id={operation_id}; {details or 'ABORTED'}. Retry only "
+            f"the identical {operation} request with the same operation_id; "
+            "never allocate a new operation_id for this logical mutation.",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteReaderConfiguration:
     max_read_range_bytes: int
@@ -770,6 +806,12 @@ class RemoteCollection:
             )
         except grpc.RpcError as error:
             code = _rpc_code_name(error)
+            if code == "ABORTED":
+                raise RemoteAbortedError(
+                    operation_id,
+                    operation,
+                    details=_rpc_details(error),
+                ) from error
             if code not in _DEFINITE_MUTATION_REJECTIONS:
                 raise AmbiguousCommitError(
                     operation_id,
@@ -1451,6 +1493,7 @@ __all__ = [
     "DEFAULT_MAX_MESSAGE_BYTES",
     "DEFAULT_SCAN_TIMEOUT_SECONDS",
     "RemoteAlreadyExistsError",
+    "RemoteAbortedError",
     "RemoteAvailabilityConfiguration",
     "RemoteCancelledError",
     "RemoteCollection",

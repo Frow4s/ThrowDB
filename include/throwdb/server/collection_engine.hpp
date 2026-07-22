@@ -110,6 +110,14 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// The current mutation was rejected before it entered durable PREPARE. Only
+// this narrower type maps to gRPC ABORTED, making the wire-level
+// definite-not-committed retry contract explicit in the C++ type system.
+class MutationAbortedError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class InsufficientStorageError final : public StorageError {
 public:
     using StorageError::StorageError;
@@ -204,6 +212,10 @@ struct EngineMaintenanceResult {
     std::uint64_t orphan_removed_bytes = 0;
     bool orphan_durability_complete = true;
     std::uint64_t orphan_failed_files = 0;
+    // A mutation published its durable PREPARE between the pass's short
+    // journal snapshot and a native lifecycle admission check. The pass made
+    // no destructive progress across that fence and may be retried normally.
+    bool pending_mutation_deferred = false;
     bool action_budget_reached = false;
 };
 

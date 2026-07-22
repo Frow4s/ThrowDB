@@ -22,6 +22,8 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
     AfterOrphanDirectorySync = 11,
     CleanerSegmentOutputDurable = 12,
     CleanerRunOutputDurable = 13,
+    BeforeLifecycleFenceCheck = 14,
+    LifecycleBuildUnlocked = 15,
 };
 
 enum class NativeCollectionTestOperation : std::uint8_t {

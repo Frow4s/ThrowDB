@@ -15,6 +15,7 @@ from throwdb.remote import (
     AmbiguousCommitError,
     LocatedIdBatch,
     LocatedIds,
+    RemoteAbortedError,
     RemoteCollection,
     RemoteProtocolError,
 )
@@ -375,6 +376,17 @@ class _ResourceExhaustedMutationService(_FakeGrpcService):
         )
 
 
+class _AbortedMutationService(_FakeGrpcService):
+    """Model an application-level conflict with an explicit retry contract."""
+
+    def Insert(self, request, context):  # type: ignore[no-untyped-def]
+        del request
+        context.abort(
+            grpc.StatusCode.ABORTED,
+            "an ambiguous operation must be resolved before another mutation",
+        )
+
+
 class _IncompatibleProtocolService(_FakeGrpcService):
     def Health(self, request, context):  # type: ignore[no-untyped-def]
         response = super().Health(request, context)
@@ -580,6 +592,35 @@ def test_resource_exhausted_mutation_is_ambiguous() -> None:
 
     assert raised.value.operation_id == operation_id
     assert raised.value.code == "RESOURCE_EXHAUSTED"
+    assert not isinstance(raised.value, RemoteAbortedError)
+
+
+def test_aborted_mutation_has_typed_same_operation_id_retry_contract() -> None:
+    operation_id = uuid.UUID("22345678-1234-5678-9abc-def012345678")
+    with _RunningGrpcServer(
+        _AbortedMutationService()
+    ) as server, RemoteCollection.connect(server.endpoint, timeout=2) as collection:
+        durable_idempotency = collection.durable_idempotency
+        with pytest.raises(RemoteAbortedError) as raised:
+            collection.insert(
+                [40],
+                _vectors(1, 5, salt=402),
+                operation_id=operation_id,
+            )
+
+    error = raised.value
+    assert isinstance(error, AmbiguousCommitError)
+    assert durable_idempotency is False
+    assert error.operation_id == operation_id
+    assert error.operation == "insert"
+    assert error.code == "ABORTED"
+    assert error.retryable is True
+    assert error.same_operation_id_required is True
+    assert error.definitely_not_committed is True
+    assert "before durable PREPARE" in str(error)
+    assert "an ambiguous operation must be resolved" in str(error)
+    assert "same operation_id" in str(error)
+    assert "never allocate a new operation_id" in str(error)
 
 
 def test_protocol_v1_server_without_tuning_diagnostics_is_compatible() -> None:

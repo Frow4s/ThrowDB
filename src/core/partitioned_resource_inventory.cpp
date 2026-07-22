@@ -362,7 +362,7 @@ void require_real_directory(
     return static_cast<std::size_t>(area);
 }
 
-[[nodiscard]] ScannedEntry inspect_entry(
+[[nodiscard]] std::optional<ScannedEntry> inspect_entry(
     const std::filesystem::directory_entry& entry,
     const PartitionedInventoryArea area) {
     ScannedEntry result;
@@ -372,6 +372,13 @@ void require_real_directory(
         (relative_area_path(area) / result.name).generic_string();
     struct stat status {};
     if (::lstat(entry.path().c_str(), &status) < 0) {
+        if (errno == ENOENT) {
+            // An unlocked writer inventory may observe a publication staging
+            // name which is atomically renamed before lstat. It supplied no
+            // deletion identity, so omitting it is the only safe plan; a later
+            // pass will classify whichever pathname survived.
+            return std::nullopt;
+        }
         throw StorageError(
             system_error_message("cannot inspect format-7 inventory entry", entry.path()));
     }
@@ -410,7 +417,10 @@ void scan_directory(
                     + " entries; reduce stale or unexpected files in the "
                       "collection namespaces before retrying");
             }
-            output.push_back(inspect_entry(*iterator, area));
+            if (auto inspected = inspect_entry(*iterator, area);
+                inspected.has_value()) {
+                output.push_back(std::move(*inspected));
+            }
         }
         iterator.increment(error);
         if (error) {
@@ -672,6 +682,45 @@ void set_work_disposition(
     }
 }
 
+[[nodiscard]] std::vector<WorkItem> orphan_work_items(
+    const PartitionedOrphanCollectionResult& result) {
+    std::vector<WorkItem> work;
+    std::map<Uuid128, std::vector<std::size_t>> complete_segment_pairs;
+    for (std::size_t index = 0; index != result.entries.size(); ++index) {
+        const PartitionedInventoryEntry& entry = result.entries[index].file;
+        if (ordinary_orphan_candidate(entry.classification)) {
+            work.push_back(WorkItem{{index}});
+        } else if (entry.classification
+                   == PartitionedInventoryClass::
+                       CompleteUnreferencedSegmentPair) {
+            const auto id = segment_id_for_entry(entry);
+            if (!id.has_value()) {
+                throw StorageError(
+                    "format-7 inventory lost a complete segment pair ID");
+            }
+            complete_segment_pairs[*id].push_back(index);
+        }
+    }
+    for (auto& [id, members] : complete_segment_pairs) {
+        static_cast<void>(id);
+        if (members.size() != 2) {
+            throw StorageError(
+                "format-7 inventory complete segment pair has wrong cardinality");
+        }
+        work.push_back(WorkItem{std::move(members)});
+    }
+    for (WorkItem& item : work) {
+        std::sort(item.entries.begin(), item.entries.end());
+    }
+    std::sort(
+        work.begin(), work.end(),
+        [&result](const WorkItem& left, const WorkItem& right) {
+            return result.entries[left.entries.front()].file.relative_path
+                 < result.entries[right.entries.front()].file.relative_path;
+        });
+    return work;
+}
+
 }  // namespace
 
 PartitionedResourceInventory inspect_partitioned_resources(
@@ -754,19 +803,10 @@ PartitionedResourceInventory inspect_partitioned_resources(
     return inventory;
 }
 
-PartitionedOrphanCollectionResult collect_partitioned_orphans(
+PartitionedOrphanCollectionPlan plan_partitioned_orphans(
     const std::filesystem::path& store_path,
-    const std::uint64_t expected_generation,
-    const Uuid128 expected_catalog_id,
     const PartitionedOrphanCollectionOptions options,
     const PartitionedOrphanCollectionHooks& hooks) {
-    const bool use_scanned_view =
-        expected_generation == 0 && expected_catalog_id.empty();
-    if ((expected_generation == 0) != expected_catalog_id.empty()) {
-        throw InvalidArgumentError(
-            "format-7 orphan collection expected CURRENT generation and ID "
-            "must either both be present or both be omitted");
-    }
     if (options.max_files == 0 || options.max_bytes == 0) {
         throw InvalidArgumentError(
             "format-7 orphan collection file and byte budgets must be positive");
@@ -775,13 +815,6 @@ PartitionedOrphanCollectionResult collect_partitioned_orphans(
     PartitionedResourceInventory inventory =
         inspect_partitioned_resources(
             store_path, hooks.maximum_uncataloged_scan_entries);
-    if (!use_scanned_view
-        && (inventory.current_generation != expected_generation
-            || inventory.current_catalog_id != expected_catalog_id)) {
-        throw StorageError(
-            "format-7 orphan collection CURRENT differs from the expected "
-            "writer view; reopen the collection");
-    }
 
     PartitionedOrphanCollectionResult result;
     result.current_generation = inventory.current_generation;
@@ -794,44 +827,10 @@ PartitionedOrphanCollectionResult collect_partitioned_orphans(
         result.entries.push_back(std::move(entry));
     }
 
-    std::vector<WorkItem> work;
-    std::map<Uuid128, std::vector<std::size_t>> complete_segment_pairs;
-    for (std::size_t index = 0; index != result.entries.size(); ++index) {
-        const PartitionedInventoryEntry& entry = result.entries[index].file;
-        if (ordinary_orphan_candidate(entry.classification)) {
-            work.push_back(WorkItem{{index}});
-        } else if (entry.classification
-                   == PartitionedInventoryClass::
-                       CompleteUnreferencedSegmentPair) {
-            const auto id = segment_id_for_entry(entry);
-            if (!id.has_value()) {
-                throw StorageError(
-                    "format-7 inventory lost a complete segment pair ID");
-            }
-            complete_segment_pairs[*id].push_back(index);
-        }
-    }
-    for (auto& [id, members] : complete_segment_pairs) {
-        static_cast<void>(id);
-        if (members.size() != 2) {
-            throw StorageError(
-                "format-7 inventory complete segment pair has wrong cardinality");
-        }
-        work.push_back(WorkItem{std::move(members)});
-    }
-    for (WorkItem& item : work) {
-        std::sort(item.entries.begin(), item.entries.end());
-    }
-    std::sort(
-        work.begin(), work.end(),
-        [&result](const WorkItem& left, const WorkItem& right) {
-            return result.entries[left.entries.front()].file.relative_path
-                 < result.entries[right.entries.front()].file.relative_path;
-        });
+    const std::vector<WorkItem> work = orphan_work_items(result);
 
     std::uint64_t selected_files = 0;
     std::uint64_t selected_bytes = 0;
-    std::array<bool, kAreaCount> selected_areas{};
     for (const WorkItem& item : work) {
         bool invalid_time = false;
         bool too_young = false;
@@ -887,6 +886,64 @@ PartitionedOrphanCollectionResult collect_partitioned_orphans(
         for (const std::size_t index : item.entries) {
             PartitionedOrphanCollectionEntry& entry = result.entries[index];
             entry.selected = true;
+        }
+    }
+
+    return PartitionedOrphanCollectionPlan{std::move(result)};
+}
+
+PartitionedOrphanCollectionResult apply_partitioned_orphan_plan(
+    const std::filesystem::path& store_path,
+    const std::uint64_t expected_generation,
+    const Uuid128 expected_catalog_id,
+    PartitionedOrphanCollectionPlan plan,
+    const PartitionedOrphanCollectionHooks& hooks) {
+    if ((expected_generation == 0) != expected_catalog_id.empty()) {
+        throw InvalidArgumentError(
+            "format-7 orphan collection expected CURRENT generation and ID "
+            "must either both be present or both be omitted");
+    }
+    const AuthoritativeView view = read_authoritative_view(store_path);
+    if (expected_generation != 0
+        && (view.catalog.generation != expected_generation
+            || view.catalog.catalog_id != expected_catalog_id)) {
+        throw StorageError(
+            "format-7 orphan collection CURRENT differs from the expected "
+            "writer view; reopen the collection");
+    }
+    const std::set<std::string> reachable = reachable_paths(view);
+    PartitionedOrphanCollectionResult result = std::move(plan.result);
+    result.current_generation = view.catalog.generation;
+    result.current_catalog_id = view.catalog.catalog_id;
+    const std::vector<WorkItem> work = orphan_work_items(result);
+
+    // Phase-one classification is advisory. Revoke the complete work item if
+    // any member became reachable before the caller acquired its mutation and
+    // publication barriers. Segment pairs therefore remain atomic.
+    for (const WorkItem& item : work) {
+        if (!result.entries[item.entries.front()].selected) {
+            continue;
+        }
+        const bool became_reachable = std::any_of(
+            item.entries.begin(), item.entries.end(),
+            [&result, &reachable](const std::size_t index) {
+                return reachable.contains(
+                    result.entries[index].file.relative_path);
+            });
+        if (!became_reachable) {
+            continue;
+        }
+        set_work_disposition(
+            result, item, PartitionedOrphanDisposition::NotCandidate);
+        for (const std::size_t index : item.entries) {
+            result.entries[index].eligible = false;
+            result.entries[index].selected = false;
+        }
+    }
+
+    std::array<bool, kAreaCount> selected_areas{};
+    for (const PartitionedOrphanCollectionEntry& entry : result.entries) {
+        if (entry.selected) {
             selected_areas[area_index(entry.file.area)] = true;
         }
     }
@@ -1006,10 +1063,23 @@ PartitionedOrphanCollectionResult collect_partitioned_orphans(
 
 PartitionedOrphanCollectionResult collect_partitioned_orphans(
     const std::filesystem::path& store_path,
+    const std::uint64_t expected_generation,
+    const Uuid128 expected_catalog_id,
     const PartitionedOrphanCollectionOptions options,
     const PartitionedOrphanCollectionHooks& hooks) {
-    return collect_partitioned_orphans(
-        store_path, 0, {}, options, hooks);
+    auto plan = plan_partitioned_orphans(store_path, options, hooks);
+    return apply_partitioned_orphan_plan(
+        store_path, expected_generation, expected_catalog_id,
+        std::move(plan), hooks);
+}
+
+PartitionedOrphanCollectionResult collect_partitioned_orphans(
+    const std::filesystem::path& store_path,
+    const PartitionedOrphanCollectionOptions options,
+    const PartitionedOrphanCollectionHooks& hooks) {
+    auto plan = plan_partitioned_orphans(store_path, options, hooks);
+    return apply_partitioned_orphan_plan(
+        store_path, 0, {}, std::move(plan), hooks);
 }
 
 }  // namespace throwdb::detail

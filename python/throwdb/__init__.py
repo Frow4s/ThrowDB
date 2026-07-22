@@ -24,6 +24,7 @@ from .id_scan import (
 from .remote import (
     AmbiguousCommitError,
     DEFAULT_SCAN_TIMEOUT_SECONDS,
+    RemoteAbortedError,
     RemoteAlreadyExistsError,
     RemoteAdmissionStatistics,
     RemoteAvailabilityConfiguration,
@@ -77,6 +78,7 @@ __all__ = [
     "CalibrationError",
     "ReaderBackendError",
     "RemoteCollection",
+    "RemoteAbortedError",
     "RemoteAlreadyExistsError",
     "RemoteAdmissionStatistics",
     "RemoteAvailabilityConfiguration",

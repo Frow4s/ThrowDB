@@ -97,13 +97,27 @@ A missing, unsupported, or corrupt registry can never make `tuning="auto"`
 unable to open otherwise valid data; it produces a conservative fallback with
 an observable reason.
 
-The registry is versioned, bounded, checksummed, and written under a separate
-advisory lock. Publication writes and fsyncs a temporary file, atomically
-replaces the registry, then fsyncs its directory. Readers do not take the write
-lock and see either the previous or next complete file. Raw device serials,
-WWIDs, filesystem UUIDs, remote mount sources, hostnames, paths, and mount
-options are never stored. A random salt inside each registry prevents its
-fingerprints from correlating devices across collections.
+The registry is versioned, bounded, checksummed, and written under two advisory
+locks. Every create/save/remove/reset first takes `locks/tuning.lock`, then
+`tuning/reader-profiles.lock`. Publication writes and fsyncs a temporary file,
+atomically replaces the registry, then fsyncs its directory. A complete S3
+checkpoint takes `writer.lock` and then `locks/tuning.lock` for its full
+inventory/upload/publication window. The global order is therefore
+`writer.lock -> locks/tuning.lock -> tuning/reader-profiles.lock`; a
+registry-only operation never acquires `writer.lock` after either tuning lock.
+If no optional tuning metadata exists, checkpoint locking creates neither the
+`tuning/` directory nor a registry payload. Readers do not take either write
+lock and see the previous or next complete file. Raw device serials, WWIDs,
+filesystem UUIDs, remote mount sources, hostnames, paths, and mount options are
+never stored. A random salt inside each registry prevents its fingerprints
+from correlating devices across collections.
+
+The barrier is an advisory collection protocol. All processes that can mutate
+tuning metadata or create S3 checkpoints must run a version that understands
+`locks/tuning.lock`. Concurrent mixed-version backup/tuning operation with an
+older ThrowDB build is unsupported; quiesce both operations while upgrading
+every worker that can access the collection. This is required because an old
+process cannot be made to honor a lock introduced by a newer wheel.
 
 The first implementation stores at most 64 profiles in a 1 MiB registry. Old
 profiles have no time-based expiry: they stop matching when a compatibility
