@@ -169,6 +169,66 @@ class NativeIdScan:
     ) -> bool: ...
 
 
+class NativeReadView:
+    @property
+    def metadata(self) -> dict[str, int]: ...
+
+    @property
+    def output_dimension(self) -> int: ...
+
+    @property
+    def dtype(self) -> str: ...
+
+    def get_into(
+        self,
+        ids: npt.NDArray[np.uint64],
+        output: _EmbeddingArray,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> NativeReadView: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
+
+
+class NativeRecordScan:
+    @property
+    def metadata(self) -> dict[str, int]: ...
+
+    @property
+    def output_dimension(self) -> int: ...
+
+    @property
+    def dtype(self) -> str: ...
+
+    @property
+    def done(self) -> bool: ...
+
+    def read_into(
+        self,
+        ids: npt.NDArray[np.uint64],
+        embeddings: _EmbeddingArray,
+        locations: npt.NDArray[np.void] | None = None,
+    ) -> int: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> NativeRecordScan: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool: ...
+
+
 class NativeCollection:
     @staticmethod
     def reader_capabilities(
@@ -275,7 +335,22 @@ class NativeCollection:
         max_inspected_slots: int,
     ) -> dict[str, object]: ...
 
-    def scan_ids(self) -> NativeIdScan: ...
+    def scan_ids(
+        self,
+        max_snapshot_bytes: int | None = None,
+    ) -> NativeIdScan: ...
+
+    def open_read_view(
+        self,
+        prefix_dimensions: int | None = None,
+        max_snapshot_bytes: int | None = None,
+    ) -> NativeReadView: ...
+
+    def scan_records(
+        self,
+        prefix_dimensions: int | None = None,
+        max_snapshot_bytes: int | None = None,
+    ) -> NativeRecordScan: ...
 
     def insert(
         self,

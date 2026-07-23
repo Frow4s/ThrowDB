@@ -90,9 +90,14 @@ flowchart LR
 - Optional exact physical locations are returned with scans.
 - `list_ids()` deliberately materializes the complete result without a memory
   guard; callers responsible for large collections should use `scan_ids()`.
+- `stream_get()` lazily consumes large ordered ID arrays/memmaps in bounded
+  batches while preserving order, duplicates, and one logical snapshot.
+- `scan_records()` streams authoritative ID/embedding pairs in physical order,
+  with optional locations and prefix-only physical reads.
 
-Prefix reads are logically correct but the current dense-row physical layout
-still reads a complete row before returning its prefix.
+Ordinary unary prefix reads remain logically correct on the dense-row layout.
+The streaming read view issues prefix-width physical requests, although
+filesystem blocks and page cache can still amplify actual device traffic.
 
 ### Mutations and lifecycle
 

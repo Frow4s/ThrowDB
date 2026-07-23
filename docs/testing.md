@@ -432,6 +432,99 @@ launched server additionally writes `server.stdout.log` and
   strictly increasing `(segment_id, row_index)` locations without materializing
   the complete ID set. Set `--scan-rows 0` to skip this phase.
 
+### Embedded and gRPC embedding-stream benchmark
+
+`benchmarks/run_streaming_read_benchmark.py` measures the two format-7
+embedding streams without concatenating batches. Exactly one target is
+required: `--store` opens an embedded collection, while `--endpoint` connects
+to an already-running `throwdbd`. The harness never starts, restarts, or stops
+the remote server. It records time to first batch, rows and logical GiB per
+second, a content digest, snapshot/terminal state, negotiated batch limits,
+and best-effort client-process RSS.
+
+Embedded examples:
+
+```bash
+python benchmarks/run_streaming_read_benchmark.py \
+  --store "$STORE" \
+  --mode scan-records \
+  --batch-rows 65536 \
+  --max-batch-mib 64 \
+  --max-snapshot-mib 256 \
+  --prefix-dimensions 128 \
+  --with-locations \
+  --output benchmark-results/scan-records.json
+
+python benchmarks/run_streaming_read_benchmark.py \
+  --store "$STORE" \
+  --mode stream-get \
+  --ids "$IDS" \
+  --batch-rows 65536 \
+  --max-batch-mib 64 \
+  --max-snapshot-mib 256 \
+  --output benchmark-results/stream-get.json
+```
+
+The equivalent remote runs use the same modes and bounded batch loop:
+
+```bash
+python benchmarks/run_streaming_read_benchmark.py \
+  --endpoint 127.0.0.1:50051 \
+  --mode scan-records \
+  --batch-rows 65536 \
+  --max-batch-mib 64 \
+  --prefix-dimensions 128 \
+  --with-locations \
+  --output benchmark-results/grpc-scan-records.json
+
+python benchmarks/run_streaming_read_benchmark.py \
+  --endpoint 127.0.0.1:50051 \
+  --mode stream-get \
+  --ids "$IDS" \
+  --batch-rows 65536 \
+  --max-batch-mib 64 \
+  --output benchmark-results/grpc-stream-get.json
+```
+
+`--max-snapshot-mib` and `--tuning` are embedded-only; remote snapshot and
+reader budgets belong to the already-running server. Remote client bounds can
+be tightened with `--max-frame-mib`, `--rpc-timeout-seconds`, and
+`--scan-timeout-seconds`. A full run must observe logical EOF and the exact
+expected row count. With `--max-rows`, stopping is allowed only after a
+completed bounded batch reaches the requested truncation point. Failed or
+unclosed streams always fail the benchmark.
+
+Human-readable progress is emitted to stderr after the first completed batch,
+at most every five seconds, and once after the validated report has been
+written. It includes completed/target rows, batches, elapsed time, average
+rows/s, logical MiB/s, ETA, and sampled peak RSS. Stdout remains the final
+machine-readable result JSON and the report file contains no progress text.
+Change the cadence with `--progress-seconds SECONDS` or use `--no-progress`.
+The rate is end-to-end logical payload throughput, including lookup, I/O,
+copies, and hashing; it is not physical device bandwidth.
+
+For a short validation rather than a full collection pass:
+
+```bash
+python benchmarks/run_streaming_read_benchmark.py \
+  --store "$STORE" \
+  --mode stream-get \
+  --ids "$IDS" \
+  --batch-rows 65536 \
+  --max-rows 1048576 \
+  --output benchmark-results/stream-get-1m.json
+```
+
+Record fields are hashed incrementally with separate ID, embedding, and
+location hashers before producing the combined digest. Consequently different
+embedded/server batch boundaries do not change the digest for identical
+logical records, and no full-result concatenation is required.
+
+The logical-byte rate is not device bandwidth: range coalescing, filesystem
+blocks, page cache, and prefix reads can change physical traffic. Retained
+inode bytes are likewise not represented by RSS. In gRPC mode the RSS fields
+describe only the benchmark client, not `throwdbd`.
+
 ## Single-collection gRPC regression/soak
 
 `benchmarks/run_grpc_server_soak.py` is the production-oriented stability gate.

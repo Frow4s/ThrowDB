@@ -150,6 +150,20 @@ struct NativeIdScanMetadata {
     std::uint64_t catalog_generation = 0;
     std::uint64_t committed_sequence = 0;
     std::uint64_t live_count = 0;
+    std::uint64_t snapshot_bytes = 0;
+};
+
+// Identity, exact logical size, and admitted heap estimate of an immutable
+// format-7 read view. The estimate excludes already-open immutable index
+// mappings and data files, which are shared with the collection and merely
+// pinned for the lifetime of the view.
+struct NativeReadViewMetadata {
+    std::uint64_t collection_id_low = 0;
+    std::uint64_t collection_id_high = 0;
+    std::uint64_t catalog_generation = 0;
+    std::uint64_t committed_sequence = 0;
+    std::uint64_t live_count = 0;
+    std::uint64_t snapshot_bytes = 0;
 };
 
 // Lightweight identity of the currently published logical view. Unlike an ID
@@ -401,10 +415,75 @@ private:
 
 class NativeCollection;
 
+// Immutable format-7 point-read snapshot. Input order and duplicates are
+// preserved. Every ID in one get_into() batch is resolved before physical I/O
+// starts, so a missing ID leaves the complete output batch untouched.
+class NativeReadView {
+public:
+    ~NativeReadView();
+
+    NativeReadView(const NativeReadView&) = delete;
+    NativeReadView& operator=(const NativeReadView&) = delete;
+    NativeReadView(NativeReadView&&) = delete;
+    NativeReadView& operator=(NativeReadView&&) = delete;
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept;
+    [[nodiscard]] DType dtype() const noexcept;
+    void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+
+private:
+    class Impl;
+    explicit NativeReadView(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+
+    friend class NativeCollection;
+};
+
+// Snapshot cursor over authoritative records in physical RowRef order. A
+// non-empty batch never spans physical segments. embeddings contains the
+// configured full row or direct on-disk prefix for each returned ID. The IDs,
+// embeddings, and optional locations output spans must be byte-disjoint.
+class NativeRecordScan {
+public:
+    using StopPredicate = std::function<bool()>;
+
+    ~NativeRecordScan();
+
+    NativeRecordScan(const NativeRecordScan&) = delete;
+    NativeRecordScan& operator=(const NativeRecordScan&) = delete;
+    NativeRecordScan(NativeRecordScan&&) = delete;
+    NativeRecordScan& operator=(NativeRecordScan&&) = delete;
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept;
+    [[nodiscard]] DType dtype() const noexcept;
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<std::byte> embeddings,
+        std::span<NativeIdLocation> locations = {});
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<std::byte> embeddings,
+        std::span<NativeIdLocation> locations,
+        const StopPredicate& stop_requested);
+    [[nodiscard]] bool done() const noexcept;
+
+private:
+    class Impl;
+    explicit NativeRecordScan(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+
+    friend class NativeCollection;
+};
+
 // Snapshot cursor over authoritative live IDs in physical RowRef order:
 // (segment_id, row_index). read_into() never mixes two physical segments in
 // one non-empty result. Passing an empty locations span disables location
-// output; otherwise it must have exactly the same capacity as ids.
+// output; otherwise it must have exactly the same capacity as ids and be
+// byte-disjoint from the IDs output span.
 class NativeIdScan {
 public:
     using StopPredicate = std::function<bool()>;
@@ -525,6 +604,18 @@ public:
     // checked under that same state lock before any overlay-sized allocation,
     // allowing servers to bind cursor memory to their admission lease.
     [[nodiscard]] std::unique_ptr<NativeIdScan> scan_ids(
+        std::uint64_t max_snapshot_bytes =
+            std::numeric_limits<std::uint64_t>::max()) const;
+    // Format 7 only. A zero prefix_dimensions selects the stored dimension;
+    // otherwise the leading prefix is passed to the physical reader as the
+    // requested record width. Range coalescing, filesystem blocks, and page
+    // cache may still amplify device traffic across unused suffix bytes.
+    [[nodiscard]] std::unique_ptr<NativeReadView> open_read_view(
+        std::uint32_t prefix_dimensions = 0,
+        std::uint64_t max_snapshot_bytes =
+            std::numeric_limits<std::uint64_t>::max()) const;
+    [[nodiscard]] std::unique_ptr<NativeRecordScan> scan_records(
+        std::uint32_t prefix_dimensions = 0,
         std::uint64_t max_snapshot_bytes =
             std::numeric_limits<std::uint64_t>::max()) const;
     [[nodiscard]] std::vector<std::byte> get_bytes(

@@ -487,6 +487,17 @@ void test_physical_id_scan_order_locations_and_snapshot_isolation() {
                 old_scan->read_into(invalid_ids, invalid_locations));
         },
         "physical ID scan accepted mismatched buffer capacities");
+    std::array<std::uint64_t, 2> overlapping_outputs{};
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(old_scan->read_into(
+                overlapping_outputs,
+                std::span<throwdb::NativeIdLocation>(
+                    reinterpret_cast<throwdb::NativeIdLocation*>(
+                        overlapping_outputs.data()),
+                    overlapping_outputs.size())));
+        },
+        "physical ID scan accepted overlapping ID and location outputs");
 
     // Mutate the live writer after the cursor captured its resource set and
     // overlay. The old cursor must retain both its logical contents and the
@@ -626,6 +637,258 @@ void test_physical_id_scan_cooperative_cancellation() {
                            1,
                            static_cast<std::uint32_t>(ids.size() - 1)},
             "resumed physical ID scan returned the wrong final row");
+}
+
+void test_read_view_and_record_scan_prefix_budget_and_concurrency() {
+    TemporaryDirectory temporary("read-view-record-scan");
+    constexpr std::uint32_t dimension = 4;
+    constexpr std::size_t record_size = 8;
+    constexpr std::size_t prefix_size = 4;
+    const std::array<std::uint64_t, 5> base_ids{1, 2, 3, 4, 5};
+    const std::vector<std::byte> base_rows = rows(base_ids.size(), record_size);
+    build_collection(
+        temporary.path(), base_ids, base_rows,
+        throwdb::DType::Float16, dimension, 2 * record_size, 1);
+
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    const std::vector<std::byte> updated_two(record_size, std::byte{0xa2});
+    const std::vector<std::byte> inserted_six(record_size, std::byte{0xb6});
+    writer->update(std::array<std::uint64_t, 1>{2}, updated_two);
+    require(
+        writer->erase(std::array<std::uint64_t, 1>{3})
+            == std::vector<std::uint8_t>({1}),
+        "read view fixture delete failed");
+    writer->insert(std::array<std::uint64_t, 1>{6}, inserted_six);
+
+    require_throws<std::length_error>(
+        [&] { static_cast<void>(writer->open_read_view(2, 4095)); },
+        "read view ignored its pre-allocation snapshot budget");
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] { static_cast<void>(writer->open_read_view(dimension + 1)); },
+        "read view accepted an oversized prefix");
+
+    auto view = writer->open_read_view(2);
+    auto scan = writer->scan_records(2);
+    require(
+        view->output_dimension() == 2
+            && scan->output_dimension() == 2
+            && view->dtype() == throwdb::DType::Float16
+            && scan->dtype() == throwdb::DType::Float16,
+        "prefix read surfaces reported the wrong output schema");
+    require(
+        view->metadata().committed_sequence == 3
+            && view->metadata().live_count == 5
+            && view->metadata().snapshot_bytes >= 4096
+            && scan->metadata().committed_sequence == 3
+            && scan->metadata().snapshot_bytes
+                   == view->metadata().snapshot_bytes,
+        "prefix read surfaces captured the wrong snapshot metadata");
+    require_throws<std::length_error>(
+        [&] {
+            static_cast<void>(writer->scan_records(
+                2, scan->metadata().snapshot_bytes - 1));
+        },
+        "record scan ignored its snapshot budget");
+
+    std::array<std::uint64_t, 2> overlap_words{};
+    std::array<std::uint64_t, 2> separate_ids{};
+    std::array<throwdb::NativeIdLocation, 2> separate_locations{};
+    std::vector<std::byte> separate_embeddings(
+        separate_ids.size() * prefix_size);
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(scan->read_into(
+                overlap_words,
+                std::span<std::byte>(
+                    reinterpret_cast<std::byte*>(overlap_words.data()),
+                    separate_embeddings.size()),
+                separate_locations));
+        },
+        "record scan accepted overlapping ID and embedding outputs");
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(scan->read_into(
+                overlap_words,
+                separate_embeddings,
+                std::span<throwdb::NativeIdLocation>(
+                    reinterpret_cast<throwdb::NativeIdLocation*>(
+                        overlap_words.data()),
+                    overlap_words.size())));
+        },
+        "record scan accepted overlapping ID and location outputs");
+    require_throws<throwdb::InvalidArgumentError>(
+        [&] {
+            static_cast<void>(scan->read_into(
+                separate_ids,
+                std::span<std::byte>(
+                    reinterpret_cast<std::byte*>(
+                        separate_locations.data()),
+                    separate_embeddings.size()),
+                separate_locations));
+        },
+        "record scan accepted overlapping embedding and location outputs");
+    require(!scan->done(),
+            "overlap validation advanced the record scan cursor");
+
+    const auto expected_prefix = [&](const std::uint64_t id) {
+        std::array<std::byte, prefix_size> result{};
+        if (id == 2) {
+            std::copy_n(updated_two.begin(), prefix_size, result.begin());
+            return result;
+        }
+        if (id == 6) {
+            std::copy_n(inserted_six.begin(), prefix_size, result.begin());
+            return result;
+        }
+        const auto position = std::find(base_ids.begin(), base_ids.end(), id);
+        if (position == base_ids.end() || id == 3) {
+            fail("unexpected ID in read-view expected-prefix helper");
+        }
+        const std::size_t row = static_cast<std::size_t>(
+            position - base_ids.begin());
+        std::copy_n(
+            base_rows.begin()
+                + static_cast<std::ptrdiff_t>(row * record_size),
+            prefix_size, result.begin());
+        return result;
+    };
+    const auto expected_batch = [&](const auto& requested) {
+        std::vector<std::byte> expected(requested.size() * prefix_size);
+        for (std::size_t index = 0; index != requested.size(); ++index) {
+            const auto prefix = expected_prefix(requested[index]);
+            std::copy(
+                prefix.begin(), prefix.end(),
+                expected.begin()
+                    + static_cast<std::ptrdiff_t>(index * prefix_size));
+        }
+        return expected;
+    };
+
+    const std::array<std::uint64_t, 4> requested{6, 1, 2, 6};
+    const std::vector<std::byte> expected = expected_batch(requested);
+    std::vector<std::byte> output(expected.size());
+    view->get_into(requested, output);
+    require(
+        output == expected,
+        "read view prefix was not bit-exact or lost order/duplicates");
+
+    const std::array<std::uint64_t, 2> with_missing{1, 999};
+    std::vector<std::byte> untouched(
+        with_missing.size() * prefix_size, std::byte{0x5d});
+    const std::vector<std::byte> sentinel = untouched;
+    require_throws<throwdb::MissingIdError>(
+        [&] { view->get_into(with_missing, untouched); },
+        "read view did not reject a missing ID");
+    require(
+        untouched == sentinel,
+        "missing-ID validation modified the current output batch");
+    view->get_into(requested, output);
+    require(
+        output == expected,
+        "read view was not reusable after a missing-ID exception");
+
+    std::atomic<bool> read_started{false};
+    std::atomic<bool> stop_reader{false};
+    std::exception_ptr reader_error;
+    std::thread reader([&] {
+        try {
+            std::vector<std::byte> concurrent_output(expected.size());
+            do {
+                view->get_into(requested, concurrent_output);
+                if (concurrent_output != expected) {
+                    fail("concurrent read view changed its snapshot bytes");
+                }
+                read_started.store(true, std::memory_order_release);
+            } while (!stop_reader.load(std::memory_order_acquire));
+        } catch (...) {
+            reader_error = std::current_exception();
+        }
+    });
+    while (!read_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    const std::vector<std::byte> newer_one(record_size, std::byte{0xc1});
+    const std::vector<std::byte> newer_two(record_size, std::byte{0xc2});
+    writer->update(std::array<std::uint64_t, 1>{1}, newer_one);
+    writer->update(std::array<std::uint64_t, 1>{2}, newer_two);
+    require(
+        writer->erase(std::array<std::uint64_t, 1>{4})
+            == std::vector<std::uint8_t>({1}),
+        "concurrent snapshot fixture delete failed");
+    static_cast<void>(writer->rotate_wal());
+    static_cast<void>(writer->materialize_frozen_wals());
+    stop_reader.store(true, std::memory_order_release);
+    reader.join();
+    if (reader_error != nullptr) {
+        std::rethrow_exception(reader_error);
+    }
+    view->get_into(requested, output);
+    require(
+        output == expected
+            && view->metadata().committed_sequence == 3,
+        "read view observed later mutation/maintenance publication");
+
+    std::array<std::uint64_t, 3> scan_ids{};
+    std::array<throwdb::NativeIdLocation, 3> scan_locations{};
+    std::vector<std::byte> scan_embeddings(scan_ids.size() * prefix_size);
+    std::vector<std::uint64_t> all_ids;
+    std::vector<std::byte> all_embeddings;
+    std::vector<throwdb::NativeIdLocation> all_locations;
+    while (!scan->done()) {
+        std::fill(scan_ids.begin(), scan_ids.end(), 0);
+        std::fill(
+            scan_embeddings.begin(), scan_embeddings.end(),
+            std::byte{0xee});
+        const std::uint64_t count = scan->read_into(
+            scan_ids, scan_embeddings, scan_locations);
+        require(count != 0, "record scan stalled before EOF");
+        for (std::size_t index = 0; index != count; ++index) {
+            all_ids.push_back(scan_ids[index]);
+            all_locations.push_back(scan_locations[index]);
+            all_embeddings.insert(
+                all_embeddings.end(),
+                scan_embeddings.begin()
+                    + static_cast<std::ptrdiff_t>(index * prefix_size),
+                scan_embeddings.begin()
+                    + static_cast<std::ptrdiff_t>(
+                        (index + 1) * prefix_size));
+        }
+        for (std::size_t index = 1; index < count; ++index) {
+            require(
+                scan_locations[index - 1].segment_id
+                    == scan_locations[index].segment_id,
+                "record scan crossed a physical segment boundary");
+        }
+    }
+    require(
+        all_ids.size() == scan->metadata().live_count,
+        "record scan returned the wrong captured live count");
+    require(
+        all_embeddings == expected_batch(all_ids),
+        "record scan prefixes were not bit-exact for its old snapshot");
+    for (std::size_t index = 1; index < all_locations.size(); ++index) {
+        const std::uint64_t previous =
+            (static_cast<std::uint64_t>(
+                 all_locations[index - 1].segment_id)
+             << 32)
+            | all_locations[index - 1].row_index;
+        const std::uint64_t current =
+            (static_cast<std::uint64_t>(all_locations[index].segment_id)
+             << 32)
+            | all_locations[index].row_index;
+        require(previous < current, "record scan locations are not ordered");
+    }
+    require(
+        scan->read_into(scan_ids, scan_embeddings, scan_locations) == 0,
+        "record scan returned rows after done");
+
+    // Both handles own the reader executor and pinned file resources.
+    writer.reset();
+    view->get_into(requested, output);
+    require(output == expected,
+            "detached read view borrowed the collection lifetime");
 }
 
 void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
@@ -2258,6 +2521,30 @@ void test_forked_builder_and_reader_lifecycle() {
         } catch (...) {
             result = 22;
         }
+        const auto require_inherited_stream_rejected =
+            [&result](auto&& open_stream, const int not_rejected,
+                      const int wrong_error) {
+                if (result != 0) {
+                    return;
+                }
+                try {
+                    static_cast<void>(open_stream());
+                    result = not_rejected;
+                } catch (const throwdb::StorageError& error) {
+                    if (std::string(error.what()).find("fork")
+                        == std::string::npos) {
+                        result = wrong_error;
+                    }
+                } catch (...) {
+                    result = wrong_error;
+                }
+            };
+        require_inherited_stream_rejected(
+            [&] { return reader->scan_ids(); }, 25, 26);
+        require_inherited_stream_rejected(
+            [&] { return reader->open_read_view(); }, 27, 28);
+        require_inherited_stream_rejected(
+            [&] { return reader->scan_records(); }, 29, 33);
         reader.reset();
         if (result == 0) {
             try {
@@ -2494,7 +2781,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 27> tests{{
+    const std::array<TestCase, 28> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
@@ -2502,6 +2789,8 @@ int main() {
          test_physical_id_scan_order_locations_and_snapshot_isolation},
         {"physical_id_scan_cooperative_cancellation",
          test_physical_id_scan_cooperative_cancellation},
+        {"read_view_and_record_scan_prefix_budget_and_concurrency",
+         test_read_view_and_record_scan_prefix_budget_and_concurrency},
         {"writable_crud_reopen_rotation_and_snapshot_isolation",
          test_writable_crud_reopen_rotation_and_snapshot_isolation},
         {"sampler_sparse_snapshot_and_overlay_quotas",

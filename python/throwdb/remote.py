@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import operator
+import threading
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Final, Iterator, Literal, overload
@@ -27,13 +29,19 @@ from .id_scan import (
     LocatedIdBatch,
     LocatedIds,
 )
+from .record_scan import RecordBatch
 from .v1 import throwdb_pb2, throwdb_pb2_grpc
 
 
 DEFAULT_MAX_MESSAGE_BYTES: Final = 1 << 30
 DEFAULT_SCAN_TIMEOUT_SECONDS: Final = 3_600.0
 _DEFAULT_SCAN_BATCH_ROWS: Final = 65_536
+_DEFAULT_STREAM_BATCH_PAYLOAD_BYTES: Final = 16 << 20
+_SCAN_FRAME_ALLOWANCE: Final = 512
+_STREAMING_FRAME_ALLOWANCE: Final = 1024
+_STREAM_GET_REQUEST_ALLOWANCE: Final = 128
 _UINT32_MAX: Final = (1 << 32) - 1
+_UINT64_MAX: Final = (1 << 64) - 1
 _GRPC_MAX_MESSAGE_BYTES: Final = (1 << 31) - 1
 _PROTOCOL_MAJOR: Final = 1
 
@@ -49,6 +57,8 @@ CAPABILITY_WRITABLE: Final = 1 << 0
 CAPABILITY_PREFIX_GET: Final = 1 << 1
 CAPABILITY_SCAN_LOCATIONS: Final = 1 << 2
 CAPABILITY_DURABLE_IDEMPOTENCY: Final = 1 << 3
+CAPABILITY_STREAM_GET: Final = 1 << 4
+CAPABILITY_SCAN_RECORDS: Final = 1 << 5
 
 
 class RemoteError(Exception):
@@ -349,6 +359,25 @@ class RemoteDescription:
     def durable_idempotency(self) -> bool:
         return bool(self.capabilities & CAPABILITY_DURABLE_IDEMPOTENCY)
 
+    @property
+    def stream_get(self) -> bool:
+        return bool(self.capabilities & CAPABILITY_STREAM_GET)
+
+    @property
+    def scan_records(self) -> bool:
+        return bool(self.capabilities & CAPABILITY_SCAN_RECORDS)
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteEmbeddingBatch:
+    """One bounded response from a snapshot-pinned remote lookup stream."""
+
+    sequence: int
+    input_offset: int
+    ids: np.ndarray
+    embeddings: np.ndarray
+    snapshot: IdScanSnapshot
+
 
 def _validate_positive_u32(value: object, *, name: str) -> int:
     if isinstance(value, (bool, np.bool_)):
@@ -360,6 +389,86 @@ def _validate_positive_u32(value: object, *, name: str) -> int:
     if not 1 <= result <= _UINT32_MAX:
         raise ValueError(f"{name} must be between 1 and {_UINT32_MAX}")
     return result
+
+
+def _validate_optional_positive_u64(value: object | None, *, name: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer, not bool")
+    try:
+        result = operator.index(value)
+    except TypeError as error:
+        raise TypeError(f"{name} must be an integer or None") from error
+    if not 1 <= result <= _UINT64_MAX:
+        raise ValueError(f"{name} must be between 1 and {_UINT64_MAX}")
+    return result
+
+
+def _bounded_stream_parameters(
+    *,
+    requested_rows: int,
+    requested_payload_bytes: int,
+    dense_row_bytes: int,
+    max_frame_bytes: int,
+    include_id_request: bool,
+    operation: str,
+) -> tuple[int, int]:
+    payload_capacity = max_frame_bytes - _STREAMING_FRAME_ALLOWANCE
+    if dense_row_bytes <= 0 or payload_capacity < dense_row_bytes:
+        raise ValueError(
+            f"max_frame_bytes cannot fit one {operation} dense row"
+        )
+    payload_bytes = min(
+        requested_payload_bytes or payload_capacity,
+        payload_capacity,
+    )
+    rows = min(requested_rows, payload_bytes // dense_row_bytes)
+    if include_id_request:
+        request_capacity = max_frame_bytes - _STREAM_GET_REQUEST_ALLOWANCE
+        if request_capacity < 8:
+            raise ValueError(
+                "max_frame_bytes cannot fit one StreamGet ID request"
+            )
+        rows = min(rows, request_capacity // 8)
+    if rows < 1:
+        raise ValueError(
+            f"streaming limits cannot fit one {operation} row"
+        )
+    return int(rows), int(payload_bytes)
+
+
+def _reject_array_overlap(
+    arrays: Sequence[tuple[str, np.ndarray]],
+    *,
+    operation: str,
+) -> None:
+    for left_index, (left_name, left) in enumerate(arrays):
+        for right_name, right in arrays[left_index + 1 :]:
+            # may_share_memory is deliberately conservative and bounded. An
+            # occasional false positive is preferable to successful-looking
+            # corruption while sequential copies advance a remote cursor.
+            if np.may_share_memory(left, right):
+                raise ValueError(
+                    f"{operation} buffers {left_name} and {right_name} "
+                    "must not overlap"
+                )
+
+
+@contextlib.contextmanager
+def _exclusive_consumer(
+    lock: threading.RLock,
+    *,
+    operation: str,
+) -> Iterator[None]:
+    if not lock.acquire(blocking=False):
+        raise RuntimeError(
+            f"{operation} supports exactly one active consumer"
+        )
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _validate_max_message_bytes(value: object) -> int:
@@ -449,6 +558,56 @@ def _proto_ids(ids: np.ndarray) -> throwdb_pb2.IdBatch:
     )
 
 
+def _remote_read_snapshot(
+    snapshot: throwdb_pb2.ReadSnapshot,
+    *,
+    operation: str,
+) -> IdScanSnapshot:
+    collection = snapshot.collection_id
+    token = snapshot.token
+    if collection.high == 0 and collection.low == 0:
+        raise RemoteProtocolError(
+            f"{operation} returned a zero collection ID"
+        )
+    if token.high == 0 and token.low == 0:
+        raise RemoteProtocolError(f"{operation} returned a zero snapshot token")
+    return IdScanSnapshot(
+        collection_id=f"{collection.high:016x}{collection.low:016x}",
+        catalog_generation=snapshot.catalog_generation,
+        committed_sequence=snapshot.committed_sequence,
+        count=snapshot.live_count,
+        token=f"{token.high:016x}{token.low:016x}",
+    )
+
+
+def _decode_embedding_batch(
+    embeddings: throwdb_pb2.EmbeddingBatch,
+    *,
+    operation: str,
+    dtype: str,
+    dimension: int,
+    row_count: int,
+) -> np.ndarray:
+    if (
+        embeddings.dtype != _DTYPE_TO_PROTO[dtype]
+        or embeddings.dimension != dimension
+        or embeddings.row_count != row_count
+    ):
+        raise RemoteProtocolError(
+            f"{operation} response metadata does not match its request"
+        )
+    expected_bytes = row_count * dimension * np.dtype(dtype).itemsize
+    if len(embeddings.values_le) != expected_bytes:
+        raise RemoteProtocolError(
+            f"{operation} response byte length does not match its metadata"
+        )
+    view = np.frombuffer(
+        embeddings.values_le,
+        dtype=np.dtype(dtype).newbyteorder("<"),
+    ).reshape((row_count, dimension))
+    return np.array(view, dtype=np.dtype(dtype), copy=True, order="C")
+
+
 def _rpc_code_name(error: grpc.RpcError) -> str:
     code = error.code()
     return getattr(code, "name", str(code).rsplit(".", 1)[-1])
@@ -486,9 +645,12 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         self._pending_offset = 0
         self._finished = False
         self._closed = False
+        self._failed = False
+        self._consumer_lock = threading.RLock()
         try:
             self._read_one()
         except BaseException:
+            self._failed = True
             self.close()
             raise
 
@@ -505,6 +667,14 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
     @property
     def done(self) -> bool:
         return self._finished and self._pending is None
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
 
     def _read_one(self) -> None:
         try:
@@ -616,13 +786,26 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         return pending if begin == 0 else pending[begin:]
 
     def __next__(self) -> np.ndarray | LocatedIdBatch:
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="ScanIds",
+        ):
+            return self._next_unlocked()
+
+    def _next_unlocked(self) -> np.ndarray | LocatedIdBatch:
         if self._closed:
             raise StopIteration
         if self._pending is not None:
             return self._take_pending()
         if self._finished:
             raise StopIteration
-        self._read_one()
+        try:
+            self._read_one()
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
         if self._pending is None:
             raise StopIteration
         return self._take_pending()
@@ -632,17 +815,35 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         ids: object,
         locations: object | None = None,
     ) -> int:
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="ScanIds",
+        ):
+            return self._read_into_unlocked(ids, locations)
+
+    def _read_into_unlocked(
+        self,
+        ids: object,
+        locations: object | None,
+    ) -> int:
         if self._closed:
             raise RuntimeError("ID scan is closed")
         output_ids, output_locations = _validate_id_scan_output(
             ids,
             locations,
             with_locations=self._with_locations,
+            operation="scan_ids",
         )
-        if self._pending is None:
-            if self._finished:
-                return 0
-            self._read_one()
+        try:
+            if self._pending is None:
+                if self._finished:
+                    return 0
+                self._read_one()
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
         pending = self._pending
         if pending is None:
             return 0
@@ -665,7 +866,6 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         if self._closed:
             return
         self._closed = True
-        self._finished = True
         self._pending = None
         self._pending_offset = 0
         self._stream.cancel()
@@ -673,6 +873,921 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
     def __enter__(self) -> RemoteIdScan:
         if self._closed:
             raise RuntimeError("ID scan is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        with contextlib.suppress(BaseException):
+            self.close()
+
+
+class _BoundedSequenceWindow(Sequence[object]):
+    """Non-owning ID window so one remote batch has one dense allocation."""
+
+    def __init__(
+        self,
+        source: Sequence[object],
+        begin: int,
+        end: int,
+    ) -> None:
+        self._source = source
+        self._begin = begin
+        self._length = end - begin
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int | slice) -> object:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._length)
+            return [
+                self._source[self._begin + position]
+                for position in range(start, stop, step)
+            ]
+        normalized = operator.index(index)
+        if normalized < 0:
+            normalized += self._length
+        if not 0 <= normalized < self._length:
+            raise IndexError(index)
+        return self._source[self._begin + normalized]
+
+
+class _IndexedIds:
+    """Lazily normalize an ndarray/memmap or ordered Python sequence."""
+
+    def __init__(self, ids: object) -> None:
+        if isinstance(ids, np.ma.MaskedArray):
+            raise TypeError("ids must not be a masked array")
+        self._array: np.ndarray | None = None
+        self._sequence: Sequence[object] | None = None
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: np.dtype[object] | None = None
+        self._strides: tuple[int, ...] | None = None
+        self._data_pointer: int | None = None
+        if isinstance(ids, np.ndarray):
+            if ids.ndim != 1:
+                raise ValueError(f"ids must have shape (N,), got {ids.shape}")
+            if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
+                1,
+                2,
+                4,
+                8,
+            }:
+                raise TypeError(
+                    "ids ndarray must have an 8-, 16-, 32-, or 64-bit "
+                    f"integer dtype, got {ids.dtype}"
+                )
+            self._array = ids
+            self._count = int(ids.shape[0])
+            self._shape = tuple(ids.shape)
+            self._dtype = ids.dtype
+            self._strides = tuple(ids.strides)
+            self._data_pointer = int(ids.ctypes.data)
+        else:
+            if isinstance(ids, (str, bytes, bytearray, memoryview)):
+                raise TypeError(
+                    "numeric ids must be a one-dimensional integer array "
+                    "or ordered sequence"
+                )
+            if not isinstance(ids, Sequence):
+                raise TypeError(
+                    "stream_get ids must be a one-dimensional integer array "
+                    "or ordered sequence"
+                )
+            self._sequence = ids
+            self._count = len(ids)
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def _require_unchanged(self) -> None:
+        if self._array is not None:
+            array = self._array
+            if (
+                array.ndim != 1
+                or tuple(array.shape) != self._shape
+                or array.dtype != self._dtype
+                or tuple(array.strides) != self._strides
+                or int(array.ctypes.data) != self._data_pointer
+            ):
+                raise RuntimeError(
+                    "ids source structure changed while stream_get was active"
+                )
+            return
+        assert self._sequence is not None
+        if len(self._sequence) != self._count:
+            raise RuntimeError(
+                "ids source length changed while stream_get was active"
+            )
+
+    def normalized_slice(self, begin: int, end: int) -> np.ndarray:
+        self._require_unchanged()
+        if not 0 <= begin <= end <= self._count:
+            raise RuntimeError("stream_get requested an invalid ID slice")
+        values: object
+        if self._array is not None:
+            values = self._array[begin:end]
+        else:
+            assert self._sequence is not None
+            values = _BoundedSequenceWindow(self._sequence, begin, end)
+        normalized = _normalize_numeric_ids(values, position_offset=begin)
+        if normalized.size != end - begin:
+            raise ValueError("ids sequence changed length during streaming")
+        self._require_unchanged()
+        return normalized
+
+    def reject_output_overlap(self, output: np.ndarray) -> None:
+        if self._array is not None:
+            _reject_array_overlap(
+                (("ids source", self._array), ("output", output)),
+                operation="StreamGet",
+            )
+
+
+class _StreamGetRequestIterator(Iterator[throwdb_pb2.StreamGetRequest]):
+    """Application-window-one producer consumed by gRPC's request thread."""
+
+    def __init__(
+        self,
+        ids: _IndexedIds,
+        *,
+        prefix_dimensions: int,
+        requested_batch_rows: int,
+        requested_batch_payload_bytes: int,
+    ) -> None:
+        self._ids = ids
+        self._open = throwdb_pb2.StreamGetRequest(
+            open=throwdb_pb2.StreamGetOpen(
+                prefix_dimensions=prefix_dimensions,
+                max_batch_rows=requested_batch_rows,
+                max_batch_payload_bytes=requested_batch_payload_bytes,
+            )
+        )
+        self._condition = threading.Condition()
+        self._open_emitted = False
+        self._configured = False
+        self._closed = False
+        self._credit = 0
+        self._max_batch_rows = 0
+        self._offset = 0
+        self._sequence = 0
+        self._pending: dict[int, np.ndarray] = {}
+        self._failure: BaseException | None = None
+
+    @property
+    def count(self) -> int:
+        return self._ids.count
+
+    @property
+    def failure(self) -> BaseException | None:
+        with self._condition:
+            return self._failure
+
+    @property
+    def pending(self) -> bool:
+        with self._condition:
+            return bool(self._pending)
+
+    def reject_output_overlap(self, output: np.ndarray) -> None:
+        self._ids.reject_output_overlap(output)
+
+    def configure(self, *, max_batch_rows: int, request_window: int) -> None:
+        with self._condition:
+            if self._configured:
+                raise RemoteProtocolError("StreamGet sent more than one open response")
+            self._max_batch_rows = max_batch_rows
+            self._credit = request_window
+            self._configured = True
+            self._condition.notify_all()
+
+    def pending_ids(self, sequence: int) -> np.ndarray:
+        with self._condition:
+            ids = self._pending.get(sequence)
+            if ids is None:
+                raise RemoteProtocolError(
+                    "StreamGet response has no matching input batch"
+                )
+            return ids
+
+    def acknowledge(self, sequence: int) -> None:
+        with self._condition:
+            if self._pending.pop(sequence, None) is None:
+                raise RemoteProtocolError(
+                    "StreamGet acknowledged an unknown input batch"
+                )
+            self._credit += 1
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            # A cancelled call must not retain the last normalized ID batch.
+            # Those arrays can be large memmap slices copied to native-endian
+            # uint64, and gRPC may keep the producer alive after cancel().
+            self._pending.clear()
+            self._condition.notify_all()
+
+    def __iter__(self) -> _StreamGetRequestIterator:
+        return self
+
+    def __next__(self) -> throwdb_pb2.StreamGetRequest:
+        with self._condition:
+            if not self._open_emitted:
+                self._open_emitted = True
+                return self._open
+            self._condition.wait_for(
+                lambda: self._closed
+                or (self._configured and self._credit > 0)
+            )
+            if self._closed:
+                raise StopIteration
+            if self._offset == self._ids.count:
+                self._closed = True
+                raise StopIteration
+            begin = self._offset
+            end = min(self._ids.count, begin + self._max_batch_rows)
+            sequence = self._sequence
+            # Reserve the only application credit, then release the condition
+            # before calling arbitrary Sequence code, NumPy, or protobuf.
+            # close() must remain prompt even if a user Sequence blocks.
+            self._credit -= 1
+        try:
+            ids = self._ids.normalized_slice(begin, end)
+            request = throwdb_pb2.StreamGetRequest(
+                batch=throwdb_pb2.StreamGetInputBatch(
+                    sequence=sequence,
+                    ids=_proto_ids(ids),
+                )
+            )
+        except BaseException as error:
+            with self._condition:
+                if self._closed:
+                    raise StopIteration from error
+                self._failure = error
+                self._closed = True
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            if self._closed:
+                raise StopIteration
+            if ids.size == 0:
+                self._failure = RuntimeError(
+                    "stream_get produced an unexpected empty ID batch"
+                )
+                self._closed = True
+                raise self._failure
+            self._pending[sequence] = ids
+            self._offset = end
+            self._sequence += 1
+            return request
+
+
+class RemoteEmbeddingStream(Iterator[RemoteEmbeddingBatch]):
+    """Snapshot-pinned, bounded remote lookup over an indexed ID source."""
+
+    def __init__(
+        self,
+        method: object,
+        ids: _IndexedIds,
+        *,
+        dtype: str,
+        dimension: int,
+        prefix_dimensions: int,
+        requested_batch_rows: int,
+        requested_batch_payload_bytes: int,
+        timeout: float | None,
+    ) -> None:
+        self._dtype = dtype
+        self._dimension = dimension
+        self._prefix_dimensions = prefix_dimensions
+        self._requested_batch_rows = requested_batch_rows
+        self._requested_batch_payload_bytes = requested_batch_payload_bytes
+        self._producer = _StreamGetRequestIterator(
+            ids,
+            prefix_dimensions=prefix_dimensions,
+            requested_batch_rows=requested_batch_rows,
+            requested_batch_payload_bytes=requested_batch_payload_bytes,
+        )
+        self._stream = method(  # type: ignore[operator]
+            self._producer,
+            timeout=timeout,
+            wait_for_ready=True,
+        )
+        self._iterator = iter(self._stream)
+        self._snapshot: IdScanSnapshot | None = None
+        self._max_batch_rows = 0
+        self._max_batch_payload_bytes = 0
+        self._next_sequence = 0
+        self._rows_completed = 0
+        self._done = False
+        self._closed = False
+        self._failed = False
+        self._consumer_lock = threading.RLock()
+        try:
+            self._read_opened()
+        except BaseException:
+            self._failed = True
+            self.close()
+            raise
+
+    @property
+    def snapshot(self) -> IdScanSnapshot:
+        if self._snapshot is None:
+            raise RuntimeError("StreamGet did not receive snapshot metadata")
+        return self._snapshot
+
+    @property
+    def rows_completed(self) -> int:
+        return self._rows_completed
+
+    @property
+    def max_batch_rows(self) -> int:
+        return self._max_batch_rows
+
+    @property
+    def max_batch_payload_bytes(self) -> int:
+        return self._max_batch_payload_bytes
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def _next_response(self) -> throwdb_pb2.StreamGetResponse:
+        try:
+            return next(self._iterator)
+        except grpc.RpcError as error:
+            producer_failure = self._producer.failure
+            if producer_failure is not None:
+                raise producer_failure
+            raise _typed_rpc_error(error) from error
+
+    def _validate_snapshot(
+        self,
+        response: throwdb_pb2.StreamGetResponse,
+    ) -> None:
+        received = _remote_read_snapshot(response.snapshot, operation="StreamGet")
+        if self._snapshot is None:
+            self._snapshot = received
+        elif received != self._snapshot:
+            raise RemoteProtocolError("StreamGet snapshot changed mid-stream")
+
+    def _read_opened(self) -> None:
+        try:
+            response = self._next_response()
+        except StopIteration as error:
+            raise RemoteProtocolError(
+                "StreamGet ended before its open response"
+            ) from error
+        self._validate_snapshot(response)
+        if response.WhichOneof("payload") != "opened":
+            raise RemoteProtocolError(
+                "StreamGet first response is not an open response"
+            )
+        opened = response.opened
+        if (
+            opened.dtype != _DTYPE_TO_PROTO[self._dtype]
+            or opened.dimension != self._dimension
+        ):
+            raise RemoteProtocolError(
+                "StreamGet open response does not match requested schema"
+            )
+        if opened.max_batch_rows == 0 or opened.max_batch_payload_bytes == 0:
+            raise RemoteProtocolError("StreamGet negotiated an empty batch budget")
+        if (
+            self._requested_batch_rows != 0
+            and opened.max_batch_rows > self._requested_batch_rows
+        ):
+            raise RemoteProtocolError(
+                "StreamGet exceeded the requested batch-row ceiling"
+            )
+        if (
+            self._requested_batch_payload_bytes != 0
+            and opened.max_batch_payload_bytes
+                > self._requested_batch_payload_bytes
+        ):
+            raise RemoteProtocolError(
+                "StreamGet exceeded the requested batch-byte ceiling"
+            )
+        if opened.request_window != 1:
+            raise RemoteProtocolError(
+                "StreamGet protocol v1 requires request_window=1"
+            )
+        self._max_batch_rows = opened.max_batch_rows
+        self._max_batch_payload_bytes = opened.max_batch_payload_bytes
+        self._producer.configure(
+            max_batch_rows=self._max_batch_rows,
+            request_window=opened.request_window,
+        )
+
+    def __iter__(self) -> RemoteEmbeddingStream:
+        return self
+
+    def __next__(self) -> RemoteEmbeddingBatch:
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="StreamGet",
+        ):
+            return self._next_unlocked()
+
+    def _next_unlocked(self) -> RemoteEmbeddingBatch:
+        if self._closed or self._done:
+            raise StopIteration
+        try:
+            response = self._next_response()
+        except StopIteration:
+            producer_failure = self._producer.failure
+            if producer_failure is not None:
+                self._failed = True
+                self.close()
+                raise producer_failure
+            if self._producer.pending:
+                self._failed = True
+                self.close()
+                raise RemoteProtocolError(
+                    "StreamGet ended before returning every submitted batch"
+                )
+            if self._rows_completed != self._producer.count:
+                self._failed = True
+                self.close()
+                raise RemoteProtocolError(
+                    "StreamGet ended before every requested ID was submitted"
+                )
+            self._done = True
+            self._producer.close()
+            raise
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
+        try:
+            self._validate_snapshot(response)
+            if response.WhichOneof("payload") != "batch":
+                raise RemoteProtocolError(
+                    "StreamGet returned an unexpected second open response"
+                )
+            batch = response.batch
+            if batch.sequence != self._next_sequence:
+                raise RemoteProtocolError(
+                    "StreamGet response sequence is not contiguous"
+                )
+            if batch.input_offset != self._rows_completed:
+                raise RemoteProtocolError(
+                    "StreamGet response offsets are not contiguous"
+                )
+            ids = self._producer.pending_ids(batch.sequence)
+            row_count = ids.size
+            if row_count == 0 or row_count > self._max_batch_rows:
+                raise RemoteProtocolError(
+                    "StreamGet response exceeds its negotiated row budget"
+                )
+            if len(batch.embeddings.values_le) > self._max_batch_payload_bytes:
+                raise RemoteProtocolError(
+                    "StreamGet response exceeds its negotiated byte budget"
+                )
+            values = _decode_embedding_batch(
+                batch.embeddings,
+                operation="StreamGet",
+                dtype=self._dtype,
+                dimension=self._dimension,
+                row_count=row_count,
+            )
+            result = RemoteEmbeddingBatch(
+                sequence=batch.sequence,
+                input_offset=batch.input_offset,
+                ids=ids,
+                embeddings=values,
+                snapshot=self.snapshot,
+            )
+            self._rows_completed += row_count
+            self._next_sequence += 1
+            self._producer.acknowledge(batch.sequence)
+            return result
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
+
+    def get_into(self, output: object) -> None:
+        """Incrementally populate output; earlier complete batches survive errors."""
+
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="StreamGet",
+        ):
+            if self._rows_completed != 0:
+                raise RuntimeError(
+                    "StreamGet get_into must start before iteration"
+                )
+            destination = _validate_output(
+                output,
+                expected_rows=self._producer.count,
+                expected_columns=self._dimension,
+                dtype=self._dtype,
+            )
+            self._producer.reject_output_overlap(destination)
+            for batch in self:
+                begin = batch.input_offset
+                end = begin + batch.embeddings.shape[0]
+                np.copyto(
+                    destination[begin:end],
+                    batch.embeddings,
+                    casting="no",
+                )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stream.cancel()
+        self._producer.close()
+
+    def __enter__(self) -> RemoteEmbeddingStream:
+        if self._closed:
+            raise RuntimeError("StreamGet is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        with contextlib.suppress(BaseException):
+            self.close()
+
+
+class RemoteRecordScan(Iterator[RecordBatch]):
+    """Bounded physical-order record scan pinned to one remote snapshot."""
+
+    def __init__(
+        self,
+        stream: grpc.Call,
+        *,
+        requested_batch_rows: int,
+        requested_batch_payload_bytes: int,
+        dtype: str,
+        dimension: int,
+        with_locations: bool,
+    ) -> None:
+        self._stream = stream
+        self._iterator = iter(stream)  # type: ignore[arg-type]
+        self._requested_batch_rows = requested_batch_rows
+        self._requested_batch_payload_bytes = requested_batch_payload_bytes
+        self._dtype = dtype
+        self._dimension = dimension
+        self._with_locations = with_locations
+        self._snapshot: IdScanSnapshot | None = None
+        self._max_batch_rows = 0
+        self._max_batch_payload_bytes = 0
+        self._received_rows = 0
+        self._delivered_rows = 0
+        self._pending: RecordBatch | None = None
+        self._pending_offset = 0
+        self._done = False
+        self._closed = False
+        self._failed = False
+        self._consumer_lock = threading.RLock()
+        try:
+            self._read_one()
+        except BaseException:
+            self._failed = True
+            self.close()
+            raise
+
+    @property
+    def snapshot(self) -> IdScanSnapshot:
+        if self._snapshot is None:
+            raise RuntimeError("ScanRecords did not receive snapshot metadata")
+        return self._snapshot
+
+    @property
+    def snapshot_count(self) -> int:
+        return self.snapshot.count
+
+    @property
+    def rows_completed(self) -> int:
+        return self._delivered_rows
+
+    @property
+    def max_batch_rows(self) -> int:
+        """Server-negotiated maximum rows in one response batch."""
+
+        return self._max_batch_rows
+
+    @property
+    def max_batch_payload_bytes(self) -> int:
+        """Server-negotiated maximum dense payload bytes per response."""
+
+        return self._max_batch_payload_bytes
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def _read_one(self) -> None:
+        try:
+            response = next(self._iterator)
+        except StopIteration:
+            if self._snapshot is None:
+                raise RemoteProtocolError(
+                    "ScanRecords ended without snapshot metadata"
+                )
+            if self._received_rows != self.snapshot.count:
+                raise RemoteProtocolError(
+                    "ScanRecords ended before its advertised snapshot count"
+                )
+            self._done = True
+            return
+        except grpc.RpcError as error:
+            raise _typed_rpc_error(error) from error
+
+        received_snapshot = _remote_read_snapshot(
+            response.snapshot,
+            operation="ScanRecords",
+        )
+        if self._snapshot is None:
+            self._snapshot = received_snapshot
+        elif received_snapshot != self._snapshot:
+            raise RemoteProtocolError("ScanRecords snapshot changed mid-stream")
+        if response.emitted_offset != self._received_rows:
+            raise RemoteProtocolError("ScanRecords offsets are not contiguous")
+        if response.max_batch_rows == 0 or response.max_batch_payload_bytes == 0:
+            raise RemoteProtocolError("ScanRecords returned an empty batch budget")
+        if response.max_batch_rows > self._requested_batch_rows:
+            raise RemoteProtocolError(
+                "ScanRecords exceeded the requested batch-row ceiling"
+            )
+        if (
+            self._requested_batch_payload_bytes != 0
+            and response.max_batch_payload_bytes
+                > self._requested_batch_payload_bytes
+        ):
+            raise RemoteProtocolError(
+                "ScanRecords exceeded the requested batch-byte ceiling"
+            )
+        if self._max_batch_rows == 0:
+            self._max_batch_rows = response.max_batch_rows
+            self._max_batch_payload_bytes = response.max_batch_payload_bytes
+        elif (
+            response.max_batch_rows != self._max_batch_rows
+            or response.max_batch_payload_bytes
+                != self._max_batch_payload_bytes
+        ):
+            raise RemoteProtocolError(
+                "ScanRecords batch negotiation changed mid-stream"
+            )
+
+        if response.ids.WhichOneof("encoding") != "uint64_ids":
+            raise RemoteProtocolError("ScanRecords returned non-uint64 IDs")
+        encoded = response.ids.uint64_ids
+        count = int(encoded.count)
+        if len(encoded.values_le) != count * 8:
+            raise RemoteProtocolError(
+                "ScanRecords ID byte length does not match row count"
+            )
+        if count > self._max_batch_rows:
+            raise RemoteProtocolError(
+                "ScanRecords response exceeds its negotiated row budget"
+            )
+        if self._received_rows + count > self.snapshot.count:
+            raise RemoteProtocolError(
+                "ScanRecords exceeded its advertised snapshot count"
+            )
+        if count == 0 and self.snapshot.count != 0:
+            raise RemoteProtocolError(
+                "non-empty ScanRecords snapshot emitted an empty batch"
+            )
+        payload_bytes = (
+            len(encoded.values_le)
+            + len(response.embeddings.values_le)
+            + len(response.locations_le)
+        )
+        if payload_bytes > self._max_batch_payload_bytes:
+            raise RemoteProtocolError(
+                "ScanRecords response exceeds its negotiated byte budget"
+            )
+        ids = np.frombuffer(encoded.values_le, dtype="<u8").astype(
+            np.uint64,
+            copy=True,
+        )
+        embeddings = _decode_embedding_batch(
+            response.embeddings,
+            operation="ScanRecords",
+            dtype=self._dtype,
+            dimension=self._dimension,
+            row_count=count,
+        )
+        locations: np.ndarray | None = None
+        if self._with_locations:
+            if (
+                response.location_encoding
+                    != throwdb_pb2.LOCATION_ENCODING_SEGMENT_ROW_U32_LE
+                or len(response.locations_le)
+                    != count * ID_LOCATION_DTYPE.itemsize
+            ):
+                raise RemoteProtocolError(
+                    "ScanRecords locations do not match the requested encoding"
+                )
+            locations = np.frombuffer(
+                response.locations_le,
+                dtype=ID_LOCATION_DTYPE,
+            ).copy()
+        elif (
+            response.location_encoding
+                != throwdb_pb2.LOCATION_ENCODING_UNSPECIFIED
+            or response.locations_le
+        ):
+            raise RemoteProtocolError(
+                "ScanRecords unexpectedly returned physical locations"
+            )
+        self._pending = (
+            RecordBatch(
+                ids=ids,
+                embeddings=embeddings,
+                locations=locations,
+                snapshot=self.snapshot,
+                emitted_offset=response.emitted_offset,
+            )
+            if count
+            else None
+        )
+        self._received_rows += count
+
+    def __iter__(self) -> RemoteRecordScan:
+        return self
+
+    def _take_pending(self) -> RecordBatch:
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("record scan has no pending batch")
+        begin = self._pending_offset
+        self._pending = None
+        self._pending_offset = 0
+        if begin == 0:
+            self._delivered_rows += pending.ids.size
+            return pending
+        result = RecordBatch(
+            ids=pending.ids[begin:],
+            embeddings=pending.embeddings[begin:],
+            locations=(
+                pending.locations[begin:]
+                if pending.locations is not None
+                else None
+            ),
+            snapshot=pending.snapshot,
+            emitted_offset=pending.emitted_offset + begin,
+        )
+        self._delivered_rows += result.ids.size
+        return result
+
+    def __next__(self) -> RecordBatch:
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="ScanRecords",
+        ):
+            return self._next_unlocked()
+
+    def _next_unlocked(self) -> RecordBatch:
+        if self._closed:
+            raise StopIteration
+        if self._pending is not None:
+            return self._take_pending()
+        if self._done:
+            raise StopIteration
+        try:
+            self._read_one()
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
+        if self._pending is None:
+            raise StopIteration
+        return self._take_pending()
+
+    def read_into(
+        self,
+        ids: object,
+        embeddings: object,
+        locations: object | None = None,
+    ) -> int:
+        """Copy at most one bounded transport batch into reusable buffers."""
+
+        with _exclusive_consumer(
+            self._consumer_lock,
+            operation="ScanRecords",
+        ):
+            return self._read_into_unlocked(ids, embeddings, locations)
+
+    def _read_into_unlocked(
+        self,
+        ids: object,
+        embeddings: object,
+        locations: object | None,
+    ) -> int:
+
+        if self._closed:
+            raise RuntimeError("record scan is closed")
+        output_ids, output_locations = _validate_id_scan_output(
+            ids,
+            locations,
+            with_locations=self._with_locations,
+            operation="scan_records",
+        )
+        output_embeddings = _validate_output(
+            embeddings,
+            expected_rows=int(output_ids.size),
+            expected_columns=self._dimension,
+            dtype=self._dtype,
+        )
+        output_arrays = [
+            ("ids", output_ids),
+            ("embeddings", output_embeddings),
+        ]
+        if output_locations is not None:
+            output_arrays.append(("locations", output_locations))
+        _reject_array_overlap(output_arrays, operation="ScanRecords")
+        try:
+            if self._pending is None:
+                if self._done:
+                    return 0
+                self._read_one()
+            pending = self._pending
+            if pending is None:
+                return 0
+            available = pending.ids.size - self._pending_offset
+            count = min(int(output_ids.size), available)
+            begin = self._pending_offset
+            end = begin + count
+            np.copyto(output_ids[:count], pending.ids[begin:end], casting="no")
+            np.copyto(
+                output_embeddings[:count],
+                pending.embeddings[begin:end],
+                casting="no",
+            )
+            if pending.locations is not None:
+                assert output_locations is not None
+                np.copyto(
+                    output_locations[:count],
+                    pending.locations[begin:end],
+                    casting="no",
+                )
+            self._pending_offset = end
+            if end == pending.ids.size:
+                self._pending = None
+                self._pending_offset = 0
+            self._delivered_rows += count
+            return count
+        except BaseException:
+            if not self._closed:
+                self._failed = True
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stream.cancel()
+        self._pending = None
+        self._pending_offset = 0
+
+    def __enter__(self) -> RemoteRecordScan:
+        if self._closed:
+            raise RuntimeError("ScanRecords is closed")
         return self
 
     def __exit__(
@@ -713,6 +1828,7 @@ class RemoteCollection:
         # client deadline; the server's independent lifetime/idle limits remain.
         self._scan_timeout = _validate_timeout(scan_timeout, name="scan_timeout")
         maximum_message = _validate_max_message_bytes(max_frame_bytes)
+        self._max_frame_bytes = maximum_message
         allow_http_proxy = _validate_bool(
             use_http_proxy,
             name="use_http_proxy",
@@ -853,6 +1969,10 @@ class RemoteCollection:
             capabilities |= CAPABILITY_SCAN_LOCATIONS
         if response.capabilities.durable_idempotency:
             capabilities |= CAPABILITY_DURABLE_IDEMPOTENCY
+        if response.capabilities.stream_get:
+            capabilities |= CAPABILITY_STREAM_GET
+        if response.capabilities.scan_records:
+            capabilities |= CAPABILITY_SCAN_RECORDS
         reader: RemoteReaderConfiguration | None = None
         if response.HasField("reader"):
             backend = {
@@ -1136,6 +2256,14 @@ class RemoteCollection:
         return self._description.durable_idempotency
 
     @property
+    def supports_stream_get(self) -> bool:
+        return self._description.stream_get
+
+    @property
+    def supports_scan_records(self) -> bool:
+        return self._description.scan_records
+
+    @property
     def idempotency_domain(self) -> uuid.UUID | None:
         return self._description.idempotency_domain
 
@@ -1214,6 +2342,62 @@ class RemoteCollection:
         )
         result = self.get(normalized_ids, prefix_dimensions=prefix)
         np.copyto(destination, result, casting="no")
+
+    def stream_get(
+        self,
+        ids: object,
+        *,
+        prefix_dimensions: int | None = None,
+        batch_rows: int = _DEFAULT_SCAN_BATCH_ROWS,
+        max_batch_payload_bytes: int | None = (
+            _DEFAULT_STREAM_BATCH_PAYLOAD_BYTES
+        ),
+    ) -> RemoteEmbeddingStream:
+        """Open a bounded, snapshot-consistent lookup stream.
+
+        IDs are normalized only when their negotiated batch is submitted. The
+        protocol uses an application window of one, so the gRPC request thread
+        cannot consume the complete source ahead of the response iterator.
+        """
+
+        self._ensure_open()
+        if not self._description.stream_get:
+            raise NotImplementedError("server does not support StreamGet")
+        prefix = _validate_prefix_dimensions(prefix_dimensions, self.dimension)
+        if prefix != self.dimension and not self._description.prefix_get:
+            raise NotImplementedError("server does not support prefix reads")
+        requested_rows = _validate_positive_u32(
+            batch_rows,
+            name="batch_rows",
+        )
+        requested_bytes = _validate_optional_positive_u64(
+            max_batch_payload_bytes,
+            name="max_batch_payload_bytes",
+        )
+        effective_rows, effective_bytes = _bounded_stream_parameters(
+            requested_rows=requested_rows,
+            requested_payload_bytes=requested_bytes,
+            dense_row_bytes=prefix * np.dtype(self.dtype).itemsize,
+            max_frame_bytes=self._max_frame_bytes,
+            include_id_request=True,
+            operation="StreamGet",
+        )
+        source = _IndexedIds(ids)
+        try:
+            return RemoteEmbeddingStream(
+                self._stub.StreamGet,
+                source,
+                dtype=self.dtype,
+                dimension=prefix,
+                prefix_dimensions=(
+                    0 if prefix_dimensions is None else prefix
+                ),
+                requested_batch_rows=effective_rows,
+                requested_batch_payload_bytes=effective_bytes,
+                timeout=self._scan_timeout,
+            )
+        except grpc.RpcError as error:
+            raise _typed_rpc_error(error) from error
 
     def _put(
         self,
@@ -1389,6 +2573,11 @@ class RemoteCollection:
             raise TypeError("with_locations must be a bool")
         if with_locations and not self._description.scan_locations:
             raise NotImplementedError("server does not support ID locations")
+        row_bytes = 8 + (ID_LOCATION_DTYPE.itemsize if with_locations else 0)
+        frame_capacity = self._max_frame_bytes - _SCAN_FRAME_ALLOWANCE
+        if frame_capacity < row_bytes:
+            raise ValueError("max_frame_bytes cannot fit one ScanIds row")
+        rows = min(rows, frame_capacity // row_bytes)
         try:
             stream = self._stub.ScanIds(
                 throwdb_pb2.ScanIdsRequest(
@@ -1403,6 +2592,69 @@ class RemoteCollection:
         return RemoteIdScan(
             stream,
             batch_rows=rows,
+            with_locations=with_locations,
+        )
+
+    def scan_records(
+        self,
+        *,
+        batch_rows: int = _DEFAULT_SCAN_BATCH_ROWS,
+        max_batch_payload_bytes: int | None = (
+            _DEFAULT_STREAM_BATCH_PAYLOAD_BYTES
+        ),
+        prefix_dimensions: int | None = None,
+        with_locations: bool = False,
+    ) -> RemoteRecordScan:
+        """Stream every live record in physical order from one snapshot."""
+
+        self._ensure_open()
+        if not self._description.scan_records:
+            raise NotImplementedError("server does not support ScanRecords")
+        rows = _validate_positive_u32(batch_rows, name="batch_rows")
+        payload_bytes = _validate_optional_positive_u64(
+            max_batch_payload_bytes,
+            name="max_batch_payload_bytes",
+        )
+        prefix = _validate_prefix_dimensions(prefix_dimensions, self.dimension)
+        if prefix != self.dimension and not self._description.prefix_get:
+            raise NotImplementedError("server does not support prefix reads")
+        if not isinstance(with_locations, bool):
+            raise TypeError("with_locations must be a bool")
+        if with_locations and not self._description.scan_locations:
+            raise NotImplementedError("server does not support record locations")
+        effective_rows, effective_payload_bytes = _bounded_stream_parameters(
+            requested_rows=rows,
+            requested_payload_bytes=payload_bytes,
+            dense_row_bytes=(
+                8
+                + prefix * np.dtype(self.dtype).itemsize
+                + (ID_LOCATION_DTYPE.itemsize if with_locations else 0)
+            ),
+            max_frame_bytes=self._max_frame_bytes,
+            include_id_request=False,
+            operation="ScanRecords",
+        )
+        try:
+            stream = self._stub.ScanRecords(
+                throwdb_pb2.ScanRecordsRequest(
+                    batch_rows=effective_rows,
+                    max_batch_payload_bytes=effective_payload_bytes,
+                    prefix_dimensions=(
+                        0 if prefix_dimensions is None else prefix
+                    ),
+                    include_locations=with_locations,
+                ),
+                timeout=self._scan_timeout,
+                wait_for_ready=True,
+            )
+        except grpc.RpcError as error:
+            raise _typed_rpc_error(error) from error
+        return RemoteRecordScan(
+            stream,
+            requested_batch_rows=effective_rows,
+            requested_batch_payload_bytes=effective_payload_bytes,
+            dtype=self.dtype,
+            dimension=prefix,
             with_locations=with_locations,
         )
 
@@ -1488,7 +2740,9 @@ __all__ = [
     "AmbiguousCommitError",
     "CAPABILITY_DURABLE_IDEMPOTENCY",
     "CAPABILITY_PREFIX_GET",
+    "CAPABILITY_SCAN_RECORDS",
     "CAPABILITY_SCAN_LOCATIONS",
+    "CAPABILITY_STREAM_GET",
     "CAPABILITY_WRITABLE",
     "DEFAULT_MAX_MESSAGE_BYTES",
     "DEFAULT_SCAN_TIMEOUT_SECONDS",
@@ -1501,6 +2755,8 @@ __all__ = [
     "RemoteDeadlineExceededError",
     "RemoteDescription",
     "RemoteEngineStatistics",
+    "RemoteEmbeddingBatch",
+    "RemoteEmbeddingStream",
     "RemoteError",
     "RemoteFailedPreconditionError",
     "RemoteIdScan",
@@ -1508,6 +2764,7 @@ __all__ = [
     "RemoteInvalidArgumentError",
     "RemoteNotFoundError",
     "RemoteProtocolError",
+    "RemoteRecordScan",
     "RemoteReaderConfiguration",
     "RemoteResourceExhaustedError",
     "RemoteUnavailableError",

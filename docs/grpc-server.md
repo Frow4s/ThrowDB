@@ -252,7 +252,8 @@ The launch defaults bound the two memory layers independently:
 - 32 admitted data-plane calls and 2 concurrent scans, with the invariant
   `max_concurrent_scans < max_concurrent_calls < max_worker_threads`;
 - 256 MiB conservative estimated in-flight memory reserved for unary Get/CRUD;
-- a separate 128 MiB ScanIds cursor/response pool;
+- a separate 128 MiB streaming cursor/response pool shared by `ScanIds`,
+  `StreamGet`, and `ScanRecords`;
 - 512 MiB gRPC resource quota for transport/parser buffers;
 - 64 gRPC worker threads; Health and Describe bypass application data-plane
   admission, although they still share the gRPC worker pool and
@@ -264,7 +265,8 @@ matching the storage engine's sole commit lane. Any ambiguous mutation error
 must be retried with the same `operation_id`. Health and Describe bypass data
 admission. Both the typed and standard Health services change to
 `NOT_SERVING` during drain and after a terminal storage/corruption fault; the
-admission gate then rejects every new Get, CRUD, and ScanIds call with
+admission gate then rejects every new Get, CRUD, `ScanIds`, `StreamGet`, and
+`ScanRecords` call with
 `UNAVAILABLE` while already admitted calls drain.
 
 Every `Describe` response also carries a lock-consistent admission snapshot:
@@ -276,26 +278,28 @@ and to Python clients as `RemoteDescription.admission_stats`. These counters
 cover decisions made by the admission gate; schema validation, health closure,
 and other failures that occur before admission are intentionally not counted.
 
-Each ScanIds cursor reserves one equal share of the independent scan byte budget
-(`max_scan_inflight_bytes / max_concurrent_scans`) for its whole lifetime. Scan
-leases never debit the unary pool, and scan concurrency leaves both a data-call
-slot and a gRPC worker outside the scan limit. The native
+Each streaming read reserves one equal share of the independent scan byte
+budget (`max_scan_inflight_bytes / max_concurrent_scans`) for its whole
+lifetime. Streaming leases never debit the unary pool, and their concurrency
+limit leaves both a data-call slot and a gRPC worker available outside the
+streaming pool. The native
 layer checks the exact current WAL-overlay cardinality under the same snapshot
 lock before allocating the cursor copy. A heavily mutated, unmaterialized
 overlay therefore fails with `RESOURCE_EXHAUSTED` instead of escaping
 admission; materialize it, reduce scan concurrency, or raise
 `--max-scan-inflight-mib`.
 
-The server independently bounds every stream to one hour and requires one
-successful transport write per minute by default. `--scan-max-duration-ms` and
-`--scan-idle-timeout-ms` override those policies. A watchdog calls gRPC
-`TryCancel`, including while a synchronous `Write` is blocked by HTTP/2 flow
-control. Raw gRPC reports that server-side watchdog path as `CANCELLED`; a
-client-supplied deadline reports `DEADLINE_EXCEEDED`. In both cases the handler
-unwinds and releases its scan slot and byte reservation before another stream
-is admitted. The Python client additionally uses a one-hour scan deadline by
-default; explicitly passing `scan_timeout=None` disables only that client
-deadline, not the server bounds.
+The server independently bounds every stream to one hour and requires
+transport progress at least once per minute by default. A successful input
+frame or output frame counts as progress; merely keeping a bidi RPC open does
+not. `--scan-max-duration-ms` and `--scan-idle-timeout-ms` override those
+policies. A watchdog calls gRPC `TryCancel`, including while a synchronous
+`Read` or `Write` is blocked. Raw gRPC reports that server-side watchdog path
+as `CANCELLED`; a client-supplied deadline reports `DEADLINE_EXCEEDED`. In both
+cases the handler unwinds and releases its streaming slot and byte reservation
+before another stream is admitted. The Python client additionally uses a
+one-hour scan deadline by default; explicitly passing `scan_timeout=None`
+disables only that client deadline, not the server bounds.
 
 ## Processes and binaries
 
@@ -309,8 +313,13 @@ deadline, not the server bounds.
   comparison.
 
 The public daemon opens one format-7 collection and enforces its single-writer
-lease. gRPC v1 provides `Health`, `Describe`, `Get`, `Insert`, `Update`,
-`Upsert`, `Delete`, and server-streaming `ScanIds`.
+lease. gRPC v1 provides `Health`, `Describe`, `Get`, bidirectional `StreamGet`,
+`Insert`, `Update`, `Upsert`, `Delete`, and server-streaming `ScanIds` and
+`ScanRecords`. `StreamGet` negotiates a stop-and-wait application window of
+one; the official client therefore never submits an unbounded ID request.
+`ScanRecords` relies on HTTP/2 flow control and the dedicated scan admission
+pool. Both operations pin one view, repeat its opaque identity on responses,
+and fail instead of falling back to multiple current-view unary reads.
 
 The daemon binds its socket in `NOT_SERVING`, starts the optional maintenance
 thread, and only then atomically marks both health services `SERVING` and emits

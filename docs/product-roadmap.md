@@ -79,8 +79,9 @@ The scheduler and backend interfaces keep the public API independent of
 
 Run one long-lived collection per server process. The first functional slice
 now includes the versioned dense-bytes gRPC contract, C++ daemon, Python
-client, CRUD, prefix Get, physical-order ID streaming, bounded messages and
-threads, health/reflection, graceful shutdown, writer fencing, and durable
+client, CRUD, prefix Get, snapshot-consistent large-query StreamGet,
+physical-order ID/record streaming, bounded messages and threads,
+health/reflection, graceful shutdown, writer fencing, and durable
 `operation_id` replay. It also includes tune-aware one-shot startup that selects
 a compatible persisted profile without implicit calibration, plus a dedicated
 bounded local-loopback/external-endpoint benchmark for correctness,

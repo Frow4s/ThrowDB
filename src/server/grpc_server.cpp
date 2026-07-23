@@ -43,8 +43,10 @@ namespace {
 namespace wire = ::throwdb::v1;
 
 inline constexpr std::uint32_t kProtocolMajor = 1;
-inline constexpr std::uint32_t kProtocolMinor = 2;
+inline constexpr std::uint32_t kProtocolMinor = 3;
 inline constexpr std::uint64_t kScanEnvelopeAllowance = 512;
+inline constexpr std::uint64_t kStreamingEnvelopeAllowance = 1024;
+inline constexpr std::uint64_t kStreamRequestEnvelopeAllowance = 128;
 inline constexpr std::uint64_t kMutationResponseUpperBound = 32;
 inline constexpr std::uint64_t kDeleteResponseEnvelopeAllowance = 64;
 // Per-row application-memory estimates deliberately include native planning
@@ -52,9 +54,16 @@ inline constexpr std::uint64_t kDeleteResponseEnvelopeAllowance = 64;
 // retain PhysicalReadRequest, sorted Request, PlannedRange, scheduler work,
 // and io_uring operation metadata. Keep this bound conservative when those
 // private structures evolve.
+// NativeReadView/PhysicalReader can simultaneously retain lookup requests,
+// sorted physical requests, a seen bitmap, planned ranges, and scheduler
+// metadata. 256 bytes leaves allocator/container slack above those structs.
 inline constexpr std::uint64_t kGetNativeScratchBytesPerRow = 256;
 inline constexpr std::uint64_t kMutationWorkingBytesPerRow = 256;
-inline constexpr std::uint64_t kScanWorkingBytesPerRow = 64;
+inline constexpr std::uint64_t kIdScanWorkingBytesPerRow = 64;
+// Record scans additionally retain pending IDs/locations even when locations
+// are not returned. The concrete per-row structs exceed 105 bytes before
+// allocator slack, so keep this deliberately conservative.
+inline constexpr std::uint64_t kRecordScanWorkingBytesPerRow = 192;
 
 enum class HealthPhase : std::uint8_t {
     Starting,
@@ -160,19 +169,22 @@ private:
 };
 
 [[nodiscard]] std::optional<grpc::Status> scan_expired_status(
-    const detail::GrpcScanExpiry expiry) {
+    const detail::GrpcScanExpiry expiry,
+    const std::string_view operation = "ScanIds") {
     switch (expiry) {
         case detail::GrpcScanExpiry::None:
             return std::nullopt;
         case detail::GrpcScanExpiry::MaximumDuration:
             return grpc::Status{
                 grpc::StatusCode::DEADLINE_EXCEEDED,
-                "ScanIds exceeded the server maximum stream duration"};
+                std::string(operation)
+                    + " exceeded the server maximum stream duration"};
         case detail::GrpcScanExpiry::IdleProgress:
             return grpc::Status{
                 grpc::StatusCode::DEADLINE_EXCEEDED,
-                "ScanIds made no transport progress before the server idle "
-                "timeout"};
+                std::string(operation)
+                    + " made no transport progress before the server idle "
+                      "timeout"};
     }
     return std::nullopt;
 }
@@ -660,6 +672,163 @@ void set_embedding_response(
     }
 }
 
+void set_embedding_batch(
+    const DType dtype,
+    const std::uint32_t dimension,
+    const std::uint64_t row_count,
+    const std::span<const std::byte> values,
+    wire::EmbeddingBatch& output) {
+    output.set_dtype(public_dtype(dtype));
+    output.set_dimension(dimension);
+    output.set_row_count(row_count);
+    if (values.empty()) {
+        output.clear_values_le();
+    } else {
+        output.set_values_le(
+            reinterpret_cast<const char*>(values.data()), values.size());
+    }
+}
+
+void set_read_snapshot(
+    const NativeReadViewMetadata& metadata,
+    const std::uint64_t token_high,
+    const std::uint64_t token_low,
+    wire::ReadSnapshot& output) {
+    output.mutable_collection_id()->set_low(metadata.collection_id_low);
+    output.mutable_collection_id()->set_high(metadata.collection_id_high);
+    output.set_catalog_generation(metadata.catalog_generation);
+    output.set_committed_sequence(metadata.committed_sequence);
+    output.set_live_count(metadata.live_count);
+    output.mutable_token()->set_high(token_high);
+    output.mutable_token()->set_low(token_low);
+}
+
+[[nodiscard]] std::uint64_t output_row_bytes(
+    const CollectionDescription& collection,
+    const std::uint32_t dimension) {
+    if (dimension == 0 || dimension > collection.dimension) {
+        throw InvalidArgumentError("prefix dimension is out of range");
+    }
+    if (collection.dimension == 0 || collection.record_size == 0
+        || collection.record_size % collection.dimension != 0) {
+        throw CorruptionError("collection row geometry is invalid");
+    }
+    std::uint64_t result = 0;
+    if (!checked_multiply(
+            dimension,
+            collection.record_size / collection.dimension,
+            result)
+        || result == 0) {
+        throw std::length_error("streaming row geometry overflows");
+    }
+    return result;
+}
+
+[[nodiscard]] std::uint64_t estimate_stream_get_batch_bytes(
+    const CollectionDescription& collection,
+    const std::uint64_t row_count,
+    const std::uint64_t output_bytes_per_row) {
+    std::uint64_t id_bytes = 0;
+    std::uint64_t native_scratch = 0;
+    std::uint64_t full_read_bytes = 0;
+    std::uint64_t output_bytes = 0;
+    if (!checked_multiply(row_count, sizeof(std::uint64_t), id_bytes)
+        || !checked_multiply(
+            row_count, kGetNativeScratchBytesPerRow, native_scratch)
+        || !checked_multiply(
+            row_count, collection.record_size, full_read_bytes)
+        || !checked_multiply(
+            row_count, output_bytes_per_row, output_bytes)) {
+        throw std::length_error("StreamGet batch-memory estimate overflow");
+    }
+
+    // Parsed request + decoded IDs + native planning + native output + the
+    // protobuf response can coexist. Prefix reads also retain the conservative
+    // full-row/backend-buffer estimate used by unary Get.
+    std::uint64_t estimated = kStreamingEnvelopeAllowance;
+    for (const std::uint64_t part : {
+             id_bytes,
+             id_bytes,
+             native_scratch,
+             full_read_bytes,
+             output_bytes,
+             output_bytes,
+             kStreamingEnvelopeAllowance,
+             estimated_read_buffer_bytes(
+                 collection.reader, row_count, full_read_bytes)}) {
+        if (!checked_add(estimated, part, estimated)) {
+            throw std::length_error(
+                "StreamGet batch-memory estimate overflow");
+        }
+    }
+    return estimated;
+}
+
+[[nodiscard]] std::uint64_t estimate_record_scan_batch_bytes(
+    const CollectionDescription& collection,
+    const std::uint64_t request_bytes,
+    const std::uint64_t row_count,
+    const std::uint64_t output_bytes_per_row,
+    const bool include_locations) {
+    std::uint64_t embedding_bytes = 0;
+    std::uint64_t id_bytes = 0;
+    std::uint64_t location_bytes = 0;
+    std::uint64_t native_scratch = 0;
+    std::uint64_t full_read_bytes = 0;
+    if (!checked_multiply(
+            row_count, output_bytes_per_row, embedding_bytes)
+        || !checked_multiply(row_count, sizeof(std::uint64_t), id_bytes)
+        || (include_locations
+            && !checked_multiply(
+                row_count, sizeof(NativeIdLocation), location_bytes))
+        || !checked_multiply(
+            row_count, kRecordScanWorkingBytesPerRow, native_scratch)
+        || !checked_multiply(
+            row_count, collection.record_size, full_read_bytes)) {
+        throw std::length_error(
+            "ScanRecords batch-memory estimate overflow");
+    }
+
+    std::uint64_t estimated = request_bytes;
+    // Native vectors and protobuf-owned response bytes coexist while Write()
+    // is blocked by HTTP/2 flow control, hence two copies of dense payload.
+    for (const std::uint64_t part : {
+             id_bytes,
+             embedding_bytes,
+             location_bytes,
+             id_bytes,
+             embedding_bytes,
+             location_bytes,
+             native_scratch,
+             kStreamingEnvelopeAllowance,
+             estimated_read_buffer_bytes(
+                 collection.reader, row_count, full_read_bytes)}) {
+        if (!checked_add(estimated, part, estimated)) {
+            throw std::length_error(
+                "ScanRecords batch-memory estimate overflow");
+        }
+    }
+    return estimated;
+}
+
+template <typename Estimate>
+[[nodiscard]] std::uint64_t maximum_rows_under_budget(
+    const std::uint64_t ceiling,
+    const std::uint64_t budget,
+    Estimate&& estimate) {
+    std::uint64_t low = 0;
+    std::uint64_t high = ceiling;
+    while (low < high) {
+        const std::uint64_t middle = low + (high - low + 1) / 2;
+        if (estimate(middle) <= budget) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    return low;
+}
+
 [[nodiscard]] OperationId operation_id(const wire::OperationId& value) {
     const OperationId result{value.high(), value.low()};
     if (result.empty()) {
@@ -760,6 +929,9 @@ public:
             capabilities->set_scan_locations(true);
             capabilities->set_durable_idempotency(
                 description.durable_idempotency);
+            capabilities->set_stream_get(description.format_version == 7);
+            capabilities->set_scan_records(
+                description.format_version == 7);
             if (description.durable_idempotency) {
                 wire::OperationId* public_domain =
                     response->mutable_idempotency_domain();
@@ -924,6 +1096,295 @@ public:
         }
     }
 
+    grpc::Status StreamGet(
+        grpc::ServerContext* context,
+        grpc::ServerReaderWriter<
+            wire::StreamGetResponse,
+            wire::StreamGetRequest>* stream) override {
+        try {
+            if (!health_->serving()) {
+                return {grpc::StatusCode::UNAVAILABLE,
+                        "ThrowDB server is not serving data-plane requests"};
+            }
+            const CollectionDescription description = engine_.describe();
+            if (description.format_version != 7) {
+                return {grpc::StatusCode::UNIMPLEMENTED,
+                        "StreamGet requires storage format 7"};
+            }
+            // Admission and the watchdog must precede the first blocking
+            // Read. Otherwise a client can open a bidi RPC, never send the
+            // Open frame, and pin one synchronous worker indefinitely.
+            [[maybe_unused]] auto admission = require_admission(
+                admission_, scan_call_budget_, true);
+            detail::GrpcScanWatchdog lifetime(
+                scan_max_duration_millis_,
+                scan_idle_timeout_millis_,
+                [context] { context->TryCancel(); });
+            const auto cancellation_status = [&]()
+                -> std::optional<grpc::Status> {
+                if (const auto expired = scan_expired_status(
+                        lifetime.expiry(), "StreamGet");
+                    expired.has_value()) {
+                    return expired;
+                }
+                if (context->IsCancelled()) {
+                    return grpc::Status{
+                        grpc::StatusCode::CANCELLED,
+                        "StreamGet was cancelled"};
+                }
+                return std::nullopt;
+            };
+            wire::StreamGetRequest request;
+            if (!stream->Read(&request)) {
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+                return {grpc::StatusCode::INVALID_ARGUMENT,
+                        "StreamGet ended before its open frame"};
+            }
+            lifetime.mark_progress();
+            require_request_budget(request, limits_);
+            if (request.payload_case() != wire::StreamGetRequest::kOpen) {
+                throw InvalidArgumentError(
+                    "StreamGet first frame must be open");
+            }
+
+            const wire::StreamGetOpen& open = request.open();
+            const std::uint32_t dimension =
+                open.prefix_dimensions() == 0
+                    ? description.dimension
+                    : open.prefix_dimensions();
+            const std::uint64_t row_bytes =
+                output_row_bytes(description, dimension);
+            if (limits_.max_response_bytes
+                <= kStreamingEnvelopeAllowance + row_bytes) {
+                throw std::length_error(
+                    "max_response_bytes cannot fit one StreamGet row");
+            }
+            const std::uint64_t response_payload_limit =
+                limits_.max_response_bytes - kStreamingEnvelopeAllowance;
+            const std::uint64_t payload_limit =
+                open.max_batch_payload_bytes() == 0
+                    ? response_payload_limit
+                    : std::min(
+                          open.max_batch_payload_bytes(),
+                          response_payload_limit);
+            if (payload_limit < row_bytes) {
+                throw std::length_error(
+                    "StreamGet payload budget cannot fit one embedding row");
+            }
+
+            if (limits_.max_request_bytes
+                < kStreamRequestEnvelopeAllowance
+                       + sizeof(std::uint64_t)) {
+                throw std::length_error(
+                    "max_request_bytes cannot fit one StreamGet ID row");
+            }
+            const std::uint64_t request_rows =
+                (limits_.max_request_bytes
+                 - kStreamRequestEnvelopeAllowance)
+                / sizeof(std::uint64_t);
+            const std::uint64_t server_row_limit =
+                std::min<std::uint64_t>({
+                    limits_.max_scan_batch_rows,
+                    limits_.max_ids_per_request,
+                    request_rows});
+            const std::uint64_t requested_rows =
+                open.max_batch_rows() == 0
+                    ? server_row_limit
+                    : std::min<std::uint64_t>(
+                          open.max_batch_rows(), server_row_limit);
+            const std::uint64_t payload_rows = payload_limit / row_bytes;
+            const std::uint64_t row_ceiling = std::min(
+                requested_rows, payload_rows);
+            if (row_ceiling == 0) {
+                throw std::length_error(
+                    "StreamGet cannot fit one row in its per-stream memory "
+                    "budget");
+            }
+            const std::uint64_t minimum_batch_memory =
+                estimate_stream_get_batch_bytes(
+                    description, 1, row_bytes);
+            if (minimum_batch_memory > scan_call_budget_) {
+                throw std::length_error(
+                    "StreamGet cannot fit one row in its per-stream memory "
+                    "budget");
+            }
+
+            auto view = engine_.open_read_view(
+                dimension, scan_call_budget_ - minimum_batch_memory);
+            const NativeReadViewMetadata metadata = view->metadata();
+            if (view->output_dimension() != dimension
+                || view->dtype() != description.dtype
+                || metadata.snapshot_bytes
+                       > scan_call_budget_ - minimum_batch_memory) {
+                throw CorruptionError(
+                    "native StreamGet view violates its admitted geometry");
+            }
+            const std::uint64_t batch_budget =
+                scan_call_budget_ - metadata.snapshot_bytes;
+            const std::uint64_t memory_rows = maximum_rows_under_budget(
+                row_ceiling,
+                batch_budget,
+                [&](const std::uint64_t rows) {
+                    return estimate_stream_get_batch_bytes(
+                        description, rows, row_bytes);
+                });
+            if (memory_rows == 0
+                || memory_rows
+                       > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error(
+                    "StreamGet cannot fit one row beside its pinned snapshot "
+                    "in the per-stream memory budget");
+            }
+            const std::uint32_t batch_rows =
+                static_cast<std::uint32_t>(memory_rows);
+            const std::uint64_t batch_memory =
+                estimate_stream_get_batch_bytes(
+                    description, batch_rows, row_bytes);
+            std::uint64_t admitted_memory = 0;
+            if (!checked_add(
+                    metadata.snapshot_bytes,
+                    batch_memory,
+                    admitted_memory)
+                || admitted_memory > scan_call_budget_) {
+                throw CorruptionError(
+                    "StreamGet negotiated memory exceeds its admitted "
+                    "budget");
+            }
+            const auto [token_high, token_low] = random_scan_token();
+            if (const auto cancelled = cancellation_status();
+                cancelled.has_value()) {
+                return *cancelled;
+            }
+
+            wire::StreamGetResponse opened_response;
+            set_read_snapshot(
+                metadata,
+                token_high,
+                token_low,
+                *opened_response.mutable_snapshot());
+            wire::StreamGetOpened* opened =
+                opened_response.mutable_opened();
+            opened->set_dtype(public_dtype(view->dtype()));
+            opened->set_dimension(view->output_dimension());
+            opened->set_max_batch_rows(batch_rows);
+            opened->set_max_batch_payload_bytes(payload_limit);
+            opened->set_request_window(1);
+            require_response_budget(opened_response, limits_);
+            if (!stream->Write(opened_response)) {
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+                return {grpc::StatusCode::CANCELLED,
+                        "StreamGet client stopped receiving"};
+            }
+            lifetime.mark_progress();
+
+            std::uint64_t expected_sequence = 0;
+            std::uint64_t input_offset = 0;
+            while (stream->Read(&request)) {
+                lifetime.mark_progress();
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+                require_request_budget(request, limits_);
+                if (request.payload_case()
+                    != wire::StreamGetRequest::kBatch) {
+                    throw InvalidArgumentError(
+                        "StreamGet accepts exactly one open frame");
+                }
+                const wire::StreamGetInputBatch& input = request.batch();
+                if (input.sequence() != expected_sequence) {
+                    throw InvalidArgumentError(
+                        "StreamGet input sequence is not contiguous");
+                }
+                const std::uint64_t count =
+                    validate_id_batch(input.ids(), limits_);
+                if (count == 0 || count > batch_rows) {
+                    throw InvalidArgumentError(
+                        "StreamGet input batch exceeds its negotiated row "
+                        "budget");
+                }
+                std::uint64_t values_size = 0;
+                if (!checked_multiply(count, row_bytes, values_size)
+                    || values_size > payload_limit
+                    || values_size
+                           > std::numeric_limits<std::size_t>::max()) {
+                    throw std::length_error(
+                        "StreamGet input batch exceeds its negotiated byte "
+                        "budget");
+                }
+                const std::uint64_t actual_memory =
+                    estimate_stream_get_batch_bytes(
+                        description, count, row_bytes);
+                std::uint64_t actual_with_snapshot = 0;
+                if (!checked_add(
+                        actual_memory,
+                        metadata.snapshot_bytes,
+                        actual_with_snapshot)
+                    || actual_with_snapshot > scan_call_budget_) {
+                    throw std::length_error(
+                        "StreamGet batch exceeds its admitted memory budget");
+                }
+
+                const std::vector<std::uint64_t> ids =
+                    decode_ids(input.ids(), limits_);
+                std::vector<std::byte> values(
+                    static_cast<std::size_t>(values_size));
+                view->get_into(ids, values);
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+
+                wire::StreamGetResponse response;
+                set_read_snapshot(
+                    metadata,
+                    token_high,
+                    token_low,
+                    *response.mutable_snapshot());
+                wire::StreamGetOutputBatch* output =
+                    response.mutable_batch();
+                output->set_sequence(expected_sequence);
+                output->set_input_offset(input_offset);
+                set_embedding_batch(
+                    view->dtype(),
+                    view->output_dimension(),
+                    count,
+                    values,
+                    *output->mutable_embeddings());
+                require_response_budget(response, limits_);
+                if (!stream->Write(response)) {
+                    if (const auto cancelled = cancellation_status();
+                        cancelled.has_value()) {
+                        return *cancelled;
+                    }
+                    return {grpc::StatusCode::CANCELLED,
+                            "StreamGet client stopped receiving"};
+                }
+                lifetime.mark_progress();
+                if (input_offset
+                    > std::numeric_limits<std::uint64_t>::max() - count) {
+                    throw std::length_error(
+                        "StreamGet input offset overflow");
+                }
+                input_offset += count;
+                ++expected_sequence;
+            }
+            if (const auto cancelled = cancellation_status();
+                cancelled.has_value()) {
+                return *cancelled;
+            }
+            return grpc::Status::OK;
+        } catch (...) {
+            return exception_status(limits_, *health_);
+        }
+    }
+
     grpc::Status Insert(
         grpc::ServerContext* context,
         const wire::MutationRequest* request,
@@ -1036,21 +1497,22 @@ public:
             const std::uint64_t response_rows =
                 (limits_.max_response_bytes - kScanEnvelopeAllowance)
                 / row_bytes;
-            const std::uint64_t batch_rows = std::min<std::uint64_t>(
+            const std::uint64_t row_ceiling = std::min<std::uint64_t>(
                 request->batch_rows(), response_rows);
-            if (batch_rows == 0
-                || batch_rows > std::numeric_limits<std::size_t>::max()) {
+            if (row_ceiling == 0) {
                 throw std::length_error(
                     "ScanIds batch does not fit this process");
             }
 
-            const std::uint64_t estimated_bytes = estimate_data_call_bytes(
-                request->ByteSizeLong(), batch_rows,
-                kScanWorkingBytesPerRow,
-                kScanEnvelopeAllowance);
-            if (estimated_bytes > scan_call_budget_) {
+            const std::uint64_t minimum_batch_memory =
+                estimate_data_call_bytes(
+                    request->ByteSizeLong(), 1,
+                    kIdScanWorkingBytesPerRow,
+                    kScanEnvelopeAllowance);
+            if (minimum_batch_memory > scan_call_budget_) {
                 throw std::length_error(
-                    "ScanIds batch exceeds its per-scan memory budget");
+                    "ScanIds cannot fit one row in its per-scan memory "
+                    "budget");
             }
             [[maybe_unused]] auto admission = require_admission(
                 admission_, scan_call_budget_, true);
@@ -1063,8 +1525,44 @@ public:
                 [context] { context->TryCancel(); });
 
             auto scan = engine_.open_scan(
-                scan_call_budget_ - estimated_bytes);
+                scan_call_budget_ - minimum_batch_memory);
             const NativeIdScanMetadata metadata = scan->metadata();
+            if (metadata.snapshot_bytes
+                > scan_call_budget_ - minimum_batch_memory) {
+                throw CorruptionError(
+                    "native ScanIds cursor violates its admitted geometry");
+            }
+            const std::uint64_t batch_budget =
+                scan_call_budget_ - metadata.snapshot_bytes;
+            const std::uint64_t batch_rows = maximum_rows_under_budget(
+                row_ceiling,
+                batch_budget,
+                [&](const std::uint64_t rows) {
+                    return estimate_data_call_bytes(
+                        request->ByteSizeLong(),
+                        rows,
+                        kIdScanWorkingBytesPerRow,
+                        kScanEnvelopeAllowance);
+                });
+            if (batch_rows == 0
+                || batch_rows > std::numeric_limits<std::size_t>::max()) {
+                throw std::length_error(
+                    "ScanIds cannot fit one row beside its pinned snapshot "
+                    "in the per-scan memory budget");
+            }
+            const std::uint64_t estimated_bytes = estimate_data_call_bytes(
+                request->ByteSizeLong(), batch_rows,
+                kIdScanWorkingBytesPerRow,
+                kScanEnvelopeAllowance);
+            std::uint64_t admitted_memory = 0;
+            if (!checked_add(
+                    metadata.snapshot_bytes,
+                    estimated_bytes,
+                    admitted_memory)
+                || admitted_memory > scan_call_budget_) {
+                throw CorruptionError(
+                    "ScanIds negotiated memory exceeds its admitted budget");
+            }
             const auto [token_high, token_low] = random_scan_token();
             std::vector<std::uint64_t> ids(
                 static_cast<std::size_t>(batch_rows));
@@ -1174,6 +1672,281 @@ public:
                     }
                     return {grpc::StatusCode::CANCELLED,
                             "ScanIds client stopped receiving"};
+                }
+                lifetime.mark_progress();
+                if (done) {
+                    break;
+                }
+            } while (true);
+            return grpc::Status::OK;
+        } catch (...) {
+            return exception_status(limits_, *health_);
+        }
+    }
+
+    grpc::Status ScanRecords(
+        grpc::ServerContext* context,
+        const wire::ScanRecordsRequest* request,
+        grpc::ServerWriter<wire::ScanRecordsResponse>* writer) override {
+        try {
+            require_request_budget(*request, limits_);
+            if (!health_->serving()) {
+                return {grpc::StatusCode::UNAVAILABLE,
+                        "ThrowDB server is not serving data-plane requests"};
+            }
+            if (request->batch_rows() == 0
+                || request->batch_rows() > limits_.max_scan_batch_rows) {
+                throw InvalidArgumentError(
+                    "ScanRecords batch_rows is out of range");
+            }
+            const CollectionDescription description = engine_.describe();
+            if (description.format_version != 7) {
+                return {grpc::StatusCode::UNIMPLEMENTED,
+                        "ScanRecords requires storage format 7"};
+            }
+            const std::uint32_t dimension =
+                request->prefix_dimensions() == 0
+                    ? description.dimension
+                    : request->prefix_dimensions();
+            const std::uint64_t embedding_row_bytes =
+                output_row_bytes(description, dimension);
+            std::uint64_t dense_row_bytes = 0;
+            if (!checked_add(
+                    sizeof(std::uint64_t),
+                    embedding_row_bytes,
+                    dense_row_bytes)
+                || (request->include_locations()
+                    && !checked_add(
+                        dense_row_bytes,
+                        sizeof(NativeIdLocation),
+                        dense_row_bytes))) {
+                throw std::length_error(
+                    "ScanRecords row geometry overflows");
+            }
+            if (limits_.max_response_bytes
+                <= kStreamingEnvelopeAllowance + dense_row_bytes) {
+                throw std::length_error(
+                    "max_response_bytes cannot fit one ScanRecords row");
+            }
+            const std::uint64_t response_payload_limit =
+                limits_.max_response_bytes - kStreamingEnvelopeAllowance;
+            const std::uint64_t payload_limit =
+                request->max_batch_payload_bytes() == 0
+                    ? response_payload_limit
+                    : std::min(
+                          request->max_batch_payload_bytes(),
+                          response_payload_limit);
+            if (payload_limit < dense_row_bytes) {
+                throw std::length_error(
+                    "ScanRecords payload budget cannot fit one row");
+            }
+            const std::uint64_t row_ceiling = std::min<std::uint64_t>(
+                request->batch_rows(),
+                payload_limit / dense_row_bytes);
+            if (row_ceiling == 0) {
+                throw std::length_error(
+                    "ScanRecords cannot fit one row in its per-stream memory "
+                    "budget");
+            }
+            const std::uint64_t minimum_batch_memory =
+                estimate_record_scan_batch_bytes(
+                    description,
+                    request->ByteSizeLong(),
+                    1,
+                    embedding_row_bytes,
+                    request->include_locations());
+            if (minimum_batch_memory > scan_call_budget_) {
+                throw std::length_error(
+                    "ScanRecords cannot fit one row in its per-stream memory "
+                    "budget");
+            }
+
+            [[maybe_unused]] auto admission = require_admission(
+                admission_, scan_call_budget_, true);
+            detail::GrpcScanWatchdog lifetime(
+                scan_max_duration_millis_,
+                scan_idle_timeout_millis_,
+                [context] { context->TryCancel(); });
+            auto scan = engine_.open_record_scan(
+                dimension, scan_call_budget_ - minimum_batch_memory);
+            const NativeReadViewMetadata metadata = scan->metadata();
+            if (scan->output_dimension() != dimension
+                || scan->dtype() != description.dtype
+                || metadata.snapshot_bytes
+                       > scan_call_budget_ - minimum_batch_memory) {
+                throw CorruptionError(
+                    "native ScanRecords cursor violates its admitted "
+                    "geometry");
+            }
+            const std::uint64_t batch_budget =
+                scan_call_budget_ - metadata.snapshot_bytes;
+            const std::uint64_t memory_rows = maximum_rows_under_budget(
+                row_ceiling,
+                batch_budget,
+                [&](const std::uint64_t rows) {
+                    return estimate_record_scan_batch_bytes(
+                        description,
+                        request->ByteSizeLong(),
+                        rows,
+                        embedding_row_bytes,
+                        request->include_locations());
+                });
+            if (memory_rows == 0
+                || memory_rows
+                       > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::length_error(
+                    "ScanRecords cannot fit one row beside its pinned "
+                    "snapshot in the per-stream memory budget");
+            }
+            const std::uint32_t batch_rows =
+                static_cast<std::uint32_t>(memory_rows);
+            const std::uint64_t batch_memory =
+                estimate_record_scan_batch_bytes(
+                    description,
+                    request->ByteSizeLong(),
+                    batch_rows,
+                    embedding_row_bytes,
+                    request->include_locations());
+            std::uint64_t admitted_memory = 0;
+            if (!checked_add(
+                    metadata.snapshot_bytes,
+                    batch_memory,
+                    admitted_memory)
+                || admitted_memory > scan_call_budget_) {
+                throw CorruptionError(
+                    "ScanRecords negotiated memory exceeds its admitted "
+                    "budget");
+            }
+            const auto [token_high, token_low] = random_scan_token();
+            std::vector<std::uint64_t> ids(batch_rows);
+            std::uint64_t embedding_capacity = 0;
+            if (!checked_multiply(
+                    batch_rows,
+                    embedding_row_bytes,
+                    embedding_capacity)
+                || embedding_capacity
+                       > std::numeric_limits<std::size_t>::max()) {
+                throw std::length_error(
+                    "ScanRecords embedding buffer does not fit this process");
+            }
+            std::vector<std::byte> embeddings(
+                static_cast<std::size_t>(embedding_capacity));
+            std::vector<NativeIdLocation> locations;
+            if (request->include_locations()) {
+                locations.resize(batch_rows);
+            }
+            const auto cancellation_status = [&]()
+                -> std::optional<grpc::Status> {
+                if (const auto expired = scan_expired_status(
+                        lifetime.expiry(), "ScanRecords");
+                    expired.has_value()) {
+                    return expired;
+                }
+                if (context->IsCancelled()) {
+                    return grpc::Status{
+                        grpc::StatusCode::CANCELLED,
+                        "ScanRecords was cancelled"};
+                }
+                return std::nullopt;
+            };
+            const NativeRecordScan::StopPredicate stop_requested =
+                [context, &lifetime] {
+                    return context->IsCancelled()
+                           || lifetime.expiry()
+                                  != detail::GrpcScanExpiry::None;
+                };
+
+            std::uint64_t emitted = 0;
+            do {
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+                const std::uint64_t count = scan->read_into(
+                    ids,
+                    embeddings,
+                    locations,
+                    stop_requested);
+                if (const auto cancelled = cancellation_status();
+                    cancelled.has_value()) {
+                    return *cancelled;
+                }
+                if (count == 0 && !scan->done()) {
+                    throw CorruptionError(
+                        "native record scan made no progress");
+                }
+                if (count > ids.size()
+                    || emitted > std::numeric_limits<std::uint64_t>::max()
+                                     - count) {
+                    throw CorruptionError(
+                        "native record scan returned an invalid row count");
+                }
+                const bool done = scan->done();
+                if ((done && emitted + count != metadata.live_count)
+                    || (!done
+                        && emitted + count >= metadata.live_count)) {
+                    throw CorruptionError(
+                        "native record scan disagrees with snapshot "
+                        "live_count");
+                }
+
+                std::uint64_t values_size = 0;
+                if (!checked_multiply(
+                        count, embedding_row_bytes, values_size)
+                    || values_size > embeddings.size()) {
+                    throw CorruptionError(
+                        "native record scan returned invalid embedding "
+                        "geometry");
+                }
+                wire::ScanRecordsResponse response;
+                set_read_snapshot(
+                    metadata,
+                    token_high,
+                    token_low,
+                    *response.mutable_snapshot());
+                response.set_emitted_offset(emitted);
+                response.set_max_batch_rows(batch_rows);
+                response.set_max_batch_payload_bytes(payload_limit);
+                encode_ids(
+                    std::span<const std::uint64_t>(
+                        ids.data(), static_cast<std::size_t>(count)),
+                    *response.mutable_ids());
+                set_embedding_batch(
+                    scan->dtype(),
+                    scan->output_dimension(),
+                    count,
+                    std::span<const std::byte>(
+                        embeddings.data(),
+                        static_cast<std::size_t>(values_size)),
+                    *response.mutable_embeddings());
+                if (request->include_locations()) {
+                    response.set_location_encoding(
+                        wire::LOCATION_ENCODING_SEGMENT_ROW_U32_LE);
+                    std::string encoded_locations;
+                    encoded_locations.reserve(
+                        static_cast<std::size_t>(count) * 8);
+                    for (std::size_t index = 0;
+                         index != static_cast<std::size_t>(count); ++index) {
+                        append_u32_le(
+                            encoded_locations, locations[index].segment_id);
+                        append_u32_le(
+                            encoded_locations, locations[index].row_index);
+                    }
+                    *response.mutable_locations_le() =
+                        std::move(encoded_locations);
+                } else {
+                    response.set_location_encoding(
+                        wire::LOCATION_ENCODING_UNSPECIFIED);
+                }
+                require_response_budget(response, limits_);
+                emitted += count;
+                if (!writer->Write(response)) {
+                    if (const auto cancelled = cancellation_status();
+                        cancelled.has_value()) {
+                        return *cancelled;
+                    }
+                    return {grpc::StatusCode::CANCELLED,
+                            "ScanRecords client stopped receiving"};
                 }
                 lifetime.mark_progress();
                 if (done) {

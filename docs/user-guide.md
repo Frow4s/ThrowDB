@@ -62,6 +62,56 @@ The bootstrap is rootless but requires outbound GitHub access, Git, CMake, a
 C++20 compiler, Make, Perl, and Python 3. A local-core-only developer build can
 disable both server targets as shown in the main README.
 
+### Reapply a source update on a remote machine
+
+After the one-time clone, use the repository updater instead of repeating the
+bootstrap and build commands manually:
+
+```bash
+cd ~/ThrowDB
+./tools/update_remote.sh --pull
+source build/remote-current/environment.sh
+```
+
+The default `smoke` check creates only a temporary test collection and starts a
+temporary server on an ephemeral loopback port. It does not open, modify, or
+maintain the production collection. The gRPC/Protobuf bootstrap is reused when
+its pinned installation is complete, while the ThrowDB C++ and Python sources
+are rebuilt incrementally with Unix Makefiles.
+
+Useful variants:
+
+```bash
+# Do not change Git state; apply files already copied or pulled into the tree.
+./tools/update_remote.sh
+
+# Add focused local and remote streaming regression tests.
+./tools/update_remote.sh --check quick
+
+# Run every Python test before publishing the stable paths.
+./tools/update_remote.sh --check full
+
+# Restart a rootless systemd service only after every selected check passes.
+./tools/update_remote.sh \
+  --check quick \
+  --restart-user-service throwdb.service
+```
+
+Successful completion publishes stable ignored paths under
+`build/remote-current/`: the public `throwdb` and `throwdbd` launchers, the raw
+`throwdbd-native` binary needed by low-level benchmark tools, and an
+`environment.sh` file. Existing `throwdbd` processes retain their old mapped
+executable until explicitly restarted; this prevents an update from
+interrupting active requests unexpectedly. Jupyter kernels, Airflow workers,
+and other long-lived Python processes that have already imported ThrowDB must
+also be restarted before they use the new C++ extension.
+
+This workflow is intended for a development or benchmark host. An editable
+installation is not an atomic production release: Python source files become
+visible from the checkout before the new extension has finished building. Use
+a versioned wheel/virtual environment or an immutable OCI image for production
+rollouts.
+
 ## Input contract
 
 `ids.npy`:
@@ -229,6 +279,40 @@ not stable logical IDs.
 `collection.list_ids()` and `remote.list_ids()` intentionally allocate arrays
 for every live ID. On hundreds of millions of rows, use `scan_ids()` unless
 that allocation is deliberate.
+
+## Stream embeddings without materializing the result
+
+Use `stream_get()` for a very large ordered query and `scan_records()` for a
+complete physical-order export:
+
+```python
+query_ids = np.load("query-ids.npy", mmap_mode="r")
+
+with throwdb.Collection.open("/nvme/throwdb/collection") as collection:
+    with collection.stream_get(
+        query_ids,
+        batch_rows=65_536,
+        max_batch_bytes=64 << 20,
+        prefix_dimensions=128,
+    ) as stream:
+        for embeddings in stream:
+            consume(embeddings)
+
+    with collection.scan_records(
+        batch_rows=65_536,
+        max_batch_bytes=64 << 20,
+        with_locations=True,
+    ) as scan:
+        for batch in scan:
+            consume(batch.ids, batch.embeddings, batch.locations)
+```
+
+For a server, `RemoteCollection.stream_get()` yields `RemoteEmbeddingBatch`
+and `RemoteCollection.scan_records()` yields the same `RecordBatch` shape.
+Always close a stream (prefer `with`): the snapshot may pin superseded files
+until release. Do not mutate the query ID array while `stream_get()` is active.
+See [`streaming-reads.md`](streaming-reads.md) for exact failure and memory
+semantics.
 
 ## Tune the reader
 

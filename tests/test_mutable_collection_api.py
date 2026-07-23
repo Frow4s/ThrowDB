@@ -310,6 +310,15 @@ def test_scan_ids_validates_buffers_and_empty_collection(tmp_path: Path) -> None
         with collection.scan_ids(with_locations=True) as scan:
             ids = np.empty(1, dtype=np.uint64)
             locations = np.empty(1, dtype=throwdb.ID_LOCATION_DTYPE)
+            shared = np.zeros(8, dtype=np.uint8)
+            overlapping_ids = np.ndarray(
+                (1,), dtype=np.uint64, buffer=shared
+            )
+            overlapping_locations = np.ndarray(
+                (1,), dtype=throwdb.ID_LOCATION_DTYPE, buffer=shared
+            )
+            with pytest.raises(ValueError, match="ids and locations"):
+                scan.read_into(overlapping_ids, overlapping_locations)
             assert scan.read_into(ids, locations) == 0
             with pytest.raises(TypeError, match="uint64"):
                 scan.read_into(np.empty(1, dtype=np.uint32), locations)

@@ -235,6 +235,102 @@ def test_server_crud_scan_and_restart(
         _assert_locations_are_in_physical_order(located)
 
 
+def test_native_server_streams_large_reads_from_one_snapshot(
+    tmp_path: Path,
+    server_process_factory: Callable[..., ServerProcess],
+) -> None:
+    """Exercise the public Python client against the real C++ streaming RPCs."""
+
+    store = tmp_path / "store"
+    base = _build_store(store)
+    server = server_process_factory(
+        store,
+        extra_args=("--writable", "--no-auto-maintenance"),
+    )
+
+    query_path = tmp_path / "query-ids.npy"
+    np.save(query_path, np.array([30, 10, 30, 20], dtype=np.uint32))
+    query = np.load(query_path, mmap_mode="r", allow_pickle=False)
+    output = np.memmap(
+        tmp_path / "stream-get-output.bin",
+        mode="w+",
+        dtype=np.float16,
+        shape=(query.size, 3),
+    )
+    output[:] = np.float16(-1)
+
+    with RemoteCollection.connect(server.endpoint, timeout=10) as remote:
+        assert remote.supports_stream_get
+        assert remote.supports_scan_records
+
+        # Construction receives StreamGetOpened and therefore fixes the
+        # native read snapshot before these later mutations are published.
+        point_stream = remote.stream_get(
+            query,
+            prefix_dimensions=3,
+            batch_rows=2,
+            max_batch_payload_bytes=12,
+        )
+        replacement = _vectors(1, 7, salt=701)
+        remote.update([30], replacement)
+        np.testing.assert_array_equal(remote.delete([10]), [True])
+        with point_stream:
+            point_stream.get_into(output)
+            assert point_stream.done
+            assert point_stream.rows_completed == query.size
+        np.testing.assert_array_equal(
+            output.view(np.uint16),
+            base[[2, 0, 2, 1], :3].view(np.uint16),
+        )
+
+        # ScanRecords prefetches its first bounded response at construction,
+        # pinning the post-update/pre-insert view. A later insert must not
+        # appear in any subsequent transport batch.
+        record_scan = remote.scan_records(
+            batch_rows=2,
+            max_batch_payload_bytes=40,
+            prefix_dimensions=2,
+            with_locations=True,
+        )
+        inserted = _vectors(1, 7, salt=901)
+        remote.insert([40], inserted)
+
+        ids_buffer = np.empty(1, dtype=np.uint64)
+        embedding_buffer = np.empty((1, 2), dtype=np.float16)
+        location_buffer = np.empty(1, dtype=throwdb.ID_LOCATION_DTYPE)
+        scanned_ids: list[int] = []
+        scanned_embeddings: list[np.ndarray] = []
+        scanned_locations: list[tuple[int, int]] = []
+        with record_scan:
+            while True:
+                count = record_scan.read_into(
+                    ids_buffer,
+                    embedding_buffer,
+                    location_buffer,
+                )
+                if count == 0:
+                    break
+                assert count == 1
+                scanned_ids.append(int(ids_buffer[0]))
+                scanned_embeddings.append(embedding_buffer[0].copy())
+                scanned_locations.append(
+                    (
+                        int(location_buffer["segment_id"][0]),
+                        int(location_buffer["row_index"][0]),
+                    )
+                )
+            assert record_scan.done
+            assert record_scan.rows_completed == 2
+
+        assert scanned_ids == [20, 30]
+        assert scanned_locations == sorted(scanned_locations)
+        np.testing.assert_array_equal(
+            np.stack(scanned_embeddings).view(np.uint16),
+            np.stack([base[1, :2], replacement[0, :2]]).view(np.uint16),
+        )
+        assert set(remote.list_ids().tolist()) == {20, 30, 40}
+
+
 def test_writable_server_runs_bounded_automatic_maintenance(
     tmp_path: Path,
     server_process_factory: Callable[..., ServerProcess],

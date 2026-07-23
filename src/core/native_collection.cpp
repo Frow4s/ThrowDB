@@ -948,6 +948,68 @@ private:
     std::unique_ptr<detail::PartitionedIdScan> scan_;
 };
 
+class NativeReadView::Impl {
+public:
+    explicit Impl(std::unique_ptr<detail::PartitionedReadView> view)
+        : view_(std::move(view)) {
+        if (view_ == nullptr) {
+            throw InvalidArgumentError("native read view is null");
+        }
+    }
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept {
+        return view_->metadata();
+    }
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept {
+        return view_->output_dimension();
+    }
+    [[nodiscard]] DType dtype() const noexcept { return view_->dtype(); }
+    void get_into(
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output) const {
+        view_->get_into(ids, output);
+    }
+
+private:
+    std::unique_ptr<detail::PartitionedReadView> view_;
+};
+
+class NativeRecordScan::Impl {
+public:
+    explicit Impl(std::unique_ptr<detail::PartitionedRecordScan> scan)
+        : scan_(std::move(scan)) {
+        if (scan_ == nullptr) {
+            throw InvalidArgumentError("native record scan is null");
+        }
+    }
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept {
+        return scan_->metadata();
+    }
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept {
+        return scan_->output_dimension();
+    }
+    [[nodiscard]] DType dtype() const noexcept { return scan_->dtype(); }
+    [[nodiscard]] std::uint64_t read_into(
+        const std::span<std::uint64_t> ids,
+        const std::span<std::byte> embeddings,
+        const std::span<NativeIdLocation> locations) {
+        return scan_->read_into(ids, embeddings, locations);
+    }
+    [[nodiscard]] std::uint64_t read_into(
+        const std::span<std::uint64_t> ids,
+        const std::span<std::byte> embeddings,
+        const std::span<NativeIdLocation> locations,
+        const NativeRecordScan::StopPredicate& stop_requested) {
+        return scan_->read_into(
+            ids, embeddings, locations, stop_requested);
+    }
+    [[nodiscard]] bool done() const noexcept { return scan_->done(); }
+
+private:
+    std::unique_ptr<detail::PartitionedRecordScan> scan_;
+};
+
 class NativeCollection::Impl {
 public:
     struct PartitionedTag {};
@@ -962,7 +1024,8 @@ public:
         : path_(std::move(path)),
           manifest_(read_manifest_timed(path_, open_stats_)),
           open_options_(open_options),
-          physical_reader_(reader_options),
+          physical_reader_(
+              std::make_shared<detail::PhysicalReader>(reader_options)),
           writer_lock_(detail::AdvisoryLockFile::open_existing(
               writer_lock_path(path_), writable || calibration)),
           commit_lock_(detail::AdvisoryLockFile::open_existing(
@@ -1045,7 +1108,8 @@ public:
         const NativeOpenOptions& open_options,
         PartitionedTag)
         : path_(std::move(path)),
-          physical_reader_(reader_options),
+          physical_reader_(
+              std::make_shared<detail::PhysicalReader>(reader_options)),
           partitioned_reader_(
               std::make_unique<detail::PartitionedIndexReader>(
                   path_, reader_options, writable, calibration,
@@ -1067,10 +1131,10 @@ public:
         const std::span<const std::uint64_t> ids,
         const std::span<std::byte> output) const {
         if (partitioned_reader_ != nullptr) {
-            partitioned_reader_->get_into(physical_reader_, ids, output);
+            partitioned_reader_->get_into(*physical_reader_, ids, output);
             return;
         }
-        get_into_impl<false>(physical_reader_, ids, output, nullptr);
+        get_into_impl<false>(*physical_reader_, ids, output, nullptr);
     }
 
     [[nodiscard]] NativeReadStats get_into_profiled(
@@ -1078,10 +1142,10 @@ public:
         const std::span<std::byte> output) const {
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->get_into_profiled(
-                physical_reader_, ids, output);
+                *physical_reader_, ids, output);
         }
         NativeReadStats stats;
-        get_into_impl<true>(physical_reader_, ids, output, &stats);
+        get_into_impl<true>(*physical_reader_, ids, output, &stats);
         return stats;
     }
 
@@ -1180,6 +1244,30 @@ public:
                 "physical ID scan requires a format-7 collection");
         }
         return partitioned_reader_->scan_ids(max_snapshot_bytes);
+    }
+
+    [[nodiscard]] std::unique_ptr<detail::PartitionedReadView>
+    open_read_view(
+        const std::uint32_t prefix_dimensions,
+        const std::uint64_t max_snapshot_bytes) const {
+        if (partitioned_reader_ == nullptr) {
+            throw InvalidArgumentError(
+                "read views require a format-7 collection");
+        }
+        return partitioned_reader_->open_read_view(
+            physical_reader_, prefix_dimensions, max_snapshot_bytes);
+    }
+
+    [[nodiscard]] std::unique_ptr<detail::PartitionedRecordScan>
+    scan_records(
+        const std::uint32_t prefix_dimensions,
+        const std::uint64_t max_snapshot_bytes) const {
+        if (partitioned_reader_ == nullptr) {
+            throw InvalidArgumentError(
+                "record scans require a format-7 collection");
+        }
+        return partitioned_reader_->scan_records(
+            physical_reader_, prefix_dimensions, max_snapshot_bytes);
     }
 
     [[nodiscard]] std::vector<std::byte> get_bytes(
@@ -1512,7 +1600,7 @@ public:
         ensure_lifecycle_not_fenced(path_);
         if (partitioned_reader_ != nullptr) {
             return partitioned_reader_->materialize_frozen_wals(
-                physical_reader_, max_wals, max_input_bytes,
+                *physical_reader_, max_wals, max_input_bytes,
                 max_input_entries, max_memory_bytes);
         }
         if (max_input_entries
@@ -1718,7 +1806,7 @@ public:
                         requests.push_back(resolve_row_unlocked(
                             source_rows[index], index, *source_resources));
                     }
-                    physical_reader_.execute(
+                    physical_reader_->execute(
                         manifest_.record_size, requests, destination);
                 });
         detail::invoke_native_collection_test_hook({
@@ -2170,7 +2258,7 @@ public:
                         requests.push_back(resolve_row_unlocked(
                             source_rows[index], index, *verified_sources));
                     }
-                    physical_reader_.execute(
+                    physical_reader_->execute(
                         manifest_.record_size, requests, destination);
                 });
         detail::invoke_native_collection_test_hook({
@@ -2411,7 +2499,7 @@ public:
             ensure_lifecycle_not_fenced(path_);
         }
         return partitioned_reader_->clean_segments(
-            physical_reader_, options);
+            *physical_reader_, options);
     }
 
     [[nodiscard]] std::uint64_t count() const {
@@ -2478,7 +2566,7 @@ public:
         }
         if (partitioned_reader_ != nullptr) {
             partitioned_reader_->abandon_after_fork();
-            physical_reader_.abandon_after_fork();
+            physical_reader_->abandon_after_fork();
             return;
         }
         // Close every inherited descriptor reference without explicitly
@@ -2495,7 +2583,7 @@ public:
         }
         writer_lock_.abandon_after_fork();
         commit_lock_.abandon_after_fork();
-        physical_reader_.abandon_after_fork();
+        physical_reader_->abandon_after_fork();
     }
 
 private:
@@ -3440,7 +3528,7 @@ private:
     detail::NativeManifest manifest_;
     NativeOpenOptions open_options_;
     detail::IndexData index_;
-    detail::PhysicalReader physical_reader_;
+    std::shared_ptr<detail::PhysicalReader> physical_reader_;
     std::unique_ptr<detail::PartitionedIndexReader> partitioned_reader_;
     detail::AdvisoryLockFile writer_lock_;
     detail::AdvisoryLockFile commit_lock_;
@@ -3860,6 +3948,47 @@ std::uint64_t NativeIdScan::read_into(
 }
 bool NativeIdScan::done() const noexcept { return impl_->done(); }
 
+NativeReadView::NativeReadView(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+NativeReadView::~NativeReadView() = default;
+const NativeReadViewMetadata& NativeReadView::metadata() const noexcept {
+    return impl_->metadata();
+}
+std::uint32_t NativeReadView::output_dimension() const noexcept {
+    return impl_->output_dimension();
+}
+DType NativeReadView::dtype() const noexcept { return impl_->dtype(); }
+void NativeReadView::get_into(
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    impl_->get_into(ids, output);
+}
+
+NativeRecordScan::NativeRecordScan(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+NativeRecordScan::~NativeRecordScan() = default;
+const NativeReadViewMetadata& NativeRecordScan::metadata() const noexcept {
+    return impl_->metadata();
+}
+std::uint32_t NativeRecordScan::output_dimension() const noexcept {
+    return impl_->output_dimension();
+}
+DType NativeRecordScan::dtype() const noexcept { return impl_->dtype(); }
+std::uint64_t NativeRecordScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<NativeIdLocation> locations) {
+    return impl_->read_into(ids, embeddings, locations);
+}
+std::uint64_t NativeRecordScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<NativeIdLocation> locations,
+    const StopPredicate& stop_requested) {
+    return impl_->read_into(ids, embeddings, locations, stop_requested);
+}
+bool NativeRecordScan::done() const noexcept { return impl_->done(); }
+
 NativeCollection::NativeCollection(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 NativeCollection::~NativeCollection() {
@@ -3913,6 +4042,22 @@ std::unique_ptr<NativeIdScan> NativeCollection::scan_ids(
     return std::unique_ptr<NativeIdScan>(new NativeIdScan(
         std::make_unique<NativeIdScan::Impl>(
             impl_->scan_ids(max_snapshot_bytes))));
+}
+std::unique_ptr<NativeReadView> NativeCollection::open_read_view(
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    return std::unique_ptr<NativeReadView>(new NativeReadView(
+        std::make_unique<NativeReadView::Impl>(
+            impl_->open_read_view(
+                prefix_dimensions, max_snapshot_bytes))));
+}
+std::unique_ptr<NativeRecordScan> NativeCollection::scan_records(
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    return std::unique_ptr<NativeRecordScan>(new NativeRecordScan(
+        std::make_unique<NativeRecordScan::Impl>(
+            impl_->scan_records(
+                prefix_dimensions, max_snapshot_bytes))));
 }
 std::vector<std::byte> NativeCollection::get_bytes(
     const std::span<const std::uint64_t> ids) const {

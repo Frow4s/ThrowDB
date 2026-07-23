@@ -8,12 +8,13 @@ import numbers
 import operator
 import os
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from os import PathLike
 from types import TracebackType
-from typing import Final, Literal, TypeAlias, TypedDict, cast, overload
+from typing import Any, Final, Literal, TypeAlias, TypedDict, cast, overload
 
 import numpy as np
 
@@ -21,6 +22,8 @@ from ._throwdb import (
     NativeCollection,
     NativeCollectionBuilder,
     NativeIdScan,
+    NativeReadView,
+    NativeRecordScan,
     ReaderBackendError,
 )
 from ._device import StorageProbeResult, probe_collection_storage
@@ -42,6 +45,7 @@ from .id_scan import (
     LocatedIdBatch,
     LocatedIds,
 )
+from .record_scan import RecordBatch
 
 
 _UINT32_MAX: Final = (1 << 32) - 1
@@ -50,6 +54,8 @@ _UINT64_MAX: Final = (1 << 64) - 1
 _DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
 _ID_SCAN_CHUNK_ROWS: Final = 1 << 20
 _DEFAULT_ID_SCAN_BATCH_ROWS: Final = 65_536
+_DEFAULT_STREAM_BATCH_BYTES: Final = 64 << 20
+_DEFAULT_STREAM_SNAPSHOT_BYTES: Final = 256 << 20
 _DEFAULT_DELTA_COMPACTION_MAX_RUNS: Final = 8
 _MAX_DELTA_COMPACTION_RUNS: Final = 64
 _MAX_PARTITIONED_FOLD_RUNS: Final = 4096
@@ -1352,6 +1358,256 @@ def _validate_id_scan_batch_rows(value: object) -> int:
     return rows
 
 
+def _validate_stream_byte_limit(value: object, *, name: str) -> int:
+    return _validate_delta_compaction_limit(value, name=name)
+
+
+def _effective_stream_batch_rows(
+    batch_rows: int,
+    max_batch_bytes: int,
+    *,
+    bytes_per_row: int,
+) -> int:
+    if bytes_per_row <= 0:
+        raise RuntimeError("stream row byte estimate must be positive")
+    if bytes_per_row > max_batch_bytes:
+        raise ValueError(
+            "max_batch_bytes cannot fit one streamed row: "
+            f"requires at least {bytes_per_row} bytes"
+        )
+    return min(batch_rows, max_batch_bytes // bytes_per_row)
+
+
+def _scan_snapshot_bytes(metadata: object) -> int:
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("native scan returned invalid metadata")
+    value = metadata.get("snapshot_bytes")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= _UINT64_MAX
+    ):
+        raise RuntimeError("native scan returned invalid snapshot_bytes")
+    return value
+
+
+def _numpy_arrays_overlap(left: np.ndarray, right: np.ndarray) -> bool:
+    """Return an exact overlap answer, with a conservative bounded fallback."""
+
+    # Drop ndarray subclasses before invoking NumPy dispatch. This keeps the
+    # check tied to the actual exported address/stride metadata and remains a
+    # zero-copy view for ndarray and memmap inputs.
+    left_view = np.asarray(left)
+    right_view = np.asarray(right)
+    if not bool(np.may_share_memory(left_view, right_view)):
+        return False
+    try:
+        return bool(
+            np.shares_memory(left_view, right_view, max_work=1024)
+        )
+    except (RuntimeError, ValueError):
+        # Fail closed when NumPy declines bounded exact analysis for an
+        # unusually complex retained stream_get source layout.
+        return True
+
+
+def _require_disjoint_numpy_arrays(
+    arrays: Sequence[tuple[str, np.ndarray]],
+) -> None:
+    for left_index, (left_name, left) in enumerate(arrays):
+        for right_name, right in arrays[left_index + 1 :]:
+            if _numpy_arrays_overlap(left, right):
+                raise ValueError(
+                    "record scan output buffers must not overlap: "
+                    f"{left_name} and {right_name}"
+                )
+
+
+class _SingleConsumerOperation:
+    """A fork-aware, fail-fast guard for one stateful local cursor."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+        self._owner_pid = os.getpid()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> Any:
+        current_pid = os.getpid()
+        if current_pid != self._owner_pid:
+            # A lock held by a vanished sibling thread must never strand the
+            # child after fork. Native handles still reject child-process I/O.
+            self._owner_pid = current_pid
+            self._lock = threading.Lock()
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError(
+                f"{self._label} is already in use by another thread"
+            )
+        return self._lock
+
+
+class _BoundedSequenceWindow(Sequence[object]):
+    """Non-owning fixed window used to avoid a second per-batch ID list."""
+
+    def __init__(
+        self,
+        source: Sequence[object],
+        begin: int,
+        end: int,
+    ) -> None:
+        self._source = source
+        self._begin = begin
+        self._length = end - begin
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int | slice) -> object:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._length)
+            return [
+                self._source[self._begin + position]
+                for position in range(start, stop, step)
+            ]
+        normalized = operator.index(index)
+        if normalized < 0:
+            normalized += self._length
+        if not 0 <= normalized < self._length:
+            raise IndexError(index)
+        return self._source[self._begin + normalized]
+
+
+class _StreamingNumericIdSource:
+    """Lazily normalize a stable ndarray/Sequence in bounded slices."""
+
+    def __init__(self, ids: object) -> None:
+        if isinstance(ids, np.ma.MaskedArray):
+            raise TypeError("ids must not be a masked array")
+        self._array: np.ndarray | None = None
+        self._sequence: Sequence[object] | None = None
+        self._shape: tuple[int, ...] | None = None
+        self._dtype: np.dtype[object] | None = None
+        self._strides: tuple[int, ...] | None = None
+        self._data_pointer: int | None = None
+
+        if isinstance(ids, np.ndarray):
+            if ids.ndim != 1:
+                raise ValueError(f"ids must have shape (N,), got {ids.shape}")
+            if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
+                1,
+                2,
+                4,
+                8,
+            }:
+                raise TypeError(
+                    "ids ndarray must have an 8-, 16-, 32-, or 64-bit "
+                    f"integer dtype, got {ids.dtype}"
+                )
+            self._array = ids
+            self._length = int(ids.shape[0])
+            self._shape = tuple(ids.shape)
+            self._dtype = ids.dtype
+            self._strides = tuple(ids.strides)
+            self._data_pointer = int(ids.ctypes.data)
+            return
+
+        if isinstance(ids, (str, bytes, bytearray, memoryview)):
+            raise TypeError(
+                "numeric ids must be a one-dimensional integer array or sequence"
+            )
+        if not isinstance(ids, Sequence):
+            raise TypeError(
+                "numeric ids must be a one-dimensional integer array or "
+                "ordered sequence; streaming iterables are not supported"
+            )
+        self._sequence = cast(Sequence[object], ids)
+        self._length = len(ids)
+
+    def __len__(self) -> int:
+        return self._length
+
+    def _require_unchanged(self) -> None:
+        if self._array is not None:
+            array = self._array
+            if (
+                array.ndim != 1
+                or tuple(array.shape) != self._shape
+                or array.dtype != self._dtype
+                or tuple(array.strides) != self._strides
+                or int(array.ctypes.data) != self._data_pointer
+            ):
+                raise RuntimeError(
+                    "ids source structure changed while stream_get was active"
+                )
+            return
+        assert self._sequence is not None
+        if len(self._sequence) != self._length:
+            raise RuntimeError(
+                "ids source length changed while stream_get was active"
+            )
+
+    def batch(self, begin: int, end: int) -> np.ndarray:
+        self._require_unchanged()
+        if not 0 <= begin <= end <= self._length:
+            raise RuntimeError("stream_get requested an invalid ID source slice")
+        if self._array is not None:
+            return _normalize_numeric_ids(
+                self._array[begin:end],
+                position_offset=begin,
+            )
+        assert self._sequence is not None
+        # Sequence slicing is not part of the minimal Sequence protocol and
+        # may itself allocate an implementation-defined object. A non-owning
+        # window lets normalization allocate only the bounded uint64 array.
+        return _normalize_numeric_ids(
+            _BoundedSequenceWindow(self._sequence, begin, end),
+            position_offset=begin,
+        )
+
+    def output_overlaps_unread(
+        self,
+        output: np.ndarray,
+        *,
+        begin: int,
+    ) -> bool:
+        """Detect address overlap with the current or a future array ID."""
+
+        if self._array is None:
+            return False
+        self._require_unchanged()
+        if not 0 <= begin <= self._length:
+            raise RuntimeError("stream_get requested an invalid ID source offset")
+        return _numpy_arrays_overlap(self._array[begin:], output)
+
+
+def _validate_stream_output(
+    output: object,
+    *,
+    expected_columns: int,
+    dtype: str,
+) -> np.ndarray:
+    if isinstance(output, np.ma.MaskedArray) or not isinstance(output, np.ndarray):
+        raise TypeError("output must be a NumPy ndarray")
+    expected_dtype = np.dtype(dtype)
+    if output.dtype != expected_dtype or not output.dtype.isnative:
+        raise TypeError(
+            f"output must have native-endian dtype {dtype}, got {output.dtype}"
+        )
+    if output.ndim != 2 or output.shape[1] != expected_columns:
+        raise ValueError(
+            "output must have shape (N, "
+            f"{expected_columns}), got {output.shape}"
+        )
+    if output.shape[0] == 0:
+        raise ValueError("output must contain at least one row")
+    if not output.flags.c_contiguous:
+        raise ValueError("output must be C-contiguous")
+    if not output.flags.aligned:
+        raise ValueError("output must be memory-aligned")
+    if not output.flags.writeable:
+        raise ValueError("output must be writable")
+    return output
+
+
 def _id_scan_snapshot(metadata: object) -> IdScanSnapshot:
     if not isinstance(metadata, Mapping):
         raise RuntimeError("native ID scan returned invalid metadata")
@@ -1397,6 +1653,7 @@ def _validate_id_scan_output(
     locations: object | None,
     *,
     with_locations: bool,
+    operation: str = "scan_ids",
 ) -> tuple[np.ndarray, np.ndarray | None]:
     if not isinstance(ids, np.ndarray):
         raise TypeError("ids output must be a NumPy ndarray")
@@ -1416,7 +1673,8 @@ def _validate_id_scan_output(
     if not with_locations:
         if locations is not None:
             raise ValueError(
-                "locations output requires scan_ids(with_locations=True)"
+                "locations output requires "
+                f"{operation}(with_locations=True)"
             )
         return ids, None
     if not isinstance(locations, np.ndarray):
@@ -1434,6 +1692,10 @@ def _validate_id_scan_output(
         raise ValueError("locations output must be memory-aligned")
     if not locations.flags.writeable:
         raise ValueError("locations output must be writable")
+    if _numpy_arrays_overlap(ids, locations):
+        raise ValueError(
+            f"{operation} output buffers must not overlap: ids and locations"
+        )
     return ids, locations
 
 
@@ -1450,10 +1712,13 @@ class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         self._native = native
         self._batch_rows = batch_rows
         self._with_locations = with_locations
-        self._snapshot = _id_scan_snapshot(native.metadata)
+        metadata = native.metadata
+        self._snapshot = _id_scan_snapshot(metadata)
+        self._snapshot_bytes = _scan_snapshot_bytes(metadata)
         self._emitted = 0
         self._closed = False
         self._finished = self._snapshot.count == 0 or bool(native.done)
+        self._operation = _SingleConsumerOperation("ID scan")
 
     @property
     def snapshot(self) -> IdScanSnapshot:
@@ -1464,6 +1729,10 @@ class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         return self._snapshot.count
 
     @property
+    def snapshot_bytes(self) -> int:
+        return self._snapshot_bytes
+
+    @property
     def done(self) -> bool:
         return self._finished
 
@@ -1471,6 +1740,17 @@ class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         self,
         ids: object,
         locations: object | None = None,
+    ) -> int:
+        operation = self._operation.acquire()
+        try:
+            return self._read_into_locked(ids, locations)
+        finally:
+            operation.release()
+
+    def _read_into_locked(
+        self,
+        ids: object,
+        locations: object | None,
     ) -> int:
         if self._closed:
             raise RuntimeError("ID scan is closed")
@@ -1501,29 +1781,40 @@ class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
         return self
 
     def __next__(self) -> np.ndarray | LocatedIdBatch:
-        if self._closed or self._finished:
-            raise StopIteration
-        ids = np.empty(self._batch_rows, dtype=np.uint64)
-        locations = (
-            np.empty(self._batch_rows, dtype=ID_LOCATION_DTYPE)
-            if self._with_locations
-            else None
-        )
-        emitted_offset = self._emitted
-        count = self.read_into(ids, locations)
-        if count == 0:
-            raise StopIteration
-        ids = ids[:count]
-        if locations is None:
-            return ids
-        return LocatedIdBatch(
-            ids=ids,
-            locations=locations[:count],
-            emitted_offset=emitted_offset,
-            snapshot=self._snapshot,
-        )
+        operation = self._operation.acquire()
+        try:
+            if self._closed or self._finished:
+                raise StopIteration
+            ids = np.empty(self._batch_rows, dtype=np.uint64)
+            locations = (
+                np.empty(self._batch_rows, dtype=ID_LOCATION_DTYPE)
+                if self._with_locations
+                else None
+            )
+            emitted_offset = self._emitted
+            count = self._read_into_locked(ids, locations)
+            if count == 0:
+                raise StopIteration
+            ids = ids[:count]
+            if locations is None:
+                return ids
+            return LocatedIdBatch(
+                ids=ids,
+                locations=locations[:count],
+                emitted_offset=emitted_offset,
+                snapshot=self._snapshot,
+            )
+        finally:
+            operation.release()
 
     def close(self) -> None:
+        operation = self._operation.acquire()
+        try:
+            self._close_native_locked()
+        finally:
+            operation.release()
+
+    def _close_native_locked(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -1533,6 +1824,392 @@ class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
     def __enter__(self) -> EmbeddedIdScan:
         if self._closed:
             raise RuntimeError("ID scan is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
+
+
+class EmbeddedReadStream(Iterator[np.ndarray]):
+    """Bounded query-order reads from one captured native collection view.
+
+    The ID source is retained rather than normalized eagerly. Its length,
+    shape, dtype, strides and data pointer (when applicable) must remain
+    unchanged until the stream is closed, and callers must not mutate its ID
+    values. Valid integer dtypes are normalized one bounded slice at a time;
+    an aligned native ``uint64`` ndarray or memmap slice stays zero-copy.
+
+    Successfully returned batches remain valid if a later batch fails. A
+    failing batch is never yielded, the logical position is not advanced, and
+    the stream becomes closed. Native missing-ID detection leaves that batch's
+    output untouched; other storage errors may have modified caller-provided
+    memory before they are reported.
+    """
+
+    def __init__(
+        self,
+        native: NativeReadView,
+        *,
+        source: _StreamingNumericIdSource,
+        batch_rows: int,
+        prefix_dimensions: int,
+        dtype: str,
+    ) -> None:
+        if int(native.output_dimension) != prefix_dimensions:
+            native.close()
+            raise RuntimeError("native read view returned the wrong output dimension")
+        if str(native.dtype) != dtype:
+            native.close()
+            raise RuntimeError("native read view returned the wrong embedding dtype")
+        metadata = native.metadata
+        self._native = native
+        self._source = source
+        self._batch_rows = batch_rows
+        self._prefix_dimensions = prefix_dimensions
+        self._dtype = dtype
+        self._snapshot = _id_scan_snapshot(metadata)
+        self._snapshot_bytes = _scan_snapshot_bytes(metadata)
+        self._position = 0
+        self._closed = False
+        self._failed = False
+        self._operation = _SingleConsumerOperation("embedding read stream")
+
+    @property
+    def snapshot(self) -> IdScanSnapshot:
+        return self._snapshot
+
+    @property
+    def snapshot_bytes(self) -> int:
+        return self._snapshot_bytes
+
+    @property
+    def requested_count(self) -> int:
+        return len(self._source)
+
+    @property
+    def emitted_count(self) -> int:
+        return self._position
+
+    @property
+    def batch_capacity(self) -> int:
+        return self._batch_rows
+
+    @property
+    def done(self) -> bool:
+        return self._position == len(self._source)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def read_into(self, output: object) -> int:
+        operation = self._operation.acquire()
+        try:
+            return self._read_into_locked(output)
+        finally:
+            operation.release()
+
+    def _read_into_locked(self, output: object) -> int:
+        if self._closed:
+            raise RuntimeError("embedding read stream is closed")
+        validated = _validate_stream_output(
+            output,
+            expected_columns=self._prefix_dimensions,
+            dtype=self._dtype,
+        )
+        remaining = len(self._source) - self._position
+        if remaining == 0:
+            return 0
+        count = min(remaining, self._batch_rows, int(validated.shape[0]))
+        begin = self._position
+        end = begin + count
+        output_slice = validated[:count]
+        if self._source.output_overlaps_unread(
+            output_slice,
+            begin=begin,
+        ):
+            raise ValueError(
+                "stream_get output must not overlap the current or future "
+                "ID source"
+            )
+        try:
+            ids = self._source.batch(begin, end)
+            self._native.get_into(ids, output_slice)
+        except BaseException:
+            self._failed = True
+            try:
+                self._close_native_locked()
+            except BaseException:
+                pass
+            raise
+        self._position = end
+        return count
+
+    def __iter__(self) -> EmbeddedReadStream:
+        return self
+
+    def __next__(self) -> np.ndarray:
+        operation = self._operation.acquire()
+        try:
+            if self._closed or self._position == len(self._source):
+                if not self._closed:
+                    self._close_native_locked()
+                raise StopIteration
+            count = min(self._batch_rows, len(self._source) - self._position)
+            output = np.empty(
+                (count, self._prefix_dimensions),
+                dtype=np.dtype(self._dtype),
+            )
+            produced = self._read_into_locked(output)
+            if produced == 0:
+                raise RuntimeError("embedding read stream made no progress")
+            return output[:produced]
+        finally:
+            operation.release()
+
+    def close(self) -> None:
+        operation = self._operation.acquire()
+        try:
+            self._close_native_locked()
+        finally:
+            operation.release()
+
+    def _close_native_locked(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._native.close()
+
+    def __enter__(self) -> EmbeddedReadStream:
+        if self._closed:
+            raise RuntimeError("embedding read stream is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        del exc_type, exc_value, traceback
+        self.close()
+        return False
+
+
+class EmbeddedRecordScan(Iterator[RecordBatch]):
+    """Snapshot cursor over bit-exact IDs and embeddings in physical order."""
+
+    def __init__(
+        self,
+        native: NativeRecordScan,
+        *,
+        batch_rows: int,
+        prefix_dimensions: int,
+        dtype: str,
+        with_locations: bool,
+    ) -> None:
+        if int(native.output_dimension) != prefix_dimensions:
+            native.close()
+            raise RuntimeError("native record scan returned the wrong output dimension")
+        if str(native.dtype) != dtype:
+            native.close()
+            raise RuntimeError("native record scan returned the wrong embedding dtype")
+        metadata = native.metadata
+        self._native = native
+        self._batch_rows = batch_rows
+        self._prefix_dimensions = prefix_dimensions
+        self._dtype = dtype
+        self._with_locations = with_locations
+        self._snapshot = _id_scan_snapshot(metadata)
+        self._snapshot_bytes = _scan_snapshot_bytes(metadata)
+        self._emitted = 0
+        self._closed = False
+        self._failed = False
+        self._finished = self._snapshot.count == 0 or bool(native.done)
+        self._operation = _SingleConsumerOperation("record scan")
+
+    @property
+    def snapshot(self) -> IdScanSnapshot:
+        return self._snapshot
+
+    @property
+    def snapshot_count(self) -> int:
+        return self._snapshot.count
+
+    @property
+    def snapshot_bytes(self) -> int:
+        return self._snapshot_bytes
+
+    @property
+    def emitted_count(self) -> int:
+        return self._emitted
+
+    @property
+    def batch_capacity(self) -> int:
+        return self._batch_rows
+
+    @property
+    def done(self) -> bool:
+        return self._finished
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    def read_into(
+        self,
+        ids: object,
+        embeddings: object,
+        locations: object | None = None,
+    ) -> int:
+        operation = self._operation.acquire()
+        try:
+            return self._read_into_locked(ids, embeddings, locations)
+        finally:
+            operation.release()
+
+    def _read_into_locked(
+        self,
+        ids: object,
+        embeddings: object,
+        locations: object | None,
+    ) -> int:
+        if self._closed:
+            raise RuntimeError("record scan is closed")
+        output_ids, output_locations = _validate_id_scan_output(
+            ids,
+            locations,
+            with_locations=self._with_locations,
+            operation="scan_records",
+        )
+        output_embeddings = _validate_stream_output(
+            embeddings,
+            expected_columns=self._prefix_dimensions,
+            dtype=self._dtype,
+        )
+        if output_embeddings.shape[0] != output_ids.shape[0]:
+            raise ValueError(
+                "embeddings output must have shape "
+                f"({output_ids.size}, {self._prefix_dimensions})"
+            )
+        named_outputs = [
+            ("ids", output_ids),
+            ("embeddings", output_embeddings),
+        ]
+        if output_locations is not None:
+            named_outputs.append(("locations", output_locations))
+        _require_disjoint_numpy_arrays(named_outputs)
+        capacity = min(self._batch_rows, int(output_ids.size))
+        id_slice = output_ids[:capacity]
+        embedding_slice = output_embeddings[:capacity]
+        location_slice = (
+            output_locations[:capacity]
+            if output_locations is not None
+            else None
+        )
+        if self._finished:
+            return 0
+        try:
+            count = int(
+                self._native.read_into(
+                    id_slice,
+                    embedding_slice,
+                    location_slice,
+                )
+            )
+            if not 0 <= count <= capacity:
+                raise RuntimeError(
+                    "native record scan returned an invalid row count"
+                )
+            if count == 0 and not self._native.done:
+                raise RuntimeError(
+                    "native record scan stopped without reaching EOF"
+                )
+            if self._emitted + count > self._snapshot.count:
+                raise RuntimeError(
+                    "native record scan exceeded its snapshot count"
+                )
+            self._emitted += count
+            if self._native.done:
+                if self._emitted != self._snapshot.count:
+                    raise RuntimeError(
+                        "native record scan ended before its snapshot count"
+                    )
+                self._finished = True
+            return count
+        except BaseException:
+            self._failed = True
+            try:
+                self._close_native_locked()
+            except BaseException:
+                pass
+            raise
+
+    def __iter__(self) -> EmbeddedRecordScan:
+        return self
+
+    def __next__(self) -> RecordBatch:
+        operation = self._operation.acquire()
+        try:
+            if self._closed or self._finished:
+                raise StopIteration
+            ids = np.empty(self._batch_rows, dtype=np.uint64)
+            embeddings = np.empty(
+                (self._batch_rows, self._prefix_dimensions),
+                dtype=np.dtype(self._dtype),
+            )
+            locations = (
+                np.empty(self._batch_rows, dtype=ID_LOCATION_DTYPE)
+                if self._with_locations
+                else None
+            )
+            emitted_offset = self._emitted
+            count = self._read_into_locked(ids, embeddings, locations)
+            if count == 0:
+                raise StopIteration
+            return RecordBatch(
+                ids=ids[:count],
+                embeddings=embeddings[:count],
+                locations=(
+                    locations[:count] if locations is not None else None
+                ),
+                snapshot=self._snapshot,
+                emitted_offset=emitted_offset,
+            )
+        finally:
+            operation.release()
+
+    def close(self) -> None:
+        operation = self._operation.acquire()
+        try:
+            self._close_native_locked()
+        finally:
+            operation.release()
+
+    def _close_native_locked(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._native.close()
+
+    def __enter__(self) -> EmbeddedRecordScan:
+        if self._closed:
+            raise RuntimeError("record scan is closed")
         return self
 
     def __exit__(
@@ -3542,6 +4219,64 @@ class Collection:
             "work_performed": actions_performed > 0,
         }
 
+    def stream_get(
+        self,
+        ids: object,
+        *,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+        max_batch_bytes: int = _DEFAULT_STREAM_BATCH_BYTES,
+        max_snapshot_bytes: int = _DEFAULT_STREAM_SNAPSHOT_BYTES,
+        prefix_dimensions: int | None = None,
+    ) -> EmbeddedReadStream:
+        """Open a bounded query-order stream against one collection snapshot.
+
+        ``ids`` must be a stable one-dimensional integer ndarray/memmap or an
+        ordered ``Sequence`` with a stable length. It is retained and
+        normalized lazily, so callers must not mutate its structure or values
+        until the returned stream is closed. Previously yielded batches remain
+        valid if a later batch contains a missing/invalid ID and fails.
+
+        The operation is available only for format 7 because older formats do
+        not expose a pinned mutable-view read primitive.
+        """
+
+        storage = self._ensure_reader()
+        if self._format_version != 7:
+            raise NotImplementedError(
+                "snapshot-consistent stream_get requires a format-7 "
+                "collection; rebuild the collection in format 7"
+            )
+        rows = _validate_id_scan_batch_rows(batch_rows)
+        batch_bytes = _validate_stream_byte_limit(
+            max_batch_bytes,
+            name="max_batch_bytes",
+        )
+        snapshot_bytes = _validate_stream_byte_limit(
+            max_snapshot_bytes,
+            name="max_snapshot_bytes",
+        )
+        prefix = _validate_prefix_dimensions(prefix_dimensions, self.dimension)
+        # Conservatively include the per-batch normalized uint64 IDs even
+        # when a native uint64 ndarray/memmap takes the zero-copy fast path.
+        bytes_per_row = 8 + prefix * np.dtype(self.dtype).itemsize
+        effective_rows = _effective_stream_batch_rows(
+            rows,
+            batch_bytes,
+            bytes_per_row=bytes_per_row,
+        )
+        source = _StreamingNumericIdSource(ids)
+        native = storage.open_read_view(
+            prefix_dimensions=prefix,
+            max_snapshot_bytes=snapshot_bytes,
+        )
+        return EmbeddedReadStream(
+            native,
+            source=source,
+            batch_rows=effective_rows,
+            prefix_dimensions=prefix,
+            dtype=self.dtype,
+        )
+
     def get(
         self,
         ids: object,
@@ -3607,12 +4342,71 @@ class Collection:
             raise RuntimeError("native profiled read returned invalid diagnostics")
         return dict(stats)
 
+    def scan_records(
+        self,
+        *,
+        batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
+        max_batch_bytes: int = _DEFAULT_STREAM_BATCH_BYTES,
+        max_snapshot_bytes: int = _DEFAULT_STREAM_SNAPSHOT_BYTES,
+        prefix_dimensions: int | None = None,
+        with_locations: bool = False,
+    ) -> EmbeddedRecordScan:
+        """Stream every live ID and embedding from one physical-order view.
+
+        Each returned :class:`RecordBatch` contains bit-exact IDs and
+        embeddings from the same format-7 snapshot. Batch row count is bounded
+        by both ``batch_rows`` and ``max_batch_bytes`` and may be smaller at a
+        physical segment boundary. A native failure closes the cursor and the
+        failing partial batch is never yielded.
+        """
+
+        storage = self._ensure_reader()
+        if self._format_version != 7:
+            raise NotImplementedError(
+                "snapshot-consistent record scanning requires a format-7 "
+                "collection; rebuild the collection in format 7"
+            )
+        rows = _validate_id_scan_batch_rows(batch_rows)
+        if not isinstance(with_locations, bool):
+            raise TypeError("with_locations must be a bool")
+        batch_bytes = _validate_stream_byte_limit(
+            max_batch_bytes,
+            name="max_batch_bytes",
+        )
+        snapshot_bytes = _validate_stream_byte_limit(
+            max_snapshot_bytes,
+            name="max_snapshot_bytes",
+        )
+        prefix = _validate_prefix_dimensions(prefix_dimensions, self.dimension)
+        bytes_per_row = (
+            8
+            + prefix * np.dtype(self.dtype).itemsize
+            + (ID_LOCATION_DTYPE.itemsize if with_locations else 0)
+        )
+        effective_rows = _effective_stream_batch_rows(
+            rows,
+            batch_bytes,
+            bytes_per_row=bytes_per_row,
+        )
+        native = storage.scan_records(
+            prefix_dimensions=prefix,
+            max_snapshot_bytes=snapshot_bytes,
+        )
+        return EmbeddedRecordScan(
+            native,
+            batch_rows=effective_rows,
+            prefix_dimensions=prefix,
+            dtype=self.dtype,
+            with_locations=with_locations,
+        )
+
     @overload
     def scan_ids(
         self,
         *,
         batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
         with_locations: Literal[False] = False,
+        max_snapshot_bytes: int | None = None,
     ) -> EmbeddedIdScan: ...
 
     @overload
@@ -3621,6 +4415,7 @@ class Collection:
         *,
         batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
         with_locations: Literal[True],
+        max_snapshot_bytes: int | None = None,
     ) -> EmbeddedIdScan: ...
 
     def scan_ids(
@@ -3628,6 +4423,7 @@ class Collection:
         *,
         batch_rows: int = _DEFAULT_ID_SCAN_BATCH_ROWS,
         with_locations: bool = False,
+        max_snapshot_bytes: int | None = None,
     ) -> EmbeddedIdScan:
         """Open a snapshot cursor in physical ``(segment_id, row_index)`` order.
 
@@ -3639,7 +4435,22 @@ class Collection:
         rows = _validate_id_scan_batch_rows(batch_rows)
         if not isinstance(with_locations, bool):
             raise TypeError("with_locations must be a bool")
-        native = self._ensure_reader().scan_ids()
+        if self._format_version != 7:
+            raise NotImplementedError(
+                "physical ID scanning requires a format-7 collection; "
+                "rebuild the collection in format 7"
+            )
+        snapshot_limit = (
+            None
+            if max_snapshot_bytes is None
+            else _validate_stream_byte_limit(
+                max_snapshot_bytes,
+                name="max_snapshot_bytes",
+            )
+        )
+        native = self._ensure_reader().scan_ids(
+            max_snapshot_bytes=snapshot_limit
+        )
         return EmbeddedIdScan(
             native,
             batch_rows=rows,
@@ -3838,6 +4649,8 @@ __all__ = [
     "Collection",
     "CollectionSchema",
     "EmbeddedIdScan",
+    "EmbeddedReadStream",
+    "EmbeddedRecordScan",
     "MaintenanceReport",
     "OrphanClassification",
     "OrphanCollectionExecutionEntry",

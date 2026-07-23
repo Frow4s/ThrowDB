@@ -468,7 +468,7 @@ void test_grpc_crud_and_scan() {
         status.ok()
             && health_response.status()
                    == wire::HealthResponse::SERVING_STATUS_SERVING
-            && health_response.protocol_minor() == 2,
+            && health_response.protocol_minor() == 3,
         "typed gRPC Health failed");
 
     grpc::ClientContext describe_context;
@@ -482,6 +482,8 @@ void test_grpc_crud_and_scan() {
             && describe_response.count() == base_ids.size()
             && describe_response.capabilities().writable()
             && describe_response.capabilities().durable_idempotency()
+            && describe_response.capabilities().stream_get()
+            && describe_response.capabilities().scan_records()
             && (describe_response.idempotency_domain().high() != 0
                 || describe_response.idempotency_domain().low() != 0)
             && describe_response.reader().max_read_range_bytes()
@@ -584,6 +586,155 @@ void test_grpc_crud_and_scan() {
             && delete_response.deleted_mask()[1] == 0,
         "gRPC Delete failed");
 
+    // StreamGet captures its view at the open handshake. A later Update must
+    // not change any batch returned through the already-open stream.
+    grpc::ClientContext stream_get_context;
+    auto stream_get = stub->StreamGet(&stream_get_context);
+    wire::StreamGetRequest stream_open;
+    stream_open.mutable_open()->set_prefix_dimensions(2);
+    stream_open.mutable_open()->set_max_batch_rows(4);
+    stream_open.mutable_open()->set_max_batch_payload_bytes(64);
+    require(
+        stream_get->Write(stream_open),
+        "gRPC StreamGet rejected its open frame");
+    wire::StreamGetResponse stream_opened;
+    require(
+        stream_get->Read(&stream_opened)
+            && stream_opened.payload_case()
+                   == wire::StreamGetResponse::kOpened
+            && stream_opened.opened().dimension() == 2
+            && stream_opened.opened().dtype()
+                   == wire::EMBEDDING_DTYPE_FLOAT16
+            && stream_opened.opened().request_window() == 1
+            && stream_opened.opened().max_batch_rows() <= 4
+            && stream_opened.opened().max_batch_payload_bytes() <= 64
+            && stream_opened.snapshot().live_count() == 4,
+        "gRPC StreamGet returned an invalid open handshake");
+
+    wire::MutationRequest update_request;
+    update_request.mutable_operation_id()->set_high(5);
+    update_request.mutable_operation_id()->set_low(6);
+    update_request.mutable_idempotency_domain()->CopyFrom(
+        describe_response.idempotency_domain());
+    const std::array<std::uint64_t, 1> update_ids{10};
+    set_ids(*update_request.mutable_ids(), update_ids);
+    const auto updated_row = rows(1, record_size, 171);
+    auto* update_embeddings = update_request.mutable_embeddings();
+    update_embeddings->set_dtype(wire::EMBEDDING_DTYPE_FLOAT16);
+    update_embeddings->set_dimension(dimension);
+    update_embeddings->set_row_count(1);
+    update_embeddings->set_values_le(
+        reinterpret_cast<const char*>(updated_row.data()),
+        updated_row.size());
+    grpc::ClientContext update_context;
+    wire::MutationResponse update_response;
+    status = stub->Update(
+        &update_context, update_request, &update_response);
+    require(
+        status.ok()
+            && update_response.committed_sequence()
+                   > stream_opened.snapshot().committed_sequence(),
+        "gRPC Update did not advance beyond the pinned StreamGet snapshot");
+
+    wire::StreamGetRequest stream_batch;
+    stream_batch.mutable_batch()->set_sequence(0);
+    const std::array<std::uint64_t, 3> stream_ids{10, 40, 10};
+    set_ids(*stream_batch.mutable_batch()->mutable_ids(), stream_ids);
+    require(
+        stream_get->Write(stream_batch) && stream_get->WritesDone(),
+        "gRPC StreamGet could not send its ID batch");
+    wire::StreamGetResponse stream_output;
+    require(
+        stream_get->Read(&stream_output)
+            && stream_output.payload_case()
+                   == wire::StreamGetResponse::kBatch
+            && stream_output.batch().sequence() == 0
+            && stream_output.batch().input_offset() == 0
+            && stream_output.batch().embeddings().row_count()
+                   == stream_ids.size()
+            && stream_output.batch().embeddings().dimension() == 2
+            && stream_output.snapshot().committed_sequence()
+                   == stream_opened.snapshot().committed_sequence()
+            && stream_output.snapshot().token().high()
+                   == stream_opened.snapshot().token().high()
+            && stream_output.snapshot().token().low()
+                   == stream_opened.snapshot().token().low(),
+        "gRPC StreamGet returned invalid batch metadata");
+    std::string expected_stream_values;
+    expected_stream_values.append(
+        reinterpret_cast<const char*>(base_rows.data()), 4);
+    expected_stream_values.append(
+        reinterpret_cast<const char*>(base_rows.data() + 3 * record_size),
+        4);
+    expected_stream_values.append(
+        reinterpret_cast<const char*>(base_rows.data()), 4);
+    require(
+        stream_output.batch().embeddings().values_le()
+                == expected_stream_values
+            && !stream_get->Read(&stream_output)
+            && stream_get->Finish().ok(),
+        "gRPC StreamGet did not preserve pinned values/order/duplicates");
+
+    // A half-close immediately after Open is the valid empty-ID request.
+    grpc::ClientContext empty_get_context;
+    auto empty_get = stub->StreamGet(&empty_get_context);
+    wire::StreamGetRequest empty_open;
+    empty_open.mutable_open()->set_max_batch_rows(2);
+    empty_open.mutable_open()->set_max_batch_payload_bytes(64);
+    wire::StreamGetResponse empty_opened;
+    require(
+        empty_get->Write(empty_open)
+            && empty_get->Read(&empty_opened)
+            && empty_get->WritesDone()
+            && !empty_get->Read(&empty_opened)
+            && empty_get->Finish().ok(),
+        "gRPC StreamGet rejected an empty ID stream");
+
+    // Missing IDs terminate the stream with the typed NOT_FOUND status after
+    // prior batches (if any) have already remained visible to the caller.
+    grpc::ClientContext missing_get_context;
+    auto missing_get = stub->StreamGet(&missing_get_context);
+    wire::StreamGetRequest missing_open;
+    missing_open.mutable_open()->set_max_batch_rows(1);
+    missing_open.mutable_open()->set_max_batch_payload_bytes(record_size);
+    wire::StreamGetResponse missing_response;
+    require(
+        missing_get->Write(missing_open)
+            && missing_get->Read(&missing_response),
+        "gRPC missing-ID StreamGet did not complete its handshake");
+    wire::StreamGetRequest missing_batch;
+    missing_batch.mutable_batch()->set_sequence(0);
+    const std::array<std::uint64_t, 1> missing_stream_id{999};
+    set_ids(
+        *missing_batch.mutable_batch()->mutable_ids(),
+        missing_stream_id);
+    require(
+        missing_get->Write(missing_batch) && missing_get->WritesDone()
+            && !missing_get->Read(&missing_response),
+        "gRPC missing-ID StreamGet unexpectedly returned a data batch");
+    const grpc::Status missing_stream_status = missing_get->Finish();
+    require(
+        missing_stream_status.error_code() == grpc::StatusCode::NOT_FOUND,
+        "gRPC StreamGet did not return NOT_FOUND for a missing ID");
+
+    grpc::ClientContext cancelled_get_context;
+    auto cancelled_get = stub->StreamGet(&cancelled_get_context);
+    wire::StreamGetRequest cancelled_open;
+    cancelled_open.mutable_open()->set_max_batch_rows(1);
+    cancelled_open.mutable_open()->set_max_batch_payload_bytes(record_size);
+    wire::StreamGetResponse cancelled_opened;
+    require(
+        cancelled_get->Write(cancelled_open)
+            && cancelled_get->Read(&cancelled_opened),
+        "gRPC cancellable StreamGet did not complete its handshake");
+    cancelled_get_context.TryCancel();
+    while (cancelled_get->Read(&cancelled_opened)) {
+    }
+    require(
+        cancelled_get->Finish().error_code()
+            == grpc::StatusCode::CANCELLED,
+        "gRPC StreamGet cancellation did not reach the server");
+
     wire::ScanIdsRequest scan_request;
     scan_request.set_batch_rows(2);
     scan_request.set_include_locations(true);
@@ -629,6 +780,157 @@ void test_grpc_crud_and_scan() {
             && scanned == std::set<std::uint64_t>({10, 20, 40, 50}),
         "gRPC ScanIds returned wrong live IDs");
 
+    wire::ScanRecordsRequest records_request;
+    records_request.set_batch_rows(1);
+    records_request.set_max_batch_payload_bytes(20);
+    records_request.set_prefix_dimensions(2);
+    records_request.set_include_locations(true);
+    grpc::ClientContext records_context;
+    auto records_reader = stub->ScanRecords(
+        &records_context, records_request);
+    wire::ScanRecordsResponse record_chunk;
+    require(
+        records_reader->Read(&record_chunk)
+            && record_chunk.snapshot().live_count() == 4
+            && record_chunk.max_batch_rows() == 1
+            && record_chunk.max_batch_payload_bytes() == 20,
+        "gRPC ScanRecords did not open its physical snapshot");
+
+    // Publish a new record after the first response. The pinned scan must
+    // still end at its original live_count and never expose this ID.
+    wire::MutationRequest later_insert_request;
+    later_insert_request.mutable_operation_id()->set_high(7);
+    later_insert_request.mutable_operation_id()->set_low(8);
+    later_insert_request.mutable_idempotency_domain()->CopyFrom(
+        describe_response.idempotency_domain());
+    const std::array<std::uint64_t, 1> later_insert_ids{60};
+    set_ids(*later_insert_request.mutable_ids(), later_insert_ids);
+    const auto later_insert_row = rows(1, record_size, 211);
+    auto* later_insert_embeddings =
+        later_insert_request.mutable_embeddings();
+    later_insert_embeddings->set_dtype(wire::EMBEDDING_DTYPE_FLOAT16);
+    later_insert_embeddings->set_dimension(dimension);
+    later_insert_embeddings->set_row_count(1);
+    later_insert_embeddings->set_values_le(
+        reinterpret_cast<const char*>(later_insert_row.data()),
+        later_insert_row.size());
+    grpc::ClientContext later_insert_context;
+    wire::MutationResponse later_insert_response;
+    status = stub->Insert(
+        &later_insert_context,
+        later_insert_request,
+        &later_insert_response);
+    require(
+        status.ok()
+            && later_insert_response.committed_sequence()
+                   > record_chunk.snapshot().committed_sequence(),
+        "gRPC Insert did not advance beyond the pinned ScanRecords snapshot");
+
+    std::set<std::uint64_t> scanned_records;
+    std::uint64_t records_offset = 0;
+    std::uint64_t previous_record_location = 0;
+    bool first_record_location = true;
+    const std::uint64_t record_snapshot_sequence =
+        record_chunk.snapshot().committed_sequence();
+    const std::uint64_t record_token_high =
+        record_chunk.snapshot().token().high();
+    const std::uint64_t record_token_low =
+        record_chunk.snapshot().token().low();
+    do {
+        const auto record_ids = read_ids(record_chunk.ids());
+        require(
+            record_chunk.emitted_offset() == records_offset
+                && record_chunk.snapshot().committed_sequence()
+                       == record_snapshot_sequence
+                && record_chunk.snapshot().token().high()
+                       == record_token_high
+                && record_chunk.snapshot().token().low()
+                       == record_token_low
+                && record_chunk.embeddings().dimension() == 2
+                && record_chunk.embeddings().row_count()
+                       == record_ids.size()
+                && record_chunk.embeddings().values_le().size()
+                       == record_ids.size() * 4
+                && record_chunk.location_encoding()
+                       == wire::LOCATION_ENCODING_SEGMENT_ROW_U32_LE
+                && record_chunk.locations_le().size()
+                       == record_ids.size() * 8,
+            "gRPC ScanRecords returned invalid batch geometry");
+        for (std::size_t index = 0; index != record_ids.size(); ++index) {
+            require(
+                scanned_records.insert(record_ids[index]).second,
+                "gRPC ScanRecords duplicated an ID");
+            const std::uint32_t segment = static_cast<std::uint32_t>(
+                read_u64_le(
+                    record_chunk.locations_le().data() + index * 8));
+            const std::uint32_t row = static_cast<std::uint32_t>(
+                read_u64_le(
+                    record_chunk.locations_le().data() + index * 8)
+                >> 32);
+            const std::uint64_t location =
+                (static_cast<std::uint64_t>(segment) << 32) | row;
+            require(
+                first_record_location
+                    || previous_record_location < location,
+                "gRPC ScanRecords lost physical order");
+            first_record_location = false;
+            previous_record_location = location;
+        }
+        records_offset += record_ids.size();
+    } while (records_reader->Read(&record_chunk));
+    require(
+        records_reader->Finish().ok() && records_offset == 4
+            && scanned_records
+                   == std::set<std::uint64_t>({10, 20, 40, 50})
+            && scanned_records.find(60) == scanned_records.end(),
+        "gRPC ScanRecords was not pinned across a later mutation");
+
+    grpc::ClientContext cancelled_records_context;
+    auto cancelled_records = stub->ScanRecords(
+        &cancelled_records_context, records_request);
+    require(
+        cancelled_records->Read(&record_chunk),
+        "gRPC cancellable ScanRecords did not return its first batch");
+    cancelled_records_context.TryCancel();
+    while (cancelled_records->Read(&record_chunk)) {
+    }
+    require(
+        cancelled_records->Finish().error_code()
+            == grpc::StatusCode::CANCELLED,
+        "gRPC ScanRecords cancellation did not reach the client");
+
+    wire::DeleteRequest delete_all_request;
+    delete_all_request.mutable_operation_id()->set_high(9);
+    delete_all_request.mutable_operation_id()->set_low(10);
+    delete_all_request.mutable_idempotency_domain()->CopyFrom(
+        describe_response.idempotency_domain());
+    const std::array<std::uint64_t, 5> all_live_ids{10, 20, 40, 50, 60};
+    set_ids(*delete_all_request.mutable_ids(), all_live_ids);
+    grpc::ClientContext delete_all_context;
+    wire::DeleteResponse delete_all_response;
+    status = stub->Delete(
+        &delete_all_context, delete_all_request, &delete_all_response);
+    require(
+        status.ok()
+            && delete_all_response.deleted_mask()
+                   == std::string(all_live_ids.size(), '\1'),
+        "gRPC Delete could not prepare the empty ScanRecords snapshot");
+
+    grpc::ClientContext empty_records_context;
+    auto empty_records = stub->ScanRecords(
+        &empty_records_context, records_request);
+    wire::ScanRecordsResponse empty_record_chunk;
+    require(
+        empty_records->Read(&empty_record_chunk)
+            && empty_record_chunk.snapshot().live_count() == 0
+            && empty_record_chunk.emitted_offset() == 0
+            && read_ids(empty_record_chunk.ids()).empty()
+            && empty_record_chunk.embeddings().row_count() == 0
+            && empty_record_chunk.embeddings().values_le().empty()
+            && !empty_records->Read(&empty_record_chunk)
+            && empty_records->Finish().ok(),
+        "gRPC ScanRecords did not represent an empty snapshot exactly once");
+
     const throwdb::server::GrpcAdmissionStats running_stats =
         server.admission_stats();
     require(
@@ -636,9 +938,9 @@ void test_grpc_crud_and_scan() {
             && running_stats.active_scans == 0
             && running_stats.unary_estimated_bytes == 0
             && running_stats.scan_estimated_bytes == 0
-            && running_stats.admitted_unary_calls == 3
+            && running_stats.admitted_unary_calls == 6
             && running_stats.rejected_unary_calls == 0
-            && running_stats.admitted_scans == 1
+            && running_stats.admitted_scans == 8
             && running_stats.rejected_scans == 0
             && !running_stats.admission_closed
             && !running_stats.draining
@@ -813,15 +1115,81 @@ void test_stalled_scan_is_cancelled_and_releases_admission() {
         }
         static_cast<void>(reader->Finish());
     }
-    const auto final_stats = wait_for_stats(
+    const auto replacement_stats = wait_for_stats(
         [](const throwdb::server::GrpcAdmissionStats& stats) {
             return stats.active_scans == 0 && stats.admitted_scans == 2
                    && stats.scan_estimated_bytes == 0;
         },
         "replacement ScanIds did not release its admission lease");
     require(
-        final_stats.rejected_scans == 0,
+        replacement_stats.rejected_scans == 0,
         "released ScanIds capacity was not reusable");
+
+    wire::ScanRecordsRequest records_request;
+    records_request.set_batch_rows(65'536);
+    records_request.set_max_batch_payload_bytes((2ULL << 20) - 1024);
+    records_request.set_prefix_dimensions(1);
+    records_request.set_include_locations(true);
+    {
+        grpc::ClientContext context;
+        context.set_deadline(
+            std::chrono::system_clock::now() + std::chrono::seconds(5));
+        auto reader = stub->ScanRecords(&context, records_request);
+        static_cast<void>(wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 1
+                       && stats.admitted_scans == 3;
+            },
+            "ScanRecords never acquired its admission lease"));
+        static_cast<void>(wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 0
+                       && stats.scan_estimated_bytes == 0;
+            },
+            "stalled ScanRecords retained admission after its watchdog"));
+        wire::ScanRecordsResponse discarded;
+        while (reader->Read(&discarded)) {
+        }
+        require(
+            reader->Finish().error_code() == grpc::StatusCode::CANCELLED,
+            "stalled ScanRecords was not cancelled by its watchdog");
+    }
+
+    // No request frame at all is the bidi slowloris case. StreamGet must
+    // acquire a scan slot and arm its idle watchdog before its first Read.
+    {
+        grpc::ClientContext context;
+        context.set_deadline(
+            std::chrono::system_clock::now() + std::chrono::seconds(5));
+        auto stream = stub->StreamGet(&context);
+        static_cast<void>(wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 1
+                       && stats.admitted_scans == 4;
+            },
+            "pre-open StreamGet never acquired its admission lease"));
+        static_cast<void>(wait_for_stats(
+            [](const throwdb::server::GrpcAdmissionStats& stats) {
+                return stats.active_scans == 0
+                       && stats.scan_estimated_bytes == 0;
+            },
+            "pre-open StreamGet retained admission after its idle watchdog"));
+        wire::StreamGetResponse discarded;
+        while (stream->Read(&discarded)) {
+        }
+        require(
+            stream->Finish().error_code() == grpc::StatusCode::CANCELLED,
+            "pre-open StreamGet slowloris was not cancelled by its watchdog");
+    }
+    const auto final_stats = wait_for_stats(
+        [](const throwdb::server::GrpcAdmissionStats& stats) {
+            return stats.active_scans == 0 && stats.admitted_scans == 4
+                   && stats.scan_estimated_bytes == 0;
+        },
+        "new streaming RPCs did not release their admission leases");
+    require(
+        final_stats.rejected_scans == 0,
+        "new streaming RPC watchdogs corrupted admission counters");
     server.shutdown();
 }
 
@@ -1093,6 +1461,161 @@ void test_get_is_rejected_before_native_read_or_allocation() {
         "Get native planner scratch bypassed server-wide admission");
 }
 
+void test_streaming_negotiation_accounts_for_snapshot_and_backend_buffers() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 1024;
+    constexpr std::uint64_t record_size = dimension * 2;
+    constexpr std::size_t row_count = 1024;
+    std::vector<std::uint64_t> ids(row_count);
+    for (std::size_t index = 0; index != ids.size(); ++index) {
+        ids[index] = index + 1;
+    }
+    std::vector<std::byte> embeddings(row_count * record_size);
+
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = dimension;
+    builder_options.dtype = throwdb::DType::Float16;
+    builder_options.segment_size_bytes = 4ULL << 20;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, embeddings);
+    builder->finish();
+
+    throwdb::ReaderOptions reader_options;
+    reader_options.max_read_range_bytes = 1ULL << 20;
+    reader_options.max_gap_bytes = 0;
+    reader_options.io_workers = 4;
+    auto collection = throwdb::NativeCollection::open(
+        store, reader_options, true);
+    // Keep every base ID in the committed overlay. At 96 estimated bytes per
+    // entry this snapshot is deliberately much larger than the slack after a
+    // memory-only maximum-batch calculation. The server must open the view
+    // with one-row headroom, measure the snapshot, and then reduce the batch;
+    // choosing the maximum batch first would reject this otherwise valid RPC.
+    collection->update(ids, embeddings);
+    {
+        auto snapshot_probe = collection->open_read_view(1);
+        require(
+            snapshot_probe->metadata().snapshot_bytes > (64ULL << 10),
+            "streaming memory-negotiation fixture did not create a large "
+            "overlay snapshot");
+    }
+    throwdb::server::EngineOptions engine_options;
+    engine_options.reader = reader_options;
+    throwdb::server::SingleCollectionEngine engine(
+        *collection, store, engine_options);
+    throwdb::server::ServiceLimits limits;
+    limits.max_request_bytes =
+        128 + row_count * sizeof(std::uint64_t);
+    limits.max_response_bytes = 4ULL << 20;
+    limits.max_scan_batch_rows = row_count;
+    throwdb::server::GrpcServerOptions options;
+    options.max_worker_threads = 8;
+    options.max_concurrent_calls = 4;
+    options.max_concurrent_scans = 1;
+    options.max_scan_inflight_bytes = 120ULL << 10;
+    options.max_grpc_memory_bytes = 8ULL << 20;
+    throwdb::server::GrpcServer server(engine, limits, options);
+    const auto endpoint = server.start();
+
+    grpc::ChannelArguments channel_options;
+    channel_options.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+    channel_options.SetMaxReceiveMessageSize(4 << 20);
+    auto channel = grpc::CreateCustomChannel(
+        endpoint.to_string(), grpc::InsecureChannelCredentials(),
+        channel_options);
+    require(
+        channel->WaitForConnected(
+            std::chrono::system_clock::now() + std::chrono::seconds(5)),
+        "ScanRecords memory-negotiation channel did not become ready");
+    auto stub = wire::ThrowDB::NewStub(channel);
+    const auto wait_for_scan_release = [&](const std::string& message) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        auto current = server.admission_stats();
+        while ((current.active_scans != 0
+                || current.scan_estimated_bytes != 0)
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            current = server.admission_stats();
+        }
+        require(
+            current.active_scans == 0
+                && current.scan_estimated_bytes == 0,
+            message + "; active="
+                + std::to_string(current.active_scans)
+                + " bytes="
+                + std::to_string(current.scan_estimated_bytes));
+        return current;
+    };
+
+    wire::ScanIdsRequest ids_request;
+    ids_request.set_batch_rows(row_count);
+    ids_request.set_include_locations(true);
+    grpc::ClientContext ids_context;
+    auto ids_reader = stub->ScanIds(&ids_context, ids_request);
+    wire::ScanIdsResponse ids_first;
+    require(
+        ids_reader->Read(&ids_first)
+            && ids_first.ids().uint64_ids().count() > 0
+            && ids_first.ids().uint64_ids().count() < row_count,
+        "ScanIds negotiation did not preserve snapshot headroom while "
+        "reducing its batch");
+    ids_context.TryCancel();
+    while (ids_reader->Read(&ids_first)) {
+    }
+    static_cast<void>(ids_reader->Finish());
+    static_cast<void>(wait_for_scan_release(
+        "ScanIds memory-negotiation call retained admission"));
+
+    grpc::ClientContext get_context;
+    auto get_stream = stub->StreamGet(&get_context);
+    wire::StreamGetRequest get_open;
+    get_open.mutable_open()->set_prefix_dimensions(1);
+    get_open.mutable_open()->set_max_batch_rows(row_count);
+    get_open.mutable_open()->set_max_batch_payload_bytes(64ULL << 10);
+    wire::StreamGetResponse get_opened;
+    require(
+        get_stream->Write(get_open)
+            && get_stream->Read(&get_opened)
+            && get_opened.payload_case()
+                   == wire::StreamGetResponse::kOpened
+            && get_opened.opened().max_batch_rows() > 0
+            && get_opened.opened().max_batch_rows() < row_count,
+        "StreamGet negotiation did not preserve snapshot headroom while "
+        "reducing its batch");
+    get_context.TryCancel();
+    while (get_stream->Read(&get_opened)) {
+    }
+    static_cast<void>(get_stream->Finish());
+    static_cast<void>(wait_for_scan_release(
+        "StreamGet memory-negotiation call retained admission"));
+
+    wire::ScanRecordsRequest request;
+    request.set_batch_rows(row_count);
+    request.set_max_batch_payload_bytes(64ULL << 10);
+    request.set_prefix_dimensions(1);
+    grpc::ClientContext context;
+    auto reader = stub->ScanRecords(&context, request);
+    wire::ScanRecordsResponse first;
+    require(
+        reader->Read(&first)
+            && first.max_batch_rows() > 0
+            && first.max_batch_rows() < row_count
+            && first.embeddings().dimension() == 1,
+        "ScanRecords negotiation ignored full-row backend buffers for a "
+        "prefix scan");
+    context.TryCancel();
+    while (reader->Read(&first)) {
+    }
+    static_cast<void>(reader->Finish());
+    static_cast<void>(wait_for_scan_release(
+        "ScanRecords memory-negotiation call retained admission"));
+    server.shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -1103,6 +1626,7 @@ int main() {
         test_grpc_rejects_legacy_storage_format();
         test_non_loopback_transport_is_fail_closed();
         test_get_is_rejected_before_native_read_or_allocation();
+        test_streaming_negotiation_accounts_for_snapshot_and_backend_buffers();
         test_stalled_scan_is_cancelled_and_releases_admission();
         test_grpc_crud_and_scan();
         std::cout << "gRPC server tests passed\n";

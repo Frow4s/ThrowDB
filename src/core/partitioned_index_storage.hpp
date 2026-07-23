@@ -57,6 +57,82 @@ private:
     std::unique_ptr<PartitionedIdScanState> state_;
 };
 
+class PartitionedReadViewState {
+public:
+    virtual ~PartitionedReadViewState() = default;
+    [[nodiscard]] virtual const NativeReadViewMetadata& metadata()
+        const noexcept = 0;
+    [[nodiscard]] virtual std::uint32_t output_dimension()
+        const noexcept = 0;
+    [[nodiscard]] virtual DType dtype() const noexcept = 0;
+    virtual void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const = 0;
+};
+
+class PartitionedReadView {
+public:
+    explicit PartitionedReadView(
+        std::shared_ptr<PartitionedReadViewState> state);
+    ~PartitionedReadView();
+
+    PartitionedReadView(const PartitionedReadView&) = delete;
+    PartitionedReadView& operator=(const PartitionedReadView&) = delete;
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept;
+    [[nodiscard]] DType dtype() const noexcept;
+    void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+
+private:
+    std::shared_ptr<PartitionedReadViewState> state_;
+};
+
+class PartitionedRecordScanState {
+public:
+    virtual ~PartitionedRecordScanState() = default;
+    [[nodiscard]] virtual const NativeReadViewMetadata& metadata()
+        const noexcept = 0;
+    [[nodiscard]] virtual std::uint32_t output_dimension()
+        const noexcept = 0;
+    [[nodiscard]] virtual DType dtype() const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<std::byte> embeddings,
+        std::span<NativeIdLocation> locations,
+        const NativeRecordScan::StopPredicate& stop_requested) = 0;
+    [[nodiscard]] virtual bool done() const noexcept = 0;
+};
+
+class PartitionedRecordScan {
+public:
+    explicit PartitionedRecordScan(
+        std::unique_ptr<PartitionedRecordScanState> state);
+    ~PartitionedRecordScan();
+
+    PartitionedRecordScan(const PartitionedRecordScan&) = delete;
+    PartitionedRecordScan& operator=(const PartitionedRecordScan&) = delete;
+
+    [[nodiscard]] const NativeReadViewMetadata& metadata() const noexcept;
+    [[nodiscard]] std::uint32_t output_dimension() const noexcept;
+    [[nodiscard]] DType dtype() const noexcept;
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<std::byte> embeddings,
+        std::span<NativeIdLocation> locations = {});
+    [[nodiscard]] std::uint64_t read_into(
+        std::span<std::uint64_t> ids,
+        std::span<std::byte> embeddings,
+        std::span<NativeIdLocation> locations,
+        const NativeRecordScan::StopPredicate& stop_requested);
+    [[nodiscard]] bool done() const noexcept;
+
+private:
+    std::unique_ptr<PartitionedRecordScanState> state_;
+};
+
 // Reads only the manifest discriminator, without following a substituted
 // symlink or blocking on a non-regular file. A false result means that the
 // existing format-6 path should perform its normal validation.
@@ -120,6 +196,14 @@ public:
         std::uint64_t seed,
         std::uint64_t max_inspected_slots) const;
     [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids(
+        std::uint64_t max_snapshot_bytes) const;
+    [[nodiscard]] std::unique_ptr<PartitionedReadView> open_read_view(
+        std::shared_ptr<PhysicalReader> physical_reader,
+        std::uint32_t prefix_dimensions,
+        std::uint64_t max_snapshot_bytes) const;
+    [[nodiscard]] std::unique_ptr<PartitionedRecordScan> scan_records(
+        std::shared_ptr<PhysicalReader> physical_reader,
+        std::uint32_t prefix_dimensions,
         std::uint64_t max_snapshot_bytes) const;
     [[nodiscard]] std::vector<std::uint8_t> contains(
         std::span<const std::uint64_t> ids) const;

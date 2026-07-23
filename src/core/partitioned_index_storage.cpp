@@ -70,6 +70,71 @@ constexpr std::uint64_t kMaterializationFixedMemoryOverhead = 16ULL << 20;
 constexpr std::uint64_t kIdScanStopCheckCandidates = 256;
 using SteadyClock = std::chrono::steady_clock;
 
+struct ByteAddressRange {
+    std::uintptr_t begin{0};
+    std::uintptr_t end{0};
+};
+
+template <typename Value>
+[[nodiscard]] ByteAddressRange checked_byte_address_range(
+    const std::span<Value> values,
+    const char* const name) {
+    if (values.empty()) {
+        return {};
+    }
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(
+        values.data());
+    const std::size_t bytes = values.size_bytes();
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        throw InvalidArgumentError(
+            std::string("record scan ") + name
+            + " output address range overflows uintptr_t");
+    }
+    return ByteAddressRange{begin, begin + bytes};
+}
+
+[[nodiscard]] bool byte_address_ranges_overlap(
+    const ByteAddressRange left,
+    const ByteAddressRange right) noexcept {
+    return left.begin != left.end && right.begin != right.end
+           && left.begin < right.end && right.begin < left.end;
+}
+
+void require_disjoint_id_scan_outputs(
+    const std::span<std::uint64_t> ids,
+    const std::span<NativeIdLocation> locations) {
+    if (byte_address_ranges_overlap(
+            checked_byte_address_range(ids, "IDs"),
+            checked_byte_address_range(locations, "locations"))) {
+        throw InvalidArgumentError(
+            "ID scan output buffers must not overlap: IDs and locations");
+    }
+}
+
+void require_disjoint_record_scan_outputs(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<NativeIdLocation> locations) {
+    const ByteAddressRange id_range = checked_byte_address_range(ids, "IDs");
+    const ByteAddressRange embedding_range =
+        checked_byte_address_range(embeddings, "embeddings");
+    const ByteAddressRange location_range =
+        checked_byte_address_range(locations, "locations");
+    if (byte_address_ranges_overlap(id_range, embedding_range)) {
+        throw InvalidArgumentError(
+            "record scan output buffers must not overlap: IDs and embeddings");
+    }
+    if (byte_address_ranges_overlap(id_range, location_range)) {
+        throw InvalidArgumentError(
+            "record scan output buffers must not overlap: IDs and locations");
+    }
+    if (byte_address_ranges_overlap(embedding_range, location_range)) {
+        throw InvalidArgumentError(
+            "record scan output buffers must not overlap: embeddings and "
+            "locations");
+    }
+}
+
 [[nodiscard]] std::uint64_t saturating_product(
     const std::uint64_t left,
     const std::uint64_t right) noexcept {
@@ -1169,6 +1234,8 @@ private:
 };
 
 class PartitionedIndexReader::Impl {
+    class ReadViewState;
+
 public:
     Impl(
         std::filesystem::path root,
@@ -1590,6 +1657,18 @@ public:
     }
 
     [[nodiscard]] std::unique_ptr<PartitionedIdScan> scan_ids(
+        std::uint64_t max_snapshot_bytes) const;
+    [[nodiscard]] std::unique_ptr<PartitionedReadView> open_read_view(
+        std::shared_ptr<PhysicalReader> physical_reader,
+        std::uint32_t prefix_dimensions,
+        std::uint64_t max_snapshot_bytes) const;
+    [[nodiscard]] std::unique_ptr<PartitionedRecordScan> scan_records(
+        std::shared_ptr<PhysicalReader> physical_reader,
+        std::uint32_t prefix_dimensions,
+        std::uint64_t max_snapshot_bytes) const;
+    [[nodiscard]] std::shared_ptr<ReadViewState> capture_read_view(
+        std::shared_ptr<PhysicalReader> physical_reader,
+        std::uint32_t prefix_dimensions,
         std::uint64_t max_snapshot_bytes) const;
 
     [[nodiscard]] std::vector<std::uint8_t> contains(
@@ -3452,6 +3531,325 @@ private:
                        : std::optional<RowRef>(RowRef::decode(value_raw));
         }
     };
+    class ReadViewState final : public PartitionedReadViewState {
+    public:
+        struct OverlayEntry {
+            std::uint64_t id;
+            VersionedMutationValue value;
+            // Resolved while state_mutex_ protects active WAL offsets. Only
+            // meaningful for PUT entries; tombstones retain fd == -1.
+            PhysicalReadRequest request;
+        };
+
+        ReadViewState(
+            PartitionedManifestV2 manifest,
+            std::shared_ptr<ResourceSet> resources,
+            std::shared_ptr<PhysicalReader> physical_reader,
+            std::vector<OverlayEntry> overlay,
+            const NativeReadViewMetadata metadata,
+            const std::uint32_t output_dimension)
+            : manifest_(std::move(manifest)),
+              resources_(std::move(resources)),
+              physical_reader_(std::move(physical_reader)),
+              overlay_(std::move(overlay)),
+              metadata_(metadata),
+              output_dimension_(output_dimension),
+              output_record_size_(checked_multiply(
+                  output_dimension_, manifest_.schema.item_size,
+                  "read view output record size")) {
+            if (resources_ == nullptr || physical_reader_ == nullptr) {
+                throw InvalidArgumentError(
+                    "partitioned read view resources are null");
+            }
+            std::sort(
+                overlay_.begin(), overlay_.end(),
+                [](const OverlayEntry& left, const OverlayEntry& right) {
+                    return left.id < right.id;
+                });
+        }
+
+        [[nodiscard]] const NativeReadViewMetadata& metadata()
+            const noexcept override {
+            return metadata_;
+        }
+        [[nodiscard]] std::uint32_t output_dimension()
+            const noexcept override {
+            return output_dimension_;
+        }
+        [[nodiscard]] DType dtype() const noexcept override {
+            return public_dtype(manifest_.schema.dtype);
+        }
+        [[nodiscard]] std::uint64_t output_record_size() const noexcept {
+            return output_record_size_;
+        }
+        [[nodiscard]] const ResourceSet& resources() const noexcept {
+            return *resources_;
+        }
+        [[nodiscard]] const std::vector<OverlayEntry>& overlay()
+            const noexcept {
+            return overlay_;
+        }
+        void execute(
+            const std::span<const PhysicalReadRequest> requests,
+            const std::span<std::byte> output) const {
+            physical_reader_->execute(output_record_size_, requests, output);
+        }
+
+        void get_into(
+            const std::span<const std::uint64_t> ids,
+            const std::span<std::byte> output) const override {
+            ensure_owner();
+            const std::uint64_t expected = checked_multiply(
+                ids.size(), output_record_size_, "read view output");
+            if (expected > std::numeric_limits<std::size_t>::max()
+                || output.size() != static_cast<std::size_t>(expected)) {
+                throw InvalidArgumentError(
+                    "output byte count does not equal ids.size() * "
+                    "prefix_record_size");
+            }
+            if (ids.empty()) {
+                return;
+            }
+            std::vector<PhysicalReadRequest> requests;
+            requests.reserve(ids.size());
+            // Resolve the complete batch before execute() can touch output.
+            for (std::size_t index = 0; index != ids.size(); ++index) {
+                requests.push_back(resolve_id(
+                    ids[index], static_cast<std::uint64_t>(index)));
+            }
+            execute(requests, output);
+        }
+
+        [[nodiscard]] bool is_authoritative(
+            const std::uint64_t id,
+            const std::uint64_t sequence,
+            const RowRef row) const {
+            const OverlayEntry* overlay = overlay_entry(id);
+            if (overlay != nullptr) {
+                return overlay->value.is_put()
+                       && overlay->value.sequence() == sequence
+                       && overlay->value.encoded_row_ref() == row.raw();
+            }
+            const std::optional<IndexedVersion> winner = indexed_version(id);
+            return winner.has_value() && !winner->tombstone()
+                   && winner->sequence == sequence
+                   && winner->value_raw == row.raw();
+        }
+
+        [[nodiscard]] PhysicalReadRequest resolve_candidate(
+            const std::uint64_t id,
+            const std::uint64_t sequence,
+            const RowRef row,
+            const std::uint64_t output_index) const {
+            const OverlayEntry* overlay = overlay_entry(id);
+            if (overlay != nullptr) {
+                if (!overlay->value.is_put()
+                    || overlay->value.sequence() != sequence
+                    || overlay->value.encoded_row_ref() != row.raw()) {
+                    throw CorruptionError(
+                        "record scan candidate is not authoritative");
+                }
+                PhysicalReadRequest result = overlay->request;
+                result.output_index = output_index;
+                return result;
+            }
+            const std::optional<IndexedVersion> winner = indexed_version(id);
+            if (!winner.has_value() || winner->tombstone()
+                || winner->sequence != sequence
+                || winner->value_raw != row.raw()) {
+                throw CorruptionError(
+                    "record scan candidate is not authoritative");
+            }
+            return resolve_indexed(row, output_index);
+        }
+
+    private:
+        void ensure_owner() const {
+            if (::getpid() != owner_pid_) {
+                throw StorageError(
+                    "read view was inherited across fork; open a new view "
+                    "in the child process");
+            }
+        }
+
+        [[nodiscard]] const OverlayEntry* overlay_entry(
+            const std::uint64_t id) const {
+            const auto position = std::lower_bound(
+                overlay_.begin(), overlay_.end(), id,
+                [](const OverlayEntry& entry, const std::uint64_t value) {
+                    return entry.id < value;
+                });
+            return position != overlay_.end() && position->id == id
+                       ? &*position
+                       : nullptr;
+        }
+
+        [[nodiscard]] std::optional<IndexedVersion> snapshot_version(
+            const std::uint64_t id) const {
+            const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
+            const std::uint64_t partition = partition_for_hash(
+                hash, manifest_.partition_bits);
+            const Snapshot& snapshot = *resources_->snapshots[
+                static_cast<std::size_t>(partition)];
+            const std::uint64_t mask =
+                snapshot.header.descriptor.capacity - 1;
+            std::uint64_t slot = hash & mask;
+            for (std::uint64_t probes = 0;
+                 probes != snapshot.header.descriptor.capacity; ++probes) {
+                if (Impl::control(snapshot, slot) == 0) {
+                    return std::nullopt;
+                }
+                if (Impl::slot_id(snapshot, slot) == id) {
+                    return IndexedVersion{
+                        Impl::slot_sequence(snapshot, slot),
+                        Impl::slot_value(snapshot, slot),
+                        snapshot.header.descriptor.epoch};
+                }
+                slot = (slot + 1) & mask;
+            }
+            throw CorruptionError(
+                "partition snapshot lookup has no empty slot");
+        }
+
+        [[nodiscard]] std::optional<IndexedVersion> indexed_version(
+            const std::uint64_t id) const {
+            std::optional<IndexedVersion> winner = snapshot_version(id);
+            const std::uint64_t hash = hash_id(id, manifest_.hash_seed);
+            const auto partition = static_cast<std::uint32_t>(
+                partition_for_hash(hash, manifest_.partition_bits));
+            for (const RunView& run : resources_->runs) {
+                if (!partition_bitmap_contains(
+                        run.catalog.active_partitions, partition)) {
+                    continue;
+                }
+                if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
+                    || run.catalog.epoch
+                           <= resources_->snapshots[partition]
+                                  ->header.descriptor.epoch) {
+                    throw CorruptionError(
+                        "active partition run is incompatible with its "
+                        "authoritative snapshot");
+                }
+                const std::optional<PartitionRunRecord> record =
+                    run.file->lookup(partition, id);
+                if (!record.has_value()) {
+                    continue;
+                }
+                const IndexedVersion candidate{
+                    record->sequence, record->value_raw, run.catalog.epoch};
+                if (!winner.has_value()
+                    || candidate.sequence > winner->sequence) {
+                    winner = candidate;
+                    continue;
+                }
+                if (candidate.sequence < winner->sequence) {
+                    continue;
+                }
+                if (candidate.value_raw == winner->value_raw) {
+                    winner->source_epoch = std::max(
+                        winner->source_epoch, candidate.source_epoch);
+                    continue;
+                }
+                bool valid_cleaner_relocation = false;
+                if (run.catalog.kind == PartitionedRunKind::Cleaner
+                    && run.catalog.epoch > winner->source_epoch
+                    && candidate.value_raw != 0
+                    && winner->value_raw != 0) {
+                    const RowRef previous =
+                        RowRef::decode(winner->value_raw);
+                    valid_cleaner_relocation =
+                        previous.segment_id().value()
+                        == run.catalog.retired_row_ref_segment_id;
+                }
+                if (!valid_cleaner_relocation) {
+                    throw CorruptionError(
+                        "partitioned index has conflicting values at one "
+                        "sequence");
+                }
+                winner = candidate;
+            }
+            return winner;
+        }
+
+        [[nodiscard]] PhysicalReadRequest resolve_indexed(
+            const RowRef row,
+            const std::uint64_t output_index) const {
+            const auto initial = resources_->initial_segment_indices.find(
+                row.segment_id().value());
+            if (initial != resources_->initial_segment_indices.end()) {
+                const Segment& segment =
+                    *resources_->initial_segments[initial->second];
+                if (row.row_index()
+                    >= segment.header.descriptor.row_count) {
+                    throw CorruptionError(
+                        "partition RowRef exceeds pinned segment");
+                }
+                return PhysicalReadRequest{
+                    segment.fd.get(),
+                    segment.header.payload_offset
+                        + static_cast<std::uint64_t>(row.row_index())
+                              * manifest_.record_size,
+                    output_index};
+            }
+            const auto materialized =
+                resources_->materialized_segment_indices.find(
+                    row.segment_id().value());
+            if (materialized
+                != resources_->materialized_segment_indices.end()) {
+                return resources_->materialized_segments[
+                    materialized->second]->resolve(row, output_index);
+            }
+            const auto source = resources_->source_indices.find(
+                row.segment_id().value());
+            if (source == resources_->source_indices.end()) {
+                throw CorruptionError(
+                    "partitioned RowRef has no pinned immutable resource");
+            }
+            if (source->second == resources_->active_index) {
+                throw CorruptionError(
+                    "indexed RowRef points into active WAL without a "
+                    "captured overlay entry");
+            }
+            const WalSource& wal = *resources_->sources[source->second];
+            if (row.row_index() >= wal.payload_offsets.size()) {
+                throw CorruptionError(
+                    "partitioned RowRef exceeds frozen WAL PUT rows");
+            }
+            return PhysicalReadRequest{
+                wal.fd.get(),
+                wal.payload_offsets[static_cast<std::size_t>(
+                    row.row_index())],
+                output_index};
+        }
+
+        [[nodiscard]] PhysicalReadRequest resolve_id(
+            const std::uint64_t id,
+            const std::uint64_t output_index) const {
+            const OverlayEntry* overlay = overlay_entry(id);
+            if (overlay != nullptr) {
+                if (!overlay->value.is_put()) {
+                    throw MissingIdError(id);
+                }
+                PhysicalReadRequest result = overlay->request;
+                result.output_index = output_index;
+                return result;
+            }
+            const std::optional<IndexedVersion> winner = indexed_version(id);
+            if (!winner.has_value() || winner->tombstone()) {
+                throw MissingIdError(id);
+            }
+            return resolve_indexed(*winner->row_ref(), output_index);
+        }
+
+        PartitionedManifestV2 manifest_;
+        std::shared_ptr<ResourceSet> resources_;
+        std::shared_ptr<PhysicalReader> physical_reader_;
+        std::vector<OverlayEntry> overlay_;
+        NativeReadViewMetadata metadata_;
+        std::uint32_t output_dimension_{0};
+        std::uint64_t output_record_size_{0};
+        const pid_t owner_pid_{::getpid()};
+    };
     class IdScanState final : public PartitionedIdScanState {
     public:
         struct OverlayEntry {
@@ -3573,6 +3971,7 @@ private:
                     "ID scan was inherited across fork; create a new scan "
                     "in the child process");
             }
+            require_disjoint_id_scan_outputs(ids, locations);
             if (!locations.empty() && locations.size() != ids.size()) {
                 throw InvalidArgumentError(
                     "ID scan locations capacity must equal IDs capacity");
@@ -3827,6 +4226,324 @@ private:
         std::uint64_t row_position_{0};
         std::uint64_t emitted_count_{0};
         bool done_{false};
+        const pid_t owner_pid_{::getpid()};
+    };
+    class RecordScanState final : public PartitionedRecordScanState {
+    public:
+        explicit RecordScanState(std::shared_ptr<ReadViewState> view)
+            : view_(std::move(view)) {
+            if (view_ == nullptr) {
+                throw InvalidArgumentError("record scan view is null");
+            }
+            const auto& overlay = view_->overlay();
+            overlay_put_order_.reserve(overlay.size());
+            for (std::size_t index = 0; index != overlay.size(); ++index) {
+                if (overlay[index].value.is_put()) {
+                    overlay_put_order_.push_back(index);
+                }
+            }
+            std::sort(
+                overlay_put_order_.begin(), overlay_put_order_.end(),
+                [&overlay](const std::size_t left, const std::size_t right) {
+                    return overlay[left].value.encoded_row_ref()
+                           < overlay[right].value.encoded_row_ref();
+                });
+
+            const ResourceSet& resources = view_->resources();
+            const std::uint64_t segment_capacity = checked_sum(
+                checked_sum(
+                    resources.initial_segments.size(),
+                    resources.materialized_segments.size(),
+                    "record scan segment capacity"),
+                checked_multiply(
+                    resources.sources.size(), 2,
+                    "record scan segment capacity"),
+                "record scan segment capacity");
+            if (segment_capacity > std::numeric_limits<std::size_t>::max()) {
+                throw std::length_error(
+                    "record scan segment capacity does not fit this process");
+            }
+            segments_.reserve(static_cast<std::size_t>(segment_capacity));
+            for (std::size_t index = 0;
+                 index != resources.initial_segments.size(); ++index) {
+                const Segment& segment =
+                    *resources.initial_segments[index];
+                segments_.push_back(SegmentView{
+                    segment.header.descriptor.row_ref_segment_id,
+                    SegmentKind::Initial,
+                    index,
+                    0,
+                    segment.header.descriptor.row_count});
+            }
+            for (std::size_t index = 0;
+                 index != resources.materialized_segments.size(); ++index) {
+                const PartitionedSegmentDescriptor& descriptor =
+                    resources.materialized_segments[index]->descriptor();
+                segments_.push_back(SegmentView{
+                    descriptor.row_ref_segment_id,
+                    SegmentKind::Materialized,
+                    index,
+                    0,
+                    descriptor.row_count});
+            }
+            std::size_t begin = 0;
+            while (begin != overlay_put_order_.size()) {
+                const std::uint32_t segment_id = overlay_row(begin)
+                                                     .segment_id()
+                                                     .value();
+                std::size_t end = begin + 1;
+                while (end != overlay_put_order_.size()
+                       && overlay_row(end).segment_id().value()
+                              == segment_id) {
+                    ++end;
+                }
+                segments_.push_back(SegmentView{
+                    segment_id,
+                    SegmentKind::Overlay,
+                    0,
+                    begin,
+                    static_cast<std::uint64_t>(end - begin)});
+                begin = end;
+            }
+            std::sort(
+                segments_.begin(), segments_.end(),
+                [](const SegmentView& left, const SegmentView& right) {
+                    return left.segment_id < right.segment_id;
+                });
+            for (std::size_t index = 1; index < segments_.size(); ++index) {
+                if (segments_[index - 1].segment_id
+                    == segments_[index].segment_id) {
+                    throw CorruptionError(
+                        "physical record scan found a duplicated segment ID");
+                }
+            }
+            done_ = metadata().live_count == 0;
+        }
+
+        [[nodiscard]] const NativeReadViewMetadata& metadata()
+            const noexcept override {
+            return view_->metadata();
+        }
+        [[nodiscard]] std::uint32_t output_dimension()
+            const noexcept override {
+            return view_->output_dimension();
+        }
+        [[nodiscard]] DType dtype() const noexcept override {
+            return view_->dtype();
+        }
+
+        [[nodiscard]] std::uint64_t read_into(
+            const std::span<std::uint64_t> ids,
+            const std::span<std::byte> embeddings,
+            const std::span<NativeIdLocation> locations,
+            const NativeRecordScan::StopPredicate& stop_requested) override {
+            if (::getpid() != owner_pid_) {
+                throw StorageError(
+                    "record scan was inherited across fork; create a new "
+                    "scan in the child process");
+            }
+            require_disjoint_record_scan_outputs(
+                ids, embeddings, locations);
+            if (!locations.empty() && locations.size() != ids.size()) {
+                throw InvalidArgumentError(
+                    "record scan locations capacity must equal IDs capacity");
+            }
+            const std::uint64_t expected = checked_multiply(
+                ids.size(), view_->output_record_size(),
+                "record scan embedding output");
+            if (expected > std::numeric_limits<std::size_t>::max()
+                || embeddings.size()
+                       != static_cast<std::size_t>(expected)) {
+                throw InvalidArgumentError(
+                    "embedding byte count does not equal IDs capacity * "
+                    "prefix_record_size");
+            }
+            if (failed_) {
+                throw StorageError(
+                    "record scan is failed and can only be destroyed");
+            }
+            if (ids.empty() || done_) {
+                return 0;
+            }
+
+            std::vector<std::uint64_t> pending_ids;
+            std::vector<NativeIdLocation> pending_locations;
+            std::vector<PhysicalReadRequest> requests;
+            pending_ids.reserve(ids.size());
+            pending_locations.reserve(ids.size());
+            requests.reserve(ids.size());
+            bool cursor_advanced = false;
+            bool completes_snapshot = false;
+            bool stop_observed = false;
+            try {
+                std::uint64_t candidates_until_stop_check = 0;
+                while (segment_position_ != segments_.size()) {
+                    const SegmentView& segment =
+                        segments_[segment_position_];
+                    while (row_position_ != segment.row_count) {
+                        if (candidates_until_stop_check == 0) {
+                            if (stop_requested && stop_requested()) {
+                                stop_observed = true;
+                                break;
+                            }
+                            candidates_until_stop_check =
+                                kIdScanStopCheckCandidates;
+                        }
+                        const Candidate candidate = candidate_at(
+                            segment, row_position_++);
+                        cursor_advanced = true;
+                        --candidates_until_stop_check;
+                        if (!view_->is_authoritative(
+                                candidate.id, candidate.sequence,
+                                candidate.row)) {
+                            continue;
+                        }
+                        const std::uint64_t output_index = requests.size();
+                        requests.push_back(view_->resolve_candidate(
+                            candidate.id, candidate.sequence, candidate.row,
+                            output_index));
+                        pending_ids.push_back(candidate.id);
+                        pending_locations.push_back(NativeIdLocation{
+                            candidate.row.segment_id().value(),
+                            candidate.row.row_index()});
+                        if (emitted_count_ + requests.size()
+                            > metadata().live_count) {
+                            throw CorruptionError(
+                                "physical record scan exceeded snapshot "
+                                "live count");
+                        }
+                        if (emitted_count_ + requests.size()
+                            == metadata().live_count) {
+                            completes_snapshot = true;
+                            break;
+                        }
+                        if (requests.size() == ids.size()) {
+                            break;
+                        }
+                    }
+                    if (row_position_ == segment.row_count) {
+                        ++segment_position_;
+                        row_position_ = 0;
+                    }
+                    if (completes_snapshot
+                        || requests.size() == ids.size()
+                        || !requests.empty() || stop_observed) {
+                        break;
+                    }
+                }
+
+                if (requests.empty()) {
+                    if (segment_position_ == segments_.size()) {
+                        if (emitted_count_ != metadata().live_count) {
+                            throw CorruptionError(
+                                "physical record scan ended before snapshot "
+                                "live count");
+                        }
+                        done_ = true;
+                    }
+                    return 0;
+                }
+
+                const std::uint64_t output_bytes = checked_multiply(
+                    requests.size(), view_->output_record_size(),
+                    "record scan returned embeddings");
+                // PhysicalReader validates every request before touching the
+                // selected prefix of the caller's embedding buffer.
+                view_->execute(
+                    requests,
+                    embeddings.first(static_cast<std::size_t>(output_bytes)));
+            } catch (...) {
+                if (cursor_advanced) {
+                    failed_ = true;
+                }
+                throw;
+            }
+
+            std::copy(pending_ids.begin(), pending_ids.end(), ids.begin());
+            if (!locations.empty()) {
+                std::copy(
+                    pending_locations.begin(), pending_locations.end(),
+                    locations.begin());
+            }
+            emitted_count_ += requests.size();
+            if (completes_snapshot) {
+                done_ = true;
+            }
+            return requests.size();
+        }
+
+        [[nodiscard]] bool done() const noexcept override {
+            return done_;
+        }
+
+    private:
+        enum class SegmentKind : std::uint8_t {
+            Initial,
+            Materialized,
+            Overlay,
+        };
+        struct SegmentView {
+            std::uint32_t segment_id;
+            SegmentKind kind;
+            std::size_t resource_index;
+            std::size_t overlay_begin;
+            std::uint64_t row_count;
+        };
+        struct Candidate {
+            std::uint64_t id;
+            std::uint64_t sequence;
+            RowRef row;
+        };
+
+        [[nodiscard]] RowRef overlay_row(
+            const std::size_t ordered_position) const {
+            return *view_->overlay()[overlay_put_order_[ordered_position]]
+                        .value.row_ref();
+        }
+
+        [[nodiscard]] Candidate candidate_at(
+            const SegmentView& segment,
+            const std::uint64_t row_position) const {
+            const RowRef row = RowRef::create(
+                segment.segment_id,
+                segment.kind == SegmentKind::Overlay
+                    ? overlay_row(
+                          segment.overlay_begin
+                          + static_cast<std::size_t>(row_position))
+                          .row_index()
+                    : row_position);
+            if (segment.kind == SegmentKind::Overlay) {
+                const auto& entry = view_->overlay()[overlay_put_order_[
+                    segment.overlay_begin
+                    + static_cast<std::size_t>(row_position)]];
+                return Candidate{entry.id, entry.value.sequence(), row};
+            }
+            const ResourceSet& resources = view_->resources();
+            if (segment.kind == SegmentKind::Materialized) {
+                const PartitionedSegmentIdEntry entry =
+                    resources.materialized_segments[segment.resource_index]
+                        ->sidecar_at(row_position);
+                return Candidate{entry.id, entry.sequence, row};
+            }
+            const Segment& initial =
+                *resources.initial_segments[segment.resource_index];
+            const std::size_t offset = static_cast<std::size_t>(
+                initial.ids_header.payload_offset
+                + row_position * kPartitionedSegmentIdEntrySize);
+            return Candidate{
+                get_u64(initial.ids_mapping.bytes(), offset),
+                get_u64(initial.ids_mapping.bytes(), offset + 8),
+                row};
+        }
+
+        std::shared_ptr<ReadViewState> view_;
+        std::vector<std::size_t> overlay_put_order_;
+        std::vector<SegmentView> segments_;
+        std::size_t segment_position_{0};
+        std::uint64_t row_position_{0};
+        std::uint64_t emitted_count_{0};
+        bool done_{false};
+        bool failed_{false};
         const pid_t owner_pid_{::getpid()};
     };
     struct CleanerPlanRecord {
@@ -5150,11 +5867,129 @@ PartitionedIndexReader::Impl::scan_ids(
         metadata.catalog_generation = catalog_.generation;
         metadata.committed_sequence = next_sequence_ - 1;
         metadata.live_count = live_count_.load(std::memory_order_relaxed);
+        metadata.snapshot_bytes = snapshot_bytes;
     }
     return std::make_unique<PartitionedIdScan>(
         std::make_unique<IdScanState>(
             manifest_, std::move(resource_pin), std::move(overlay),
             metadata));
+}
+
+std::shared_ptr<PartitionedIndexReader::Impl::ReadViewState>
+PartitionedIndexReader::Impl::capture_read_view(
+    std::shared_ptr<PhysicalReader> physical_reader,
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    ensure_healthy();
+    if (physical_reader == nullptr) {
+        throw InvalidArgumentError("read view physical reader is null");
+    }
+    const std::uint32_t output_dimension =
+        prefix_dimensions == 0
+            ? manifest_.schema.dimension
+            : prefix_dimensions;
+    if (output_dimension == 0
+        || output_dimension > manifest_.schema.dimension) {
+        throw InvalidArgumentError(
+            "prefix_dimensions must be between 1 and the stored dimension, "
+            "or zero for the full embedding");
+    }
+
+    std::shared_ptr<ResourceSet> resource_pin;
+    std::vector<ReadViewState::OverlayEntry> overlay;
+    NativeReadViewMetadata metadata;
+    {
+        std::shared_lock state(state_mutex_);
+        ensure_healthy();
+        resource_pin = resources_;
+        // Includes the sorted immutable overlay, its ordering vector when the
+        // same view backs a record scan, segment traversal descriptors, and
+        // conservative allocator slack. Existing mmap/file resources are
+        // shared and therefore deliberately excluded.
+        constexpr std::uint64_t kOverlaySnapshotBytesPerEntry = 96;
+        constexpr std::uint64_t kSegmentSnapshotBytesPerEntry = 64;
+        constexpr std::uint64_t kSnapshotFixedAllowance = 4096;
+        const std::uint64_t overlay_entries = overlay_.size();
+        const std::uint64_t segment_entries = checked_sum(
+            checked_sum(
+                resources_->initial_segments.size(),
+                resources_->materialized_segments.size(),
+                "read view segment memory estimate"),
+            checked_multiply(
+                resources_->sources.size(), 2,
+                "read view segment memory estimate"),
+            "read view segment memory estimate");
+        std::uint64_t snapshot_bytes = kSnapshotFixedAllowance;
+        if (overlay_entries
+                > (std::numeric_limits<std::uint64_t>::max()
+                   - snapshot_bytes)
+                      / kOverlaySnapshotBytesPerEntry) {
+            throw std::length_error(
+                "read view overlay memory estimate overflow");
+        }
+        snapshot_bytes +=
+            overlay_entries * kOverlaySnapshotBytesPerEntry;
+        if (segment_entries
+                > (std::numeric_limits<std::uint64_t>::max()
+                   - snapshot_bytes)
+                      / kSegmentSnapshotBytesPerEntry) {
+            throw std::length_error(
+                "read view segment memory estimate overflow");
+        }
+        snapshot_bytes +=
+            segment_entries * kSegmentSnapshotBytesPerEntry;
+        if (snapshot_bytes > max_snapshot_bytes) {
+            throw std::length_error(
+                "read view snapshot exceeds its admitted memory budget; "
+                "materialize WALs or raise the snapshot budget");
+        }
+
+        overlay.reserve(overlay_.size());
+        for (const auto& [id, value] : overlay_) {
+            if (!value.has_value()) {
+                continue;
+            }
+            PhysicalReadRequest request;
+            if (value->is_put()) {
+                // Active WAL payload_offsets is appendable. Convert the
+                // RowRef to immutable fd+offset while state_mutex_ pins the
+                // exact publication; never consult that vector after unlock.
+                request = resolve_unlocked(
+                    *value->row_ref(), 0, *resource_pin);
+            }
+            overlay.push_back(ReadViewState::OverlayEntry{
+                id, *value, request});
+        }
+        metadata.collection_id_low = manifest_.collection_id.low;
+        metadata.collection_id_high = manifest_.collection_id.high;
+        metadata.catalog_generation = catalog_.generation;
+        metadata.committed_sequence = next_sequence_ - 1;
+        metadata.live_count = live_count_.load(std::memory_order_relaxed);
+        metadata.snapshot_bytes = snapshot_bytes;
+    }
+    return std::make_shared<ReadViewState>(
+        manifest_, std::move(resource_pin), std::move(physical_reader),
+        std::move(overlay), metadata, output_dimension);
+}
+
+std::unique_ptr<PartitionedReadView>
+PartitionedIndexReader::Impl::open_read_view(
+    std::shared_ptr<PhysicalReader> physical_reader,
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    return std::make_unique<PartitionedReadView>(capture_read_view(
+        std::move(physical_reader), prefix_dimensions, max_snapshot_bytes));
+}
+
+std::unique_ptr<PartitionedRecordScan>
+PartitionedIndexReader::Impl::scan_records(
+    std::shared_ptr<PhysicalReader> physical_reader,
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    auto view = capture_read_view(
+        std::move(physical_reader), prefix_dimensions, max_snapshot_bytes);
+    return std::make_unique<PartitionedRecordScan>(
+        std::make_unique<RecordScanState>(std::move(view)));
 }
 
 PartitionedIdScan::PartitionedIdScan(
@@ -5186,6 +6021,63 @@ std::uint64_t PartitionedIdScan::read_into(
 }
 
 bool PartitionedIdScan::done() const noexcept {
+    return state_->done();
+}
+
+PartitionedReadView::PartitionedReadView(
+    std::shared_ptr<PartitionedReadViewState> state)
+    : state_(std::move(state)) {
+    if (state_ == nullptr) {
+        throw InvalidArgumentError("partitioned read view state is null");
+    }
+}
+PartitionedReadView::~PartitionedReadView() = default;
+const NativeReadViewMetadata& PartitionedReadView::metadata() const noexcept {
+    return state_->metadata();
+}
+std::uint32_t PartitionedReadView::output_dimension() const noexcept {
+    return state_->output_dimension();
+}
+DType PartitionedReadView::dtype() const noexcept { return state_->dtype(); }
+void PartitionedReadView::get_into(
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    state_->get_into(ids, output);
+}
+
+PartitionedRecordScan::PartitionedRecordScan(
+    std::unique_ptr<PartitionedRecordScanState> state)
+    : state_(std::move(state)) {
+    if (state_ == nullptr) {
+        throw InvalidArgumentError("partitioned record scan state is null");
+    }
+}
+PartitionedRecordScan::~PartitionedRecordScan() = default;
+const NativeReadViewMetadata& PartitionedRecordScan::metadata()
+    const noexcept {
+    return state_->metadata();
+}
+std::uint32_t PartitionedRecordScan::output_dimension() const noexcept {
+    return state_->output_dimension();
+}
+DType PartitionedRecordScan::dtype() const noexcept {
+    return state_->dtype();
+}
+std::uint64_t PartitionedRecordScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<NativeIdLocation> locations) {
+    return state_->read_into(
+        ids, embeddings, locations, NativeRecordScan::StopPredicate{});
+}
+std::uint64_t PartitionedRecordScan::read_into(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<NativeIdLocation> locations,
+    const NativeRecordScan::StopPredicate& stop_requested) {
+    return state_->read_into(ids, embeddings, locations, stop_requested);
+}
+bool PartitionedRecordScan::done() const noexcept {
     return state_->done();
 }
 
@@ -5249,6 +6141,22 @@ NativeIdSample PartitionedIndexReader::sample_ids(
 std::unique_ptr<PartitionedIdScan> PartitionedIndexReader::scan_ids(
     const std::uint64_t max_snapshot_bytes) const {
     return impl_->scan_ids(max_snapshot_bytes);
+}
+std::unique_ptr<PartitionedReadView>
+PartitionedIndexReader::open_read_view(
+    std::shared_ptr<PhysicalReader> physical_reader,
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    return impl_->open_read_view(
+        std::move(physical_reader), prefix_dimensions, max_snapshot_bytes);
+}
+std::unique_ptr<PartitionedRecordScan>
+PartitionedIndexReader::scan_records(
+    std::shared_ptr<PhysicalReader> physical_reader,
+    const std::uint32_t prefix_dimensions,
+    const std::uint64_t max_snapshot_bytes) const {
+    return impl_->scan_records(
+        std::move(physical_reader), prefix_dimensions, max_snapshot_bytes);
 }
 std::vector<std::uint8_t> PartitionedIndexReader::contains(
     const std::span<const std::uint64_t> ids) const {

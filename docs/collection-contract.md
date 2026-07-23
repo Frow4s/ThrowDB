@@ -152,6 +152,42 @@ population in RAM must use `scan_ids()` instead. Enumeration order is physical
 storage order rather than insertion order, numeric sort order, or lookup-request
 order.
 
+### Bounded embedding streams
+
+Format 7 exposes two snapshot-consistent embedding paths:
+
+```python
+# Query order and duplicates are preserved; ids may be a NumPy memmap.
+with collection.stream_get(
+    query_ids,
+    batch_rows=65_536,
+    max_batch_bytes=64 << 20,
+    max_snapshot_bytes=256 << 20,
+    prefix_dimensions=128,
+) as stream:
+    for embeddings in stream:
+        consume(embeddings)
+
+# Authoritative records are emitted in physical storage order.
+with collection.scan_records(
+    batch_rows=65_536,
+    max_batch_bytes=64 << 20,
+    max_snapshot_bytes=256 << 20,
+    prefix_dimensions=128,
+    with_locations=True,
+) as scan:
+    for batch in scan:
+        consume(batch.ids, batch.embeddings, batch.locations)
+```
+
+Both operations pin immutable files and copy the mutable overlay once. The
+snapshot-memory and batch-payload limits are independent; immutable mmaps,
+page cache, and batches retained by the caller are not charged to those Python
+limits. Mutations and maintenance may continue, but cannot change later
+batches from an already-open stream. A failed batch is never yielded and the
+stream cannot be resumed against a newer view. Full semantics are specified in
+[`streaming-reads.md`](streaming-reads.md).
+
 ## Write contract
 
 The initial Python surface is intended to be:

@@ -706,6 +706,20 @@ public:
         return collection_.scan_ids(max_snapshot_bytes);
     }
 
+    [[nodiscard]] std::unique_ptr<NativeReadView> open_read_view(
+        const std::uint32_t prefix_dimension,
+        const std::uint64_t max_snapshot_bytes) const {
+        return collection_.open_read_view(
+            prefix_dimension, max_snapshot_bytes);
+    }
+
+    [[nodiscard]] std::unique_ptr<NativeRecordScan> open_record_scan(
+        const std::uint32_t prefix_dimension,
+        const std::uint64_t max_snapshot_bytes) const {
+        return collection_.scan_records(
+            prefix_dimension, max_snapshot_bytes);
+    }
+
     [[nodiscard]] bool durable_idempotency() const noexcept {
         return journal_ != nullptr;
     }
@@ -1260,6 +1274,16 @@ MutationResult SingleCollectionEngine::mutate_in_domain(
 std::unique_ptr<NativeIdScan> SingleCollectionEngine::open_scan(
     const std::uint64_t max_snapshot_bytes) const {
     return impl_->open_scan(max_snapshot_bytes);
+}
+std::unique_ptr<NativeReadView> SingleCollectionEngine::open_read_view(
+    const std::uint32_t prefix_dimension,
+    const std::uint64_t max_snapshot_bytes) const {
+    return impl_->open_read_view(prefix_dimension, max_snapshot_bytes);
+}
+std::unique_ptr<NativeRecordScan> SingleCollectionEngine::open_record_scan(
+    const std::uint32_t prefix_dimension,
+    const std::uint64_t max_snapshot_bytes) const {
+    return impl_->open_record_scan(prefix_dimension, max_snapshot_bytes);
 }
 NativeCollection& SingleCollectionEngine::collection() noexcept {
     return impl_->collection();

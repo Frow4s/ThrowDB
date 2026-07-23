@@ -126,16 +126,20 @@ class DescribeRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class Capabilities(_message.Message):
-    __slots__ = ("writable", "prefix_get", "scan_locations", "durable_idempotency")
+    __slots__ = ("writable", "prefix_get", "scan_locations", "durable_idempotency", "stream_get", "scan_records")
     WRITABLE_FIELD_NUMBER: _ClassVar[int]
     PREFIX_GET_FIELD_NUMBER: _ClassVar[int]
     SCAN_LOCATIONS_FIELD_NUMBER: _ClassVar[int]
     DURABLE_IDEMPOTENCY_FIELD_NUMBER: _ClassVar[int]
+    STREAM_GET_FIELD_NUMBER: _ClassVar[int]
+    SCAN_RECORDS_FIELD_NUMBER: _ClassVar[int]
     writable: bool
     prefix_get: bool
     scan_locations: bool
     durable_idempotency: bool
-    def __init__(self, writable: _Optional[bool] = ..., prefix_get: _Optional[bool] = ..., scan_locations: _Optional[bool] = ..., durable_idempotency: _Optional[bool] = ...) -> None: ...
+    stream_get: bool
+    scan_records: bool
+    def __init__(self, writable: _Optional[bool] = ..., prefix_get: _Optional[bool] = ..., scan_locations: _Optional[bool] = ..., durable_idempotency: _Optional[bool] = ..., stream_get: _Optional[bool] = ..., scan_records: _Optional[bool] = ...) -> None: ...
 
 class CollectionSchema(_message.Message):
     __slots__ = ("id_type", "embedding_dtype", "dimension")
@@ -321,6 +325,80 @@ class GetResponse(_message.Message):
     embeddings: EmbeddingBatch
     def __init__(self, embeddings: _Optional[_Union[EmbeddingBatch, _Mapping]] = ...) -> None: ...
 
+class ReadSnapshot(_message.Message):
+    __slots__ = ("collection_id", "catalog_generation", "committed_sequence", "live_count", "token")
+    COLLECTION_ID_FIELD_NUMBER: _ClassVar[int]
+    CATALOG_GENERATION_FIELD_NUMBER: _ClassVar[int]
+    COMMITTED_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    LIVE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    TOKEN_FIELD_NUMBER: _ClassVar[int]
+    collection_id: CollectionId
+    catalog_generation: int
+    committed_sequence: int
+    live_count: int
+    token: ScanToken
+    def __init__(self, collection_id: _Optional[_Union[CollectionId, _Mapping]] = ..., catalog_generation: _Optional[int] = ..., committed_sequence: _Optional[int] = ..., live_count: _Optional[int] = ..., token: _Optional[_Union[ScanToken, _Mapping]] = ...) -> None: ...
+
+class StreamGetOpen(_message.Message):
+    __slots__ = ("prefix_dimensions", "max_batch_rows", "max_batch_payload_bytes")
+    PREFIX_DIMENSIONS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_ROWS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_PAYLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    prefix_dimensions: int
+    max_batch_rows: int
+    max_batch_payload_bytes: int
+    def __init__(self, prefix_dimensions: _Optional[int] = ..., max_batch_rows: _Optional[int] = ..., max_batch_payload_bytes: _Optional[int] = ...) -> None: ...
+
+class StreamGetInputBatch(_message.Message):
+    __slots__ = ("sequence", "ids")
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    IDS_FIELD_NUMBER: _ClassVar[int]
+    sequence: int
+    ids: IdBatch
+    def __init__(self, sequence: _Optional[int] = ..., ids: _Optional[_Union[IdBatch, _Mapping]] = ...) -> None: ...
+
+class StreamGetRequest(_message.Message):
+    __slots__ = ("open", "batch")
+    OPEN_FIELD_NUMBER: _ClassVar[int]
+    BATCH_FIELD_NUMBER: _ClassVar[int]
+    open: StreamGetOpen
+    batch: StreamGetInputBatch
+    def __init__(self, open: _Optional[_Union[StreamGetOpen, _Mapping]] = ..., batch: _Optional[_Union[StreamGetInputBatch, _Mapping]] = ...) -> None: ...
+
+class StreamGetOpened(_message.Message):
+    __slots__ = ("dtype", "dimension", "max_batch_rows", "max_batch_payload_bytes", "request_window")
+    DTYPE_FIELD_NUMBER: _ClassVar[int]
+    DIMENSION_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_ROWS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_PAYLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_WINDOW_FIELD_NUMBER: _ClassVar[int]
+    dtype: EmbeddingDType
+    dimension: int
+    max_batch_rows: int
+    max_batch_payload_bytes: int
+    request_window: int
+    def __init__(self, dtype: _Optional[_Union[EmbeddingDType, str]] = ..., dimension: _Optional[int] = ..., max_batch_rows: _Optional[int] = ..., max_batch_payload_bytes: _Optional[int] = ..., request_window: _Optional[int] = ...) -> None: ...
+
+class StreamGetOutputBatch(_message.Message):
+    __slots__ = ("sequence", "input_offset", "embeddings")
+    SEQUENCE_FIELD_NUMBER: _ClassVar[int]
+    INPUT_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDINGS_FIELD_NUMBER: _ClassVar[int]
+    sequence: int
+    input_offset: int
+    embeddings: EmbeddingBatch
+    def __init__(self, sequence: _Optional[int] = ..., input_offset: _Optional[int] = ..., embeddings: _Optional[_Union[EmbeddingBatch, _Mapping]] = ...) -> None: ...
+
+class StreamGetResponse(_message.Message):
+    __slots__ = ("snapshot", "opened", "batch")
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    OPENED_FIELD_NUMBER: _ClassVar[int]
+    BATCH_FIELD_NUMBER: _ClassVar[int]
+    snapshot: ReadSnapshot
+    opened: StreamGetOpened
+    batch: StreamGetOutputBatch
+    def __init__(self, snapshot: _Optional[_Union[ReadSnapshot, _Mapping]] = ..., opened: _Optional[_Union[StreamGetOpened, _Mapping]] = ..., batch: _Optional[_Union[StreamGetOutputBatch, _Mapping]] = ...) -> None: ...
+
 class MutationRequest(_message.Message):
     __slots__ = ("operation_id", "ids", "embeddings", "idempotency_domain")
     OPERATION_ID_FIELD_NUMBER: _ClassVar[int]
@@ -396,3 +474,35 @@ class ScanIdsResponse(_message.Message):
     location_encoding: LocationEncoding
     locations_le: bytes
     def __init__(self, snapshot: _Optional[_Union[IdScanSnapshot, _Mapping]] = ..., emitted_offset: _Optional[int] = ..., ids: _Optional[_Union[IdBatch, _Mapping]] = ..., location_encoding: _Optional[_Union[LocationEncoding, str]] = ..., locations_le: _Optional[bytes] = ...) -> None: ...
+
+class ScanRecordsRequest(_message.Message):
+    __slots__ = ("batch_rows", "max_batch_payload_bytes", "prefix_dimensions", "include_locations")
+    BATCH_ROWS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_PAYLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PREFIX_DIMENSIONS_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_LOCATIONS_FIELD_NUMBER: _ClassVar[int]
+    batch_rows: int
+    max_batch_payload_bytes: int
+    prefix_dimensions: int
+    include_locations: bool
+    def __init__(self, batch_rows: _Optional[int] = ..., max_batch_payload_bytes: _Optional[int] = ..., prefix_dimensions: _Optional[int] = ..., include_locations: _Optional[bool] = ...) -> None: ...
+
+class ScanRecordsResponse(_message.Message):
+    __slots__ = ("snapshot", "emitted_offset", "ids", "embeddings", "location_encoding", "locations_le", "max_batch_rows", "max_batch_payload_bytes")
+    SNAPSHOT_FIELD_NUMBER: _ClassVar[int]
+    EMITTED_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    IDS_FIELD_NUMBER: _ClassVar[int]
+    EMBEDDINGS_FIELD_NUMBER: _ClassVar[int]
+    LOCATION_ENCODING_FIELD_NUMBER: _ClassVar[int]
+    LOCATIONS_LE_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_ROWS_FIELD_NUMBER: _ClassVar[int]
+    MAX_BATCH_PAYLOAD_BYTES_FIELD_NUMBER: _ClassVar[int]
+    snapshot: ReadSnapshot
+    emitted_offset: int
+    ids: IdBatch
+    embeddings: EmbeddingBatch
+    location_encoding: LocationEncoding
+    locations_le: bytes
+    max_batch_rows: int
+    max_batch_payload_bytes: int
+    def __init__(self, snapshot: _Optional[_Union[ReadSnapshot, _Mapping]] = ..., emitted_offset: _Optional[int] = ..., ids: _Optional[_Union[IdBatch, _Mapping]] = ..., embeddings: _Optional[_Union[EmbeddingBatch, _Mapping]] = ..., location_encoding: _Optional[_Union[LocationEncoding, str]] = ..., locations_le: _Optional[bytes] = ..., max_batch_rows: _Optional[int] = ..., max_batch_payload_bytes: _Optional[int] = ...) -> None: ...

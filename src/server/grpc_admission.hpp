@@ -17,7 +17,7 @@ struct GrpcAdmissionSnapshot {
     // scan-pool bottleneck from pressure on the latency-sensitive data plane.
     std::uint32_t active_calls = 0;
     std::uint32_t active_scans = 0;
-    // Unary Get/CRUD and ScanIds have deliberately independent memory pools.
+    // Unary Get/CRUD and streaming reads have deliberately independent pools.
     // A slow stream must never consume the bytes reserved for unary work.
     std::uint64_t estimated_bytes = 0;
     std::uint64_t scan_estimated_bytes = 0;
@@ -89,7 +89,7 @@ enum class GrpcScanExpiry : std::uint8_t {
     IdleProgress,
 };
 
-// Transport-independent timer used by the synchronous gRPC ScanIds handler.
+// Transport-independent timer used by synchronous gRPC streaming handlers.
 // The injected callback lets the timer be tested deterministically enough
 // without manufacturing a live grpc::ServerContext.
 class GrpcScanWatchdog final {

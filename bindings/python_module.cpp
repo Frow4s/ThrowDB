@@ -75,6 +75,28 @@ struct DTypeInfo {
     return py::dtype::from_args(py::str(dtype_info(dtype).name));
 }
 
+[[nodiscard]] std::uint64_t embedding_record_size(
+    const throwdb::DType dtype, const std::uint32_t dimension) {
+    const std::uint64_t item_size =
+        dtype == throwdb::DType::Float16 ? 2 : 4;
+    if (dimension > std::numeric_limits<std::uint64_t>::max() / item_size) {
+        throw py::value_error("embedding record size is too large");
+    }
+    return static_cast<std::uint64_t>(dimension) * item_size;
+}
+
+[[nodiscard]] py::dict read_view_metadata_dict(
+    const throwdb::NativeReadViewMetadata& metadata) {
+    py::dict result;
+    result["collection_id_low"] = metadata.collection_id_low;
+    result["collection_id_high"] = metadata.collection_id_high;
+    result["catalog_generation"] = metadata.catalog_generation;
+    result["committed_sequence"] = metadata.committed_sequence;
+    result["live_count"] = metadata.live_count;
+    result["snapshot_bytes"] = metadata.snapshot_bytes;
+    return result;
+}
+
 [[nodiscard]] py::dict mutation_log_stats_dict(
     const throwdb::NativeMutationLogStats& stats) {
     py::dict result;
@@ -601,6 +623,107 @@ void require_dtype(const py::array& array,
             bytes};
 }
 
+[[nodiscard]] std::span<std::uint64_t> validate_writable_id_output(
+    py::array& ids) {
+    static_cast<void>(validate_ids(ids));
+    if (!ids.writeable()) {
+        throw py::value_error("ids must be writable");
+    }
+    return {
+        static_cast<std::uint64_t*>(ids.mutable_data()),
+        static_cast<std::size_t>(ids.shape(0))};
+}
+
+[[nodiscard]] std::span<throwdb::NativeIdLocation>
+validate_location_output(
+    py::array& locations, const py::ssize_t expected_rows) {
+    if (!dtype_equal(
+            locations.dtype(),
+            py::dtype::of<throwdb::NativeIdLocation>())) {
+        throw py::value_error(
+            "locations must have dtype "
+            "[('segment_id', '<u4'), ('row_index', '<u4')]");
+    }
+    require_native_endian(locations, "locations");
+    if (locations.ndim() != 1
+        || locations.shape(0) != expected_rows) {
+        throw py::value_error(
+            "locations must have shape (len(ids),)");
+    }
+    require_c_contiguous(locations, "locations");
+    require_aligned(locations, "locations");
+    if (!locations.writeable()) {
+        throw py::value_error("locations must be writable");
+    }
+    return {
+        static_cast<throwdb::NativeIdLocation*>(locations.mutable_data()),
+        static_cast<std::size_t>(locations.shape(0))};
+}
+
+struct ByteAddressRange {
+    std::uintptr_t begin{0};
+    std::uintptr_t end{0};
+};
+
+template <typename Value>
+[[nodiscard]] ByteAddressRange checked_byte_address_range(
+    const std::span<Value> values,
+    const char* const name) {
+    if (values.empty()) {
+        return {};
+    }
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(
+        values.data());
+    const std::size_t bytes = values.size_bytes();
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        throw py::value_error(
+            std::string(name) + " output address range overflows uintptr_t");
+    }
+    return ByteAddressRange{begin, begin + bytes};
+}
+
+[[nodiscard]] bool byte_address_ranges_overlap(
+    const ByteAddressRange left,
+    const ByteAddressRange right) noexcept {
+    return left.begin != left.end && right.begin != right.end
+           && left.begin < right.end && right.begin < left.end;
+}
+
+void require_disjoint_id_scan_outputs(
+    const std::span<std::uint64_t> ids,
+    const std::span<throwdb::NativeIdLocation> locations) {
+    if (byte_address_ranges_overlap(
+            checked_byte_address_range(ids, "ids"),
+            checked_byte_address_range(locations, "locations"))) {
+        throw py::value_error(
+            "ID scan output buffers must not overlap: ids and locations");
+    }
+}
+
+void require_disjoint_record_scan_outputs(
+    const std::span<std::uint64_t> ids,
+    const std::span<std::byte> embeddings,
+    const std::span<throwdb::NativeIdLocation> locations) {
+    const ByteAddressRange id_range = checked_byte_address_range(ids, "ids");
+    const ByteAddressRange embedding_range =
+        checked_byte_address_range(embeddings, "embeddings");
+    const ByteAddressRange location_range =
+        checked_byte_address_range(locations, "locations");
+    if (byte_address_ranges_overlap(id_range, embedding_range)) {
+        throw py::value_error(
+            "record scan output buffers must not overlap: ids and embeddings");
+    }
+    if (byte_address_ranges_overlap(id_range, location_range)) {
+        throw py::value_error(
+            "record scan output buffers must not overlap: ids and locations");
+    }
+    if (byte_address_ranges_overlap(embedding_range, location_range)) {
+        throw py::value_error(
+            "record scan output buffers must not overlap: embeddings and "
+            "locations");
+    }
+}
+
 class PyWriter {
 public:
     static std::unique_ptr<PyWriter> create(
@@ -1030,11 +1153,17 @@ public:
         result["catalog_generation"] = metadata.catalog_generation;
         result["committed_sequence"] = metadata.committed_sequence;
         result["live_count"] = metadata.live_count;
+        result["snapshot_bytes"] = metadata.snapshot_bytes;
         return result;
     }
 
     [[nodiscard]] bool done() const {
-        const std::scoped_lock operation(operation_mutex_);
+        const std::unique_lock operation(
+            operation_mutex_, std::try_to_lock);
+        if (!operation.owns_lock()) {
+            throw std::runtime_error(
+                "native ID scan is already in use by another thread");
+        }
         return acquire()->done();
     }
 
@@ -1091,7 +1220,14 @@ public:
                 static_cast<std::size_t>(locations.shape(0))};
         }
 
-        const std::scoped_lock operation(operation_mutex_);
+        require_disjoint_id_scan_outputs(id_span, location_span);
+
+        const std::unique_lock operation(
+            operation_mutex_, std::try_to_lock);
+        if (!operation.owns_lock()) {
+            throw std::runtime_error(
+                "native ID scan is already in use by another thread");
+        }
         const auto scan = acquire();
         py::gil_scoped_release release;
         return scan->read_into(id_span, location_span);
@@ -1109,6 +1245,162 @@ private:
     mutable std::mutex handle_mutex_;
     mutable std::mutex operation_mutex_;
     std::shared_ptr<throwdb::NativeIdScan> scan_;
+};
+
+class PyNativeReadView {
+public:
+    explicit PyNativeReadView(
+        std::unique_ptr<throwdb::NativeReadView> view)
+        : view_(std::move(view)) {
+        if (view_ == nullptr) {
+            throw std::runtime_error("native read view is null");
+        }
+    }
+
+    void close() {
+        std::shared_ptr<throwdb::NativeReadView> view;
+        {
+            const std::scoped_lock lock(handle_mutex_);
+            view = std::move(view_);
+        }
+        if (view == nullptr) {
+            return;
+        }
+        py::gil_scoped_release release;
+        view.reset();
+    }
+
+    [[nodiscard]] py::dict metadata() const {
+        return read_view_metadata_dict(acquire()->metadata());
+    }
+    [[nodiscard]] std::uint32_t output_dimension() const {
+        return acquire()->output_dimension();
+    }
+    [[nodiscard]] std::string dtype() const {
+        return dtype_info(acquire()->dtype()).name;
+    }
+    void get_into(const py::array& ids, py::array output) const {
+        const auto view = acquire();
+        const auto id_span = validate_ids(ids);
+        auto output_span = validate_output(
+            output,
+            ids.shape(0),
+            view->output_dimension(),
+            view->dtype(),
+            embedding_record_size(
+                view->dtype(), view->output_dimension()));
+        translate_id_errors([&] {
+            py::gil_scoped_release release;
+            view->get_into(id_span, output_span);
+        });
+    }
+
+private:
+    [[nodiscard]] std::shared_ptr<throwdb::NativeReadView> acquire() const {
+        const std::scoped_lock lock(handle_mutex_);
+        if (view_ == nullptr) {
+            throw std::runtime_error("native read view is closed");
+        }
+        return view_;
+    }
+
+    mutable std::mutex handle_mutex_;
+    std::shared_ptr<throwdb::NativeReadView> view_;
+};
+
+class PyNativeRecordScan {
+public:
+    explicit PyNativeRecordScan(
+        std::unique_ptr<throwdb::NativeRecordScan> scan)
+        : scan_(std::move(scan)) {
+        if (scan_ == nullptr) {
+            throw std::runtime_error("native record scan is null");
+        }
+    }
+
+    void close() {
+        std::shared_ptr<throwdb::NativeRecordScan> scan;
+        {
+            const std::scoped_lock lock(handle_mutex_);
+            scan = std::move(scan_);
+        }
+        if (scan == nullptr) {
+            return;
+        }
+        py::gil_scoped_release release;
+        scan.reset();
+    }
+
+    [[nodiscard]] py::dict metadata() const {
+        return read_view_metadata_dict(acquire()->metadata());
+    }
+    [[nodiscard]] std::uint32_t output_dimension() const {
+        return acquire()->output_dimension();
+    }
+    [[nodiscard]] std::string dtype() const {
+        return dtype_info(acquire()->dtype()).name;
+    }
+    [[nodiscard]] bool done() const {
+        const std::unique_lock operation(
+            operation_mutex_, std::try_to_lock);
+        if (!operation.owns_lock()) {
+            throw std::runtime_error(
+                "native record scan is already in use by another thread");
+        }
+        return acquire()->done();
+    }
+    [[nodiscard]] std::uint64_t read_into(
+        py::array ids,
+        py::array embeddings,
+        const py::object& locations_object) {
+        auto id_span = validate_writable_id_output(ids);
+        const auto scan = acquire();
+        auto embedding_span = validate_output(
+            embeddings,
+            ids.shape(0),
+            scan->output_dimension(),
+            scan->dtype(),
+            embedding_record_size(
+                scan->dtype(), scan->output_dimension()));
+
+        py::array locations;
+        std::span<throwdb::NativeIdLocation> location_span;
+        if (!locations_object.is_none()) {
+            if (!py::isinstance<py::array>(locations_object)) {
+                throw py::type_error(
+                    "locations must be a NumPy ndarray or None");
+            }
+            locations = py::cast<py::array>(locations_object);
+            location_span = validate_location_output(
+                locations, ids.shape(0));
+        }
+
+        require_disjoint_record_scan_outputs(
+            id_span, embedding_span, location_span);
+
+        const std::unique_lock operation(
+            operation_mutex_, std::try_to_lock);
+        if (!operation.owns_lock()) {
+            throw std::runtime_error(
+                "native record scan is already in use by another thread");
+        }
+        py::gil_scoped_release release;
+        return scan->read_into(
+            id_span, embedding_span, location_span);
+    }
+
+private:
+    [[nodiscard]] std::shared_ptr<throwdb::NativeRecordScan> acquire() const {
+        const std::scoped_lock lock(handle_mutex_);
+        if (scan_ == nullptr) {
+            throw std::runtime_error("native record scan is closed");
+        }
+        return scan_;
+    }
+
+    mutable std::mutex handle_mutex_;
+    mutable std::mutex operation_mutex_;
+    std::shared_ptr<throwdb::NativeRecordScan> scan_;
 };
 
 class PyNativeCollection {
@@ -1447,14 +1739,69 @@ public:
         return result;
     }
 
-    [[nodiscard]] std::unique_ptr<PyNativeIdScan> scan_ids() const {
+    [[nodiscard]] std::unique_ptr<PyNativeIdScan> scan_ids(
+        const py::object& max_snapshot_bytes) const {
         const auto collection = acquire_collection();
+        const std::uint64_t checked_budget = max_snapshot_bytes.is_none()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : checked_uint64_option(
+                  max_snapshot_bytes, "max_snapshot_bytes", true);
         std::unique_ptr<throwdb::NativeIdScan> scan;
         {
             py::gil_scoped_release release;
-            scan = collection->scan_ids();
+            scan = collection->scan_ids(checked_budget);
         }
         return std::make_unique<PyNativeIdScan>(std::move(scan));
+    }
+
+    [[nodiscard]] std::unique_ptr<PyNativeReadView> open_read_view(
+        const py::object& prefix_dimensions,
+        const py::object& max_snapshot_bytes) const {
+        const auto collection = acquire_collection();
+        const std::uint64_t prefix = prefix_dimensions.is_none()
+            ? 0
+            : checked_uint64_option(
+                  prefix_dimensions, "prefix_dimensions", false);
+        if (prefix > std::numeric_limits<std::uint32_t>::max()) {
+            throw py::value_error(
+                "prefix_dimensions exceeds the uint32 range");
+        }
+        const std::uint64_t budget = max_snapshot_bytes.is_none()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : checked_uint64_option(
+                  max_snapshot_bytes, "max_snapshot_bytes", true);
+        std::unique_ptr<throwdb::NativeReadView> view;
+        {
+            py::gil_scoped_release release;
+            view = collection->open_read_view(
+                static_cast<std::uint32_t>(prefix), budget);
+        }
+        return std::make_unique<PyNativeReadView>(std::move(view));
+    }
+
+    [[nodiscard]] std::unique_ptr<PyNativeRecordScan> scan_records(
+        const py::object& prefix_dimensions,
+        const py::object& max_snapshot_bytes) const {
+        const auto collection = acquire_collection();
+        const std::uint64_t prefix = prefix_dimensions.is_none()
+            ? 0
+            : checked_uint64_option(
+                  prefix_dimensions, "prefix_dimensions", false);
+        if (prefix > std::numeric_limits<std::uint32_t>::max()) {
+            throw py::value_error(
+                "prefix_dimensions exceeds the uint32 range");
+        }
+        const std::uint64_t budget = max_snapshot_bytes.is_none()
+            ? std::numeric_limits<std::uint64_t>::max()
+            : checked_uint64_option(
+                  max_snapshot_bytes, "max_snapshot_bytes", true);
+        std::unique_ptr<throwdb::NativeRecordScan> scan;
+        {
+            py::gil_scoped_release release;
+            scan = collection->scan_records(
+                static_cast<std::uint32_t>(prefix), budget);
+        }
+        return std::make_unique<PyNativeRecordScan>(std::move(scan));
     }
 
     [[nodiscard]] py::dict rotate_wal() {
@@ -1801,6 +2148,54 @@ PYBIND11_MODULE(_throwdb, module) {
                const py::object&,
                const py::object&) { scan.close(); });
 
+    py::class_<PyNativeReadView>(module, "NativeReadView")
+        .def_property_readonly("metadata", &PyNativeReadView::metadata)
+        .def_property_readonly(
+            "output_dimension", &PyNativeReadView::output_dimension)
+        .def_property_readonly("dtype", &PyNativeReadView::dtype)
+        .def(
+            "get_into",
+            &PyNativeReadView::get_into,
+            py::arg("ids"),
+            py::arg("output"))
+        .def("close", &PyNativeReadView::close)
+        .def(
+            "__enter__",
+            [](PyNativeReadView& view) -> PyNativeReadView& { return view; },
+            py::return_value_policy::reference_internal)
+        .def(
+            "__exit__",
+            [](PyNativeReadView& view,
+               const py::object&,
+               const py::object&,
+               const py::object&) { view.close(); });
+
+    py::class_<PyNativeRecordScan>(module, "NativeRecordScan")
+        .def_property_readonly("metadata", &PyNativeRecordScan::metadata)
+        .def_property_readonly(
+            "output_dimension", &PyNativeRecordScan::output_dimension)
+        .def_property_readonly("dtype", &PyNativeRecordScan::dtype)
+        .def_property_readonly("done", &PyNativeRecordScan::done)
+        .def(
+            "read_into",
+            &PyNativeRecordScan::read_into,
+            py::arg("ids"),
+            py::arg("embeddings"),
+            py::arg("locations") = py::none())
+        .def("close", &PyNativeRecordScan::close)
+        .def(
+            "__enter__",
+            [](PyNativeRecordScan& scan) -> PyNativeRecordScan& {
+                return scan;
+            },
+            py::return_value_policy::reference_internal)
+        .def(
+            "__exit__",
+            [](PyNativeRecordScan& scan,
+               const py::object&,
+               const py::object&,
+               const py::object&) { scan.close(); });
+
     py::class_<PyNativeCollection>(module, "NativeCollection")
         .def_static(
             "reader_capabilities",
@@ -1876,7 +2271,20 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("requested_count"),
             py::arg("seed"),
             py::arg("max_inspected_slots"))
-        .def("scan_ids", &PyNativeCollection::scan_ids)
+        .def(
+            "scan_ids",
+            &PyNativeCollection::scan_ids,
+            py::arg("max_snapshot_bytes") = py::none())
+        .def(
+            "open_read_view",
+            &PyNativeCollection::open_read_view,
+            py::arg("prefix_dimensions") = py::none(),
+            py::arg("max_snapshot_bytes") = py::none())
+        .def(
+            "scan_records",
+            &PyNativeCollection::scan_records,
+            py::arg("prefix_dimensions") = py::none(),
+            py::arg("max_snapshot_bytes") = py::none())
         .def("get", &PyNativeCollection::get, py::arg("ids"))
         .def(
             "get_into",

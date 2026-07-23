@@ -11,6 +11,11 @@ service ThrowDB {
   rpc Describe(DescribeRequest) returns (DescribeResponse);
   rpc Get(GetRequest) returns (GetResponse);
 
+  // Opens one pinned logical view, then exchanges bounded ID and embedding
+  // batches in request order. Protocol v1 uses an application window of one:
+  // the server writes one result before reading the next ID batch.
+  rpc StreamGet(stream StreamGetRequest) returns (stream StreamGetResponse);
+
   rpc Insert(MutationRequest) returns (MutationResponse);
   rpc Update(MutationRequest) returns (MutationResponse);
   rpc Upsert(MutationRequest) returns (MutationResponse);
@@ -20,6 +25,10 @@ service ThrowDB {
   // physical (segment_id, row_index) order. Each response is bounded by the
   // requested batch_rows and the server's configured message-byte limit.
   rpc ScanIds(ScanIdsRequest) returns (stream ScanIdsResponse);
+
+  // Pins one logical collection view and emits every live record exactly once
+  // in physical (segment_id, row_index) order.
+  rpc ScanRecords(ScanRecordsRequest) returns (stream ScanRecordsResponse);
 }
 
 enum IdType {
@@ -103,6 +112,8 @@ message Capabilities {
   // interrupted request against WAL recovery. Clients must not retry an
   // ambiguous mutation while this is false.
   bool durable_idempotency = 4;
+  bool stream_get = 5;
+  bool scan_records = 6;
 }
 
 message CollectionSchema {
@@ -234,6 +245,67 @@ message GetResponse {
   EmbeddingBatch embeddings = 1;
 }
 
+// Snapshot metadata is repeated on every streaming response. The token is
+// cursor-scoped, opaque, and nonzero. It is not resumable or accepted by
+// another RPC in protocol v1.
+message ReadSnapshot {
+  CollectionId collection_id = 1;
+  uint64 catalog_generation = 2;
+  uint64 committed_sequence = 3;
+  uint64 live_count = 4;
+  ScanToken token = 5;
+}
+
+message StreamGetOpen {
+  // Zero means the collection's complete dimension.
+  uint32 prefix_dimensions = 1;
+  // Zero lets the server choose. A nonzero value is a client-side ceiling;
+  // the server may negotiate a smaller batch.
+  uint32 max_batch_rows = 2;
+  // Maximum dense response payload bytes, excluding protobuf framing. Zero
+  // lets the server choose.
+  uint64 max_batch_payload_bytes = 3;
+}
+
+message StreamGetInputBatch {
+  // Starts at zero and must be contiguous within this stream.
+  uint64 sequence = 1;
+  IdBatch ids = 2;
+}
+
+message StreamGetRequest {
+  oneof payload {
+    // Must be the first and only open frame.
+    StreamGetOpen open = 1;
+    StreamGetInputBatch batch = 2;
+  }
+}
+
+message StreamGetOpened {
+  EmbeddingDType dtype = 1;
+  uint32 dimension = 2;
+  uint32 max_batch_rows = 3;
+  uint64 max_batch_payload_bytes = 4;
+  // Protocol v1 is deliberately stop-and-wait. A later minor version may
+  // negotiate a larger bounded window without changing message shapes.
+  uint32 request_window = 5;
+}
+
+message StreamGetOutputBatch {
+  uint64 sequence = 1;
+  // Number of rows returned by earlier batches in this stream.
+  uint64 input_offset = 2;
+  EmbeddingBatch embeddings = 3;
+}
+
+message StreamGetResponse {
+  ReadSnapshot snapshot = 1;
+  oneof payload {
+    StreamGetOpened opened = 2;
+    StreamGetOutputBatch batch = 3;
+  }
+}
+
 message MutationRequest {
   // Required and nonzero. Reusing it with the same operation and payload
   // returns the original committed result; reusing it for another payload is
@@ -295,4 +367,27 @@ message ScanIdsResponse {
   IdBatch ids = 3;
   LocationEncoding location_encoding = 4;
   bytes locations_le = 5;
+}
+
+message ScanRecordsRequest {
+  // Required client-side row ceiling. The server may emit fewer rows to honor
+  // response and admission-memory bounds.
+  uint32 batch_rows = 1;
+  // Maximum dense response payload bytes (IDs, embeddings, and optional
+  // locations), excluding protobuf framing. Zero lets the server choose.
+  uint64 max_batch_payload_bytes = 2;
+  // Zero means the collection's complete dimension.
+  uint32 prefix_dimensions = 3;
+  bool include_locations = 4;
+}
+
+message ScanRecordsResponse {
+  ReadSnapshot snapshot = 1;
+  uint64 emitted_offset = 2;
+  IdBatch ids = 3;
+  EmbeddingBatch embeddings = 4;
+  LocationEncoding location_encoding = 5;
+  bytes locations_le = 6;
+  uint32 max_batch_rows = 7;
+  uint64 max_batch_payload_bytes = 8;
 }

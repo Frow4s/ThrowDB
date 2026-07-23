@@ -64,6 +64,25 @@ For an editable complete-server checkout, use the same exported prefix:
 python -m pip install -e '.[test]'
 ```
 
+On a remote development machine, the repeatable update path is:
+
+```bash
+git pull --ff-only
+./tools/update_remote.sh
+source build/remote-current/environment.sh
+```
+
+The updater reuses the pinned gRPC toolchain, performs an incremental complete
+editable build without requiring Ninja, and runs a black-box smoke test against
+a temporary collection. It never touches a real collection or restarts a
+running daemon by default. Use `--pull` to include the fast-forward update,
+`--check quick` for focused streaming regressions, or
+`--restart-user-service UNIT` for an explicitly managed user-systemd service.
+See `./tools/update_remote.sh --help` for paths and environment overrides.
+Restart long-lived Jupyter kernels and Airflow workers after a successful
+update: a process that has already imported the C++ extension keeps the old
+code in memory.
+
 The bootstrap requires outbound GitHub access, Git, CMake, a C++ compiler,
 Make, Perl, and Python 3. It never uses `sudo`. See
 [`docs/grpc-server.md`](docs/grpc-server.md) for the reproducible server build
@@ -157,7 +176,8 @@ an unexpectedly dense WAL prefix into an unbounded allocation.
 then starts the native daemon for exactly one format-7 collection. It binds
 loopback by default, shares one in-memory index across clients, and exposes
 typed Health, Describe, Get, Insert, Update, Upsert, Delete, and
-server-streaming ScanIds. Startup never calibrates: `--tuning auto` reuses a
+snapshot-consistent StreamGet, ScanIds, and ScanRecords. Startup never
+calibrates: `--tuning auto` reuses a
 safe profile or reports a conservative fallback, `persisted` fails closed on a
 miss, and `conservative` bypasses the registry. The same Python package
 provides `RemoteCollection`:
@@ -196,7 +216,33 @@ with throwdb.RemoteCollection.connect("127.0.0.1:50051") as collection:
     with collection.scan_ids(batch_rows=65_536, with_locations=True) as scan:
         for batch in scan:
             print(batch.ids, batch.locations["segment_id"])
+
+    # Arbitrarily large query arrays/memmaps are normalized one batch at a
+    # time. Order and duplicates are preserved by one pinned read snapshot.
+    with collection.stream_get(
+        query_ids,
+        batch_rows=65_536,
+        max_batch_payload_bytes=64 << 20,
+        prefix_dimensions=128,
+    ) as stream:
+        for batch in stream:
+            consume(batch.ids, batch.embeddings)
+
+    # Full export is also bounded and stays in physical storage order.
+    with collection.scan_records(
+        batch_rows=65_536,
+        prefix_dimensions=128,
+        with_locations=True,
+    ) as scan:
+        for batch in scan:
+            consume(batch.ids, batch.embeddings, batch.locations)
 ```
+
+The local `Collection` exposes the same two operations. Its `stream_get()`
+iterator yields embedding arrays in query order, while `scan_records()` yields
+`RecordBatch`; both also have reusable-buffer forms for direct NumPy memmap
+writes. See [`docs/streaming-reads.md`](docs/streaming-reads.md) for snapshot,
+memory, cancellation, and partial-progress semantics.
 
 Public mutations always carry a nonzero UUID operation ID. Supplying one
 explicitly lets a caller repeat an ambiguous request after reconnect/restart;
@@ -668,7 +714,8 @@ can interrupt cleanup.
 - fair DRR scheduling and one shared I/O budget for mixed-size concurrent reads
   whenever the thread-pool or io_uring parallel coordinator is enabled;
 - a public C++ gRPC service for one existing format-7 collection, including
-  numeric CRUD, prefix reads, physical-order ID streaming, health checks, and
+  numeric CRUD, prefix reads, bounded snapshot point-read streaming,
+  physical-order ID/record streaming, health checks, and
   bounded durable mutation replay with explicit replay domains; it starts
   read-only, restricts plaintext to numeric loopback, supports mTLS, closes its
   data plane on drain/terminal storage faults, reserves independent unary/scan
@@ -687,6 +734,7 @@ can interrupt cleanup.
 
 See [the storage format](docs/storage-format.md),
 [the mutable-storage design](docs/mutable-storage.md), and
+[the streaming contract](docs/streaming-reads.md), plus
 [the benchmark plan](docs/testing.md) for details. The legacy
 `benchmarks/random_read.py` and `throwdb_bench` runners are sequential-baseline
 benchmarks: they open `Storage` without enabling the internal executor. For a

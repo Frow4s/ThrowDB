@@ -51,6 +51,11 @@ class ThrowDBStub:
                 request_serializer=throwdb_dot_v1_dot_throwdb__pb2.GetRequest.SerializeToString,
                 response_deserializer=throwdb_dot_v1_dot_throwdb__pb2.GetResponse.FromString,
                 _registered_method=True)
+        self.StreamGet = channel.stream_stream(
+                '/throwdb.v1.ThrowDB/StreamGet',
+                request_serializer=throwdb_dot_v1_dot_throwdb__pb2.StreamGetRequest.SerializeToString,
+                response_deserializer=throwdb_dot_v1_dot_throwdb__pb2.StreamGetResponse.FromString,
+                _registered_method=True)
         self.Insert = channel.unary_unary(
                 '/throwdb.v1.ThrowDB/Insert',
                 request_serializer=throwdb_dot_v1_dot_throwdb__pb2.MutationRequest.SerializeToString,
@@ -76,6 +81,11 @@ class ThrowDBStub:
                 request_serializer=throwdb_dot_v1_dot_throwdb__pb2.ScanIdsRequest.SerializeToString,
                 response_deserializer=throwdb_dot_v1_dot_throwdb__pb2.ScanIdsResponse.FromString,
                 _registered_method=True)
+        self.ScanRecords = channel.unary_stream(
+                '/throwdb.v1.ThrowDB/ScanRecords',
+                request_serializer=throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsRequest.SerializeToString,
+                response_deserializer=throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsResponse.FromString,
+                _registered_method=True)
 
 
 class ThrowDBServicer:
@@ -97,6 +107,15 @@ class ThrowDBServicer:
 
     def Get(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StreamGet(self, request_iterator, context):
+        """Opens one pinned logical view, then exchanges bounded ID and embedding
+        batches in request order. Protocol v1 uses an application window of one:
+        the server writes one result before reading the next ID batch.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -134,6 +153,14 @@ class ThrowDBServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ScanRecords(self, request, context):
+        """Pins one logical collection view and emits every live record exactly once
+        in physical (segment_id, row_index) order.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ThrowDBServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -151,6 +178,11 @@ def add_ThrowDBServicer_to_server(servicer, server):
                     servicer.Get,
                     request_deserializer=throwdb_dot_v1_dot_throwdb__pb2.GetRequest.FromString,
                     response_serializer=throwdb_dot_v1_dot_throwdb__pb2.GetResponse.SerializeToString,
+            ),
+            'StreamGet': grpc.stream_stream_rpc_method_handler(
+                    servicer.StreamGet,
+                    request_deserializer=throwdb_dot_v1_dot_throwdb__pb2.StreamGetRequest.FromString,
+                    response_serializer=throwdb_dot_v1_dot_throwdb__pb2.StreamGetResponse.SerializeToString,
             ),
             'Insert': grpc.unary_unary_rpc_method_handler(
                     servicer.Insert,
@@ -176,6 +208,11 @@ def add_ThrowDBServicer_to_server(servicer, server):
                     servicer.ScanIds,
                     request_deserializer=throwdb_dot_v1_dot_throwdb__pb2.ScanIdsRequest.FromString,
                     response_serializer=throwdb_dot_v1_dot_throwdb__pb2.ScanIdsResponse.SerializeToString,
+            ),
+            'ScanRecords': grpc.unary_stream_rpc_method_handler(
+                    servicer.ScanRecords,
+                    request_deserializer=throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsRequest.FromString,
+                    response_serializer=throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -261,6 +298,33 @@ class ThrowDB:
             '/throwdb.v1.ThrowDB/Get',
             throwdb_dot_v1_dot_throwdb__pb2.GetRequest.SerializeToString,
             throwdb_dot_v1_dot_throwdb__pb2.GetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamGet(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_stream(
+            request_iterator,
+            target,
+            '/throwdb.v1.ThrowDB/StreamGet',
+            throwdb_dot_v1_dot_throwdb__pb2.StreamGetRequest.SerializeToString,
+            throwdb_dot_v1_dot_throwdb__pb2.StreamGetResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -396,6 +460,33 @@ class ThrowDB:
             '/throwdb.v1.ThrowDB/ScanIds',
             throwdb_dot_v1_dot_throwdb__pb2.ScanIdsRequest.SerializeToString,
             throwdb_dot_v1_dot_throwdb__pb2.ScanIdsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ScanRecords(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/throwdb.v1.ThrowDB/ScanRecords',
+            throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsRequest.SerializeToString,
+            throwdb_dot_v1_dot_throwdb__pb2.ScanRecordsResponse.FromString,
             options,
             channel_credentials,
             insecure,

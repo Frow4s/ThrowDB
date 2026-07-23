@@ -253,6 +253,14 @@ public:
     [[nodiscard]] std::unique_ptr<NativeIdScan> open_scan(
         std::uint64_t max_snapshot_bytes =
             std::numeric_limits<std::uint64_t>::max()) const;
+    [[nodiscard]] std::unique_ptr<NativeReadView> open_read_view(
+        std::uint32_t prefix_dimension = 0,
+        std::uint64_t max_snapshot_bytes =
+            std::numeric_limits<std::uint64_t>::max()) const;
+    [[nodiscard]] std::unique_ptr<NativeRecordScan> open_record_scan(
+        std::uint32_t prefix_dimension = 0,
+        std::uint64_t max_snapshot_bytes =
+            std::numeric_limits<std::uint64_t>::max()) const;
 
     [[nodiscard]] NativeCollection& collection() noexcept;
     [[nodiscard]] const NativeCollection& collection() const noexcept;
