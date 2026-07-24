@@ -67,18 +67,23 @@ python -m pip install -e '.[test]'
 On a remote development machine, the repeatable update path is:
 
 ```bash
-git pull --ff-only
 ./tools/update_remote.sh
 source build/remote-current/environment.sh
 ```
 
 The updater reuses the pinned gRPC toolchain, performs an incremental complete
 editable build without requiring Ninja, and runs a black-box smoke test against
-a temporary collection. It never touches a real collection or restarts a
-running daemon by default. Use `--pull` to include the fast-forward update,
+a temporary collection. A copied source snapshot is supported even when it has
+no usable Git metadata (including a `.git` file that points back to the source
+machine); only `--pull` requires a real Git worktree. The updater never touches
+a real collection or restarts a running daemon by default. Use `--pull` in a
+real clone to include the fast-forward update,
 `--check quick` for focused streaming regressions, or
 `--restart-user-service UNIT` for an explicitly managed user-systemd service.
 See `./tools/update_remote.sh --help` for paths and environment overrides.
+Finish copying a source snapshot before invoking the updater: it fingerprints
+the build inputs before and after validation and refuses to publish stable
+launcher paths if they changed mid-build.
 Restart long-lived Jupyter kernels and Airflow workers after a successful
 update: a process that has already imported the C++ extension keeps the old
 code in memory.

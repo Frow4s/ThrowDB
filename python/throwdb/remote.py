@@ -1088,14 +1088,21 @@ class _StreamGetRequestIterator(Iterator[throwdb_pb2.StreamGetRequest]):
             self._credit += 1
             self._condition.notify_all()
 
-    def close(self) -> None:
+    def cancel(self) -> None:
         with self._condition:
             self._closed = True
-            # A cancelled call must not retain the last normalized ID batch.
-            # Those arrays can be large memmap slices copied to native-endian
-            # uint64, and gRPC may keep the producer alive after cancel().
-            self._pending.clear()
             self._condition.notify_all()
+
+    def release_pending(self) -> None:
+        with self._condition:
+            # A cancelled call must not retain the last normalized ID batch.
+            # The consumer lock guarantees that no received response is still
+            # resolving its matching IDs while this map is cleared.
+            self._pending.clear()
+
+    def close(self) -> None:
+        self.cancel()
+        self.release_pending()
 
     def __iter__(self) -> _StreamGetRequestIterator:
         return self
@@ -1418,8 +1425,14 @@ class RemoteEmbeddingStream(Iterator[RemoteEmbeddingBatch]):
         if self._closed:
             return
         self._closed = True
+        # Cancel transport/producer first so a consumer blocked in gRPC or a
+        # request source is released promptly. Keep pending IDs alive until
+        # the exclusive consumer leaves response decoding: close() can race
+        # after _next_response() but before pending_ids().
         self._stream.cancel()
-        self._producer.close()
+        self._producer.cancel()
+        with self._consumer_lock:
+            self._producer.release_pending()
 
     def __enter__(self) -> RemoteEmbeddingStream:
         if self._closed:

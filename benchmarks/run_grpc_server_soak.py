@@ -44,7 +44,7 @@ import run_grpc_server_benchmark as benchmark  # noqa: E402
 
 
 REPORT_FORMAT = "throwdb-grpc-server-soak"
-REPORT_REVISION = 1
+REPORT_REVISION = 2
 DEFAULT_SEED = 20260717
 GIB = 1 << 30
 MIB = 1 << 20
@@ -57,6 +57,10 @@ class SoakConfigurationError(ValueError):
 
 class SoakInvariantError(RuntimeError):
     pass
+
+
+class _ExpectedStreamStop(RuntimeError):
+    """Internal control-flow signal for a generation that is being stopped."""
 
 
 def log(message: str) -> None:
@@ -353,7 +357,7 @@ class _OperationAccumulator:
     useful_bytes: int = 0
     latency_sum_ns: int = 0
     latency_max_ns: int = 0
-    samples: dict[int, tuple[int, int]] = field(default_factory=dict)
+    samples: dict[int, tuple[int, int, bool]] = field(default_factory=dict)
 
 
 class OperationMetrics:
@@ -397,7 +401,7 @@ class OperationMetrics:
                 ).digest(),
                 "little",
             )
-            item.samples[ordinal] = (priority, latency_ns)
+            item.samples[ordinal] = (priority, latency_ns, success)
             if len(item.samples) > self._maximum:
                 evicted = max(
                     item.samples,
@@ -414,8 +418,21 @@ class OperationMetrics:
                 [item.samples[key][1] for key in sorted(item.samples)],
                 dtype=np.int64,
             )
+            successful_values = np.asarray(
+                [
+                    item.samples[key][1]
+                    for key in sorted(item.samples)
+                    if item.samples[key][2]
+                ],
+                dtype=np.int64,
+            )
             latency = (
                 benchmark.load_test.latency_metrics(values) if values.size else {}
+            )
+            successful_latency = (
+                benchmark.load_test.latency_metrics(successful_values)
+                if successful_values.size
+                else {}
             )
             result[name] = {
                 "attempts": item.attempts,
@@ -433,6 +450,9 @@ class OperationMetrics:
                 ),
                 "latency_max_all_ms": item.latency_max_ns / 1_000_000,
                 "latency_sample_count": int(values.size),
+                "successful_latency_sample_count": int(
+                    successful_values.size
+                ),
                 "latency_sampling": (
                     f"deterministic hash-priority reservoir, max {self._maximum}"
                 ),
@@ -443,6 +463,10 @@ class OperationMetrics:
                     max(item.samples) if item.samples else None
                 ),
                 **latency,
+                **{
+                    key.replace("latency_", "successful_latency_", 1): value
+                    for key, value in successful_latency.items()
+                },
             }
         return result
 
@@ -544,6 +568,20 @@ def payload_for(
 
 def _wire_get(rows: int, prefix: int, itemsize: int) -> int:
     return rows * (8 + prefix * itemsize)
+
+
+def _wire_scan_records(
+    rows: int,
+    prefix: int,
+    itemsize: int,
+    *,
+    with_locations: bool,
+) -> int:
+    return rows * (
+        8
+        + prefix * itemsize
+        + (throwdb.ID_LOCATION_DTYPE.itemsize if with_locations else 0)
+    )
 
 
 def _wire_put(rows: int, record_size: int) -> int:
@@ -651,15 +689,9 @@ def _invoke_mutation_with_replay(
 ) -> tuple[Any, Any, int]:
     primary: Any = None
     attempts = 0
+    replay_domain = idempotency_domain
     for attempt in range(primary_attempts):
         attempts += 1
-        if attempt:
-            _set_timeout(remote, budget, rpc_timeout)
-            _assert_idempotency_domain(
-                remote,
-                idempotency_domain,
-                operation_id=operation_id,
-            )
         _set_timeout(remote, budget, rpc_timeout)
         started = time.perf_counter_ns()
         try:
@@ -670,10 +702,39 @@ def _invoke_mutation_with_replay(
                 f"mutation_{name}", ordinal_base + attempt, elapsed,
                 rows=rows, useful_bytes=useful_bytes, success=False,
             )
-            errors.record(f"mutation_{name}", error)
+            if not isinstance(error, throwdb.RemoteAbortedError):
+                errors.record(f"mutation_{name}", error)
             if attempt + 1 == primary_attempts:
                 raise
-            continue
+            if isinstance(error, throwdb.RemoteAbortedError):
+                # ABORTED is the one mutation status guaranteed to have been
+                # rejected before durable PREPARE. Refreshing Describe may
+                # therefore move this same logical UUID into a newly rotated
+                # replay domain without risking a duplicate commit.
+                _set_timeout(remote, budget, rpc_timeout)
+                refreshed = remote.describe().idempotency_domain
+                if refreshed is None:
+                    raise SoakInvariantError(
+                        "ABORTED retry lost its durable idempotency domain"
+                    ) from error
+                replay_domain = refreshed
+                time.sleep(min(0.05 * (2 ** attempt), 0.5))
+                continue
+            if isinstance(
+                error,
+                (throwdb.AmbiguousCommitError, TimeoutError, ConnectionError),
+            ):
+                _set_timeout(remote, budget, rpc_timeout)
+                _assert_idempotency_domain(
+                    remote,
+                    replay_domain,
+                    operation_id=operation_id,
+                )
+                continue
+            # Semantic rejections, protocol/integrity failures, and arbitrary
+            # local exceptions are definitive. Retrying them can hide a broken
+            # workload or apply a request the caller did not intend.
+            raise
         elapsed = time.perf_counter_ns() - started
         metrics.record(
             f"mutation_{name}", ordinal_base + attempt, elapsed,
@@ -689,7 +750,7 @@ def _invoke_mutation_with_replay(
     _set_timeout(remote, budget, rpc_timeout)
     _assert_idempotency_domain(
         remote,
-        idempotency_domain,
+        replay_domain,
         operation_id=operation_id,
     )
     started = time.perf_counter_ns()
@@ -1026,6 +1087,1251 @@ class PopulationSample:
     source_rows: np.ndarray | None
 
 
+class RepeatedIds(Sequence[int]):
+    """A fixed-size, lazy repetition of a bounded uint64 population."""
+
+    def __init__(self, values: np.ndarray, count: int) -> None:
+        normalized = np.asarray(values, dtype=np.uint64)
+        if normalized.ndim != 1 or normalized.size == 0:
+            raise ValueError("repeated ID population must be non-empty and 1-D")
+        if count <= 0 or count > sys.maxsize:
+            raise ValueError("repeated ID count must fit a positive Py_ssize_t")
+        self._values = normalized
+        self._count = count
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index: int | slice) -> int | list[int]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self._count)
+            return [int(self._values[position % self._values.size])
+                    for position in range(start, stop, step)]
+        normalized = int(index)
+        if normalized < 0:
+            normalized += self._count
+        if not 0 <= normalized < self._count:
+            raise IndexError(index)
+        return int(self._values[normalized % self._values.size])
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingConfiguration:
+    stream_get_workers: int
+    scan_records_workers: int
+    stream_get_rows: int
+    scan_records_rows: int
+    batch_rows: int
+    max_batch_payload_bytes: int
+    prefix: int
+    attempt_seconds: float
+    progress_timeout_seconds: float
+    stop_timeout_seconds: float
+    rpc_timeout_seconds: float
+    mutation_rows: int
+    with_locations: bool = True
+    source_oracle: bool = False
+
+    @property
+    def worker_count(self) -> int:
+        return self.stream_get_workers + self.scan_records_workers
+
+    @property
+    def enabled_modes(self) -> tuple[str, ...]:
+        result: list[str] = []
+        if self.stream_get_workers:
+            result.append("stream_get")
+        if self.scan_records_workers:
+            result.append("scan_records")
+        return tuple(result)
+
+    def workers_for(self, mode: str) -> int:
+        if mode == "stream_get":
+            return self.stream_get_workers
+        if mode == "scan_records":
+            return self.scan_records_workers
+        raise ValueError(f"unsupported streaming mode: {mode}")
+
+
+@dataclass(slots=True)
+class _StreamingModeAccumulator:
+    configured_workers: int
+    workers_started: int = 0
+    workers_joined: int = 0
+    attempts_started: int = 0
+    attempts_completed: int = 0
+    attempts_rotated: int = 0
+    attempts_cancelled: int = 0
+    expected_restart_interruptions: int = 0
+    budget_stops: int = 0
+    unexpected_failures: int = 0
+    batches: int = 0
+    rows: int = 0
+    useful_bytes: int = 0
+    source_verified_rows: int = 0
+    shadow_checks: int = 0
+    worker_active_seconds: float = 0.0
+    open_latency_ns: int = 0
+    open_latency_max_ns: int = 0
+    max_inter_batch_gap_seconds: float = 0.0
+    first_snapshot: dict[str, Any] | None = None
+    last_snapshot: dict[str, Any] | None = None
+    snapshot_count: int = 0
+    first_digest_blake2b_256: str | None = None
+    last_digest_blake2b_256: str | None = None
+
+
+class StreamingMetrics:
+    """Bounded, thread-safe aggregate metrics for generation-scoped streams."""
+
+    def __init__(
+        self,
+        config: StreamingConfiguration,
+        operations: OperationMetrics,
+    ) -> None:
+        self._operations = operations
+        self._lock = threading.Lock()
+        self._modes = {
+            mode: _StreamingModeAccumulator(config.workers_for(mode))
+            for mode in config.enabled_modes
+        }
+        self._last_progress: dict[tuple[int, str, int], float] = {}
+        self._ordinals: dict[str, int] = {}
+        self._stream_get_reference_digest: str | None = None
+        self._generation_events: list[dict[str, Any]] = []
+
+    def worker_started(self, mode: str) -> None:
+        with self._lock:
+            self._modes[mode].workers_started += 1
+
+    def worker_finished(self, mode: str, elapsed_seconds: float) -> None:
+        with self._lock:
+            item = self._modes[mode]
+            item.workers_joined += 1
+            item.worker_active_seconds += elapsed_seconds
+
+    def attempt_opened(
+        self,
+        mode: str,
+        worker_key: tuple[int, str, int],
+        *,
+        snapshot: Any,
+        latency_ns: int,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            item = self._modes[mode]
+            item.attempts_started += 1
+            item.open_latency_ns += latency_ns
+            item.open_latency_max_ns = max(item.open_latency_max_ns, latency_ns)
+            encoded = _json_value(snapshot)
+            if item.first_snapshot is None:
+                item.first_snapshot = encoded
+            item.last_snapshot = encoded
+            item.snapshot_count += 1
+            self._last_progress[worker_key] = now
+            ordinal = self._ordinals.get(f"{mode}_open", 0)
+            self._ordinals[f"{mode}_open"] = ordinal + 1
+        self._operations.record(
+            f"{mode}_open",
+            ordinal,
+            latency_ns,
+            rows=0,
+            useful_bytes=0,
+            success=True,
+        )
+
+    def batch(
+        self,
+        mode: str,
+        worker_key: tuple[int, str, int],
+        *,
+        latency_ns: int,
+        rows: int,
+        useful_bytes: int,
+        source_verified_rows: int,
+        shadow_checked: bool,
+    ) -> None:
+        now = time.monotonic()
+        with self._lock:
+            item = self._modes[mode]
+            previous = self._last_progress.get(worker_key)
+            if previous is not None:
+                item.max_inter_batch_gap_seconds = max(
+                    item.max_inter_batch_gap_seconds,
+                    now - previous,
+                )
+            self._last_progress[worker_key] = now
+            item.batches += 1
+            item.rows += rows
+            item.useful_bytes += useful_bytes
+            item.source_verified_rows += source_verified_rows
+            item.shadow_checks += int(shadow_checked)
+            ordinal = self._ordinals.get(f"{mode}_batch", 0)
+            self._ordinals[f"{mode}_batch"] = ordinal + 1
+        self._operations.record(
+            f"{mode}_batch",
+            ordinal,
+            latency_ns,
+            rows=rows,
+            useful_bytes=useful_bytes,
+            success=True,
+        )
+
+    def attempt_finished(
+        self,
+        mode: str,
+        *,
+        status: str,
+        digest: str | None,
+    ) -> None:
+        with self._lock:
+            item = self._modes[mode]
+            if status == "completed":
+                item.attempts_completed += 1
+            elif status == "rotated":
+                item.attempts_rotated += 1
+            elif status == "cancelled":
+                item.attempts_cancelled += 1
+            elif status == "restart_interrupted":
+                item.expected_restart_interruptions += 1
+            elif status == "budget":
+                item.budget_stops += 1
+            else:
+                raise ValueError(f"unsupported stream attempt status: {status}")
+            if digest is not None:
+                if item.first_digest_blake2b_256 is None:
+                    item.first_digest_blake2b_256 = digest
+                item.last_digest_blake2b_256 = digest
+                if mode == "stream_get" and status == "completed":
+                    if self._stream_get_reference_digest is None:
+                        self._stream_get_reference_digest = digest
+                    elif digest != self._stream_get_reference_digest:
+                        raise SoakInvariantError(
+                            "StreamGet returned different bytes for the stable "
+                            "base-ID corpus across completed snapshots"
+                        )
+
+    def failure(self, mode: str) -> None:
+        with self._lock:
+            self._modes[mode].unexpected_failures += 1
+
+    def progress_count(self, generation: int, mode: str) -> int:
+        with self._lock:
+            return sum(
+                1
+                for (observed_generation, observed_mode, _), timestamp
+                in self._last_progress.items()
+                if observed_generation == generation
+                and observed_mode == mode
+                and timestamp > 0
+            )
+
+    def record_generation(self, event: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._generation_events.append(dict(event))
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            modes = {
+                mode: _json_value(item)
+                for mode, item in self._modes.items()
+            }
+            events = [dict(item) for item in self._generation_events]
+        for item in modes.values():
+            active = float(item["worker_active_seconds"])
+            rows = int(item["rows"])
+            useful = int(item["useful_bytes"])
+            attempts = int(item["attempts_started"])
+            item["rows_per_worker_active_second"] = (
+                rows / active if active > 0 else 0.0
+            )
+            item["logical_mib_per_worker_active_second"] = (
+                useful / MIB / active if active > 0 else 0.0
+            )
+            item["mean_open_latency_ms"] = (
+                item["open_latency_ns"] / attempts / 1_000_000
+                if attempts
+                else None
+            )
+            item["max_open_latency_ms"] = (
+                item["open_latency_max_ns"] / 1_000_000
+            )
+        return {"modes": modes, "generations": events}
+
+
+@dataclass(slots=True)
+class _StreamingGeneration:
+    generation: int
+    endpoint: str
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    budget_exhausted: threading.Event = field(default_factory=threading.Event)
+    release_event: threading.Event = field(default_factory=threading.Event)
+    expected_interruption: threading.Event = field(default_factory=threading.Event)
+    expected_interruption_workers: set[tuple[str, int]] = field(
+        default_factory=set
+    )
+    interrupted_workers: set[tuple[str, int]] = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    clients: dict[tuple[str, int], Any] = field(default_factory=dict)
+    streams: dict[tuple[str, int], Any] = field(default_factory=dict)
+    threads: list[threading.Thread] = field(default_factory=list)
+    failures: list[BaseException] = field(default_factory=list)
+    progress_by_worker: dict[tuple[str, int], int] = field(
+        default_factory=dict
+    )
+    last_progress_monotonic: dict[tuple[str, int], float] = field(
+        default_factory=dict
+    )
+    started_monotonic: float = field(default_factory=time.monotonic)
+
+
+class StreamingWorkload:
+    """Own dedicated streaming clients and make restart boundaries explicit."""
+
+    def __init__(
+        self,
+        *,
+        config: StreamingConfiguration,
+        population: np.ndarray,
+        source_rows: np.ndarray | None,
+        source_embeddings: np.ndarray | None,
+        shadow_payload: np.ndarray,
+        dimension: int,
+        dtype: str,
+        budget: benchmark.ResourceBudget,
+        operations: OperationMetrics,
+        errors: ErrorMetrics,
+    ) -> None:
+        self.config = config
+        self._population = np.array(population, dtype=np.uint64, copy=True)
+        self._source_rows = (
+            np.array(source_rows, dtype=np.int64, copy=True)
+            if source_rows is not None
+            else None
+        )
+        self._source_embeddings = source_embeddings
+        self._shadow_payload = shadow_payload
+        self._dimension = dimension
+        self._dtype = np.dtype(dtype)
+        self._budget = budget
+        self._operations = operations
+        self._errors = errors
+        self.metrics = StreamingMetrics(config, operations)
+        self._current: _StreamingGeneration | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.config.worker_count > 0
+
+    def _connect(self, endpoint: str) -> Any:
+        remaining = max(1.0, self._budget.remaining_seconds())
+        scan_timeout = min(
+            self.config.attempt_seconds + self.config.rpc_timeout_seconds,
+            remaining + self.config.stop_timeout_seconds,
+        )
+        return throwdb.RemoteCollection.connect(
+            endpoint,
+            timeout=min(self.config.rpc_timeout_seconds, remaining),
+            scan_timeout=max(1.0, scan_timeout),
+        )
+
+    def _register_client(
+        self,
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+        client: Any,
+    ) -> None:
+        with state.lock:
+            if state.stop_event.is_set():
+                client.close()
+                raise _ExpectedStreamStop(
+                    "stream generation stopped during connect"
+                )
+            state.clients[key] = client
+            state.last_progress_monotonic[key] = time.monotonic()
+
+    def _register_stream(
+        self,
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+        stream: Any,
+    ) -> None:
+        with state.lock:
+            if state.stop_event.is_set():
+                stream.close()
+                raise _ExpectedStreamStop(
+                    "stream generation stopped during open"
+                )
+            state.streams[key] = stream
+            state.last_progress_monotonic[key] = time.monotonic()
+
+    @staticmethod
+    def _unregister_stream(
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+    ) -> None:
+        with state.lock:
+            state.streams.pop(key, None)
+
+    @staticmethod
+    def _raise_if_stopped(state: _StreamingGeneration) -> None:
+        if state.stop_event.is_set():
+            raise _ExpectedStreamStop("stream generation is stopping")
+
+    def _open_stream(
+        self,
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+        factory: Callable[[], Any],
+    ) -> tuple[Any, Any, int]:
+        """Open one stream, tolerating asynchronous release of a prior lease."""
+
+        started = time.perf_counter_ns()
+        deadline = time.monotonic() + min(
+            self.config.progress_timeout_seconds,
+            max(0.001, self._budget.remaining_seconds()),
+        )
+        delay = 0.005
+        while True:
+            self._raise_if_stopped(state)
+            stream: Any | None = None
+            try:
+                stream = factory()
+                # Both remote streaming APIs receive and validate their opened
+                # response during construction. Accessing snapshot makes that
+                # contract explicit for fakes and future implementations.
+                snapshot = stream.snapshot
+                self._register_stream(state, key, stream)
+                return (
+                    stream,
+                    snapshot,
+                    time.perf_counter_ns() - started,
+                )
+            except throwdb.RemoteResourceExhaustedError:
+                if stream is not None:
+                    with contextlib.suppress(BaseException):
+                        stream.close()
+                self._raise_if_stopped(state)
+                remaining = min(
+                    deadline - time.monotonic(),
+                    self._budget.remaining_seconds(),
+                )
+                if remaining <= 0:
+                    raise
+                # A cancelled partial stream releases its server-side admission
+                # lease asynchronously. Retry only the fresh open; no partial
+                # data or snapshot is ever resumed.
+                if state.stop_event.wait(min(delay, remaining)):
+                    raise _ExpectedStreamStop(
+                        "stream generation stopped during admission retry"
+                    )
+                delay = min(0.1, delay * 2)
+            except BaseException:
+                if stream is not None:
+                    with contextlib.suppress(BaseException):
+                        stream.close()
+                raise
+
+    @staticmethod
+    def _snapshot_digest_part(digest: Any, values: np.ndarray) -> None:
+        contiguous = np.ascontiguousarray(values)
+        digest.update(memoryview(contiguous).cast("B"))
+
+    def _expected_positions(self, offset: int, rows: int) -> np.ndarray:
+        return (
+            np.arange(offset, offset + rows, dtype=np.uint64)
+            % np.uint64(self._population.size)
+        ).astype(np.int64, copy=False)
+
+    def _run_stream_get_attempt(
+        self,
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+        client: Any,
+        *,
+        first_attempt: bool,
+    ) -> str:
+        self._raise_if_stopped(state)
+        rows = self.config.stream_get_rows
+        maximum_batch_rows = min(self.config.batch_rows, rows)
+        maximum_batch_wire = _wire_get(
+            maximum_batch_rows,
+            self.config.prefix,
+            self._dtype.itemsize,
+        )
+
+        def reserve_batch() -> None:
+            self._budget.reserve(
+                maximum_batch_wire,
+                extra_memory_bytes=(
+                    3 * self.config.max_batch_payload_bytes
+                    * self.config.worker_count
+                ),
+            )
+
+        # The open response may be followed immediately by a buffered first
+        # batch, so reserve one complete negotiated-request batch before open.
+        reserve_batch()
+        source = RepeatedIds(self._population, rows)
+        stream, snapshot, open_latency_ns = self._open_stream(
+            state,
+            key,
+            lambda: client.stream_get(
+                source,
+                prefix_dimensions=self.config.prefix,
+                batch_rows=self.config.batch_rows,
+                max_batch_payload_bytes=self.config.max_batch_payload_bytes,
+            ),
+        )
+        worker_key = (state.generation, key[0], key[1])
+        self.metrics.attempt_opened(
+            "stream_get",
+            worker_key,
+            snapshot=snapshot,
+            latency_ns=open_latency_ns,
+        )
+        if first_attempt:
+            while not state.release_event.wait(0.05):
+                if state.stop_event.is_set():
+                    return (
+                        "restart_interrupted"
+                        if state.expected_interruption.is_set()
+                        else "cancelled"
+                    )
+            if state.stop_event.is_set():
+                return (
+                    "restart_interrupted"
+                    if state.expected_interruption.is_set()
+                    else "cancelled"
+                )
+        digest = hashlib.blake2b(digest_size=32)
+        emitted = 0
+        reserved_batch_available = True
+        attempt_started = time.monotonic()
+        status = "completed"
+        try:
+            with stream:
+                iterator = iter(stream)
+                while True:
+                    if state.stop_event.is_set():
+                        status = (
+                            "restart_interrupted"
+                            if state.expected_interruption.is_set()
+                            else "cancelled"
+                        )
+                        break
+                    if not reserved_batch_available and emitted < rows:
+                        reserve_batch()
+                        reserved_batch_available = True
+                    next_started = time.perf_counter_ns()
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        if state.stop_event.is_set() and emitted < rows:
+                            status = (
+                                "restart_interrupted"
+                                if state.expected_interruption.is_set()
+                                else "cancelled"
+                            )
+                        break
+                    reserved_batch_available = False
+                    latency_ns = time.perf_counter_ns() - next_started
+                    rows_in_batch = int(batch.ids.size)
+                    if batch.input_offset != emitted:
+                        raise SoakInvariantError(
+                            "StreamGet offsets are not contiguous"
+                        )
+                    positions = self._expected_positions(emitted, rows_in_batch)
+                    expected_ids = self._population[positions]
+                    if not np.array_equal(batch.ids, expected_ids):
+                        raise SoakInvariantError(
+                            "StreamGet changed requested ID ordering"
+                        )
+                    expected_shape = (rows_in_batch, self.config.prefix)
+                    if (
+                        batch.embeddings.shape != expected_shape
+                        or batch.embeddings.dtype != self._dtype
+                    ):
+                        raise SoakInvariantError(
+                            "StreamGet returned an invalid dtype or shape"
+                        )
+                    shadow_checked = emitted == 0
+                    if shadow_checked:
+                        _assert_bits(
+                            batch.embeddings[:1],
+                            self._shadow_payload[:, : self.config.prefix],
+                            "StreamGet shadow row",
+                        )
+                    verified_rows = 0
+                    if (
+                        self._source_embeddings is not None
+                        and self._source_rows is not None
+                    ):
+                        expected = np.asarray(
+                            self._source_embeddings[
+                                self._source_rows[positions],
+                                : self.config.prefix,
+                            ],
+                            dtype=self._dtype,
+                            order="C",
+                        )
+                        _assert_bits(
+                            batch.embeddings,
+                            expected,
+                            "StreamGet source oracle",
+                        )
+                        verified_rows = rows_in_batch
+                    self._snapshot_digest_part(digest, batch.ids)
+                    self._snapshot_digest_part(digest, batch.embeddings)
+                    useful = _wire_get(
+                        rows_in_batch,
+                        self.config.prefix,
+                        self._dtype.itemsize,
+                    )
+                    emitted += rows_in_batch
+                    self.metrics.batch(
+                        "stream_get",
+                        worker_key,
+                        latency_ns=latency_ns,
+                        rows=rows_in_batch,
+                        useful_bytes=useful,
+                        source_verified_rows=verified_rows,
+                        shadow_checked=shadow_checked,
+                    )
+                    with state.lock:
+                        state.progress_by_worker[key] = (
+                            state.progress_by_worker.get(key, 0)
+                            + rows_in_batch
+                        )
+                        state.last_progress_monotonic[key] = time.monotonic()
+                    if (
+                        time.monotonic() - attempt_started
+                        >= self.config.attempt_seconds
+                        and emitted < rows
+                    ):
+                        status = "rotated"
+                        break
+            if status == "completed":
+                if emitted != rows or not stream.done:
+                    raise SoakInvariantError(
+                        "StreamGet ended before every requested row"
+                    )
+                return digest.hexdigest()
+            return status
+        finally:
+            self._unregister_stream(state, key)
+
+    def _run_scan_records_attempt(
+        self,
+        state: _StreamingGeneration,
+        key: tuple[str, int],
+        client: Any,
+        *,
+        first_attempt: bool,
+    ) -> tuple[str, str]:
+        self._raise_if_stopped(state)
+        description = client.describe()
+        if description.count <= 0:
+            raise SoakInvariantError("ScanRecords requires a non-empty snapshot")
+        planned_target_rows = min(
+            self.config.scan_records_rows,
+            description.count + 2 * self.config.mutation_rows,
+        )
+        possible_rows = min(
+            description.count + 2 * self.config.mutation_rows,
+            planned_target_rows + self.config.batch_rows - 1,
+        )
+        maximum_batch_rows = min(self.config.batch_rows, possible_rows)
+        maximum_batch_wire = _wire_scan_records(
+            maximum_batch_rows,
+            self.config.prefix,
+            self._dtype.itemsize,
+            with_locations=self.config.with_locations,
+        )
+
+        def reserve_batch() -> None:
+            self._budget.reserve(
+                maximum_batch_wire,
+                extra_memory_bytes=(
+                    3 * self.config.max_batch_payload_bytes
+                    * self.config.worker_count
+                ),
+            )
+
+        # RemoteRecordScan may eagerly receive its first data frame while
+        # opening, hence the first per-batch charge precedes the RPC.
+        reserve_batch()
+        stream, snapshot, open_latency_ns = self._open_stream(
+            state,
+            key,
+            lambda: client.scan_records(
+                prefix_dimensions=self.config.prefix,
+                batch_rows=self.config.batch_rows,
+                max_batch_payload_bytes=self.config.max_batch_payload_bytes,
+                with_locations=self.config.with_locations,
+            ),
+        )
+        target_rows = min(
+            self.config.scan_records_rows,
+            int(stream.snapshot_count),
+        )
+        if target_rows <= 0:
+            raise SoakInvariantError("ScanRecords opened an empty snapshot")
+        worker_key = (state.generation, key[0], key[1])
+        self.metrics.attempt_opened(
+            "scan_records",
+            worker_key,
+            snapshot=snapshot,
+            latency_ns=open_latency_ns,
+        )
+        if first_attempt:
+            while not state.release_event.wait(0.05):
+                if state.stop_event.is_set():
+                    return (
+                        (
+                            "restart_interrupted"
+                            if state.expected_interruption.is_set()
+                            else "cancelled"
+                        ),
+                        "",
+                    )
+            if state.stop_event.is_set():
+                return (
+                    (
+                        "restart_interrupted"
+                        if state.expected_interruption.is_set()
+                        else "cancelled"
+                    ),
+                    "",
+                )
+        digest = hashlib.blake2b(digest_size=32)
+        emitted = 0
+        reserved_batch_available = True
+        previous_location: int | None = None
+        attempt_started = time.monotonic()
+        status = "completed"
+        try:
+            with stream:
+                iterator = iter(stream)
+                while True:
+                    if state.stop_event.is_set():
+                        status = (
+                            "restart_interrupted"
+                            if state.expected_interruption.is_set()
+                            else "cancelled"
+                        )
+                        break
+                    if (
+                        not reserved_batch_available
+                        and emitted < target_rows
+                    ):
+                        reserve_batch()
+                        reserved_batch_available = True
+                    next_started = time.perf_counter_ns()
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        if state.stop_event.is_set() and emitted < target_rows:
+                            status = (
+                                "restart_interrupted"
+                                if state.expected_interruption.is_set()
+                                else "cancelled"
+                            )
+                        break
+                    reserved_batch_available = False
+                    latency_ns = time.perf_counter_ns() - next_started
+                    rows_in_batch = int(batch.ids.size)
+                    if batch.emitted_offset != emitted:
+                        raise SoakInvariantError(
+                            "ScanRecords offsets are not contiguous"
+                        )
+                    if (
+                        batch.embeddings.shape
+                        != (rows_in_batch, self.config.prefix)
+                        or batch.embeddings.dtype != self._dtype
+                    ):
+                        raise SoakInvariantError(
+                            "ScanRecords returned an invalid dtype or shape"
+                        )
+                    locations = batch.locations
+                    if self.config.with_locations:
+                        if (
+                            locations is None
+                            or locations.dtype != throwdb.ID_LOCATION_DTYPE
+                            or locations.shape != (rows_in_batch,)
+                        ):
+                            raise SoakInvariantError(
+                                "ScanRecords omitted requested locations"
+                            )
+                        encoded_locations = (
+                            locations["segment_id"].astype(np.uint64) << 32
+                        ) | locations["row_index"].astype(np.uint64)
+                        if encoded_locations.size:
+                            if (
+                                previous_location is not None
+                                and int(encoded_locations[0])
+                                <= previous_location
+                            ) or (
+                                encoded_locations.size > 1
+                                and bool(np.any(
+                                    encoded_locations[1:]
+                                    <= encoded_locations[:-1]
+                                ))
+                            ):
+                                raise SoakInvariantError(
+                                    "ScanRecords locations are not strictly "
+                                    "in physical order"
+                                )
+                            previous_location = int(encoded_locations[-1])
+                    self._snapshot_digest_part(digest, batch.ids)
+                    self._snapshot_digest_part(digest, batch.embeddings)
+                    if locations is not None:
+                        self._snapshot_digest_part(digest, locations)
+                    useful = _wire_scan_records(
+                        rows_in_batch,
+                        self.config.prefix,
+                        self._dtype.itemsize,
+                        with_locations=self.config.with_locations,
+                    )
+                    emitted += rows_in_batch
+                    self.metrics.batch(
+                        "scan_records",
+                        worker_key,
+                        latency_ns=latency_ns,
+                        rows=rows_in_batch,
+                        useful_bytes=useful,
+                        source_verified_rows=0,
+                        shadow_checked=False,
+                    )
+                    with state.lock:
+                        state.progress_by_worker[key] = (
+                            state.progress_by_worker.get(key, 0)
+                            + rows_in_batch
+                        )
+                        state.last_progress_monotonic[key] = time.monotonic()
+                    if emitted >= target_rows and target_rows < stream.snapshot_count:
+                        break
+                    if (
+                        time.monotonic() - attempt_started
+                        >= self.config.attempt_seconds
+                        and emitted < target_rows
+                    ):
+                        status = "rotated"
+                        break
+            if status == "completed" and emitted < target_rows:
+                raise SoakInvariantError(
+                    "ScanRecords ended before its bounded target"
+                )
+            return status, digest.hexdigest()
+        finally:
+            self._unregister_stream(state, key)
+
+    @staticmethod
+    def _expected_controlled_stop_error(error: BaseException) -> bool:
+        if isinstance(
+            error,
+            (
+                throwdb.RemoteCancelledError,
+                throwdb.RemoteDeadlineExceededError,
+                throwdb.RemoteUnavailableError,
+            ),
+        ):
+            return True
+        return (
+            isinstance(error, RuntimeError)
+            and str(error) in {
+                "remote collection is closed",
+                "StreamGet is closed",
+                "ScanRecords is closed",
+                "record scan is closed",
+            }
+        )
+
+    def _worker(
+        self,
+        state: _StreamingGeneration,
+        mode: str,
+        worker_index: int,
+    ) -> None:
+        key = (mode, worker_index)
+        started = time.monotonic()
+        self.metrics.worker_started(mode)
+        client: Any | None = None
+        first_attempt = True
+        try:
+            client = self._connect(state.endpoint)
+            self._register_client(state, key, client)
+            while not state.stop_event.is_set():
+                try:
+                    if mode == "stream_get":
+                        result = self._run_stream_get_attempt(
+                            state,
+                            key,
+                            client,
+                            first_attempt=first_attempt,
+                        )
+                        if result in {
+                            "rotated",
+                            "cancelled",
+                            "restart_interrupted",
+                        }:
+                            status = result
+                            digest = None
+                        else:
+                            status = "completed"
+                            digest = result
+                    else:
+                        status, digest = self._run_scan_records_attempt(
+                            state,
+                            key,
+                            client,
+                            first_attempt=first_attempt,
+                        )
+                    self.metrics.attempt_finished(
+                        mode,
+                        status=status,
+                        digest=(
+                            digest or None
+                            if status == "completed"
+                            else None
+                        ),
+                    )
+                    if status == "restart_interrupted":
+                        with state.lock:
+                            state.interrupted_workers.add(key)
+                    first_attempt = False
+                    if status in {"cancelled", "restart_interrupted"}:
+                        return
+                except _ExpectedStreamStop:
+                    return
+                except benchmark.BenchmarkBudgetExceeded:
+                    self.metrics.attempt_finished(
+                        mode,
+                        status="budget",
+                        digest=None,
+                    )
+                    state.budget_exhausted.set()
+                    self._cancel_state(state)
+                    return
+                except BaseException as error:
+                    if (
+                        (state.stop_event.is_set()
+                         or state.expected_interruption.is_set())
+                        and self._expected_controlled_stop_error(error)
+                    ):
+                        self.metrics.attempt_finished(
+                            mode,
+                            status=(
+                                "restart_interrupted"
+                                if state.expected_interruption.is_set()
+                                else "cancelled"
+                            ),
+                            digest=None,
+                        )
+                        if state.expected_interruption.is_set():
+                            with state.lock:
+                                state.interrupted_workers.add(key)
+                        return
+                    self.metrics.failure(mode)
+                    self._errors.record(mode, error)
+                    with state.lock:
+                        state.failures.append(error)
+                    self._cancel_state(state)
+                    return
+        except _ExpectedStreamStop:
+            pass
+        except benchmark.BenchmarkBudgetExceeded:
+            self.metrics.attempt_finished(mode, status="budget", digest=None)
+            state.budget_exhausted.set()
+            self._cancel_state(state)
+        except BaseException as error:
+            if (
+                (state.stop_event.is_set()
+                 or state.expected_interruption.is_set())
+                and self._expected_controlled_stop_error(error)
+            ):
+                self.metrics.attempt_finished(
+                    mode,
+                    status=(
+                        "restart_interrupted"
+                        if state.expected_interruption.is_set()
+                        else "cancelled"
+                    ),
+                    digest=None,
+                )
+                if state.expected_interruption.is_set():
+                    with state.lock:
+                        state.interrupted_workers.add(key)
+            else:
+                self.metrics.failure(mode)
+                self._errors.record(mode, error)
+                with state.lock:
+                    state.failures.append(error)
+                self._cancel_state(state)
+        finally:
+            with state.lock:
+                state.streams.pop(key, None)
+                state.clients.pop(key, None)
+            if client is not None:
+                with contextlib.suppress(BaseException):
+                    client.close()
+            self.metrics.worker_finished(mode, time.monotonic() - started)
+
+    def start_generation(self, endpoint: str, generation: int) -> None:
+        if not self.enabled:
+            return
+        if self._current is not None:
+            raise RuntimeError("stream generation is already active")
+        state = _StreamingGeneration(generation=generation, endpoint=endpoint)
+        self._current = state
+        for mode in self.config.enabled_modes:
+            for worker_index in range(self.config.workers_for(mode)):
+                thread = threading.Thread(
+                    target=self._worker,
+                    args=(state, mode, worker_index),
+                    name=f"throwdb-soak-{mode}-g{generation}-w{worker_index}",
+                    daemon=True,
+                )
+                state.threads.append(thread)
+                thread.start()
+        self.wait_until_open()
+
+    def wait_until_open(self) -> None:
+        state = self._current
+        if state is None:
+            return
+        deadline = time.monotonic() + min(
+            self.config.progress_timeout_seconds,
+            max(0.001, self._budget.remaining_seconds()),
+        )
+        while time.monotonic() < deadline:
+            self.check()
+            with state.lock:
+                if len(state.streams) == self.config.worker_count:
+                    return
+                alive = any(thread.is_alive() for thread in state.threads)
+            if not alive:
+                break
+            time.sleep(0.02)
+        self._cancel_state(state)
+        raise SoakInvariantError(
+            "stream workers did not all open before the progress timeout"
+        )
+
+    def release_and_wait_for_progress(self) -> None:
+        state = self._current
+        if state is None:
+            return
+        state.release_event.set()
+        deadline = time.monotonic() + min(
+            self.config.progress_timeout_seconds,
+            max(0.001, self._budget.remaining_seconds()),
+        )
+        while time.monotonic() < deadline:
+            self.check()
+            with state.lock:
+                expected_workers = {
+                    (mode, worker_index)
+                    for mode in self.config.enabled_modes
+                    for worker_index in range(
+                        self.config.workers_for(mode)
+                    )
+                }
+                progressed = all(
+                    state.progress_by_worker.get(key, 0) > 0
+                    for key in expected_workers
+                )
+            if progressed:
+                return
+            if state.budget_exhausted.is_set():
+                raise benchmark.BenchmarkBudgetExceeded(
+                    "streaming budget was exhausted before every worker "
+                    "made first-batch progress"
+                )
+            time.sleep(0.02)
+        self._cancel_state(state)
+        raise SoakInvariantError(
+            "stream workers made no first-batch progress before timeout"
+        )
+
+    def wait_until_any_active(self) -> None:
+        state = self._current
+        if state is None:
+            raise SoakInvariantError("no active stream generation")
+        deadline = time.monotonic() + min(
+            self.config.progress_timeout_seconds,
+            max(0.001, self._budget.remaining_seconds()),
+        )
+        while time.monotonic() < deadline:
+            self.check()
+            with state.lock:
+                if state.streams:
+                    return
+            time.sleep(0.02)
+        raise SoakInvariantError(
+            "no active stream remained for forced-restart interruption"
+        )
+
+    def expect_forced_interruption(self) -> None:
+        if self._current is None:
+            return
+        self.wait_until_any_active()
+        self.mark_forced_interruption()
+
+    def mark_forced_interruption(self) -> None:
+        """Mark the current generation immediately before supervisor SIGKILL."""
+
+        self.wait_until_any_active()
+        state = self._current
+        if state is not None:
+            with state.lock:
+                state.expected_interruption_workers = set(
+                    state.streams
+                )
+            state.expected_interruption.set()
+
+    def check(self) -> None:
+        state = self._current
+        if state is None:
+            return
+        with state.lock:
+            if state.failures:
+                raise state.failures[0]
+            alive = any(thread.is_alive() for thread in state.threads)
+            now = time.monotonic()
+            active_gaps = [
+                now - state.last_progress_monotonic.get(key, now)
+                for key in state.clients
+            ]
+        if not alive and not state.stop_event.is_set():
+            raise SoakInvariantError(
+                "every stream worker stopped before the workload barrier"
+            )
+        if active_gaps:
+            worst_gap = max(active_gaps)
+            if worst_gap > self.config.progress_timeout_seconds:
+                error = SoakInvariantError(
+                    "stream batch progress stalled for "
+                    f"{worst_gap:.3f}s (limit "
+                    f"{self.config.progress_timeout_seconds:.3f}s)"
+                )
+                with state.lock:
+                    state.failures.append(error)
+                self._cancel_state(state)
+                raise error
+
+    @property
+    def budget_exhausted(self) -> bool:
+        return bool(
+            self._current is not None
+            and self._current.budget_exhausted.is_set()
+        )
+
+    @staticmethod
+    def _cancel_state(state: _StreamingGeneration) -> None:
+        state.stop_event.set()
+        state.release_event.set()
+        with state.lock:
+            streams = list(state.streams.values())
+            clients = list(state.clients.values())
+        for stream in streams:
+            with contextlib.suppress(BaseException):
+                stream.close()
+        for client in clients:
+            with contextlib.suppress(BaseException):
+                client.close()
+
+    def stop_generation(self, reason: str) -> dict[str, Any]:
+        state = self._current
+        if state is None:
+            return {
+                "generation": None,
+                "reason": reason,
+                "joined": True,
+                "seconds": 0.0,
+            }
+        started = time.monotonic()
+        self._cancel_state(state)
+        deadline = started + self.config.stop_timeout_seconds
+        for thread in state.threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                thread.join(remaining)
+        alive = [thread.name for thread in state.threads if thread.is_alive()]
+        with state.lock:
+            failures = list(state.failures)
+            progress_by_worker = dict(state.progress_by_worker)
+            expected_interruption_workers = set(
+                state.expected_interruption_workers
+            )
+            interrupted_workers = set(state.interrupted_workers)
+        progress_by_mode = {
+            mode: sum(
+                rows
+                for (worker_mode, _), rows in progress_by_worker.items()
+                if worker_mode == mode
+            )
+            for mode in self.config.enabled_modes
+        }
+        encoded_worker_progress = [
+            {
+                "mode": mode,
+                "worker_index": worker_index,
+                "rows": rows,
+            }
+            for (mode, worker_index), rows in sorted(
+                progress_by_worker.items()
+            )
+        ]
+        event = {
+            "generation": state.generation,
+            "reason": reason,
+            "expected_forced_interruption": (
+                state.expected_interruption.is_set()
+            ),
+            "expected_interruption_workers": [
+                {"mode": mode, "worker_index": worker_index}
+                for mode, worker_index in sorted(
+                    expected_interruption_workers
+                )
+            ],
+            "interrupted_workers": [
+                {"mode": mode, "worker_index": worker_index}
+                for mode, worker_index in sorted(interrupted_workers)
+            ],
+            "all_marked_workers_interrupted": (
+                not expected_interruption_workers
+                or expected_interruption_workers <= interrupted_workers
+            ),
+            "progress_rows": progress_by_mode,
+            "progress_rows_by_worker": encoded_worker_progress,
+            "every_worker_progressed": (
+                len(progress_by_worker) == self.config.worker_count
+                and all(rows > 0 for rows in progress_by_worker.values())
+            ),
+            "joined": not alive,
+            "alive_threads": alive,
+            "seconds": time.monotonic() - started,
+        }
+        if alive:
+            raise SoakInvariantError(
+                "stream workers did not stop within "
+                f"{self.config.stop_timeout_seconds:.3f}s: {alive}"
+            )
+        self.metrics.record_generation(event)
+        self._current = None
+        if failures:
+            raise failures[0]
+        return event
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "configuration": _json_value(self.config),
+            **self.metrics.summary(),
+        }
+
+
 def load_population(
     path: Path,
     requested: int,
@@ -1175,6 +2481,382 @@ def scan_acceptance(
     }
 
 
+def capture_stream_get_oracle(
+    remote: Any,
+    *,
+    ids: np.ndarray,
+    prefix: int,
+    batch_rows: int,
+    budget: benchmark.ResourceBudget,
+    rpc_timeout: float,
+) -> np.ndarray:
+    """Capture a bounded unary oracle used for every repeated StreamGet row."""
+
+    normalized = np.asarray(ids, dtype=np.uint64)
+    if normalized.ndim != 1 or normalized.size == 0:
+        raise SoakConfigurationError("stream oracle IDs must be non-empty")
+    itemsize = np.dtype(remote.dtype).itemsize
+    budget.check(
+        extra_memory_bytes=normalized.size * prefix * itemsize,
+    )
+    output = np.empty((normalized.size, prefix), dtype=np.dtype(remote.dtype))
+    for begin in range(0, normalized.size, batch_rows):
+        end = min(normalized.size, begin + batch_rows)
+        rows = end - begin
+        budget.reserve(
+            _wire_get(rows, prefix, itemsize),
+            extra_memory_bytes=3 * rows * prefix * itemsize,
+        )
+        _set_timeout(remote, budget, rpc_timeout)
+        values = remote.get(
+            normalized[begin:end],
+            prefix_dimensions=(
+                None if prefix == remote.dimension else prefix
+            ),
+        )
+        expected_shape = (rows, prefix)
+        if values.shape != expected_shape or values.dtype != output.dtype:
+            raise SoakInvariantError(
+                "unary stream oracle returned an invalid dtype or shape"
+            )
+        output[begin:end] = values
+    return output
+
+
+@dataclass(frozen=True, slots=True)
+class FairnessQuery:
+    ids: np.ndarray
+    source_expected: np.ndarray | None
+
+
+def build_fairness_queries(
+    remote: Any,
+    *,
+    population: np.ndarray,
+    population_source_rows: np.ndarray | None,
+    source_embeddings: np.ndarray | None,
+    shadow_id: np.ndarray,
+    calls: int,
+    batch_size: int,
+    prefix: int,
+    seed: int,
+    budget: benchmark.ResourceBudget,
+) -> tuple[list[FairnessQuery], str]:
+    """Build one deterministic corpus reused by isolated and mixed windows."""
+
+    rng = np.random.default_rng(seed ^ 0xBACE_1EAF)
+    digest = hashlib.sha256()
+    itemsize = np.dtype(remote.dtype).itemsize
+    budget.check(
+        extra_memory_bytes=(
+            calls * batch_size * (8 + prefix * itemsize) * 2
+        ),
+    )
+    queries: list[FairnessQuery] = []
+    for _ in range(calls):
+        positions = rng.integers(
+            0,
+            population.size,
+            size=batch_size,
+            dtype=np.int64,
+        )
+        positions[0] = seed % population.size
+        ids = np.asarray(
+            population[positions],
+            dtype=np.uint64,
+            order="C",
+        ).copy()
+        ids[0] = shadow_id[0]
+        digest.update(memoryview(np.asarray(ids, dtype="<u8")).cast("B"))
+        queries.append(
+            FairnessQuery(
+                ids=ids,
+                source_expected=(
+                    np.array(
+                        source_embeddings[
+                            population_source_rows[positions],
+                            :prefix,
+                        ],
+                        copy=True,
+                        order="C",
+                    )
+                    if source_embeddings is not None
+                    and population_source_rows is not None
+                    else None
+                ),
+            )
+        )
+    return queries, digest.hexdigest()
+
+
+def run_get_fairness_window(
+    remote: Any,
+    *,
+    queries: Sequence[FairnessQuery],
+    query_digest_sha256: str,
+    label: str,
+    shadow_payload: np.ndarray,
+    prefix: int,
+    workers: int,
+    max_inflight: int,
+    budget: benchmark.ResourceBudget,
+    rpc_timeout: float,
+    retries: int,
+    metrics: OperationMetrics,
+    errors: ErrorMetrics,
+) -> dict[str, Any]:
+    """Run one matched concurrent short-Get responsiveness window."""
+
+    itemsize = np.dtype(remote.dtype).itemsize
+    successful = 0
+    clients = [
+        _connect(remote.endpoint, budget, rpc_timeout)
+        for _ in range(workers)
+    ]
+    locks = [threading.Lock() for _ in clients]
+    inflight: set[Future[bool]] = set()
+
+    def consume(done: set[Future[bool]]) -> None:
+        nonlocal successful
+        for future in done:
+            successful += int(future.result())
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for ordinal, query in enumerate(queries):
+                while len(inflight) >= max_inflight:
+                    done, inflight = wait(
+                        inflight,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    consume(done)
+                wire = _wire_get(query.ids.size, prefix, itemsize)
+                budget.reserve(
+                    wire,
+                    extra_memory_bytes=(
+                        3 * query.ids.size * prefix * itemsize
+                    ),
+                )
+                plan = GetPlan(
+                    ordinal=ordinal,
+                    label=label,
+                    ids=query.ids,
+                    prefix=prefix,
+                    wire_bytes=wire,
+                    shadow_expected=np.array(
+                        shadow_payload[:, :prefix],
+                        copy=True,
+                        order="C",
+                    ),
+                    source_expected=query.source_expected,
+                )
+                client_index = ordinal % len(clients)
+                inflight.add(
+                    executor.submit(
+                        execute_get_on_client,
+                        locks[client_index],
+                        clients[client_index],
+                        plan,
+                        dimension=remote.dimension,
+                        itemsize=itemsize,
+                        retries=retries,
+                        budget=budget,
+                        rpc_timeout=rpc_timeout,
+                        metrics=metrics,
+                        errors=errors,
+                    )
+                )
+            while inflight:
+                done, inflight = wait(
+                    inflight,
+                    return_when=FIRST_COMPLETED,
+                )
+                consume(done)
+    finally:
+        for client in clients:
+            with contextlib.suppress(BaseException):
+                client.close()
+    return {
+        "label": label,
+        "calls": len(queries),
+        "successful_calls": successful,
+        "batch_size": int(queries[0].ids.size),
+        "prefix_dimensions": prefix,
+        "query_ids_digest_sha256": query_digest_sha256,
+        "source_oracle": all(
+            query.source_expected is not None for query in queries
+        ),
+        "workers": workers,
+        "max_inflight": max_inflight,
+    }
+
+
+def wait_for_scan_admission(
+    remote: Any,
+    *,
+    expected_active_scans: int | None = None,
+    minimum_admitted_scans: int | None = None,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    """Poll Describe until scan counters/gauges reach the requested state."""
+
+    if expected_active_scans is None and minimum_admitted_scans is None:
+        raise ValueError("one scan-admission expectation is required")
+
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last: Any | None = None
+    while time.monotonic() < deadline:
+        remote._timeout = max(  # type: ignore[attr-defined]
+            0.001,
+            min(2.0, deadline - time.monotonic()),
+        )
+        description = remote.describe()
+        last = description.admission_stats
+        if last is None:
+            raise SoakConfigurationError(
+                "streaming acceptance requires admission statistics"
+        )
+        active_matches = (
+            True
+            if expected_active_scans is None
+            else (
+                last.active_scans == 0
+                and last.scan_estimated_bytes == 0
+                if expected_active_scans == 0
+                else (
+                    last.active_scans >= expected_active_scans
+                    and last.scan_estimated_bytes > 0
+                )
+            )
+        )
+        admitted_matches = (
+            minimum_admitted_scans is None
+            or last.admitted_scans >= minimum_admitted_scans
+        )
+        matches = active_matches and admitted_matches
+        if matches:
+            return {
+                "status": "passed",
+                "expected_active_scans": expected_active_scans,
+                "minimum_admitted_scans": minimum_admitted_scans,
+                "elapsed_seconds": time.monotonic() - started,
+                "admission_stats": _json_value(last),
+            }
+        time.sleep(0.02)
+    return {
+        "status": "failed",
+        "expected_active_scans": expected_active_scans,
+        "minimum_admitted_scans": minimum_admitted_scans,
+        "elapsed_seconds": time.monotonic() - started,
+        "admission_stats": _json_value(last),
+    }
+
+
+def fairness_acceptance(
+    operations: Mapping[str, Mapping[str, Any]],
+    *,
+    baseline_label: str,
+    mixed_label: str,
+    minimum_mixed_successes: int,
+    maximum_p99_ratio: float,
+) -> dict[str, Any]:
+    baseline = operations.get(baseline_label)
+    mixed = operations.get(mixed_label)
+    baseline_samples = (
+        int(
+            baseline.get(
+                "successful_latency_sample_count",
+                baseline.get("latency_sample_count", 0),
+            )
+        )
+        if baseline is not None
+        else 0
+    )
+    mixed_samples = (
+        int(
+            mixed.get(
+                "successful_latency_sample_count",
+                mixed.get("latency_sample_count", 0),
+            )
+        )
+        if mixed is not None
+        else 0
+    )
+    mixed_successes = (
+        int(mixed.get("successes", 0)) if mixed is not None else 0
+    )
+    baseline_p99 = (
+        float(
+            baseline.get(
+                "successful_latency_p99_ms",
+                baseline["latency_p99_ms"],
+            )
+        )
+        if baseline is not None and "latency_p99_ms" in baseline
+        else None
+    )
+    mixed_p99 = (
+        float(
+            mixed.get(
+                "successful_latency_p99_ms",
+                mixed["latency_p99_ms"],
+            )
+        )
+        if mixed is not None and "latency_p99_ms" in mixed
+        else None
+    )
+    baseline_errors = (
+        int(baseline.get("errors", 0)) if baseline is not None else 0
+    )
+    evaluable = (
+        baseline_p99 is not None
+        and mixed_p99 is not None
+        and baseline_samples > 0
+        and mixed_samples >= minimum_mixed_successes
+        and mixed_successes >= minimum_mixed_successes
+        and baseline_errors == 0
+    )
+    ratio = (
+        mixed_p99 / baseline_p99
+        if evaluable and baseline_p99 is not None and baseline_p99 > 0
+        else None
+    )
+    passed = bool(
+        evaluable
+        and ratio is not None
+        and ratio <= maximum_p99_ratio
+    )
+    return {
+        "baseline_label": baseline_label,
+        "mixed_label": mixed_label,
+        "baseline_sample_count": baseline_samples,
+        "mixed_sample_count": mixed_samples,
+        "mixed_successes": mixed_successes,
+        "baseline_errors": baseline_errors,
+        "baseline_p99_ms": baseline_p99,
+        "mixed_p99_ms": mixed_p99,
+        "observed_p99_ratio": ratio,
+        "maximum_p99_ratio": maximum_p99_ratio,
+        "minimum_mixed_successes": minimum_mixed_successes,
+        "evaluable": evaluable,
+        "passed": passed,
+        "reason": (
+            None
+            if passed
+            else (
+                (
+                    "isolated baseline contained RPC errors"
+                    if baseline_errors
+                    else "insufficient successful latency samples"
+                )
+                if not evaluable
+                else "mixed short-Get P99 exceeded the configured ratio"
+            )
+        ),
+    }
+
+
 class LocalSupervisor:
     def __init__(self, args: argparse.Namespace, results: Path) -> None:
         self._args = args
@@ -1214,6 +2896,12 @@ class LocalSupervisor:
                 self._args.server_maintenance_interval_seconds
             ),
             disable_automatic_maintenance=self._args.server_no_auto_maintenance,
+            max_concurrent_calls=self._args.server_max_concurrent_calls,
+            max_concurrent_scans=self._args.server_max_concurrent_scans,
+            scan_max_duration_ms=self._args.server_scan_max_duration_ms,
+            scan_idle_timeout_ms=self._args.server_scan_idle_timeout_ms,
+            shutdown_grace_ms=self._args.server_shutdown_grace_ms,
+            shutdown_hard_timeout_ms=self._args.server_shutdown_hard_timeout_ms,
         )
         self._started_monotonic = started
         self._initial_snapshot = process_snapshot(self.server.pid)
@@ -1281,6 +2969,7 @@ def restart_replay_probe(
     rpc_timeout: float,
     start_timeout: float,
     restart_mode: str,
+    before_restart: Callable[[], None] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     # Two scheduled UUIDs plus one fresh emergency cleanup UUID.
     if not mutation_budget.can_reserve(3):
@@ -1323,6 +3012,8 @@ def restart_replay_probe(
         remote.close()
 
         restart_started = time.perf_counter()
+        if before_restart is not None:
+            before_restart()
         supervisor.restart(
             min(start_timeout, budget.remaining_seconds()), restart_mode
         )
@@ -1411,6 +3102,54 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SoakConfigurationError("pass either --endpoint or --store, not both")
     if args.endpoint is not None and args.native_binary is not None:
         raise SoakConfigurationError("--native-binary is local-launch only")
+    if args.endpoint is not None:
+        local_only_overrides = {
+            "--tuning": args.tuning != "auto",
+            "--server-start-timeout": args.server_start_timeout != 30.0,
+            "--server-max-worker-threads": (
+                args.server_max_worker_threads is not None
+            ),
+            "--server-max-concurrent-calls": (
+                args.server_max_concurrent_calls is not None
+            ),
+            "--server-max-concurrent-scans": (
+                args.server_max_concurrent_scans is not None
+            ),
+            "--server-max-ids-per-request": (
+                args.server_max_ids_per_request is not None
+            ),
+            "--server-max-scan-batch-rows": (
+                args.server_max_scan_batch_rows is not None
+            ),
+            "--server-scan-max-duration-ms": (
+                args.server_scan_max_duration_ms is not None
+            ),
+            "--server-scan-idle-timeout-ms": (
+                args.server_scan_idle_timeout_ms is not None
+            ),
+            "--server-shutdown-grace-ms": (
+                args.server_shutdown_grace_ms is not None
+            ),
+            "--server-shutdown-hard-timeout-ms": (
+                args.server_shutdown_hard_timeout_ms is not None
+            ),
+            "--server-maintenance-interval-seconds": (
+                args.server_maintenance_interval_seconds is not None
+            ),
+            "--server-no-auto-maintenance": (
+                args.server_no_auto_maintenance
+            ),
+        }
+        ignored = [
+            option
+            for option, configured in local_only_overrides.items()
+            if configured
+        ]
+        if ignored:
+            raise SoakConfigurationError(
+                "local-launch-only options cannot be used with --endpoint: "
+                + ", ".join(ignored)
+            )
     if args.endpoint is None and args.server_pid is not None:
         raise SoakConfigurationError("--server-pid is external-endpoint only")
     if args.endpoint is not None and args.restart_cycles:
@@ -1421,9 +3160,43 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.source_embeddings is not None and args.ids is None:
         raise SoakConfigurationError("--source-embeddings requires --ids")
+    if args.stream_source_oracle and args.source_embeddings is None:
+        raise SoakConfigurationError(
+            "--stream-source-oracle requires --source-embeddings"
+        )
+    if args.require_maintenance_progress and args.server_no_auto_maintenance:
+        raise SoakConfigurationError(
+            "--require-maintenance-progress conflicts with "
+            "--server-no-auto-maintenance"
+        )
     if args.max_inflight_gets < args.get_workers:
         raise SoakConfigurationError(
             "--max-inflight-gets must be >= --get-workers"
+        )
+    if (
+        args.fairness_baseline_get_calls
+        < args.min_mixed_small_get_successes
+    ):
+        raise SoakConfigurationError(
+            "--fairness-baseline-get-calls must be >= "
+            "--min-mixed-small-get-successes"
+        )
+    if args.max_latency_samples < args.min_mixed_small_get_successes:
+        raise SoakConfigurationError(
+            "--max-latency-samples must be >= "
+            "--min-mixed-small-get-successes"
+        )
+    configured_get_classes = (
+        len(args.get_batch_sizes)
+        * len([part for part in args.prefix_dimensions.split(",") if part])
+    )
+    if (
+        args.max_get_calls
+        and args.max_get_calls < configured_get_classes
+    ):
+        raise SoakConfigurationError(
+            "--max-get-calls must exercise every configured Get class at "
+            "least once"
         )
     if args.get_retries > 99:
         raise SoakConfigurationError("--get-retries must be at most 99")
@@ -1431,6 +3204,57 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SoakConfigurationError(
             "--mutation-primary-attempts must be at most 50"
         )
+    stream_workers = args.stream_get_workers + args.scan_records_workers
+    sigkill_stream_probe_requested = bool(
+        stream_workers
+        and args.restart_cycles
+        and (
+            args.restart_mode == "sigkill"
+            or (
+                args.restart_mode == "alternating"
+                and args.restart_cycles >= 2
+            )
+        )
+    )
+    if sigkill_stream_probe_requested and args.stream_get_workers == 0:
+        raise SoakConfigurationError(
+            "active-stream SIGKILL acceptance requires at least one "
+            "--stream-get-worker"
+        )
+    if (
+        sigkill_stream_probe_requested
+        and args.stream_get_rows <= args.stream_batch_rows
+    ):
+        raise SoakConfigurationError(
+            "active-stream SIGKILL acceptance requires --stream-get-rows "
+            "greater than --stream-batch-rows"
+        )
+    if (
+        args.server_max_concurrent_scans is not None
+        and stream_workers > args.server_max_concurrent_scans
+    ):
+        raise SoakConfigurationError(
+            "configured stream workers exceed --server-max-concurrent-scans"
+        )
+    if (
+        args.server_max_concurrent_calls is not None
+        and stream_workers + args.get_workers + 1
+        > args.server_max_concurrent_calls
+    ):
+        raise SoakConfigurationError(
+            "stream workers, Get workers, and one control/mutation RPC "
+            "exceed --server-max-concurrent-calls"
+        )
+    if (
+        args.server_scan_max_duration_ms is not None
+        and args.stream_attempt_seconds * 1000
+        >= args.server_scan_max_duration_ms
+    ):
+        raise SoakConfigurationError(
+            "--stream-attempt-seconds must be below the server scan watchdog"
+        )
+    if args.stream_get_rows > sys.maxsize:
+        raise SoakConfigurationError("--stream-get-rows must fit Py_ssize_t")
     minimum_mutations = 5 + 2 * args.restart_cycles
     if args.max_mutations < minimum_mutations:
         raise SoakConfigurationError(
@@ -1476,10 +3300,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-start-timeout", type=_positive_float, default=30.0)
     parser.add_argument("--rpc-timeout", type=_positive_float, default=30.0)
     parser.add_argument("--server-max-worker-threads", type=_positive_int)
+    parser.add_argument("--server-max-concurrent-calls", type=_positive_int)
+    parser.add_argument("--server-max-concurrent-scans", type=_positive_int)
     parser.add_argument("--server-max-ids-per-request", type=_positive_int)
     parser.add_argument("--server-max-scan-batch-rows", type=_positive_int)
+    parser.add_argument("--server-scan-max-duration-ms", type=_positive_int)
+    parser.add_argument("--server-scan-idle-timeout-ms", type=_positive_int)
+    parser.add_argument("--server-shutdown-grace-ms", type=_positive_int)
+    parser.add_argument("--server-shutdown-hard-timeout-ms", type=_positive_int)
     parser.add_argument("--server-maintenance-interval-seconds", type=_positive_int)
     parser.add_argument("--server-no-auto-maintenance", action="store_true")
+    parser.add_argument(
+        "--require-maintenance-progress",
+        action="store_true",
+        help=(
+            "fail unless final engine counters contain maintenance publication "
+            "evidence; disabled by default because small runs may not hit policy "
+            "thresholds"
+        ),
+    )
 
     parser.add_argument("--seed", type=_uint64, default=DEFAULT_SEED)
     parser.add_argument(
@@ -1504,6 +3343,106 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--get-retries", type=_nonnegative_int, default=1)
     parser.add_argument("--get-batch-sizes", type=parse_sizes, default=(1, 128, 1024))
     parser.add_argument("--prefix-dimensions", default="full,128")
+    parser.add_argument("--stream-get-workers", type=_nonnegative_int, default=1)
+    parser.add_argument(
+        "--scan-records-workers",
+        type=_nonnegative_int,
+        default=1,
+    )
+    parser.add_argument(
+        "--stream-get-rows",
+        type=_positive_int,
+        default=131_072,
+        help="logical ID rows in one finite StreamGet snapshot attempt",
+    )
+    parser.add_argument(
+        "--scan-records-rows",
+        type=_positive_int,
+        default=131_072,
+        help="minimum physical rows consumed in one ScanRecords attempt",
+    )
+    parser.add_argument(
+        "--stream-batch-rows",
+        type=_positive_int,
+        default=16_384,
+    )
+    parser.add_argument(
+        "--stream-max-batch-mib",
+        type=_positive_float,
+        default=32.0,
+    )
+    parser.add_argument(
+        "--stream-prefix-dimensions",
+        default="full",
+        help="one prefix dimension or 'full' for both streaming modes",
+    )
+    parser.add_argument(
+        "--stream-attempt-seconds",
+        type=_positive_float,
+        default=300.0,
+        help="rotate a partial stream below server/client watchdog deadlines",
+    )
+    parser.add_argument(
+        "--stream-progress-timeout-seconds",
+        type=_positive_float,
+        default=60.0,
+    )
+    parser.add_argument(
+        "--stream-stop-timeout-seconds",
+        type=_positive_float,
+        default=15.0,
+    )
+    parser.add_argument(
+        "--stream-locations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="request and validate exact physical locations in ScanRecords",
+    )
+    parser.add_argument(
+        "--stream-source-oracle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "verify the bounded unary StreamGet oracle once against source "
+            "embeddings before the mixed window"
+        ),
+    )
+    parser.add_argument(
+        "--stream-oracle-rows",
+        type=_positive_int,
+        default=256,
+        help=(
+            "bounded unique-ID corpus captured through unary Get and then "
+            "checked bit-for-bit in every StreamGet batch"
+        ),
+    )
+    parser.add_argument(
+        "--fairness-baseline-get-calls",
+        type=_positive_int,
+        default=32,
+    )
+    parser.add_argument(
+        "--min-mixed-small-get-successes",
+        type=_positive_int,
+        default=20,
+    )
+    parser.add_argument(
+        "--max-small-get-p99-ratio",
+        type=_positive_float,
+        default=5.0,
+        help="hard mixed/isolated P99 limit for the smallest Get class",
+    )
+    parser.add_argument(
+        "--min-stream-batches-per-mode",
+        type=_positive_int,
+        default=1,
+    )
+    parser.add_argument(
+        "--min-stream-rows-per-second",
+        type=_nonnegative_float,
+        default=0.0,
+        help="optional absolute per-worker active-time progress gate",
+    )
     parser.add_argument("--population-rows", type=_positive_int, default=100_000)
     parser.add_argument(
         "--population-scan-batch-rows",
@@ -1581,16 +3520,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "started_unix_ns": time.time_ns(),
         "arguments": _json_value(vars(args)),
         "methodology": {
-            "workload": "closed-loop bounded mixed Get and canary mutations",
+            "workload": (
+                "closed-loop bounded short Get, long StreamGet/ScanRecords, "
+                "and canary mutations"
+            ),
             "mutation_state": (
                 "absent -> insert -> update -> upsert -> delete -> absent"
             ),
             "retry": "same deterministic UUID and identical bytes",
             "transfer_accounting": (
                 "dominant IDs/embeddings/location payload; protobuf and HTTP/2 "
-                "framing excluded"
+                "framing excluded; one maximum batch is charged before stream "
+                "open and each subsequent receive is charged before requesting "
+                "it, so a time-rotated large logical input is bounded without "
+                "precharging its unconsumed tail"
             ),
-            "latency": "client-observed synchronous RPC round trip",
+            "latency": (
+                "client-observed synchronous RPC round trip; fairness uses "
+                "successful samples only and matched concurrent windows over "
+                "one exact query corpus"
+            ),
             "safety": (
                 "canary IDs are proven absent and restored absent; WAL/tombstone "
                 "history remains, so use a disposable collection clone"
@@ -1605,7 +3554,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "server": {"generations": []},
         "mutation_cycles": [],
+        "mutation_schedule": {
+            "periodic_enabled": True,
+            "skipped_intervals": 0,
+            "skip_reasons": {},
+            "disabled_reason": None,
+        },
         "restart_cycles": [],
+        "streaming_admission": [],
     }
     budget = benchmark.ResourceBudget(
         max_seconds=args.max_seconds,
@@ -1619,15 +3575,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     remote: Any | None = None
     read_clients: list[Any] = []
     read_client_locks: list[threading.Lock] = []
+    streaming: StreamingWorkload | None = None
+    stream_config: StreamingConfiguration | None = None
+    fairness_baseline_report: dict[str, Any] | None = None
     generation_holder = {"generation": 0, "pid": args.server_pid}
 
-    if args.endpoint is None:
-        supervisor = LocalSupervisor(args, args.results)
-        supervisor.start(min(args.server_start_timeout, budget.remaining_seconds()))
-        endpoint = supervisor.endpoint
-        generation_holder.update(generation=supervisor.generation, pid=supervisor.pid)
-    else:
-        endpoint = args.endpoint
+    _checkpoint(report_path, report, budget)
+    try:
+        if args.endpoint is None:
+            supervisor = LocalSupervisor(args, args.results)
+            supervisor.start(
+                min(args.server_start_timeout, budget.remaining_seconds())
+            )
+            endpoint = supervisor.endpoint
+            generation_holder.update(
+                generation=supervisor.generation,
+                pid=supervisor.pid,
+            )
+        else:
+            endpoint = args.endpoint
+    except BaseException as error:
+        report["status"] = "failed"
+        report["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+            "phase": "server_start",
+        }
+        report["finished_unix_ns"] = time.time_ns()
+        if supervisor is not None:
+            with contextlib.suppress(BaseException):
+                supervisor.stop()
+            report["server"]["generations"] = supervisor.generations
+        _checkpoint(report_path, report, budget)
+        raise
     monitor = MetricsStream(
         args.results / "metrics.jsonl",
         interval_seconds=args.telemetry_interval_seconds,
@@ -1642,9 +3623,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     try:
         monitor.start()
-    except Exception:
+    except BaseException as error:
         if supervisor is not None:
-            supervisor.stop()
+            with contextlib.suppress(BaseException):
+                supervisor.stop()
+            report["server"]["generations"] = supervisor.generations
+        report["status"] = "failed"
+        report["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+            "phase": "monitor_start",
+        }
+        report["finished_unix_ns"] = time.time_ns()
+        _checkpoint(report_path, report, budget)
         raise
     started = time.monotonic()
     stop_reason = "unknown"
@@ -1660,13 +3652,81 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         prefixes = benchmark.parse_prefixes(
             args.prefix_dimensions, description.schema.dimension
         )
+        stream_prefixes = benchmark.parse_prefixes(
+            args.stream_prefix_dimensions,
+            description.schema.dimension,
+        )
+        if len(stream_prefixes) != 1:
+            raise SoakConfigurationError(
+                "--stream-prefix-dimensions must select exactly one prefix"
+            )
+        stream_config = StreamingConfiguration(
+            stream_get_workers=args.stream_get_workers,
+            scan_records_workers=args.scan_records_workers,
+            stream_get_rows=args.stream_get_rows,
+            scan_records_rows=args.scan_records_rows,
+            batch_rows=args.stream_batch_rows,
+            max_batch_payload_bytes=int(args.stream_max_batch_mib * MIB),
+            prefix=stream_prefixes[0],
+            attempt_seconds=args.stream_attempt_seconds,
+            progress_timeout_seconds=args.stream_progress_timeout_seconds,
+            stop_timeout_seconds=args.stream_stop_timeout_seconds,
+            rpc_timeout_seconds=args.rpc_timeout,
+            mutation_rows=args.mutation_rows,
+            with_locations=args.stream_locations,
+            source_oracle=args.stream_source_oracle,
+        )
+        if stream_config.stream_get_workers and not description.stream_get:
+            raise SoakConfigurationError(
+                "server does not advertise StreamGet"
+            )
+        if stream_config.scan_records_workers and not description.scan_records:
+            raise SoakConfigurationError(
+                "server does not advertise ScanRecords"
+            )
+        if stream_config.worker_count:
+            availability = description.availability
+            if availability is None or description.admission_stats is None:
+                raise SoakConfigurationError(
+                    "streaming acceptance requires availability/admission "
+                    "diagnostics"
+                )
+            if stream_config.worker_count > availability.max_concurrent_scans:
+                raise SoakConfigurationError(
+                    "configured streaming workers exceed the server's "
+                    "max_concurrent_scans"
+                )
+            if (
+                stream_config.worker_count + args.get_workers + 1
+                > availability.max_concurrent_calls
+            ):
+                raise SoakConfigurationError(
+                    "streaming plus Get workers and one control/mutation RPC "
+                    "exceed max_concurrent_calls"
+                )
+            if (
+                stream_config.attempt_seconds * 1000
+                >= availability.scan_max_duration_millis
+            ):
+                raise SoakConfigurationError(
+                    "stream attempt duration must remain below the server "
+                    "scan watchdog"
+                )
         largest_response = (
             max(args.get_batch_sizes)
             * max(prefixes)
             * np.dtype(description.schema.dtype).itemsize
         )
         budget.check(
-            extra_memory_bytes=args.max_inflight_gets * 3 * largest_response
+            extra_memory_bytes=(
+                args.max_inflight_gets * 3 * largest_response
+                + stream_config.worker_count
+                * 3
+                * stream_config.max_batch_payload_bytes
+                + stream_config.stream_get_workers
+                * stream_config.batch_rows
+                * 16
+            )
         )
         monitor.emit("connected", remote)
         report["server"]["initial"] = remote_diagnostics(remote)
@@ -1799,6 +3859,208 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             budget=budget, rpc_timeout=args.rpc_timeout,
         )
         report["scan_ids"] = scan_result
+
+        fairness_batch_size = min(args.get_batch_sizes)
+        fairness_prefix = min(prefixes)
+        fairness_queries, fairness_query_digest = build_fairness_queries(
+            remote,
+            population=population,
+            population_source_rows=population_sample.source_rows,
+            source_embeddings=source_embeddings,
+            shadow_id=shadow_id,
+            calls=args.fairness_baseline_get_calls,
+            batch_size=fairness_batch_size,
+            prefix=fairness_prefix,
+            seed=args.seed,
+            budget=budget,
+        )
+        fairness_baseline_label = (
+            f"baseline_get_b{fairness_batch_size}_p{fairness_prefix}"
+        )
+        fairness_mixed_label = (
+            f"mixed_fairness_get_b{fairness_batch_size}_p{fairness_prefix}"
+        )
+        fairness_baseline_report = run_get_fairness_window(
+            remote,
+            queries=fairness_queries,
+            query_digest_sha256=fairness_query_digest,
+            label=fairness_baseline_label,
+            shadow_payload=shadow_payload,
+            prefix=fairness_prefix,
+            workers=args.get_workers,
+            max_inflight=args.max_inflight_gets,
+            budget=budget,
+            rpc_timeout=args.rpc_timeout,
+            retries=args.get_retries,
+            metrics=metrics,
+            errors=errors,
+        )
+        fairness_baseline_report["mixed_label"] = fairness_mixed_label
+        report["fairness_baseline"] = fairness_baseline_report
+
+        shadow_population_index = args.seed % population.size
+        stream_population = np.array(population, dtype=np.uint64, copy=True)
+        stream_population[
+            [0, shadow_population_index]
+        ] = stream_population[
+            [shadow_population_index, 0]
+        ]
+        stream_source_rows = (
+            np.array(
+                population_sample.source_rows,
+                dtype=np.int64,
+                copy=True,
+            )
+            if population_sample.source_rows is not None
+            else None
+        )
+        if stream_source_rows is not None:
+            stream_source_rows[
+                [0, shadow_population_index]
+            ] = stream_source_rows[
+                [shadow_population_index, 0]
+            ]
+        stream_oracle_embeddings: np.ndarray | None = None
+        stream_oracle_source_rows: np.ndarray | None = None
+        if stream_config.stream_get_workers:
+            oracle_rows = min(
+                args.stream_oracle_rows,
+                int(stream_population.size),
+            )
+            stream_population = np.array(
+                stream_population[:oracle_rows],
+                dtype=np.uint64,
+                copy=True,
+            )
+            selected_source_rows = (
+                np.array(
+                    stream_source_rows[:oracle_rows],
+                    dtype=np.int64,
+                    copy=True,
+                )
+                if stream_source_rows is not None
+                else None
+            )
+            oracle_batch_rows = min(
+                oracle_rows,
+                args.server_max_ids_per_request or 64,
+                64,
+            )
+            stream_oracle_embeddings = capture_stream_get_oracle(
+                remote,
+                ids=stream_population,
+                prefix=stream_config.prefix,
+                batch_rows=oracle_batch_rows,
+                budget=budget,
+                rpc_timeout=args.rpc_timeout,
+            )
+            source_verified = False
+            if args.stream_source_oracle:
+                assert source_embeddings is not None
+                assert selected_source_rows is not None
+                expected_oracle = np.asarray(
+                    source_embeddings[
+                        selected_source_rows,
+                        : stream_config.prefix,
+                    ],
+                    dtype=np.dtype(description.schema.dtype),
+                    order="C",
+                )
+                _assert_bits(
+                    stream_oracle_embeddings,
+                    expected_oracle,
+                    "captured StreamGet unary/source oracle",
+                )
+                source_verified = True
+            stream_oracle_source_rows = np.arange(
+                oracle_rows,
+                dtype=np.int64,
+            )
+            report["stream_get_oracle"] = {
+                "kind": (
+                    "source_npy_verified_unary_capture"
+                    if source_verified
+                    else "unary_capture"
+                ),
+                "rows": oracle_rows,
+                "batch_rows": oracle_batch_rows,
+                "prefix_dimensions": stream_config.prefix,
+                "payload_sha256": hashlib.sha256(
+                    memoryview(stream_oracle_embeddings).cast("B")
+                ).hexdigest(),
+                "every_stream_get_row_checked": True,
+            }
+        else:
+            report["stream_get_oracle"] = {
+                "kind": "disabled",
+                "rows": 0,
+                "every_stream_get_row_checked": False,
+            }
+        streaming = StreamingWorkload(
+            config=stream_config,
+            population=stream_population,
+            source_rows=stream_oracle_source_rows,
+            source_embeddings=stream_oracle_embeddings,
+            shadow_payload=shadow_payload,
+            dimension=description.schema.dimension,
+            dtype=description.schema.dtype,
+            budget=budget,
+            operations=metrics,
+            errors=errors,
+        )
+        if streaming.enabled:
+            current_generation = (
+                supervisor.generation if supervisor is not None else 0
+            )
+            admission_before = remote.describe().admission_stats
+            if admission_before is None:
+                raise SoakConfigurationError(
+                    "streaming acceptance requires admission statistics"
+                )
+            streaming.start_generation(endpoint, current_generation)
+            opened_admission = wait_for_scan_admission(
+                remote,
+                minimum_admitted_scans=(
+                    admission_before.admitted_scans
+                    + stream_config.worker_count
+                ),
+                timeout_seconds=stream_config.progress_timeout_seconds,
+            )
+            opened_admission.update(
+                event="generation_streams_open",
+                generation=current_generation,
+            )
+            report["streaming_admission"].append(opened_admission)
+            if opened_admission["status"] != "passed":
+                raise SoakInvariantError(
+                    "server admission did not accept every opened stream"
+                )
+            monitor.emit("streams_open", remote)
+            streaming.release_and_wait_for_progress()
+            monitor.emit("streams_progressing", remote)
+        fairness_mixed_report = run_get_fairness_window(
+            remote,
+            queries=fairness_queries,
+            query_digest_sha256=fairness_query_digest,
+            label=fairness_mixed_label,
+            shadow_payload=shadow_payload,
+            prefix=fairness_prefix,
+            workers=args.get_workers,
+            max_inflight=args.max_inflight_gets,
+            budget=budget,
+            rpc_timeout=args.rpc_timeout,
+            retries=args.get_retries,
+            metrics=metrics,
+            errors=errors,
+        )
+        report["fairness_mixed"] = fairness_mixed_report
+        if (
+            fairness_mixed_report["query_ids_digest_sha256"]
+            != fairness_baseline_report["query_ids_digest_sha256"]
+        ):
+            raise SoakInvariantError(
+                "fairness windows did not use the same query corpus"
+            )
         _checkpoint(report_path, report, budget)
 
         for _ in range(args.get_workers):
@@ -1812,6 +4074,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         successful_gets = 0
         restart_count = 0
         mutation_sequence = 2
+        periodic_mutations_enabled = True
         next_mutation_get = args.mutation_every_gets
         next_restart_get = args.restart_every_gets
 
@@ -1820,6 +4083,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for future in done:
                 successful_gets += int(future.result())
                 completed_gets += 1
+            if streaming is not None:
+                streaming.check()
 
         def drain() -> None:
             nonlocal inflight
@@ -1829,6 +4094,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         with ThreadPoolExecutor(max_workers=args.get_workers) as executor:
             while True:
+                if streaming is not None:
+                    streaming.check()
+                    if streaming.budget_exhausted:
+                        stop_reason = "max_transfer_or_memory"
+                        break
                 if budget.remaining_seconds() <= 0:
                     stop_reason = "max_seconds"
                     break
@@ -1920,16 +4190,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 submitted_gets += 1
 
-                if submitted_gets >= next_mutation_get:
+                if (
+                    periodic_mutations_enabled
+                    and submitted_gets >= next_mutation_get
+                ):
                     remaining_restarts = args.restart_cycles - restart_count
                     if not can_schedule_periodic_mutation(
                         mutation_budget,
                         remaining_restarts=remaining_restarts,
                     ):
-                        cycle = {
-                            "status": "skipped",
-                            "reason": "restart_and_cleanup_headroom",
-                        }
+                        reason = "restart_and_cleanup_headroom"
+                        schedule = report["mutation_schedule"]
+                        schedule["skipped_intervals"] += 1
+                        reasons = schedule["skip_reasons"]
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                        if remaining_restarts == 0:
+                            periodic_mutations_enabled = False
+                            schedule["periodic_enabled"] = False
+                            schedule["disabled_reason"] = (
+                                "mutation_ceiling_preserves_cleanup_headroom"
+                            )
                     else:
                         try:
                             cycle = run_mutation_cycle(
@@ -1940,9 +4220,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 primary_attempts=args.mutation_primary_attempts,
                             )
                         except benchmark.BenchmarkBudgetExceeded:
-                            cycle = {"status": "skipped", "reason": "run_budget"}
-                    report["mutation_cycles"].append(cycle)
-                    mutation_sequence += 1
+                            reason = "run_budget"
+                            schedule = report["mutation_schedule"]
+                            schedule["skipped_intervals"] += 1
+                            reasons = schedule["skip_reasons"]
+                            reasons[reason] = reasons.get(reason, 0) + 1
+                        else:
+                            report["mutation_cycles"].append(cycle)
+                            mutation_sequence += 1
                     next_mutation_get += args.mutation_every_gets
 
                 if (
@@ -1955,10 +4240,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         read_client.close()
                     read_clients.clear()
                     read_client_locks.clear()
-                    monitor.emit("before_restart", remote)
                     restart_mode = (
                         "graceful" if restart_count % 2 == 0 else "sigkill"
                     ) if args.restart_mode == "alternating" else args.restart_mode
+                    if streaming is not None and streaming.enabled:
+                        if restart_mode == "graceful":
+                            streaming.stop_generation("graceful_restart")
+                            drained = wait_for_scan_admission(
+                                remote,
+                                expected_active_scans=0,
+                                timeout_seconds=(
+                                    stream_config.stop_timeout_seconds
+                                ),
+                            )
+                            drained.update(
+                                event="before_graceful_restart_drained",
+                                generation=supervisor.generation,
+                            )
+                            report["streaming_admission"].append(drained)
+                            if drained["status"] != "passed":
+                                raise SoakInvariantError(
+                                    "stream admission did not drain before "
+                                    "graceful restart"
+                                )
+                        else:
+                            streaming.wait_until_any_active()
+                            forced_active = wait_for_scan_admission(
+                                remote,
+                                expected_active_scans=1,
+                                timeout_seconds=(
+                                    stream_config.progress_timeout_seconds
+                                ),
+                            )
+                            forced_active.update(
+                                event="before_sigkill_stream_active",
+                                generation=supervisor.generation,
+                            )
+                            report["streaming_admission"].append(
+                                forced_active
+                            )
+                            if forced_active["status"] != "passed":
+                                raise SoakInvariantError(
+                                    "SIGKILL restart did not observe an active "
+                                    "server-side stream lease"
+                                )
+                    monitor.emit("before_restart", remote)
                     remote, result = restart_replay_probe(
                         remote=remote, supervisor=supervisor,
                         canaries=canaries,
@@ -1970,7 +4296,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         errors=errors, rpc_timeout=args.rpc_timeout,
                         start_timeout=args.server_start_timeout,
                         restart_mode=restart_mode,
+                        before_restart=(
+                            streaming.mark_forced_interruption
+                            if (
+                                streaming is not None
+                                and streaming.enabled
+                                and restart_mode == "sigkill"
+                            )
+                            else None
+                        ),
                     )
+                    if (
+                        streaming is not None
+                        and streaming.enabled
+                        and restart_mode == "sigkill"
+                    ):
+                        streaming.stop_generation("sigkill_restart")
+                        replacement_drained = wait_for_scan_admission(
+                            remote,
+                            expected_active_scans=0,
+                            timeout_seconds=(
+                                stream_config.stop_timeout_seconds
+                            ),
+                        )
+                        replacement_drained.update(
+                            event="after_sigkill_replacement_drained",
+                            generation=supervisor.generation,
+                        )
+                        report["streaming_admission"].append(
+                            replacement_drained
+                        )
+                        if replacement_drained["status"] != "passed":
+                            raise SoakInvariantError(
+                                "replacement server inherited active scan "
+                                "admission state"
+                            )
                     report["restart_cycles"].append(result)
                     restart_count += 1
                     next_restart_get += args.restart_every_gets
@@ -1980,10 +4340,63 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                             _connect(endpoint, budget, args.rpc_timeout)
                         )
                         read_client_locks.append(threading.Lock())
+                    if streaming is not None and streaming.enabled:
+                        admission_before = remote.describe().admission_stats
+                        if admission_before is None:
+                            raise SoakConfigurationError(
+                                "streaming acceptance requires admission "
+                                "statistics"
+                            )
+                        streaming.start_generation(
+                            endpoint,
+                            supervisor.generation,
+                        )
+                        opened_admission = wait_for_scan_admission(
+                            remote,
+                            minimum_admitted_scans=(
+                                admission_before.admitted_scans
+                                + stream_config.worker_count
+                            ),
+                            timeout_seconds=(
+                                stream_config.progress_timeout_seconds
+                            ),
+                        )
+                        opened_admission.update(
+                            event="generation_streams_open",
+                            generation=supervisor.generation,
+                        )
+                        report["streaming_admission"].append(
+                            opened_admission
+                        )
+                        if opened_admission["status"] != "passed":
+                            raise SoakInvariantError(
+                                "stream admission did not recover after restart"
+                            )
+                        streaming.release_and_wait_for_progress()
                     monitor.emit("after_restart", remote)
                     _checkpoint(report_path, report, budget)
             drain()
 
+        if streaming is not None and streaming.enabled:
+            streaming.stop_generation("workload_complete")
+            final_stream_drain = wait_for_scan_admission(
+                remote,
+                expected_active_scans=0,
+                timeout_seconds=stream_config.stop_timeout_seconds,
+            )
+            final_stream_drain.update(
+                event="workload_streams_drained",
+                generation=(
+                    supervisor.generation if supervisor is not None else 0
+                ),
+            )
+            report["streaming_admission"].append(final_stream_drain)
+            if final_stream_drain["status"] != "passed":
+                raise SoakInvariantError(
+                    "stream admission did not drain at workload completion"
+                )
+        if streaming is not None:
+            report["streaming"] = streaming.summary()
         report["workload"] = {
             "stop_reason": stop_reason,
             "submitted_get_calls": submitted_gets,
@@ -2029,6 +4442,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "traceback": traceback.format_exc(),
         }
     finally:
+        if streaming is not None:
+            with contextlib.suppress(BaseException):
+                streaming.stop_generation("finally_cleanup")
+            report["streaming"] = streaming.summary()
         for read_client in read_clients:
             with contextlib.suppress(Exception):
                 read_client.close()
@@ -2100,6 +4517,144 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "operations": operation_summary,
         "errors": error_summary,
         "resources": resource_summary,
+    }
+    if fairness_baseline_report is not None:
+        fairness = fairness_acceptance(
+            operation_summary,
+            baseline_label=fairness_baseline_report["label"],
+            mixed_label=fairness_baseline_report["mixed_label"],
+            minimum_mixed_successes=args.min_mixed_small_get_successes,
+            maximum_p99_ratio=args.max_small_get_p99_ratio,
+        )
+    else:
+        fairness = {
+            "evaluable": False,
+            "passed": False,
+            "reason": "fairness baseline did not complete",
+        }
+    report["fairness"] = fairness
+    streaming_report = report.get("streaming", {})
+    streaming_modes = streaming_report.get("modes", {})
+    stream_mode_gates: dict[str, Any] = {}
+    for mode in ("stream_get", "scan_records"):
+        configured_workers = (
+            args.stream_get_workers
+            if mode == "stream_get"
+            else args.scan_records_workers
+        )
+        values = streaming_modes.get(mode)
+        if configured_workers == 0:
+            stream_mode_gates[mode] = {
+                "enabled": False,
+                "passed": True,
+                "reason": "disabled by zero workers",
+            }
+            continue
+        if values is None:
+            stream_mode_gates[mode] = {
+                "enabled": True,
+                "passed": False,
+                "reason": "no streaming metrics were produced",
+            }
+            continue
+        source_gate = (
+            mode != "stream_get"
+            or int(values["source_verified_rows"]) == int(values["rows"])
+        )
+        mode_passed = (
+            int(values["attempts_started"]) > 0
+            and int(values["attempts_completed"]) > 0
+            and int(values["batches"]) >= args.min_stream_batches_per_mode
+            and int(values["rows"]) > 0
+            and int(values["unexpected_failures"]) == 0
+            and int(values["workers_started"])
+            == int(values["workers_joined"])
+            and float(values["max_inter_batch_gap_seconds"])
+            <= args.stream_progress_timeout_seconds
+            and float(values["rows_per_worker_active_second"])
+            >= args.min_stream_rows_per_second
+            and source_gate
+        )
+        stream_mode_gates[mode] = {
+            "enabled": True,
+            "passed": mode_passed,
+            "minimum_batches": args.min_stream_batches_per_mode,
+            "minimum_rows_per_worker_active_second": (
+                args.min_stream_rows_per_second
+            ),
+            "maximum_inter_batch_gap_seconds": (
+                args.stream_progress_timeout_seconds
+            ),
+            "source_oracle_required": (
+                mode == "stream_get"
+            ),
+            "source_oracle_passed": source_gate,
+        }
+    stream_generation_events = streaming_report.get("generations", [])
+    expected_stream_generations = (
+        len(report.get("restart_cycles", [])) + 1
+        if stream_config is not None and stream_config.worker_count
+        else 0
+    )
+    generation_stream_progress = (
+        len(stream_generation_events) == expected_stream_generations
+        and all(
+            bool(event.get("joined"))
+            and bool(event.get("every_worker_progressed"))
+            for event in stream_generation_events
+        )
+    )
+    sigkill_restarts = sum(
+        item.get("restart_mode") == "sigkill"
+        for item in report.get("restart_cycles", [])
+    )
+    observed_restart_interruptions = sum(
+        int(values.get("expected_restart_interruptions", 0))
+        for values in streaming_modes.values()
+    )
+    forced_generation_events = [
+        event
+        for event in stream_generation_events
+        if event.get("expected_forced_interruption")
+    ]
+    all_marked_workers_interrupted = (
+        len(forced_generation_events) == sigkill_restarts
+        and all(
+            bool(event.get("expected_interruption_workers"))
+            and bool(event.get("all_marked_workers_interrupted"))
+            for event in forced_generation_events
+        )
+    )
+    stream_admission_events = report.get("streaming_admission", [])
+    stream_admission_passed = (
+        (
+            stream_config is None
+            or stream_config.worker_count == 0
+            or bool(stream_admission_events)
+        )
+        and all(
+            item.get("status") == "passed"
+            for item in stream_admission_events
+        )
+    )
+    report["streaming_gates"] = {
+        "modes": stream_mode_gates,
+        "expected_generation_count": expected_stream_generations,
+        "observed_generation_count": len(stream_generation_events),
+        "every_generation_progressed_and_joined": generation_stream_progress,
+        "sigkill_restarts": sigkill_restarts,
+        "observed_expected_restart_interruptions": (
+            observed_restart_interruptions
+        ),
+        "forced_restart_interruption_passed": (
+            stream_config is None
+            or stream_config.worker_count == 0
+            or (
+                observed_restart_interruptions >= sigkill_restarts
+                and all_marked_workers_interrupted
+            )
+        ),
+        "admission_events_passed": stream_admission_passed,
     }
     report["mutation_budget"] = mutation_budget.as_dict()
     configured_classes = set(
@@ -2182,9 +4737,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     final_server_healthy = bool(
         final_server.get("health", {}).get("serving")
     )
+    initial_engine = (
+        report.get("server", {}).get("initial", {}).get("engine_stats")
+        or {}
+    )
+    final_engine = final_server.get("engine_stats") or {}
+    engine_stats_available = bool(initial_engine) and bool(final_engine)
+    engine_invariants_passed = bool(
+        engine_stats_available
+        and int(final_engine.get("committed_sequence", -1))
+        >= int(initial_engine.get("committed_sequence", 0))
+        and int(final_engine.get("materialized_sequence", -1))
+        >= int(initial_engine.get("materialized_sequence", 0))
+        and int(final_engine.get("materialized_sequence", -1))
+        <= int(final_engine.get("committed_sequence", -2))
+        and int(final_engine.get("filesystem_available_bytes", -1))
+        >= int(final_engine.get("mutation_disk_reserve_bytes", 0))
+    )
+    maintenance_publication_evidence = bool(
+        engine_stats_available
+        and (
+            int(final_engine.get("materialized_sequence", 0))
+            > int(initial_engine.get("materialized_sequence", 0))
+            or int(final_engine.get("delta_run_count", 0))
+            != int(initial_engine.get("delta_run_count", 0))
+            or int(final_engine.get("total_delta_run_bytes", 0))
+            != int(initial_engine.get("total_delta_run_bytes", 0))
+            or int(final_engine.get("frozen_wal_count", 0))
+            != int(initial_engine.get("frozen_wal_count", 0))
+        )
+    )
+    maintenance_progress_gate_passed = (
+        not args.require_maintenance_progress
+        or maintenance_publication_evidence
+    )
+    report["maintenance"] = {
+        "engine_stats_available": engine_stats_available,
+        "engine_invariants_passed": engine_invariants_passed,
+        "publication_evidence": maintenance_publication_evidence,
+        "publication_evidence_required": args.require_maintenance_progress,
+        "progress_gate_passed": maintenance_progress_gate_passed,
+        "initial": initial_engine,
+        "final": final_engine,
+        "note": (
+            "maintenance_active is instantaneous; progress is inferred from "
+            "persistent materialization/run/WAL counters"
+        ),
+    }
     final_admission_drained = (
         not bool(final_admission.get("terminal_faulted", True))
         and not bool(final_admission.get("draining", True))
+        and not bool(final_admission.get("admission_closed", True))
         and int(final_admission.get("active_scans", -1)) == 0
         and int(final_admission.get("active_unary_calls", -1)) == 0
         and int(final_admission.get("scan_estimated_bytes", -1)) == 0
@@ -2207,6 +4810,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "base_read_correctness_gate_passed": (
             not source_oracle_required or source_oracle_verified
+        ),
+        "short_get_fairness_gate_passed": fairness["passed"],
+        "stream_modes_passed": all(
+            item["passed"] for item in stream_mode_gates.values()
+        ),
+        "stream_generations_progressed_and_joined": (
+            generation_stream_progress
+        ),
+        "stream_forced_restart_interruption_passed": (
+            report["streaming_gates"][
+                "forced_restart_interruption_passed"
+            ]
+        ),
+        "stream_admission_lifecycle_passed": stream_admission_passed,
+        "maintenance_engine_invariants_passed": engine_invariants_passed,
+        "maintenance_progress_gate_passed": (
+            maintenance_progress_gate_passed
         ),
         "crud_operations_exercised": mutation_names
         >= {"insert", "update", "upsert", "delete"},

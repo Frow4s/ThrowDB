@@ -145,6 +145,88 @@ def test_parser_accepts_external_endpoint_without_store_and_bounds_seed() -> Non
 
 
 @pytest.mark.parametrize(
+    (
+        "shutdown_grace_ms",
+        "shutdown_hard_timeout_ms",
+        "expected_seconds",
+    ),
+    [
+        (None, None, 65.0),
+        (45_000, None, 65.0),
+        (None, 120_000, 125.0),
+        (60_000, 180_000, 185.0),
+        (1, 1, 10.0),
+        (1, 10_000_000, 900.0),
+    ],
+)
+def test_local_server_stop_timeout_tracks_native_shutdown_bounds(
+    shutdown_grace_ms: int | None,
+    shutdown_hard_timeout_ms: int | None,
+    expected_seconds: float,
+) -> None:
+    assert BENCHMARK._local_server_stop_timeout_seconds(
+        shutdown_grace_ms=shutdown_grace_ms,
+        shutdown_hard_timeout_ms=shutdown_hard_timeout_ms,
+    ) == expected_seconds
+
+
+def test_local_server_close_waits_for_configured_shutdown_before_kill(
+    tmp_path: Path,
+) -> None:
+    class Process:
+        pid = 123
+
+        def __init__(self) -> None:
+            self.terminated = False
+            self.killed = False
+            self.wait_timeouts: list[float] = []
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, *, timeout: float) -> int:
+            self.wait_timeouts.append(timeout)
+            if len(self.wait_timeouts) == 1:
+                raise BENCHMARK.subprocess.TimeoutExpired("throwdbd", timeout)
+            return -9
+
+    class Thread:
+        def __init__(self) -> None:
+            self.join_timeouts: list[float] = []
+
+        def join(self, *, timeout: float) -> None:
+            self.join_timeouts.append(timeout)
+
+    process = Process()
+    stdout_thread = Thread()
+    stderr_thread = Thread()
+    server = BENCHMARK.LocalServer(
+        process=process,
+        command=["throwdbd"],
+        ready={"endpoint": "127.0.0.1:1"},
+        stdout_path=tmp_path / "stdout.log",
+        stderr_path=tmp_path / "stderr.log",
+        _stdout_thread=stdout_thread,
+        _stderr_thread=stderr_thread,
+        _stop_timeout_seconds=185.0,
+    )
+
+    server.close()
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.wait_timeouts == [185.0, 2]
+    assert stdout_thread.join_timeouts == [1]
+    assert stderr_thread.join_timeouts == [1]
+
+
+@pytest.mark.parametrize(
     ("locally_launched_server", "expected"),
     [
         (True, ("cold", "warm")),

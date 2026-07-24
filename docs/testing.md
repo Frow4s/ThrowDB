@@ -432,6 +432,15 @@ launched server additionally writes `server.stdout.log` and
   strictly increasing `(segment_id, row_index)` locations without materializing
   the complete ID set. Set `--scan-rows 0` to skip this phase.
 
+When either gRPC harness owns a local daemon, normal shutdown gives the daemon
+time to execute its own drain/watchdog policy. The parent-side timeout is the
+larger of the effective grace and hard-shutdown limits, plus five seconds,
+bounded to the range 10–900 seconds. With the native defaults of 30 seconds
+grace and 60 seconds hard timeout, the harness therefore waits 65 seconds
+before forcing a kill. The legacy 10-second path is only a floor and an
+early-launch-failure cleanup bound; it is not the normal default shutdown
+timeout.
+
 ### Embedded and gRPC embedding-stream benchmark
 
 `benchmarks/run_streaming_read_benchmark.py` measures the two format-7
@@ -529,77 +538,285 @@ describe only the benchmark client, not `throwdbd`.
 
 `benchmarks/run_grpc_server_soak.py` is the production-oriented stability gate.
 It complements, rather than replaces, the controlled performance benchmark.
-The harness streams a deterministic closed-loop mix of different Get batch and
-prefix sizes while running canary `insert -> update -> upsert -> delete`
-cycles. Every mutation has a deterministic UUID and is deliberately replayed
-with the same bytes. UUIDs are derived inside a fresh per-invocation `run_id`
-namespace, preventing a later soak from accidentally reusing an old journal
-entry; the chosen `run_id` is stored in `report.json` and can be supplied
-explicitly with `--run-id` when exact orchestration reproduction is required.
-The canaries are proven absent before use and verified
-absent after every cycle, so logical contents are restored; WAL and tombstone
-history still changes. Run it only against a disposable/rebuildable collection
-clone, never a live collection shared with another writer.
+Report revision 2 runs three kinds of work concurrently:
+
+- closed-loop unary `Get` calls over the configured batch and prefix matrix;
+- dedicated long-lived workers that repeatedly open bounded, snapshot-pinned
+  `StreamGet` and `ScanRecords` attempts;
+- canary `insert -> update -> upsert -> delete` cycles while a locally launched
+  server's automatic maintenance remains enabled unless explicitly disabled.
+
+Every mutation has a deterministic UUID and is deliberately replayed with the
+same bytes. UUIDs are derived inside a fresh per-invocation `run_id` namespace,
+preventing a later soak from accidentally reusing an old journal entry; the
+chosen `run_id` is stored in `report.json` and can be supplied explicitly with
+`--run-id` when exact orchestration reproduction is required. The canaries are
+proven absent before use and verified absent after every cycle, so logical
+contents are restored; WAL and tombstone history still changes. Run it only
+against a disposable/rebuildable collection clone, never a live collection
+shared with another writer.
 
 After an ambiguous primary mutation result, the harness reuses the same UUID
 and exact payload only if `Describe` still reports the original idempotency
 domain. It fails closed instead of sending an old operation UUID into a new
-domain. The deliberate post-success replay uses the same guard.
+domain. A typed `ABORTED` is handled separately: the server guarantees that
+the request was rejected before durable PREPARE, so the harness refreshes
+`Describe`, applies bounded backoff, and retries the identical request with the
+same UUID even if maintenance rotated the replay domain. Semantic rejections
+and arbitrary local/protocol failures are never retried. The deliberate
+post-success replay uses the current guarded domain.
 
-By default a local run performs two restart cycles and observes three process
-generations: the initial process, one after a graceful restart, and one after a
-SIGKILL restart. Before each restart it acknowledges a canary insert;
-after Health returns `SERVING`, it first verifies that the idempotency replay
-domain did not change, then repeats the same insert UUID. This would fail with
-`ALREADY_EXISTS` if the result were not durably replayed. A final replayed
-delete restores the absent canary state. Each generation has separate stdout
-and stderr files under `server-generations/gNNNN/`.
+### Streaming workload and defaults
+
+The default configuration uses one `StreamGet` worker and one `ScanRecords`
+worker, exactly filling the server's default two-slot scan-admission pool.
+Each worker owns a separate `RemoteCollection`; its scan deadline and mutable
+client state therefore cannot race with the unary control client or another
+worker. Before mixed traffic starts, all configured workers must have opened
+and each individual worker must return its first batch. Opening is accepted
+only after the monotonic `Describe.admission_stats.admitted_scans` counter has
+increased by at least the number of newly opened workers. The instantaneous
+`active_scans` gauge is recorded for observation, but is not the open gate:
+a short finite attempt can complete and reopen while `Describe` is sampled.
+Zero `active_scans` and zero estimated scan bytes remain hard requirements at
+explicit drain boundaries.
+
+The worker itself is long-lived, but one RPC attempt is finite. Completed or
+time-rotated attempts are reopened on a new snapshot until the generation is
+stopped. This continuously exercises snapshot creation and release without
+turning one cursor into an unbounded lifetime. It is not a resumable export:
+closing a partial attempt and opening another starts a new snapshot from the
+beginning of that attempt's logical input.
+
+The revision-2 defaults are:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--stream-get-workers` | 1 | Dedicated `StreamGet` clients; zero disables this mode |
+| `--scan-records-workers` | 1 | Dedicated `ScanRecords` clients; zero disables this mode |
+| `--stream-get-rows` | 131072 | Logical ID rows in one finite point-stream attempt |
+| `--scan-records-rows` | 131072 | Minimum physical rows consumed by one record-scan attempt |
+| `--stream-batch-rows` | 16384 | Requested row ceiling for both streaming modes |
+| `--stream-max-batch-mib` | 32 | Requested dense-payload ceiling for one batch |
+| `--stream-prefix-dimensions` | `full` | One prefix shared by both streaming modes |
+| `--stream-attempt-seconds` | 300 | Rotate a still-partial attempt below client/server lifetime bounds |
+| `--stream-progress-timeout-seconds` | 60 | Open, first-progress, and maximum inter-batch-stall bound |
+| `--stream-stop-timeout-seconds` | 15 | Bound for cancelling and joining one generation's workers |
+| `--stream-locations` | enabled | Request and validate physical locations from `ScanRecords` |
+| `--stream-oracle-rows` | 256 | Bounded unique-ID corpus captured through unary `Get` and repeated by `StreamGet` |
+| `--stream-source-oracle` | disabled | Independently verify the unary-captured corpus against the row-aligned source memmap |
+
+Before long streams start, the harness reads at most `--stream-oracle-rows`
+unique IDs through bounded unary `Get` calls and stores their exact embedding
+bits. `StreamGet` then receives a lazy repetition of this bounded corpus, so
+the complete logical ID input is not allocated. Every returned row is compared
+bit-for-bit with the captured unary oracle; every response is also checked for
+contiguous offsets, input ordering, dtype, and shape, and the first row of each
+attempt is checked against the stable shadow value. A completed attempt
+contributes a BLAKE2b digest, and repeated completed attempts over the stable
+base-ID corpus must have the same digest.
+`ScanRecords` checks offsets, dtype, shape, and, by default, strictly increasing
+physical locations. Its bounded target may be exceeded by the final complete
+transport batch; a partial batch is never invented merely to hit the target.
+
+When `--stream-source-oracle` is enabled, the bounded unary capture is first
+compared bit-for-bit with the matching rows in `--source-embeddings`. The long
+stream still compares against the in-memory capture, so source-memmap I/O occurs
+only during setup rather than on every streaming batch. Without the flag the
+stream remains fully checked against unary results, but that oracle is not
+independently grounded in the source file. Neither check is a special mutation
+snapshot canary; the test does not claim to prove visibility of a row changed
+after that particular stream opened. In the report,
+`stream_get_oracle.kind` distinguishes plain unary capture from a
+source-verified capture; the historical `source_verified_rows` streaming
+counter counts rows checked against the effective captured oracle.
+
+The harness checks the effective `Describe` bounds before starting: streaming
+workers may not exceed `max_concurrent_scans`, and
+`streaming workers + Get workers + 1` may not exceed
+`max_concurrent_calls`. The extra slot is reserved for the control/mutation
+RPC used while reads are active. The attempt duration must also remain below
+the server's scan-duration watchdog. Local-only pass-through options such as
+`--server-max-concurrent-calls`, `--server-max-concurrent-scans`,
+`--server-scan-max-duration-ms`, `--server-scan-idle-timeout-ms`, and the two
+shutdown bounds make an explicitly overridden server configuration
+reproducible in the report.
+
+### Short-Get fairness gate
+
+Before opening the long streams, the harness runs an isolated concurrent
+window for the smallest configured Get batch and prefix. It uses 32 calls by
+default (`--fairness-baseline-get-calls`) with the configured Get worker and
+in-flight limits. After every stream worker has produced a first batch, it
+runs a second concurrent window with the same client topology and the exact
+same ordered query corpus; matching SHA-256 query digests are a hard
+invariant. This second window isolates short-Get responsiveness under active
+streaming load. Periodic mutation scheduling begins only after the window, so
+the ratio is not presented as a simultaneous mutation-contention result.
+
+The gate is evaluable only when the mixed class has at least
+`--min-mixed-small-get-successes` successful latency samples, 20 by default.
+The default hard bound is:
+
+```text
+mixed smallest-Get P99 / isolated smallest-Get P99 <= 5.0
+```
+
+Change it with `--max-small-get-p99-ratio`; a production run can select a
+stricter value after establishing a stable host baseline. Insufficient samples
+fail closed, as does any error in the isolated baseline. Both P99 values use
+successful calls only; failed-call latencies cannot improve or worsen the
+ratio, while the ordinary error budget remains a separate acceptance gate.
+This deliberately generous default is a critical starvation guard, not a
+performance SLA: cache state is not controlled and RPC latency still combines
+client, transport, server admission, queueing, I/O, and response copies. Use
+`run_grpc_server_benchmark.py` for controlled cache modes and throughput
+comparisons.
+
+Each enabled stream mode must also complete at least one attempt and
+`--min-stream-batches-per-mode` batches. Every configured worker—not merely
+each mode in aggregate—must produce a batch in every process generation, every
+worker must join, the largest observed inter-batch gap must remain within the
+progress timeout, and no unexpected failure may be reported. The optional
+`--min-stream-rows-per-second` adds a hardware-specific absolute progress
+floor; its default of zero checks liveness without pretending to define a
+portable throughput SLA.
+
+### Correctness population
 
 A small collection is sufficient for CI or installation regression testing.
 `--ids` is optional: without it, the harness discovers a bounded physical-order
 ID prefix through `ScanIds` and retains at most `--population-rows` IDs.
 When row-aligned source files are available, pass both `--ids` and
 `--source-embeddings`. The embeddings file is opened as a NumPy memmap and only
-the sampled query rows/prefixes are copied; every mixed Get is then checked
+the sampled query rows/prefixes are copied; every unary Get is then checked
 bit-for-bit. Without it, the report explicitly uses
 `transport_stability_only`, sets `base_read_correctness_verified: false`, and
 does not claim correctness for every pre-existing base row. It still checks a
-stable captured-row shadow on every Get and validates all known mutation
-payloads bit-for-bit.
-Source-memmap reads are client-side oracle I/O and are not included in the
-gRPC transfer-byte ceiling; only sampled rows are touched.
+stable captured-row shadow on every Get, every `StreamGet` row against its
+bounded unary capture, and all known mutation payloads bit-for-bit. This
+proves transport stability relative to the capture, not that arbitrary base
+rows match an external source. Source-memmap reads are client-side oracle I/O
+and are not included in the gRPC transfer-byte ceiling.
+
+### Restarts and admission lifecycle
+
+By default a local run performs two restart cycles and observes three process
+generations: the initial process, one after a graceful restart, and one after a
+SIGKILL restart. Unary futures are drained and their clients are closed before
+either restart, making the stream behavior at the boundary explicit:
+
+- Before a graceful restart, the harness closes every stream, joins its worker,
+  and polls `Describe` until `active_scans == 0` and
+  `scan_estimated_bytes == 0`. The server is terminated only after this clean
+  application-level drain.
+- Before SIGKILL, the harness proves that at least one stream is still active,
+  marks transport cancellation as expected, and kills the process.
+  `CANCELLED`, `DEADLINE_EXCEEDED`, or `UNAVAILABLE` is accepted only for this
+  marked interruption. The replacement generation must initially expose no
+  inherited scan lease.
+
+After either restart, new dedicated clients open new streams and must make
+progress again. Completed batches from the old generation remain valid
+observations, but the harness never reuses an opaque token, transparently
+resumes a cursor, or combines two generations into one snapshot result.
+
+Before each restart it also acknowledges a canary insert. After Health returns
+`SERVING`, it verifies that the idempotency replay domain did not change and
+repeats the same insert UUID. This would fail with `ALREADY_EXISTS` if the
+result were not durably replayed. A final replayed delete restores the absent
+canary state. Each generation has separate stdout and stderr files under
+`server-generations/gNNNN/`.
+
+Admission snapshots are recorded when streams open, before graceful restart,
+after SIGKILL replacement, and after the workload drains. The final
+acceptance gate requires zero active unary/scan calls, zero estimated bytes,
+`draining=false`, `admission_closed=false`, no terminal fault, and a serving
+server. This verifies the configured stream lifecycle; it is not an
+admission-saturation test.
+
+### Short smoke test
 
 ```bash
 STORE=/tmp/throwdb-soak-store
-NATIVE="$PWD/build-grpc-dev/throwdbd"
+IDS=/datasets/ids.npy
+EMBEDDINGS=/datasets/embeddings.npy
+NATIVE="$PWD/build/server-release/throwdbd"
 
 python benchmarks/run_grpc_server_soak.py \
   --store "$STORE" \
+  --ids "$IDS" \
+  --source-embeddings "$EMBEDDINGS" \
   --results benchmark-results/grpc-soak-smoke \
   --native-binary "$NATIVE" \
   --tuning conservative \
-  --max-seconds 120 \
-  --max-transfer-gib 2 \
+  --max-seconds 180 \
+  --max-transfer-gib 4 \
   --max-client-memory-mib 1024 \
-  --max-get-calls 1000 \
+  --max-get-calls 120 \
   --max-mutations 40 \
   --restart-cycles 2 \
-  --restart-every-gets 250 \
+  --restart-every-gets 40 \
+  --stream-get-rows 65536 \
+  --scan-records-rows 65536 \
+  --stream-batch-rows 4096 \
+  --stream-max-batch-mib 8 \
+  --stream-attempt-seconds 60 \
+  --stream-progress-timeout-seconds 30 \
+  --stream-stop-timeout-seconds 10 \
+  --stream-oracle-rows 256 \
+  --stream-source-oracle \
   --scan-rows 10000
 ```
 
-The three independent run-wide ceilings are `--max-seconds`,
-`--max-transfer-gib`, and `--max-mutations`; `--max-get-calls` adds a
-deterministic smoke-test endpoint and may be `0` for a duration/transfer-driven
-soak. Transfer accounting includes dominant ID, embedding, delete-mask, and
-scan-location payloads plus conservatively reserved mutation-cleanup headroom.
-It excludes protobuf tags and HTTP/2 framing. New RPC deadlines are clipped to
-the remaining wall-clock budget. Best-effort canary cleanup and the final
-atomic report may extend slightly past that work deadline.
+This smoke verifies the bounded unary capture against the source file once
+during setup. Omitting `--stream-source-oracle` still checks every streamed row
+against that capture, but no longer proves that the captured bits match the
+external source.
+
+### Resource accounting
+
+`--max-seconds` and `--max-transfer-gib` are run-wide work ceilings.
+`--max-mutations` independently caps unique mutation UUIDs without stopping
+read/stream work, while `--max-get-calls` adds a deterministic unary-workload
+endpoint and may be `0` for a duration/transfer-driven soak. Transfer
+accounting includes dominant ID, embedding, delete-mask, and scan-location
+payloads plus conservatively reserved mutation-cleanup headroom.
+
+Streaming traffic is charged one conservatively sized batch at a time. Before
+opening either stream, the harness reserves one complete maximum requested
+batch because the first data frame may already be buffered by the open call.
+Before requesting each subsequent batch it reserves the same maximum, even if
+the server will return fewer rows because of payload or logical-tail limits.
+It therefore may exhaust the accounting ceiling before actual logical bytes
+reach the nominal limit, but it does not precharge an unconsumed multi-batch
+tail and cannot continue receiving batches after the ceiling is exhausted.
+Budget exhaustion cancels the generation's peer streams and ends new workload
+submission instead of silently leaving a worker stopped.
+
+The accounting excludes protobuf tags, HTTP/2 framing, physical read
+amplification, page cache, and source-oracle memmap reads. New unary RPC
+deadlines are clipped to the remaining wall-clock budget. Each dedicated
+streaming client instead receives a separate deadline derived when its process
+generation starts from the attempt duration, normal RPC timeout, remaining run
+time, and stop allowance. Best-effort canary cleanup and the final atomic
+report may extend slightly past the work deadline.
+
+`--max-client-memory-mib` is a fourth, independent client-side bound. Before
+work begins, the harness checks one aggregate estimate containing every
+in-flight Get response, three payload-sized buffers per streaming worker, and
+the `StreamGet` ID-batch working arrays. Later checks combine sampled client RSS
+growth with the next operation's conservative temporary-memory estimate. This
+is benchmark fail-fast accounting rather than an operating-system memory
+cgroup; retained NumPy objects, source-memmap residency, and allocator behavior
+remain visible in the sampled RSS.
+
 `--max-errors` can tolerate only explicitly transient Get statuses
 (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`, or `CANCELLED`);
 wrong bits/shapes, missing sampled IDs, protocol failures, and `DATA_LOSS`
 always fail immediately and are never converted into an availability pass.
+Expected stream interruption during the marked SIGKILL window is counted in
+the streaming report rather than against this ordinary error allowance.
 
 `--max-mutations` counts unique operation UUIDs, not retry attempts. The
 harness always preserves one emergency-Delete slot and all not-yet-run restart
@@ -607,19 +824,74 @@ probes before admitting another periodic four-operation CRUD cycle. This keeps
 the documented restart schedule reachable even when periodic mutations would
 otherwise consume the ceiling. The final probe is read-only and reports every
 canary as `absent`, `present`, or `unknown` without spending another UUID.
+Intervals skipped for mutation/restart/cleanup headroom or another run budget
+are aggregated in the bounded `mutation_schedule.skipped_intervals` and
+`skip_reasons` counters rather than appended as one report row per interval.
+After all requested restarts, an exhausted mutation allowance disables further
+periodic cycles and records `disabled_reason`; Gets and streams continue until
+their own stopping bound is reached.
 Read workers use separate clients, so per-RPC deadline updates cannot race
 between concurrent Gets.
 
-`report.json` is checkpointed atomically. `metrics.jsonl` is append-only and
-records server generation, client/server `/proc` RSS, CPU, faults, thread/FD
-counts, `/proc/PID/io`, and cgroup CPU counters; safe workload milestones also
-include Health, admission, engine/WAL/overlay, journal, free-space, and
-maintenance diagnostics. The final report contains bounded latency samples,
-all-attempt counters, errors by operation/status, per-generation recovery time,
-RSS/FD growth, cgroup throttling, and hard acceptance gates. The command exits
-nonzero for a wrong shadow read, lost/rejected replay, changed replay domain,
-unexpected RPC error, incomplete restart, excessive recovery time, unexpected
-server exit, failed scan ordering, or canary restoration failure.
+### Revision-2 report
+
+`report.json` is checkpointed atomically. An initial `status=running`
+checkpoint is published immediately after the result directory is created,
+before server or monitor startup. A startup failure replaces it with
+`status=failed`, a traceback, and `error.phase=server_start` or
+`monitor_start`; this early artifact is intentionally partial because workload
+sections do not exist yet. Later safe milestones and the final acceptance
+result are also atomically published.
+
+`metrics.jsonl` is append-only and records server generation, client/server
+`/proc` RSS, CPU, faults, thread/FD counts, `/proc/PID/io`, and cgroup CPU
+counters; safe workload milestones also include Health, admission,
+engine/WAL/overlay, journal, free-space, and maintenance state. Automatic
+maintenance is exercised as ambient server behavior. The `maintenance`
+section checks persistent engine invariants and reports publication evidence
+inferred from materialized-sequence, delta-run, and frozen-WAL transitions.
+There is still no completed-cycle counter, so a normal run does not claim that
+a particular policy action ran. Use `--require-maintenance-progress` only when
+the collection and server thresholds are intentionally configured to make such
+a publication observable; it then becomes a hard gate.
+
+Revision 2 adds these top-level sections:
+
+- `fairness_baseline` and `fairness_mixed` record the matched concurrent
+  smallest-Get windows, shared deterministic query digest, worker/in-flight
+  topology, and successes; `fairness` contains successful-sample counts, both
+  success-only P99 values, their ratio, configured limit, evaluability, and
+  pass/fail reason.
+- `stream_get_oracle` records the bounded unary capture, payload digest, and
+  whether it was independently verified against the source file.
+- `streaming.configuration` records the effective harness-side settings.
+  `streaming.modes` aggregates worker/attempt outcomes, batches, rows, logical
+  bytes, captured-oracle/shadow checks, open latency, maximum inter-batch gap,
+  active-time rates, snapshots, and digests for `stream_get` and
+  `scan_records`.
+- `streaming.generations` records why each generation stopped, per-worker and
+  per-mode progress, worker join state, and whether a forced interruption was
+  expected.
+- `streaming_admission` stores the open/drain `Describe` observations.
+  `streaming_gates` records per-mode liveness/correctness gates,
+  generation/restart coverage, and admission lifecycle results.
+- `mutation_schedule` contains bounded aggregate counters for skipped mutation
+  intervals and the reason periodic mutations were disabled, if any.
+- `maintenance` records initial/final engine counters, sequence/free-space
+  invariants, inferred publication evidence, and the optional progress gate.
+- `metrics.operations` includes the existing Get/CRUD measurements plus
+  `baseline_get_*`, `stream_get_open`, `stream_get_batch`,
+  `scan_records_open`, and `scan_records_batch`.
+
+The final report also retains all-attempt counters, errors by operation/status,
+per-generation recovery time, RSS/FD growth, cgroup throttling, and a flattened
+`acceptance` map for CI. The command exits nonzero for a wrong shadow/source
+read, stream ordering/shape/location failure, stalled or leaked stream,
+insufficient fairness samples, P99 gate failure, lost/rejected replay, changed
+replay domain, unexpected RPC error, incomplete restart, excessive recovery
+time, unexpected server exit, failed `ScanIds` ordering, or canary restoration
+failure.
+
 Latency percentiles use a deterministic hash-priority reservoir rather than an
 early-run prefix, while mean and maximum cover every attempt. Resource growth
 is observational by default. Set `--max-rss-growth-mib`, `--max-fd-growth`,
@@ -646,6 +918,12 @@ python benchmarks/run_grpc_server_soak.py \
 `--server-pid` is optional and does not grant process-control rights; when the
 PID is visible in the current PID namespace it only enables the same `/proc`
 RSS, FD, thread, CPU, fault, and I/O samples collected for local launches.
+External mode fails fast rather than silently ignoring local-launch settings.
+It requires `--restart-cycles 0` and rejects a non-default `--tuning`,
+`--native-binary`, server startup/worker/admission/request/scan/watchdog/
+shutdown/maintenance overrides, and `--server-no-auto-maintenance`.
+`--server-pid` remains telemetry-only, and `--allow-external-mutations` is
+still required because this soak always exercises mutation semantics.
 
 Functional CI cannot establish the 500M-row/Linux/NVMe acceptance result. Run
 the same local-launch command on the target host with the real collection,
@@ -661,11 +939,27 @@ python benchmarks/run_grpc_server_soak.py \
   --native-binary "$PWD/build/server-release/throwdbd" \
   --tuning persisted \
   --max-seconds 21600 \
-  --max-transfer-gib 512 \
+  --max-transfer-gib 2048 \
   --max-client-memory-mib 32768 \
   --max-get-calls 0 \
   --max-mutations 2000 \
   --get-batch-sizes 1,128,1024,10000 \
+  --stream-get-workers 1 \
+  --scan-records-workers 1 \
+  --stream-get-rows 131072 \
+  --scan-records-rows 131072 \
+  --stream-batch-rows 16384 \
+  --stream-max-batch-mib 32 \
+  --stream-prefix-dimensions full \
+  --stream-attempt-seconds 300 \
+  --stream-progress-timeout-seconds 60 \
+  --stream-stop-timeout-seconds 15 \
+  --stream-oracle-rows 256 \
+  --stream-source-oracle \
+  --fairness-baseline-get-calls 200 \
+  --min-mixed-small-get-successes 200 \
+  --max-small-get-p99-ratio 2 \
+  --min-stream-batches-per-mode 100 \
   --restart-cycles 2 \
   --restart-every-gets 50000 \
   --max-recovery-seconds 60 \
@@ -674,10 +968,20 @@ python benchmarks/run_grpc_server_soak.py \
   --scan-rows 1000000
 ```
 
+The production example source-verifies the bounded unary StreamGet capture
+once during setup; long streams then compare against memory and do not compete
+with repeated source-file reads. It also tightens the P99 ratio only after
+moving to a real, stable host. Wall-time or transfer exhaustion ends new work;
+the Get-count bound ends the ordinary unary loop, while mutation-ceiling
+exhaustion disables periodic mutation cycles but does not stop reads or
+streams. Size `--max-transfer-gib` for the requested duration and streaming
+prefix.
+
 The large-host run is the authoritative acceptance artifact. A passing small
-run proves bounded orchestration, CRUD/replay semantics, restart recovery, and
-reporting, but cannot predict 1.5-TiB page-cache behavior, NVMe latency tails,
-cgroup throttling, free-space pressure, or long-term RSS/FD slopes.
+run proves bounded orchestration, stream liveness/admission cleanup,
+CRUD/replay semantics, restart recovery, and reporting, but cannot predict
+1.5-TiB page-cache behavior, NVMe latency tails, cgroup throttling, free-space
+pressure, or long-term RSS/FD slopes.
 
 ### Concurrent timing and matched mixed-workload references
 

@@ -5,15 +5,27 @@
 # This script is intentionally safe for a remote development host:
 # - it never mutates a collection;
 # - it never changes Git state unless --pull is requested;
+# - it also accepts a copied source snapshot with no usable Git metadata;
 # - it never restarts a live daemon unless --restart-user-service is supplied;
 # - the pinned C++ gRPC toolchain is bootstrapped only when it is missing.
 set -Eeuo pipefail
 
-readonly SCRIPT_DIR="$(
+SCRIPT_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1
     pwd -P
-)"
-readonly REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd -P)"
+)" || {
+    echo "update_remote.sh: cannot resolve the script directory" >&2
+    exit 1
+}
+readonly SCRIPT_DIR
+REPOSITORY_ROOT="$(
+    cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1
+    pwd -P
+)" || {
+    echo "update_remote.sh: cannot resolve the source directory" >&2
+    exit 1
+}
+readonly REPOSITORY_ROOT
 
 VENV="${THROWDB_VENV:-${REPOSITORY_ROOT}/.venv}"
 PYTHON_COMMAND="${THROWDB_PYTHON:-python3}"
@@ -33,7 +45,8 @@ Usage: ./tools/update_remote.sh [OPTIONS]
 Apply the current ThrowDB checkout to a remote development environment.
 
 Options:
-  --pull                       Run "git pull --ff-only" before building.
+  --pull                       Run "git pull --ff-only" before building;
+                               requires a real Git worktree.
   --venv PATH                  Virtual environment (default: .venv).
   --python COMMAND             Python used to create .venv (default: python3).
   --grpc-prefix PATH           Pinned gRPC installation prefix.
@@ -58,6 +71,8 @@ Environment equivalents:
   THROWDB_UPDATE_CHECK
   THROWDB_UPDATE_BOOTSTRAP_GRPC
   THROWDB_UPDATE_SYSTEMD_USER_UNIT
+  THROWDB_SOURCE_REVISION           Optional 1-128 character safe label for a
+                                    copied source snapshot.
 
 The script does not touch a production collection. An already running
 throwdbd keeps serving its old executable until it is explicitly restarted.
@@ -156,13 +171,6 @@ case "${BOOTSTRAP_MODE}" in
     *) die "--bootstrap-grpc must be one of: auto, always, never" ;;
 esac
 
-for command in git cmake c++ make perl; do
-    command -v "${command}" >/dev/null 2>&1 ||
-        die "required build command not found: ${command}"
-done
-command -v "${PYTHON_COMMAND}" >/dev/null 2>&1 ||
-    die "Python command not found: ${PYTHON_COMMAND}"
-
 cd -- "${REPOSITORY_ROOT}"
 
 mkdir -p -- "${REPOSITORY_ROOT}/build"
@@ -172,18 +180,190 @@ if command -v flock >/dev/null 2>&1; then
         die "another tools/update_remote.sh process is already running"
 fi
 
-if [[ "${PULL}" -eq 1 ]]; then
-    git diff --quiet && git diff --cached --quiet ||
-        die "--pull requires a clean tracked worktree; commit or stash local changes first"
-    log "fast-forwarding the current Git branch"
-    run git pull --ff-only
+GIT_COMMAND_AVAILABLE=0
+if command -v git >/dev/null 2>&1; then
+    GIT_COMMAND_AVAILABLE=1
 fi
 
-readonly SOURCE_REVISION="$(
-    git rev-parse --verify HEAD 2>/dev/null ||
-        die "repository HEAD cannot be resolved"
-)"
-log "updating ThrowDB ${SOURCE_REVISION}"
+GIT_WORKTREE_AVAILABLE=0
+if [[ "${GIT_COMMAND_AVAILABLE}" -eq 1 ]]; then
+    GIT_TOPLEVEL="$(
+        git -C "${REPOSITORY_ROOT}" rev-parse --show-toplevel 2>/dev/null ||
+            true
+    )"
+    GIT_ABSOLUTE_DIR="$(
+        git -C "${REPOSITORY_ROOT}" rev-parse \
+            --absolute-git-dir 2>/dev/null || true
+    )"
+    GIT_METADATA_MATCHES_ROOT=0
+    if [[ -d "${REPOSITORY_ROOT}/.git" ]] &&
+        [[ -n "${GIT_ABSOLUTE_DIR}" ]] &&
+        [[ -d "${GIT_ABSOLUTE_DIR}" ]] &&
+        [[ "$(
+            cd -- "${GIT_ABSOLUTE_DIR}" &&
+                pwd -P
+        )" == "${REPOSITORY_ROOT}/.git" ]]; then
+        GIT_METADATA_MATCHES_ROOT=1
+    elif [[ -f "${REPOSITORY_ROOT}/.git" ]] &&
+        [[ -n "${GIT_ABSOLUTE_DIR}" ]] &&
+        [[ -f "${GIT_ABSOLUTE_DIR}/gitdir" ]]; then
+        GIT_WORKTREE_BACKLINK="$(
+            sed -n '1p' "${GIT_ABSOLUTE_DIR}/gitdir"
+        )"
+        if [[ "${GIT_WORKTREE_BACKLINK}" != /* ]]; then
+            GIT_WORKTREE_BACKLINK="${GIT_ABSOLUTE_DIR}/${GIT_WORKTREE_BACKLINK}"
+        fi
+        GIT_WORKTREE_BACKLINK_PARENT="$(
+            dirname -- "${GIT_WORKTREE_BACKLINK}"
+        )"
+        GIT_WORKTREE_BACKLINK_CANONICAL=""
+        if [[ -d "${GIT_WORKTREE_BACKLINK_PARENT}" ]]; then
+            GIT_WORKTREE_BACKLINK_CANONICAL="$(
+                cd -- "${GIT_WORKTREE_BACKLINK_PARENT}" &&
+                    printf '%s/%s\n' \
+                        "$(pwd -P)" \
+                        "$(basename -- "${GIT_WORKTREE_BACKLINK}")"
+            )"
+        fi
+        if [[ "${GIT_WORKTREE_BACKLINK_CANONICAL}" == \
+            "${REPOSITORY_ROOT}/.git" ]]; then
+            GIT_METADATA_MATCHES_ROOT=1
+        fi
+    fi
+    if [[ "${GIT_METADATA_MATCHES_ROOT}" -eq 1 ]] &&
+        [[ -n "${GIT_TOPLEVEL}" ]] &&
+        [[ -d "${GIT_TOPLEVEL}" ]] &&
+        [[ "$(cd -- "${GIT_TOPLEVEL}" && pwd -P)" == "${REPOSITORY_ROOT}" ]] &&
+        [[ "$(
+            git -C "${REPOSITORY_ROOT}" rev-parse \
+                --is-inside-work-tree 2>/dev/null || true
+        )" == "true" ]]; then
+        GIT_WORKTREE_AVAILABLE=1
+    fi
+fi
+
+if [[ "${PULL}" -eq 1 ]]; then
+    [[ "${GIT_COMMAND_AVAILABLE}" -eq 1 ]] ||
+        die "--pull requires Git, but the git command is not installed"
+    [[ "${GIT_WORKTREE_AVAILABLE}" -eq 1 ]] ||
+        die "--pull requires a real Git worktree; this directory is a source snapshot"
+    if ! git -C "${REPOSITORY_ROOT}" diff --quiet ||
+        ! git -C "${REPOSITORY_ROOT}" diff --cached --quiet; then
+        die "--pull requires a clean tracked worktree; commit or stash local changes first"
+    fi
+    log "fast-forwarding the current Git branch"
+    run git -C "${REPOSITORY_ROOT}" pull --ff-only
+fi
+
+if [[ "${GIT_WORKTREE_AVAILABLE}" -eq 1 ]]; then
+    SOURCE_REVISION="$(
+        git -C "${REPOSITORY_ROOT}" rev-parse --verify HEAD 2>/dev/null
+    )"
+    SOURCE_KIND="git-worktree"
+else
+    SOURCE_REVISION="${THROWDB_SOURCE_REVISION:-source-snapshot}"
+    SOURCE_KIND="source-snapshot"
+fi
+[[ "${SOURCE_REVISION}" =~ ^[A-Za-z0-9][A-Za-z0-9._+/:@-]{0,127}$ ]] ||
+    die "THROWDB_SOURCE_REVISION must be a 1-128 character safe label"
+readonly SOURCE_REVISION
+readonly SOURCE_KIND
+log "updating ThrowDB ${SOURCE_REVISION} (${SOURCE_KIND})"
+
+for command in cmake c++ make perl; do
+    command -v "${command}" >/dev/null 2>&1 ||
+        die "required build command not found: ${command}"
+done
+command -v "${PYTHON_COMMAND}" >/dev/null 2>&1 ||
+    die "Python command not found: ${PYTHON_COMMAND}"
+
+snapshot_source_fingerprint() {
+    "${PYTHON_COMMAND}" - "${REPOSITORY_ROOT}" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+source_entries = (
+    ".dockerignore",
+    ".github",
+    ".gitignore",
+    "CMakeLists.txt",
+    "CMakePresets.json",
+    "README.md",
+    "benchmarks",
+    "bindings",
+    "deploy",
+    "docs",
+    "include",
+    "proto",
+    "pyproject.toml",
+    "python",
+    "src",
+    "tests",
+    "tools",
+)
+ignored_directories = {
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
+
+paths: list[Path] = []
+for entry_name in source_entries:
+    entry = root / entry_name
+    if entry.is_symlink() or entry.is_file():
+        paths.append(entry)
+        continue
+    if not entry.is_dir():
+        continue
+    for directory, directory_names, file_names in os.walk(
+        entry,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_names[:] = sorted(
+            name
+            for name in directory_names
+            if name not in ignored_directories
+        )
+        directory_path = Path(directory)
+        for file_name in sorted(file_names):
+            if file_name.endswith((".pyc", ".pyo")):
+                continue
+            paths.append(directory_path / file_name)
+
+digest = hashlib.sha256()
+for path in sorted(paths, key=lambda candidate: candidate.relative_to(root).as_posix()):
+    relative = path.relative_to(root).as_posix().encode("utf-8")
+    digest.update(relative)
+    digest.update(b"\0")
+    if path.is_symlink():
+        digest.update(b"L\0")
+        digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+    else:
+        digest.update(b"F\0")
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    digest.update(b"\0")
+
+print(digest.hexdigest())
+PY
+}
+
+if [[ "${SOURCE_KIND}" == "source-snapshot" ]]; then
+    if ! STARTING_SOURCE_FINGERPRINT="$(snapshot_source_fingerprint)"; then
+        die "cannot fingerprint the copied source snapshot"
+    fi
+    [[ "${STARTING_SOURCE_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]] ||
+        die "copied source snapshot produced an invalid fingerprint"
+    readonly STARTING_SOURCE_FINGERPRINT
+fi
 
 if [[ ! -x "${VENV}/bin/python" ]]; then
     if [[ -e "${VENV}" ]]; then
@@ -207,6 +387,8 @@ grpc_toolchain_ready() {
 
 case "${BOOTSTRAP_MODE}" in
     always)
+        [[ "${GIT_COMMAND_AVAILABLE}" -eq 1 ]] ||
+            die "Git is required to bootstrap the pinned gRPC toolchain"
         log "rebuilding the pinned gRPC/Protobuf toolchain"
         run env \
             THROWDB_GRPC_PREFIX="${GRPC_PREFIX}" \
@@ -217,6 +399,8 @@ case "${BOOTSTRAP_MODE}" in
         if grpc_toolchain_ready; then
             log "reusing pinned gRPC/Protobuf toolchain: ${GRPC_PREFIX}"
         else
+            [[ "${GIT_COMMAND_AVAILABLE}" -eq 1 ]] ||
+                die "Git is required to bootstrap the pinned gRPC toolchain"
             log "bootstrapping pinned gRPC/Protobuf toolchain once: ${GRPC_PREFIX}"
             run env \
                 THROWDB_GRPC_PREFIX="${GRPC_PREFIX}" \
@@ -240,10 +424,13 @@ run "${VENV_PYTHON}" -m pip install \
     "scikit-build-core>=0.10" \
     "pybind11>=2.12"
 
-readonly PYTHON_TAG="$(
+if ! PYTHON_TAG="$(
     "${VENV_PYTHON}" -c \
         'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")'
-)"
+)"; then
+    die "cannot resolve the virtual environment's Python tag"
+fi
+readonly PYTHON_TAG
 readonly EDITABLE_BUILD_DIR="${REPOSITORY_ROOT}/build/remote-editable-${PYTHON_TAG}"
 
 log "building and installing the complete editable package"
@@ -266,7 +453,7 @@ run "${VENV_PYTHON}" -c \
 run "${VENV}/bin/throwdb" --help
 run "${VENV}/bin/throwdbd" --help
 
-readonly NATIVE_SERVER="$(
+if ! NATIVE_SERVER="$(
     "${VENV_PYTHON}" - <<'PY'
 from importlib import metadata
 from pathlib import Path
@@ -279,7 +466,10 @@ if not native.is_file():
     raise SystemExit(f"installed native daemon is missing: {native}")
 print(native)
 PY
-)"
+)"; then
+    die "cannot locate the installed native daemon"
+fi
+readonly NATIVE_SERVER
 [[ -x "${NATIVE_SERVER}" ]] ||
     die "installed native daemon is not executable: ${NATIVE_SERVER}"
 run "${NATIVE_SERVER}" --help
@@ -302,7 +492,9 @@ case "${CHECK_MODE}" in
             THROWDB_SERVER_BINARY="${NATIVE_SERVER}" \
             "${VENV_PYTHON}" -m pytest -q \
             "${REPOSITORY_ROOT}/tests/test_record_scan_api.py" \
-            "${REPOSITORY_ROOT}/tests/test_grpc_remote_collection.py"
+            "${REPOSITORY_ROOT}/tests/test_grpc_remote_collection.py" \
+            "${REPOSITORY_ROOT}/tests/test_grpc_server_soak.py" \
+            "${REPOSITORY_ROOT}/tests/test_grpc_server_soak_regressions.py"
         ;;
     full)
         log "running black-box smoke and complete Python test suite"
@@ -315,9 +507,25 @@ case "${CHECK_MODE}" in
         ;;
 esac
 
-readonly FINISHED_REVISION="$(git rev-parse --verify HEAD)"
-[[ "${FINISHED_REVISION}" == "${SOURCE_REVISION}" ]] ||
-    die "Git HEAD changed during the build; run the updater again"
+if [[ "${GIT_WORKTREE_AVAILABLE}" -eq 1 ]]; then
+    if ! FINISHED_REVISION="$(
+        git -C "${REPOSITORY_ROOT}" rev-parse --verify HEAD
+    )"; then
+        die "repository HEAD cannot be resolved after the build"
+    fi
+    readonly FINISHED_REVISION
+    [[ "${FINISHED_REVISION}" == "${SOURCE_REVISION}" ]] ||
+        die "Git HEAD changed during the build; run the updater again"
+else
+    if ! FINISHED_SOURCE_FINGERPRINT="$(snapshot_source_fingerprint)"; then
+        die "cannot fingerprint the copied source snapshot after the build"
+    fi
+    [[ "${FINISHED_SOURCE_FINGERPRINT}" =~ ^[0-9a-f]{64}$ ]] ||
+        die "copied source snapshot produced an invalid final fingerprint"
+    readonly FINISHED_SOURCE_FINGERPRINT
+    [[ "${FINISHED_SOURCE_FINGERPRINT}" == "${STARTING_SOURCE_FINGERPRINT}" ]] ||
+        die "source snapshot changed during the build; finish copying it and rerun"
+fi
 
 readonly CURRENT_DIR="${REPOSITORY_ROOT}/build/remote-current"
 mkdir -p -- "${CURRENT_DIR}"
@@ -351,6 +559,7 @@ fi
 
 log "ThrowDB update completed"
 printf 'Revision:       %s\n' "${SOURCE_REVISION}"
+printf 'Source kind:    %s\n' "${SOURCE_KIND}"
 printf 'Python:         %s\n' "${VENV_PYTHON}"
 printf 'CLI:            %s\n' "${CURRENT_DIR}/throwdb"
 printf 'Server launcher:%s\n' " ${CURRENT_DIR}/throwdbd"

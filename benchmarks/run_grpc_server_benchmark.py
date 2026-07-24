@@ -48,6 +48,11 @@ MIB = 1 << 20
 UINT64_MASK = (1 << 64) - 1
 CACHE_BACKING_RATIO_MAX = 0.10
 CACHE_STORAGE_RATIO_MIN = 0.50
+_LEGACY_LOCAL_SERVER_STOP_TIMEOUT_SECONDS = 10.0
+_LOCAL_SERVER_SHUTDOWN_TIMEOUT_MARGIN_SECONDS = 5.0
+_MAX_LOCAL_SERVER_STOP_TIMEOUT_SECONDS = 15.0 * 60.0
+_DEFAULT_SERVER_SHUTDOWN_GRACE_MS = 30_000
+_DEFAULT_SERVER_SHUTDOWN_HARD_TIMEOUT_MS = 60_000
 
 
 def log(message: str) -> None:
@@ -462,6 +467,38 @@ def collect_external_client_information() -> dict[str, Any]:
     }
 
 
+def _local_server_stop_timeout_seconds(
+    *,
+    shutdown_grace_ms: int | None,
+    shutdown_hard_timeout_ms: int | None,
+) -> float:
+    """Return the bounded parent-side wait for a configured server shutdown.
+
+    Wait through the effective native hard deadline plus a small scheduling
+    margin so the harness does not preempt the daemon's own drain/watchdog
+    policy. This includes the native defaults when no override is supplied.
+    """
+
+    effective_grace_ms = (
+        _DEFAULT_SERVER_SHUTDOWN_GRACE_MS
+        if shutdown_grace_ms is None
+        else shutdown_grace_ms
+    )
+    effective_hard_timeout_ms = (
+        _DEFAULT_SERVER_SHUTDOWN_HARD_TIMEOUT_MS
+        if shutdown_hard_timeout_ms is None
+        else shutdown_hard_timeout_ms
+    )
+    configured_seconds = (
+        max(effective_grace_ms, effective_hard_timeout_ms) / 1_000.0
+        + _LOCAL_SERVER_SHUTDOWN_TIMEOUT_MARGIN_SECONDS
+    )
+    return min(
+        _MAX_LOCAL_SERVER_STOP_TIMEOUT_SECONDS,
+        max(_LEGACY_LOCAL_SERVER_STOP_TIMEOUT_SECONDS, configured_seconds),
+    )
+
+
 @dataclass(slots=True)
 class LocalServer:
     process: subprocess.Popen[str]
@@ -471,6 +508,10 @@ class LocalServer:
     stderr_path: Path
     _stdout_thread: threading.Thread
     _stderr_thread: threading.Thread
+    _stop_timeout_seconds: float = (
+        _DEFAULT_SERVER_SHUTDOWN_HARD_TIMEOUT_MS / 1_000.0
+        + _LOCAL_SERVER_SHUTDOWN_TIMEOUT_MARGIN_SECONDS
+    )
 
     @property
     def endpoint(self) -> str:
@@ -495,6 +536,12 @@ class LocalServer:
         max_scan_batch_rows: int | None,
         maintenance_interval_seconds: int | None,
         disable_automatic_maintenance: bool,
+        max_concurrent_calls: int | None = None,
+        max_concurrent_scans: int | None = None,
+        scan_max_duration_ms: int | None = None,
+        scan_idle_timeout_ms: int | None = None,
+        shutdown_grace_ms: int | None = None,
+        shutdown_hard_timeout_ms: int | None = None,
     ) -> "LocalServer":
         command = [
             sys.executable,
@@ -518,6 +565,12 @@ class LocalServer:
             ("--max-ids-per-request", max_ids_per_request),
             ("--max-scan-batch-rows", max_scan_batch_rows),
             ("--maintenance-interval-seconds", maintenance_interval_seconds),
+            ("--max-concurrent-calls", max_concurrent_calls),
+            ("--max-concurrent-scans", max_concurrent_scans),
+            ("--scan-max-duration-ms", scan_max_duration_ms),
+            ("--scan-idle-timeout-ms", scan_idle_timeout_ms),
+            ("--shutdown-grace-ms", shutdown_grace_ms),
+            ("--shutdown-hard-timeout-ms", shutdown_hard_timeout_ms),
         ):
             if value is not None:
                 command.extend((option, str(value)))
@@ -612,20 +665,31 @@ class LocalServer:
             stderr_path=stderr_path,
             _stdout_thread=stdout_thread,
             _stderr_thread=stderr_thread,
+            _stop_timeout_seconds=_local_server_stop_timeout_seconds(
+                shutdown_grace_ms=shutdown_grace_ms,
+                shutdown_hard_timeout_ms=shutdown_hard_timeout_ms,
+            ),
         )
 
     @staticmethod
-    def _stop_process(process: subprocess.Popen[str]) -> None:
+    def _stop_process(
+        process: subprocess.Popen[str],
+        *,
+        timeout_seconds: float = _LEGACY_LOCAL_SERVER_STOP_TIMEOUT_SECONDS,
+    ) -> None:
         if process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
 
     def close(self) -> None:
-        self._stop_process(self.process)
+        self._stop_process(
+            self.process,
+            timeout_seconds=self._stop_timeout_seconds,
+        )
         self._stdout_thread.join(timeout=1)
         self._stderr_thread.join(timeout=1)
 

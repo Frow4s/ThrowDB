@@ -73,6 +73,24 @@ cd ~/ThrowDB
 source build/remote-current/environment.sh
 ```
 
+The same updater also accepts a directory copied from another machine without
+repository metadata. This includes Codex worktrees whose `.git` text file
+contains an absolute path that is valid only on the source machine:
+
+```bash
+cd ~/ThrowDB
+./tools/update_remote.sh --check quick
+source build/remote-current/environment.sh
+```
+
+In snapshot mode Git revision checks are skipped and the generated environment
+is labelled `source-snapshot`; optionally set `THROWDB_SOURCE_REVISION` to a
+1-128 character release/build identifier composed of letters, digits and
+`._+/:@-`. Do not pass `--pull` unless the directory is a genuine Git worktree.
+Finish copying the snapshot before starting the updater. It fingerprints the
+source inputs before and after the build and refuses to publish
+`build/remote-current` when files change during validation.
+
 The default `smoke` check creates only a temporary test collection and starts a
 temporary server on an ephemeral loopback port. It does not open, modify, or
 maintain the production collection. The gRPC/Protobuf bootstrap is reused when

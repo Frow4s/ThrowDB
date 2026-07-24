@@ -926,6 +926,62 @@ def test_stream_get_cancel_releases_pending_ids_without_claiming_eof() -> None:
             stream.close()
 
 
+def test_stream_get_close_keeps_pending_ids_until_response_decode_finishes() -> None:
+    with _RunningGrpcServer() as server, RemoteCollection.connect(
+        server.endpoint,
+        timeout=2,
+    ) as collection:
+        stream = collection.stream_get([10, 20], batch_rows=2)
+        entered_pending_lookup = threading.Event()
+        release_pending_lookup = threading.Event()
+        original_pending_ids = stream._producer.pending_ids  # type: ignore[attr-defined]
+
+        def blocked_pending_ids(sequence: int) -> np.ndarray:
+            entered_pending_lookup.set()
+            assert release_pending_lookup.wait(timeout=2)
+            return original_pending_ids(sequence)
+
+        stream._producer.pending_ids = blocked_pending_ids  # type: ignore[attr-defined]
+        batches: list[object] = []
+        worker_errors: list[BaseException] = []
+
+        def consume() -> None:
+            try:
+                batches.append(next(stream))
+            except BaseException as error:
+                worker_errors.append(error)
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        assert entered_pending_lookup.wait(timeout=2)
+        close_finished = threading.Event()
+
+        def close_stream() -> None:
+            stream.close()
+            close_finished.set()
+
+        closer = threading.Thread(target=close_stream)
+        closer.start()
+        try:
+            # close() has cancelled transport but must not clear the ID map
+            # while the consumer is between response receipt and lookup.
+            assert not close_finished.wait(timeout=0.05)
+            assert stream._producer.pending  # type: ignore[attr-defined]
+        finally:
+            release_pending_lookup.set()
+            consumer.join(timeout=2)
+            closer.join(timeout=2)
+
+        assert not consumer.is_alive()
+        assert not closer.is_alive()
+        assert close_finished.is_set()
+        assert not worker_errors
+        assert len(batches) == 1
+        assert not stream._producer.pending  # type: ignore[attr-defined]
+        assert stream.closed
+        assert not stream.failed
+
+
 def test_stream_get_close_does_not_wait_for_blocking_sequence_code() -> None:
     source = _BlockingIds()
     with _RunningGrpcServer() as server, RemoteCollection.connect(
