@@ -137,6 +137,11 @@ sharding, hot tiers, prefix layout, index representation, cache allocation, and
 tuning profiles. Validate the new version and atomically publish it; do not
 rewrite the active collection in place.
 
+The accepted first implementation is specified in
+[workload-aware-layout.md](workload-aware-layout.md). It starts with bounded
+point-read logs and exact metadata-only replay, then uses a bounded hot-set and
+sparse co-access layout before constructing an offline sibling collection.
+
 ## Adaptive execution strategy
 
 Adaptation is split into three bounded mechanisms.
