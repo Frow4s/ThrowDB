@@ -3752,6 +3752,8 @@ NativeCollectionMetadata NativeCollection::inspect_metadata(
         index_header.body_checksum_algorithm != 0;
 
     NativeCollectionMetadata metadata;
+    metadata.collection_id_low = manifest.collection_id.low;
+    metadata.collection_id_high = manifest.collection_id.high;
     metadata.format_version = delta_managed
         ? kDeltaPublicNativeFormatVersion
         : (catalog_managed

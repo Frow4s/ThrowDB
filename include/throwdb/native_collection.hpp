@@ -81,6 +81,10 @@ struct NativeCollectionMetadata {
     std::string feature_discriminator;
     std::uint64_t required_feature_bits = 0;
     std::uint64_t optional_feature_bits = 0;
+    // Appended to preserve positional aggregate initialization of the
+    // pre-existing metadata fields.
+    std::uint64_t collection_id_low = 0;
+    std::uint64_t collection_id_high = 0;
 };
 
 // Process/container capability probe used before selecting a persisted reader

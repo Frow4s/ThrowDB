@@ -17,6 +17,15 @@ from ._tuning import TuningRegistryError
 from .collection import Collection, CollectionSchema, _normalize_numeric_ids
 from .s3_backup import S3BackupError, backup_to_s3, restore_from_s3
 from .server import add_server_arguments, run_server
+from .workload import (
+    DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_FILES,
+    DEFAULT_MAX_PREFIX_ENTRIES,
+    DEFAULT_MAX_REPORT_ENTRIES,
+    DEFAULT_MAX_TOTAL_BYTES,
+    WorkloadLogError,
+    inspect_workload_logs,
+)
 
 
 DEFAULT_SHARD_SIZE_GIB = 16
@@ -497,6 +506,35 @@ def _serve(args: argparse.Namespace) -> None:
     run_server(args)
 
 
+def _workload_inspect(args: argparse.Namespace) -> None:
+    report = inspect_workload_logs(
+        args.logs,
+        storage=args.storage,
+        max_drop_ratio=args.max_drop_ratio,
+        max_row_drop_ratio=args.max_row_drop_ratio,
+        max_files=args.max_files,
+        max_total_bytes=args.max_total_bytes,
+        max_file_bytes=args.max_file_bytes,
+        max_report_entries=args.max_report_entries,
+        max_prefix_entries=args.max_prefix_entries,
+    )
+    serialized = json.dumps(
+        report,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    )
+    if args.output is not None:
+        _write_json_atomic(args.output, serialized)
+    print(serialized)
+    if args.require_suitable and not report["quality"]["suitable"]:
+        reasons = ", ".join(report["quality"]["reasons"])
+        raise WorkloadLogError(
+            "workload logs did not pass the quality gate: "
+            + (reasons or "unspecified quality failure")
+        )
+
+
 def _backup_s3(args: argparse.Namespace) -> None:
     report = backup_to_s3(
         args.storage,
@@ -675,6 +713,99 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     add_server_arguments(serve)
     serve.set_defaults(handler=_serve)
+
+    workload = subparsers.add_parser(
+        "workload",
+        help="inspect or prepare bounded read-workload artifacts",
+    )
+    workload_commands = workload.add_subparsers(
+        dest="workload_command",
+        required=True,
+    )
+    workload_inspect = workload_commands.add_parser(
+        "inspect",
+        help="validate workload-log frames and report aggregate quality",
+    )
+    workload_inspect.add_argument("--logs", type=Path, required=True)
+    workload_inspect.add_argument(
+        "--storage",
+        type=Path,
+        help="also require the logs to match this collection identity",
+    )
+    workload_inspect.add_argument(
+        "--max-drop-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "maximum accepted completed-event outcome drop ratio "
+            "(default: 0.05)"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-row-drop-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "maximum accepted completed-row outcome drop ratio "
+            "(default: 0.05)"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-files",
+        type=_positive_int,
+        default=DEFAULT_MAX_FILES,
+        help=(
+            "hard maximum log files to inspect, no more than the directory "
+            f"inventory ceiling (default: {DEFAULT_MAX_FILES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-total-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_TOTAL_BYTES,
+        help=(
+            "hard maximum aggregate input bytes "
+            f"(default: {DEFAULT_MAX_TOTAL_BYTES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-file-bytes",
+        type=_positive_int,
+        default=DEFAULT_MAX_FILE_BYTES,
+        help=(
+            "hard maximum bytes for one input file "
+            f"(default: {DEFAULT_MAX_FILE_BYTES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-report-entries",
+        type=_nonnegative_int,
+        default=DEFAULT_MAX_REPORT_ENTRIES,
+        help=(
+            "maximum per-file reports retained in JSON; zero disables them "
+            f"(default: {DEFAULT_MAX_REPORT_ENTRIES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-prefix-entries",
+        type=_positive_int,
+        default=DEFAULT_MAX_PREFIX_ENTRIES,
+        help=(
+            "hard maximum distinct prefix-dimension buckets "
+            f"(default: {DEFAULT_MAX_PREFIX_ENTRIES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--output",
+        type=Path,
+        help="also save the JSON report atomically",
+    )
+    workload_inspect.add_argument(
+        "--require-suitable",
+        action="store_true",
+        help="return an error after writing the report when quality fails",
+    )
+    workload_inspect.set_defaults(handler=_workload_inspect)
 
     backup = subparsers.add_parser(
         "backup",
@@ -1129,6 +1260,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         CalibrationError,
         S3BackupError,
         TuningRegistryError,
+        WorkloadLogError,
         NotImplementedError,
         TypeError,
         ValueError,

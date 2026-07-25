@@ -91,6 +91,7 @@ if(THROWDB_BUILD_SERVER)
         src/server/collection_engine.cpp
         src/server/idempotency_journal.cpp
         src/server/protocol.cpp
+        src/server/read_workload_log.cpp
         src/server/single_collection_service.cpp
         src/server/tcp_server.cpp
     )
@@ -248,6 +249,8 @@ if(THROWDB_BUILD_PYTHON)
 
     pybind11_add_module(_throwdb MODULE bindings/python_module.cpp)
     target_link_libraries(_throwdb PRIVATE throwdb::core)
+    target_include_directories(
+        _throwdb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
     target_compile_features(_throwdb PRIVATE cxx_std_20)
     install(TARGETS _throwdb LIBRARY DESTINATION throwdb)
 endif()
@@ -547,6 +550,18 @@ if(THROWDB_BUILD_TESTS)
         add_test(
             NAME throwdb_server_idempotency_tests
             COMMAND throwdb_server_idempotency_tests)
+
+        add_executable(
+            throwdb_read_workload_log_tests
+            tests/read_workload_log_tests.cpp)
+        target_link_libraries(
+            throwdb_read_workload_log_tests PRIVATE throwdb::server)
+        target_compile_features(
+            throwdb_read_workload_log_tests PRIVATE cxx_std_20)
+        throwdb_enable_warnings(throwdb_read_workload_log_tests)
+        add_test(
+            NAME throwdb_read_workload_log_tests
+            COMMAND throwdb_read_workload_log_tests)
     endif()
 
     if(THROWDB_BUILD_GRPC_SERVER)

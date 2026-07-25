@@ -1139,6 +1139,9 @@ public:
     [[nodiscard]] const NativeCollection& collection() const noexcept {
         return collection_;
     }
+    [[nodiscard]] const std::filesystem::path& storage_path() const noexcept {
+        return storage_path_;
+    }
 
 private:
     void refresh_operational_cache_unlocked_noexcept() const noexcept {
@@ -1290,6 +1293,10 @@ NativeCollection& SingleCollectionEngine::collection() noexcept {
 }
 const NativeCollection& SingleCollectionEngine::collection() const noexcept {
     return impl_->collection();
+}
+const std::filesystem::path&
+SingleCollectionEngine::storage_path() const noexcept {
+    return impl_->storage_path();
 }
 bool SingleCollectionEngine::durable_idempotency() const noexcept {
     return impl_->durable_idempotency();

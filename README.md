@@ -194,6 +194,49 @@ throwdbd \
   --writable
 ```
 
+Point-read workload logging for future physical-layout optimization is
+optional and disabled by default. Enable it only with a dedicated directory
+that is neither inside nor above the collection:
+
+```bash
+throwdbd \
+  --storage /data/example \
+  --listen 127.0.0.1:50051 \
+  --read-log-dir /data/throwdb-workload/example
+
+throwdb workload inspect \
+  --logs /data/throwdb-workload/example \
+  --storage /data/example \
+  --max-drop-ratio 0.05 \
+  --max-row-drop-ratio 0.05 \
+  --require-suitable \
+  --output workload-report.json
+```
+
+The dedicated log directory is bound to the collection ID. If the collection
+is rebuilt under a new ID, archive or remove that directory before enabling
+logging for the rebuilt collection.
+
+The native hot path samples complete successful `Get`/`StreamGet` batches into
+a preallocated nonblocking queue. Queue or disk pressure drops telemetry rather
+than failing reads. The default writer cap is 16 MiB/s and debits every
+sequential telemetry byte before it is written. Retention also has a 4096-file
+total ceiling, including the current active segment, in addition to age, byte,
+rotation, private-permission, and minimum-free-space bounds. A `.tdbrl` file
+exists only after a terminal counter checkpoint and fsync succeed; low-space
+or runtime failures leave `.open` for
+bounded-prefix recovery, and an unused pre-bind segment is removed rather than
+published as an empty finalized log. Every segment also carries an opening
+counter baseline, so offline event/row loss ratios remain scoped to the
+retained files after oldest-first retention removes an earlier prefix. Their
+denominator is completed outcomes (`written + dropped`), which remains correct
+when a request crosses a segment rotation.
+Version 1 logs raw numeric IDs, not
+embeddings, so these files are sensitive and deliberately live outside
+collection backup. See
+[`docs/workload-aware-layout.md`](docs/workload-aware-layout.md) and the
+[server runbook](docs/grpc-server.md#optional-bounded-read-workload-logging).
+
 Both the ready record and `RemoteCollection.describe()` report the complete
 effective reader/tuning selection and separate unary/scan availability bounds.
 `Describe` additionally reports live per-pool gauges, saturating admit/reject

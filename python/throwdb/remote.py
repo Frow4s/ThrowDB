@@ -44,6 +44,9 @@ _UINT32_MAX: Final = (1 << 32) - 1
 _UINT64_MAX: Final = (1 << 64) - 1
 _GRPC_MAX_MESSAGE_BYTES: Final = (1 << 31) - 1
 _PROTOCOL_MAJOR: Final = 1
+_READ_LOG_HEADER_BYTES: Final = 4_096
+_READ_LOG_RECORD_HEADER_BYTES: Final = 256
+_READ_LOG_TERMINAL_CHECKPOINT_BYTES: Final = 256
 
 _DTYPE_TO_PROTO: Final = {
     "float16": throwdb_pb2.EMBEDDING_DTYPE_FLOAT16,
@@ -327,6 +330,76 @@ class RemoteEngineStatistics:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteReadLoggingConfiguration:
+    enabled: bool
+    sample_ppm: int
+    max_ids_per_event: int
+    buffer_bytes: int
+    segment_bytes: int
+    rotate_seconds: int
+    retention_bytes: int
+    retention_seconds: int
+    minimum_free_bytes: int
+    max_write_bytes_per_second: int
+    max_retained_files: int
+
+    def as_dict(self) -> dict[str, int | str | bool]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteReadLoggingStatistics:
+    enabled: bool
+    considered_events: int
+    sampled_events: int
+    enqueued_events: int
+    written_events: int
+    truncated_events: int
+    captured_ids: int
+    dropped_queue_events: int
+    dropped_disk_pressure_events: int
+    dropped_error_events: int
+    bytes_written: int
+    segments_created: int
+    retained_bytes: int
+    retained_segments: int
+    queue_bytes: int
+    peak_queue_bytes: int
+    retention_deleted_bytes: int
+    retention_deleted_segments: int
+    writer_errors: int
+    observed_ids: int
+    unsampled_events: int
+    dropped_busy_events: int
+    dropped_full_events: int
+    rotated_segments: int
+    queued_events: int
+    buffer_capacity_bytes: int
+    last_error_number: int
+    paused_for_minimum_free_space: bool
+    runtime_failed: bool
+    shutting_down: bool
+    sampled_ids: int
+    enqueued_ids: int
+    written_ids: int
+    dropped_busy_ids: int
+    dropped_full_ids: int
+    dropped_error_ids: int
+    dropped_disk_pressure_ids: int
+    dropped_io_budget_events: int
+    dropped_io_budget_ids: int
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteDescription:
     format_version: int
     schema: CollectionSchema
@@ -342,6 +415,10 @@ class RemoteDescription:
     # domain. Journal checkpoint rotates it before retiring old operation
     # results, so a delayed retry fails closed instead of being applied twice.
     idempotency_domain: uuid.UUID | None
+    # Added in protocol 1.4. Defaults preserve source compatibility for
+    # callers that construct the previously public dataclass themselves.
+    read_logging: RemoteReadLoggingConfiguration | None = None
+    read_logging_stats: RemoteReadLoggingStatistics | None = None
 
     @property
     def writable(self) -> bool:
@@ -2182,6 +2259,133 @@ class RemoteCollection:
                     for field in RemoteEngineStatistics.__dataclass_fields__
                 }
             )
+        read_logging: RemoteReadLoggingConfiguration | None = None
+        has_read_logging = response.HasField("read_logging")
+        has_read_logging_stats = response.HasField("read_logging_stats")
+        if (
+            self._protocol_minor is not None
+            and self._protocol_minor >= 4
+            and (not has_read_logging or not has_read_logging_stats)
+        ):
+            raise RemoteProtocolError(
+                "server omitted protocol-v1.4 read-logging diagnostics"
+            )
+        if has_read_logging:
+            raw_logging = response.read_logging
+            maximum_event_bytes = (
+                _READ_LOG_RECORD_HEADER_BYTES
+                + 8 * raw_logging.max_ids_per_event
+            )
+            configured_values = (
+                raw_logging.sample_ppm,
+                raw_logging.max_ids_per_event,
+                raw_logging.buffer_bytes,
+                raw_logging.segment_bytes,
+                raw_logging.rotate_seconds,
+                raw_logging.retention_bytes,
+                raw_logging.retention_seconds,
+                raw_logging.minimum_free_bytes,
+                raw_logging.max_write_bytes_per_second,
+                raw_logging.max_retained_files,
+            )
+            if (
+                raw_logging.enabled
+                and (
+                    raw_logging.sample_ppm < 1
+                    or raw_logging.sample_ppm > 1_000_000
+                    or raw_logging.max_ids_per_event < 1
+                    or raw_logging.max_ids_per_event > 65_536
+                    or raw_logging.buffer_bytes
+                        < 2 * maximum_event_bytes
+                    or raw_logging.segment_bytes
+                        < (
+                            _READ_LOG_HEADER_BYTES
+                            + maximum_event_bytes
+                            + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+                        )
+                    or raw_logging.rotate_seconds < 1
+                    or raw_logging.rotate_seconds > (1 << 63) - 1
+                    or raw_logging.retention_bytes
+                        < raw_logging.segment_bytes
+                    or raw_logging.retention_seconds < 1
+                    or raw_logging.max_write_bytes_per_second
+                        < (
+                            _READ_LOG_HEADER_BYTES
+                            + maximum_event_bytes
+                            + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+                        )
+                    or raw_logging.max_retained_files < 1
+                    or raw_logging.max_retained_files > 65_533
+                )
+            ) or (
+                not raw_logging.enabled and any(configured_values)
+            ):
+                raise RemoteProtocolError(
+                    "server returned invalid read-logging configuration"
+                )
+            read_logging = RemoteReadLoggingConfiguration(
+                **{
+                    field: getattr(raw_logging, field)
+                    for field in
+                    RemoteReadLoggingConfiguration.__dataclass_fields__
+                }
+            )
+        read_logging_stats: RemoteReadLoggingStatistics | None = None
+        if has_read_logging_stats:
+            raw_logging_stats = response.read_logging_stats
+            maximum_u64 = (1 << 64) - 1
+            expected_queue_drops = min(
+                maximum_u64,
+                raw_logging_stats.dropped_busy_events
+                + raw_logging_stats.dropped_full_events,
+            )
+            numeric_stats = (
+                getattr(raw_logging_stats, field)
+                for field in
+                RemoteReadLoggingStatistics.__dataclass_fields__
+                if field not in {
+                    "enabled",
+                    "paused_for_minimum_free_space",
+                    "runtime_failed",
+                    "shutting_down",
+                }
+            )
+            if (
+                read_logging is None
+                or raw_logging_stats.enabled != read_logging.enabled
+            ) or (
+                raw_logging_stats.dropped_queue_events
+                    != expected_queue_drops
+            ) or (
+                raw_logging_stats.enabled
+                and (
+                    raw_logging_stats.buffer_capacity_bytes == 0
+                    or raw_logging_stats.buffer_capacity_bytes
+                        > read_logging.buffer_bytes
+                    or raw_logging_stats.queue_bytes
+                        > raw_logging_stats.buffer_capacity_bytes
+                    or raw_logging_stats.peak_queue_bytes
+                        > raw_logging_stats.buffer_capacity_bytes
+                )
+            ) or (
+                not raw_logging_stats.enabled
+                and (
+                    any(numeric_stats)
+                    or raw_logging_stats.paused_for_minimum_free_space
+                    or raw_logging_stats.runtime_failed
+                    or raw_logging_stats.shutting_down
+                )
+            ):
+                raise RemoteProtocolError(
+                    "server returned inconsistent read-logging statistics"
+                )
+            read_logging_stats = RemoteReadLoggingStatistics(
+                **{
+                    field: getattr(raw_logging_stats, field)
+                    for field in
+                    RemoteReadLoggingStatistics.__dataclass_fields__
+                }
+            )
         return RemoteDescription(
             format_version=response.format_version,
             schema=schema,
@@ -2193,6 +2397,8 @@ class RemoteCollection:
             availability=availability,
             admission_stats=admission_stats,
             engine_stats=engine_stats,
+            read_logging=read_logging,
+            read_logging_stats=read_logging_stats,
             idempotency_domain=idempotency_domain,
         )
 
@@ -2302,6 +2508,15 @@ class RemoteCollection:
     def engine_stats(self) -> RemoteEngineStatistics | None:
         # The mutation backlog and filesystem headroom are live gauges.
         return self.describe().engine_stats
+
+    @property
+    def read_logging(self) -> RemoteReadLoggingConfiguration | None:
+        return self._description.read_logging
+
+    @property
+    def read_logging_stats(self) -> RemoteReadLoggingStatistics | None:
+        # Queue pressure, retention and writer failures are live diagnostics.
+        return self.describe().read_logging_stats
 
     def get(
         self,
@@ -2777,6 +2992,8 @@ __all__ = [
     "RemoteInvalidArgumentError",
     "RemoteNotFoundError",
     "RemoteProtocolError",
+    "RemoteReadLoggingConfiguration",
+    "RemoteReadLoggingStatistics",
     "RemoteRecordScan",
     "RemoteReaderConfiguration",
     "RemoteResourceExhaustedError",

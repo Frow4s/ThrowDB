@@ -746,6 +746,8 @@ NativeCollectionMetadata inspect_partitioned_index_metadata(
     const PartitionedManifestV2 manifest =
         read_partitioned_manifest(store_path);
     NativeCollectionMetadata metadata;
+    metadata.collection_id_low = manifest.collection_id.low;
+    metadata.collection_id_high = manifest.collection_id.high;
     metadata.format_version = kPartitionedPublicFormatVersion;
     metadata.dimension = manifest.schema.dimension;
     metadata.dtype = public_dtype(manifest.schema.dtype);

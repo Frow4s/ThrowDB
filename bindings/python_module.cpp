@@ -14,6 +14,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include "crc32c.hpp"
 #include "throwdb/errors.hpp"
 #include "throwdb/native_collection.hpp"
 #include "throwdb/storage.hpp"
@@ -1442,6 +1443,8 @@ public:
             metadata = throwdb::NativeCollection::inspect_metadata(native_path);
         }
         py::dict result;
+        result["collection_id_low"] = metadata.collection_id_low;
+        result["collection_id_high"] = metadata.collection_id_high;
         result["format_version"] = metadata.format_version;
         result["dimension"] = metadata.dimension;
         result["dtype"] = dtype_info(metadata.dtype).name;
@@ -2049,6 +2052,37 @@ private:
 PYBIND11_MODULE(_throwdb, module) {
     module.doc() = "Native bindings for the ThrowDB storage engine";
     module.attr("__version__") = "0.1.0";
+    module.def(
+        "_crc32c",
+        [](const py::buffer& input,
+           const std::size_t zero_offset,
+           const std::size_t zero_size) {
+            const py::buffer_info info = input.request();
+            if (info.ndim != 1 || info.itemsize != 1
+                || info.strides.empty() || info.strides[0] != 1) {
+                throw py::value_error(
+                    "CRC32C input must be a contiguous one-byte buffer");
+            }
+            if (info.size < 0) {
+                throw py::value_error("CRC32C input size is invalid");
+            }
+            const auto size = static_cast<std::size_t>(info.size);
+            if (zero_offset > size || zero_size > size - zero_offset) {
+                throw py::value_error(
+                    "CRC32C zeroed field is outside the input buffer");
+            }
+            const auto* data = static_cast<const std::byte*>(info.ptr);
+            const std::span<const std::byte> bytes(data, size);
+            throwdb::detail::Crc32c checksum;
+            checksum.update(bytes.first(zero_offset));
+            checksum.update_zeroes(zero_size);
+            checksum.update(bytes.subspan(zero_offset + zero_size));
+            return checksum.value();
+        },
+        py::arg("input"),
+        py::arg("zero_offset") = 0,
+        py::arg("zero_size") = 0,
+        "Compute CRC32C while treating one byte range as zero.");
     PYBIND11_NUMPY_DTYPE(
         throwdb::NativeIdLocation, segment_id, row_index);
     py::register_exception<throwdb::ReaderBackendError>(

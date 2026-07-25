@@ -16,6 +16,7 @@ import os
 import platform
 import queue
 import resource
+import stat
 import statistics
 import subprocess
 import sys
@@ -41,7 +42,7 @@ import run_load_test as load_test  # noqa: E402
 
 
 REPORT_FORMAT = "throwdb-grpc-server-benchmark"
-REPORT_REVISION = 2
+REPORT_REVISION = 3
 DEFAULT_SEED = 20260715
 GIB = 1 << 30
 MIB = 1 << 20
@@ -53,6 +54,27 @@ _LOCAL_SERVER_SHUTDOWN_TIMEOUT_MARGIN_SECONDS = 5.0
 _MAX_LOCAL_SERVER_STOP_TIMEOUT_SECONDS = 15.0 * 60.0
 _DEFAULT_SERVER_SHUTDOWN_GRACE_MS = 30_000
 _DEFAULT_SERVER_SHUTDOWN_HARD_TIMEOUT_MS = 60_000
+_DEFAULT_READ_LOG_MAX_EVENT_DROP_RATIO = 0.05
+_DEFAULT_READ_LOG_MAX_ROW_DROP_RATIO = 0.05
+_MAX_READ_LOG_IDS_PER_EVENT = 65_536
+_MAX_READ_LOG_RETAINED_FILES = 65_533
+_MAX_READ_LOG_ROTATE_SECONDS = (1 << 63) - 1
+_MAX_UINT64_MIB = UINT64_MASK >> 20
+_MAX_INSPECTED_READ_LOG_FILES = 65_536
+_SERVER_READ_LOG_TUNING_ARGUMENTS = (
+    "server_read_log_sample_ppm",
+    "server_read_log_max_ids_per_event",
+    "server_read_log_buffer_mib",
+    "server_read_log_segment_mib",
+    "server_read_log_rotate_seconds",
+    "server_read_log_retention_mib",
+    "server_read_log_retention_seconds",
+    "server_read_log_min_free_mib",
+    "server_read_log_max_write_mib_per_second",
+    "server_read_log_max_retained_files",
+    "server_read_log_max_event_drop_ratio",
+    "server_read_log_max_row_drop_ratio",
+)
 
 
 def log(message: str) -> None:
@@ -97,6 +119,29 @@ def _positive_float(value: str) -> float:
     if not np.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(
             "value must be finite and greater than zero"
+        )
+    return parsed
+
+
+def _unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("value must be finite and in [0, 1]")
+    return parsed
+
+
+def _read_log_sample_ppm(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 1_000_000:
+        raise argparse.ArgumentTypeError("value must not exceed 1000000")
+    return parsed
+
+
+def _read_log_max_ids(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > _MAX_READ_LOG_IDS_PER_EVENT:
+        raise argparse.ArgumentTypeError(
+            f"value must not exceed {_MAX_READ_LOG_IDS_PER_EVENT}"
         )
     return parsed
 
@@ -499,6 +544,58 @@ def _local_server_stop_timeout_seconds(
     )
 
 
+def _read_log_server_arguments(
+    *,
+    directory: Path | None,
+    sample_ppm: int | None,
+    max_ids_per_event: int | None,
+    buffer_mib: int | None,
+    segment_mib: int | None,
+    rotate_seconds: int | None,
+    retention_mib: int | None,
+    retention_seconds: int | None,
+    min_free_mib: int | None,
+    max_write_mib_per_second: int | None,
+    max_retained_files: int | None,
+) -> list[str]:
+    """Build the explicit public-launcher arguments for read logging."""
+
+    configured = (
+        sample_ppm,
+        max_ids_per_event,
+        buffer_mib,
+        segment_mib,
+        rotate_seconds,
+        retention_mib,
+        retention_seconds,
+        min_free_mib,
+        max_write_mib_per_second,
+        max_retained_files,
+    )
+    if directory is None:
+        if any(value is not None for value in configured):
+            raise ValueError(
+                "server read-log tuning requires a dedicated log directory"
+            )
+        return []
+    result = ["--read-log-dir", str(directory)]
+    for option, value in (
+        ("--read-log-sample-ppm", sample_ppm),
+        ("--read-log-max-ids-per-event", max_ids_per_event),
+        ("--read-log-buffer-mib", buffer_mib),
+        ("--read-log-segment-mib", segment_mib),
+        ("--read-log-rotate-seconds", rotate_seconds),
+        ("--read-log-retention-mib", retention_mib),
+        ("--read-log-retention-seconds", retention_seconds),
+        ("--read-log-min-free-mib", min_free_mib),
+        ("--read-log-max-write-mib-per-second", max_write_mib_per_second),
+        ("--read-log-max-retained-files", max_retained_files),
+    ):
+        if value is not None:
+            result.extend((option, str(value)))
+    return result
+
+
 @dataclass(slots=True)
 class LocalServer:
     process: subprocess.Popen[str]
@@ -542,6 +639,17 @@ class LocalServer:
         scan_idle_timeout_ms: int | None = None,
         shutdown_grace_ms: int | None = None,
         shutdown_hard_timeout_ms: int | None = None,
+        read_log_directory: Path | None = None,
+        read_log_sample_ppm: int | None = None,
+        read_log_max_ids_per_event: int | None = None,
+        read_log_buffer_mib: int | None = None,
+        read_log_segment_mib: int | None = None,
+        read_log_rotate_seconds: int | None = None,
+        read_log_retention_mib: int | None = None,
+        read_log_retention_seconds: int | None = None,
+        read_log_min_free_mib: int | None = None,
+        read_log_max_write_mib_per_second: int | None = None,
+        read_log_max_retained_files: int | None = None,
     ) -> "LocalServer":
         command = [
             sys.executable,
@@ -574,6 +682,23 @@ class LocalServer:
         ):
             if value is not None:
                 command.extend((option, str(value)))
+        command.extend(
+            _read_log_server_arguments(
+                directory=read_log_directory,
+                sample_ppm=read_log_sample_ppm,
+                max_ids_per_event=read_log_max_ids_per_event,
+                buffer_mib=read_log_buffer_mib,
+                segment_mib=read_log_segment_mib,
+                rotate_seconds=read_log_rotate_seconds,
+                retention_mib=read_log_retention_mib,
+                retention_seconds=read_log_retention_seconds,
+                min_free_mib=read_log_min_free_mib,
+                max_write_mib_per_second=(
+                    read_log_max_write_mib_per_second
+                ),
+                max_retained_files=read_log_max_retained_files,
+            )
+        )
 
         process = subprocess.Popen(
             command,
@@ -721,6 +846,16 @@ def description_dict(description: throwdb.RemoteDescription) -> dict[str, Any]:
         "tuning": (
             asdict(description.tuning) if description.tuning is not None else None
         ),
+        "read_logging": (
+            description.read_logging.as_dict()
+            if description.read_logging is not None
+            else None
+        ),
+        "read_logging_stats": (
+            description.read_logging_stats.as_dict()
+            if description.read_logging_stats is not None
+            else None
+        ),
     }
 
 
@@ -754,6 +889,179 @@ def validate_ready_description(
         raise RuntimeError(
             "ready event and Describe disagree about durable idempotency"
         )
+    ready_read_logging = ready.get("read_logging")
+    described_read_logging = description.read_logging
+    if described_read_logging is None:
+        if ready_read_logging is not None:
+            raise RuntimeError(
+                "ready event advertised read logging that Describe omitted"
+            )
+        return
+    if not isinstance(ready_read_logging, dict):
+        raise RuntimeError(
+            "ready event or Describe omitted read-logging configuration"
+        )
+    if ready_read_logging.get("enabled") != described_read_logging.enabled:
+        raise RuntimeError(
+            "ready event and Describe disagree about read-logging state"
+        )
+    if described_read_logging.enabled:
+        if not isinstance(ready_read_logging.get("directory"), str):
+            raise RuntimeError(
+                "ready event omitted the local read-log directory"
+            )
+        for field_name, expected_value in described_read_logging.as_dict().items():
+            if (
+                field_name != "enabled"
+                and ready_read_logging.get(field_name) != expected_value
+            ):
+                raise RuntimeError(
+                    "ready event and Describe disagree about read-logging "
+                    f"field {field_name}"
+                )
+
+
+def _capture_final_describe(
+    remote: throwdb.RemoteCollection,
+    *,
+    budget: ResourceBudget,
+    rpc_timeout: float,
+) -> dict[str, Any]:
+    if budget.remaining_seconds() <= 0:
+        return {
+            "status": "skipped_budget_exhausted",
+            "description": None,
+        }
+    started = time.perf_counter()
+    try:
+        _set_remote_timeout(remote, budget, rpc_timeout)
+        description = remote.describe()
+    except Exception as error:
+        return {
+            "status": "error",
+            "elapsed_seconds": time.perf_counter() - started,
+            "description": None,
+            "error": {
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+        }
+    return {
+        "status": "complete",
+        "elapsed_seconds": time.perf_counter() - started,
+        "captured_unix_ns": time.time_ns(),
+        "description": description_dict(description),
+    }
+
+
+def _inspect_read_log_after_shutdown(
+    *,
+    directory: Path,
+    storage: Path,
+    clean_shutdown: bool,
+    budget: ResourceBudget,
+    max_event_drop_ratio: float,
+    max_row_drop_ratio: float,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": "pending",
+        "raw_ids_included": False,
+        "max_event_drop_ratio": max_event_drop_ratio,
+        "max_row_drop_ratio": max_row_drop_ratio,
+    }
+    if not clean_shutdown:
+        result["status"] = "skipped_unclean_server_shutdown"
+        return result
+    try:
+        budget.check()
+    except BenchmarkBudgetExceeded as error:
+        result["status"] = "skipped_budget_exhausted"
+        result["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+        return result
+
+    started = time.perf_counter()
+    try:
+        file_count = 0
+        total_bytes = 0
+        maximum_file_bytes = 0
+        scanned_entries = 0
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                budget.check()
+                scanned_entries += 1
+                if scanned_entries > _MAX_INSPECTED_READ_LOG_FILES:
+                    raise BenchmarkBudgetExceeded(
+                        "read-log directory exceeds the bounded post-shutdown "
+                        "inventory limit"
+                    )
+                path = Path(entry.path)
+                if path.suffix not in {".tdbrl", ".open"}:
+                    continue
+                status = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(status.st_mode):
+                    continue
+                file_count += 1
+                if file_count > _MAX_INSPECTED_READ_LOG_FILES:
+                    raise BenchmarkBudgetExceeded(
+                        "read-log file count exceeds the bounded "
+                        "post-shutdown inspection limit"
+                    )
+                file_bytes = int(status.st_size)
+                total_bytes += file_bytes
+                maximum_file_bytes = max(maximum_file_bytes, file_bytes)
+        # Charge the complete logical input before mmap/CRC traversal. This
+        # remains conservative if files shrink and fails before reading if
+        # either transfer or worst-case per-file RSS would exceed the harness.
+        budget.reserve(
+            total_bytes,
+            extra_memory_bytes=maximum_file_bytes,
+        )
+        inspection = throwdb.inspect_workload_logs(
+            directory,
+            storage=storage,
+            max_drop_ratio=max_event_drop_ratio,
+            max_row_drop_ratio=max_row_drop_ratio,
+            max_files=max(1, file_count),
+            max_total_bytes=max(1, total_bytes),
+            max_file_bytes=max(1, maximum_file_bytes),
+            _deadline_monotonic=budget.deadline,
+        )
+        budget.check()
+    except BenchmarkBudgetExceeded as error:
+        result["status"] = "skipped_budget_exhausted"
+        result["error"] = {
+            "type": type(error).__name__,
+            "message": str(error),
+        }
+    except Exception as error:
+        # A deadline enforced inside the inspector is still a benchmark-budget
+        # outcome, not corrupt telemetry. Re-check the authoritative budget
+        # before classifying any other optional-inspection error.
+        try:
+            budget.check()
+        except BenchmarkBudgetExceeded as budget_error:
+            result["status"] = "skipped_budget_exhausted"
+            result["error"] = {
+                "type": type(budget_error).__name__,
+                "message": str(budget_error),
+            }
+        else:
+            # Workload logging and its offline qualification are optional.
+            # Preserve the benchmark result while making failure explicit.
+            result["status"] = "error"
+            result["error"] = {
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+    else:
+        result["status"] = "complete"
+        result["inspection"] = inspection
+        result["accounted_input_bytes"] = total_bytes
+    result["elapsed_seconds"] = time.perf_counter() - started
+    return result
 
 
 def canonical_ids(values: np.ndarray) -> np.ndarray:
@@ -2187,6 +2495,60 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-max-scan-batch-rows", type=_positive_int)
     parser.add_argument("--server-maintenance-interval-seconds", type=_positive_int)
     parser.add_argument("--server-no-auto-maintenance", action="store_true")
+    parser.add_argument(
+        "--server-read-log-dir",
+        type=Path,
+        help=(
+            "enable bounded point-read logging for a locally launched server "
+            "in this dedicated directory"
+        ),
+    )
+    parser.add_argument(
+        "--server-read-log-sample-ppm",
+        type=_read_log_sample_ppm,
+    )
+    parser.add_argument(
+        "--server-read-log-max-ids-per-event",
+        type=_read_log_max_ids,
+    )
+    parser.add_argument("--server-read-log-buffer-mib", type=_positive_int)
+    parser.add_argument("--server-read-log-segment-mib", type=_positive_int)
+    parser.add_argument("--server-read-log-rotate-seconds", type=_positive_int)
+    parser.add_argument("--server-read-log-retention-mib", type=_positive_int)
+    parser.add_argument(
+        "--server-read-log-retention-seconds",
+        type=_positive_int,
+    )
+    parser.add_argument(
+        "--server-read-log-min-free-mib",
+        type=_nonnegative_int,
+    )
+    parser.add_argument(
+        "--server-read-log-max-write-mib-per-second",
+        type=_positive_int,
+    )
+    parser.add_argument(
+        "--server-read-log-max-retained-files",
+        type=_positive_int,
+    )
+    parser.add_argument(
+        "--server-read-log-max-event-drop-ratio",
+        type=_unit_interval,
+        help=(
+            "inspection suitability threshold for completed event outcomes "
+            "lost "
+            "(default: 0.05 when read logging is enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--server-read-log-max-row-drop-ratio",
+        type=_unit_interval,
+        help=(
+            "inspection suitability threshold for completed row outcomes "
+            "lost "
+            "(default: 0.05 when read logging is enabled)"
+        ),
+    )
     parser.add_argument("--max-seconds", type=_positive_float, default=300.0)
     parser.add_argument("--max-transfer-gib", type=_positive_float, default=16.0)
     parser.add_argument(
@@ -2242,6 +2604,76 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_server_read_log_arguments(args: argparse.Namespace) -> None:
+    configured_tuning = [
+        name
+        for name in _SERVER_READ_LOG_TUNING_ARGUMENTS
+        if getattr(args, name) is not None
+    ]
+    enabled = args.server_read_log_dir is not None
+    if args.endpoint is not None and (enabled or configured_tuning):
+        raise ValueError(
+            "--server-read-log-* options are only valid for a locally "
+            "launched server"
+        )
+    if not enabled and configured_tuning:
+        rendered = ", ".join(
+            "--" + name.replace("_", "-") for name in configured_tuning
+        )
+        raise ValueError(
+            f"{rendered} require --server-read-log-dir; logging remains "
+            "disabled unless its directory is explicit"
+        )
+    if enabled:
+        for name in (
+            "server_read_log_buffer_mib",
+            "server_read_log_segment_mib",
+            "server_read_log_retention_mib",
+            "server_read_log_min_free_mib",
+            "server_read_log_max_write_mib_per_second",
+        ):
+            value = getattr(args, name)
+            if value is not None and value > _MAX_UINT64_MIB:
+                raise ValueError(
+                    f"--{name.replace('_', '-')} exceeds the uint64 MiB "
+                    "range"
+                )
+        if (
+            args.server_read_log_retention_seconds is not None
+            and args.server_read_log_retention_seconds > UINT64_MASK
+        ):
+            raise ValueError(
+                "--server-read-log-retention-seconds exceeds the uint64 "
+                "range"
+            )
+        if (
+            args.server_read_log_rotate_seconds is not None
+            and args.server_read_log_rotate_seconds
+                > _MAX_READ_LOG_ROTATE_SECONDS
+        ):
+            raise ValueError(
+                "--server-read-log-rotate-seconds must fit signed "
+                "64-bit seconds"
+            )
+        if (
+            args.server_read_log_max_retained_files is not None
+            and args.server_read_log_max_retained_files
+                > _MAX_READ_LOG_RETAINED_FILES
+        ):
+            raise ValueError(
+                "--server-read-log-max-retained-files must be in "
+                "[1, 65533]"
+            )
+        if args.server_read_log_max_event_drop_ratio is None:
+            args.server_read_log_max_event_drop_ratio = (
+                _DEFAULT_READ_LOG_MAX_EVENT_DROP_RATIO
+            )
+        if args.server_read_log_max_row_drop_ratio is None:
+            args.server_read_log_max_row_drop_ratio = (
+                _DEFAULT_READ_LOG_MAX_ROW_DROP_RATIO
+            )
+
+
 def _checkpoint(
     report_path: Path,
     report: dict[str, Any],
@@ -2261,6 +2693,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.source_embeddings = args.source_embeddings.resolve()
     if args.native_binary is not None:
         args.native_binary = args.native_binary.resolve()
+    if args.server_read_log_dir is not None:
+        args.server_read_log_dir = args.server_read_log_dir.resolve()
+    _validate_server_read_log_arguments(args)
     if args.endpoint is not None and args.native_binary is not None:
         raise ValueError("--native-binary is only valid for a locally launched server")
     if args.endpoint is None and args.store is None:
@@ -2382,6 +2817,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     disable_automatic_maintenance=(
                         args.server_no_auto_maintenance
+                    ),
+                    read_log_directory=args.server_read_log_dir,
+                    read_log_sample_ppm=args.server_read_log_sample_ppm,
+                    read_log_max_ids_per_event=(
+                        args.server_read_log_max_ids_per_event
+                    ),
+                    read_log_buffer_mib=args.server_read_log_buffer_mib,
+                    read_log_segment_mib=args.server_read_log_segment_mib,
+                    read_log_rotate_seconds=(
+                        args.server_read_log_rotate_seconds
+                    ),
+                    read_log_retention_mib=(
+                        args.server_read_log_retention_mib
+                    ),
+                    read_log_retention_seconds=(
+                        args.server_read_log_retention_seconds
+                    ),
+                    read_log_min_free_mib=(
+                        args.server_read_log_min_free_mib
+                    ),
+                    read_log_max_write_mib_per_second=(
+                        args.server_read_log_max_write_mib_per_second
+                    ),
+                    read_log_max_retained_files=(
+                        args.server_read_log_max_retained_files
                     ),
                 )
                 startup_seconds = time.perf_counter() - launch_started
@@ -2963,13 +3423,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             with contextlib.suppress(Exception):
                 embedded.close()
         if remote is not None:
+            report.setdefault("server", {})["final_describe"] = (
+                _capture_final_describe(
+                    remote,
+                    budget=budget,
+                    rpc_timeout=args.rpc_timeout,
+                )
+            )
             with contextlib.suppress(Exception):
                 remote.close()
         if local_server is not None:
             local_server.close()
-            report.setdefault("server", {})["returncode_after_shutdown"] = (
-                local_server.process.returncode
-            )
+            returncode = local_server.process.returncode
+            report.setdefault("server", {})["returncode_after_shutdown"] = returncode
+            if (
+                args.server_read_log_dir is not None
+                and args.store is not None
+            ):
+                report["server"]["read_log_inspection"] = (
+                    _inspect_read_log_after_shutdown(
+                        directory=args.server_read_log_dir,
+                        storage=args.store,
+                        clean_shutdown=returncode == 0,
+                        budget=budget,
+                        max_event_drop_ratio=(
+                            args.server_read_log_max_event_drop_ratio
+                        ),
+                        max_row_drop_ratio=(
+                            args.server_read_log_max_row_drop_ratio
+                        ),
+                    )
+                )
         report["diskstats"] = diskstats.summary()
         report["finished_unix_ns"] = time.time_ns()
         _checkpoint(report_path, report, budget)

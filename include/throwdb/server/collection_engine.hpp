@@ -264,6 +264,7 @@ public:
 
     [[nodiscard]] NativeCollection& collection() noexcept;
     [[nodiscard]] const NativeCollection& collection() const noexcept;
+    [[nodiscard]] const std::filesystem::path& storage_path() const noexcept;
     [[nodiscard]] bool durable_idempotency() const noexcept;
     [[nodiscard]] OperationId idempotency_domain() const;
     [[nodiscard]] IdempotencyStats idempotency_stats() const;

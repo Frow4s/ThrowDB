@@ -716,6 +716,10 @@ void test_lightweight_metadata_inspection() {
 
     const throwdb::NativeCollectionMetadata metadata =
         throwdb::NativeCollection::inspect_metadata(store);
+    require(
+        metadata.collection_id_low != 0
+            || metadata.collection_id_high != 0,
+        "metadata collection identity is empty");
     require(metadata.format_version == 6, "metadata format version is wrong");
     require(metadata.dimension == options.dimension,
             "metadata dimension is wrong");

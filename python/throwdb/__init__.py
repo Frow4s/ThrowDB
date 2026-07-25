@@ -45,6 +45,8 @@ from .remote import (
     RemoteInvalidArgumentError,
     RemoteNotFoundError,
     RemoteProtocolError,
+    RemoteReadLoggingConfiguration,
+    RemoteReadLoggingStatistics,
     RemoteRecordScan,
     RemoteReaderConfiguration,
     RemoteResourceExhaustedError,
@@ -60,6 +62,7 @@ from .s3_backup import (
     backup_to_s3,
     restore_from_s3,
 )
+from .workload import WorkloadLogError, inspect_workload_logs
 
 __all__ = [
     "Collection",
@@ -104,6 +107,8 @@ __all__ = [
     "RemoteInvalidArgumentError",
     "RemoteNotFoundError",
     "RemoteProtocolError",
+    "RemoteReadLoggingConfiguration",
+    "RemoteReadLoggingStatistics",
     "RemoteRecordScan",
     "RemoteReaderConfiguration",
     "RemoteResourceExhaustedError",
@@ -112,9 +117,11 @@ __all__ = [
     "RemoteUnimplementedError",
     "Storage",
     "TuningRegistryError",
+    "WorkloadLogError",
     "Writer",
     "RecordBatch",
     "backup_to_s3",
+    "inspect_workload_logs",
     "restore_from_s3",
     "__version__",
 ]

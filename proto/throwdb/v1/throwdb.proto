@@ -217,6 +217,72 @@ message EngineStatistics {
   bool maintenance_active = 24;
 }
 
+// Effective bounded workload-logging policy. Workload logging is disabled
+// unless directory is explicitly configured by the server operator. The
+// directory is intentionally outside the collection and is not authoritative
+// collection state.
+message ReadLoggingConfiguration {
+  bool enabled = 1;
+  // Reserved: local filesystem paths are process diagnostics and must not be
+  // disclosed to remote data-plane clients.
+  reserved 2;
+  uint32 sample_ppm = 3;
+  uint32 max_ids_per_event = 4;
+  uint64 buffer_bytes = 5;
+  uint64 segment_bytes = 6;
+  uint64 rotate_seconds = 7;
+  uint64 retention_bytes = 8;
+  uint64 retention_seconds = 9;
+  uint64 minimum_free_bytes = 10;
+  uint64 max_write_bytes_per_second = 11;
+  uint64 max_retained_files = 12;
+}
+
+// Monotonic process-local counters plus the current bounded queue/disk state.
+// A sampled event may still be dropped by backpressure, disk pressure, or a
+// non-fatal writer error; those failures never fail the read RPC itself.
+message ReadLoggingStatistics {
+  bool enabled = 1;
+  uint64 considered_events = 2;
+  uint64 sampled_events = 3;
+  uint64 enqueued_events = 4;
+  uint64 written_events = 5;
+  uint64 truncated_events = 6;
+  uint64 captured_ids = 7;
+  uint64 dropped_queue_events = 8;
+  uint64 dropped_disk_pressure_events = 9;
+  uint64 dropped_error_events = 10;
+  uint64 bytes_written = 11;
+  uint64 segments_created = 12;
+  uint64 retained_bytes = 13;
+  uint64 retained_segments = 14;
+  uint64 queue_bytes = 15;
+  uint64 peak_queue_bytes = 16;
+  uint64 retention_deleted_bytes = 17;
+  uint64 retention_deleted_segments = 18;
+  uint64 writer_errors = 19;
+  uint64 observed_ids = 20;
+  uint64 unsampled_events = 21;
+  uint64 dropped_busy_events = 22;
+  uint64 dropped_full_events = 23;
+  uint64 rotated_segments = 24;
+  uint64 queued_events = 25;
+  uint64 buffer_capacity_bytes = 26;
+  int32 last_error_number = 27;
+  bool paused_for_minimum_free_space = 28;
+  bool runtime_failed = 29;
+  bool shutting_down = 30;
+  uint64 sampled_ids = 31;
+  uint64 enqueued_ids = 32;
+  uint64 written_ids = 33;
+  uint64 dropped_busy_ids = 34;
+  uint64 dropped_full_ids = 35;
+  uint64 dropped_error_ids = 36;
+  uint64 dropped_disk_pressure_ids = 37;
+  uint64 dropped_io_budget_events = 38;
+  uint64 dropped_io_budget_ids = 39;
+}
+
 message DescribeResponse {
   uint32 format_version = 1;
   CollectionSchema schema = 2;
@@ -233,6 +299,8 @@ message DescribeResponse {
   OperationId idempotency_domain = 9;
   AdmissionStatistics admission_stats = 10;
   EngineStatistics engine_stats = 11;
+  ReadLoggingConfiguration read_logging = 12;
+  ReadLoggingStatistics read_logging_stats = 13;
 }
 
 message GetRequest {

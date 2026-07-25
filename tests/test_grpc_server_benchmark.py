@@ -6,7 +6,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -112,6 +112,297 @@ def test_parser_has_bounded_reproducible_defaults() -> None:
     assert args.repeats == 3
     assert args.crud_rows == 0
     assert args.endpoint is None
+    assert args.server_read_log_dir is None
+    assert args.server_read_log_max_event_drop_ratio is None
+    assert args.server_read_log_max_row_drop_ratio is None
+
+
+def test_parser_forwards_every_explicit_read_log_control() -> None:
+    args = BENCHMARK.build_parser().parse_args(
+        [
+            "--store",
+            "/store",
+            "--ids",
+            "/ids.npy",
+            "--results",
+            "/results",
+            "--server-read-log-dir",
+            "/logs",
+            "--server-read-log-sample-ppm",
+            "12345",
+            "--server-read-log-max-ids-per-event",
+            "2048",
+            "--server-read-log-buffer-mib",
+            "32",
+            "--server-read-log-segment-mib",
+            "64",
+            "--server-read-log-rotate-seconds",
+            "120",
+            "--server-read-log-retention-mib",
+            "512",
+            "--server-read-log-retention-seconds",
+            "3600",
+            "--server-read-log-min-free-mib",
+            "0",
+            "--server-read-log-max-write-mib-per-second",
+            "8",
+            "--server-read-log-max-retained-files",
+            "128",
+            "--server-read-log-max-event-drop-ratio",
+            "0.01",
+            "--server-read-log-max-row-drop-ratio",
+            "0.02",
+        ]
+    )
+
+    BENCHMARK._validate_server_read_log_arguments(args)
+    assert BENCHMARK._read_log_server_arguments(
+        directory=args.server_read_log_dir,
+        sample_ppm=args.server_read_log_sample_ppm,
+        max_ids_per_event=args.server_read_log_max_ids_per_event,
+        buffer_mib=args.server_read_log_buffer_mib,
+        segment_mib=args.server_read_log_segment_mib,
+        rotate_seconds=args.server_read_log_rotate_seconds,
+        retention_mib=args.server_read_log_retention_mib,
+        retention_seconds=args.server_read_log_retention_seconds,
+        min_free_mib=args.server_read_log_min_free_mib,
+        max_write_mib_per_second=(
+            args.server_read_log_max_write_mib_per_second
+        ),
+        max_retained_files=args.server_read_log_max_retained_files,
+    ) == [
+        "--read-log-dir",
+        "/logs",
+        "--read-log-sample-ppm",
+        "12345",
+        "--read-log-max-ids-per-event",
+        "2048",
+        "--read-log-buffer-mib",
+        "32",
+        "--read-log-segment-mib",
+        "64",
+        "--read-log-rotate-seconds",
+        "120",
+        "--read-log-retention-mib",
+        "512",
+        "--read-log-retention-seconds",
+        "3600",
+        "--read-log-min-free-mib",
+        "0",
+        "--read-log-max-write-mib-per-second",
+        "8",
+        "--read-log-max-retained-files",
+        "128",
+    ]
+
+
+def test_read_log_options_reject_external_or_implicit_enablement() -> None:
+    parser = BENCHMARK.build_parser()
+    external = parser.parse_args(
+        [
+            "--endpoint",
+            "127.0.0.1:50051",
+            "--ids",
+            "/ids.npy",
+            "--results",
+            "/results",
+            "--server-read-log-dir",
+            "/logs",
+        ]
+    )
+    with pytest.raises(ValueError, match="locally launched"):
+        BENCHMARK._validate_server_read_log_arguments(external)
+
+    no_directory = parser.parse_args(
+        [
+            "--store",
+            "/store",
+            "--ids",
+            "/ids.npy",
+            "--results",
+            "/results",
+            "--server-read-log-sample-ppm",
+            "10000",
+        ]
+    )
+    with pytest.raises(ValueError, match="require --server-read-log-dir"):
+        BENCHMARK._validate_server_read_log_arguments(no_directory)
+
+    oversized_rotation = parser.parse_args(
+        [
+            "--store",
+            "/store",
+            "--ids",
+            "/ids.npy",
+            "--results",
+            "/results",
+            "--server-read-log-dir",
+            "/logs",
+            "--server-read-log-rotate-seconds",
+            str(1 << 63),
+        ]
+    )
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        BENCHMARK._validate_server_read_log_arguments(oversized_rotation)
+
+    oversized_mib = parser.parse_args(
+        [
+            "--store",
+            "/store",
+            "--ids",
+            "/ids.npy",
+            "--results",
+            "/results",
+            "--server-read-log-dir",
+            "/logs",
+            "--server-read-log-buffer-mib",
+            str(1 << 44),
+        ]
+    )
+    with pytest.raises(ValueError, match="uint64 MiB"):
+        BENCHMARK._validate_server_read_log_arguments(oversized_mib)
+
+
+def test_description_dict_includes_read_logging_diagnostics() -> None:
+    read_logging = SimpleNamespace(
+        as_dict=lambda: {"enabled": True, "sample_ppm": 10_000}
+    )
+    read_logging_stats = SimpleNamespace(
+        as_dict=lambda: {"enabled": True, "written_events": 17}
+    )
+    description = SimpleNamespace(
+        format_version=7,
+        schema=throwdb.CollectionSchema(dimension=8, dtype="float16"),
+        capabilities=0,
+        record_size=16,
+        count=4,
+        writable=False,
+        prefix_get=True,
+        scan_locations=True,
+        durable_idempotency=False,
+        reader=None,
+        tuning=None,
+        read_logging=read_logging,
+        read_logging_stats=read_logging_stats,
+    )
+
+    result = BENCHMARK.description_dict(description)
+
+    assert result["read_logging"] == {
+        "enabled": True,
+        "sample_ppm": 10_000,
+    }
+    assert result["read_logging_stats"] == {
+        "enabled": True,
+        "written_events": 17,
+    }
+
+
+def test_post_shutdown_read_log_inspection_is_bounded_and_nonfatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def inspect(*args: object, **kwargs: object) -> dict[str, object]:
+        calls.append((args, kwargs))
+        return {"quality": {"suitable": True}, "events": {"records": 9}}
+
+    monkeypatch.setattr(BENCHMARK.throwdb, "inspect_workload_logs", inspect)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+
+    class BudgetProbe:
+        deadline = 123.0
+
+        def __init__(self) -> None:
+            self.reservations: list[tuple[int, int]] = []
+
+        def check(self) -> None:
+            return None
+
+        def reserve(
+            self,
+            byte_count: int,
+            *,
+            extra_memory_bytes: int = 0,
+        ) -> None:
+            self.reservations.append((byte_count, extra_memory_bytes))
+
+    budget = BudgetProbe()
+    result = BENCHMARK._inspect_read_log_after_shutdown(
+        directory=logs,
+        storage=tmp_path / "store",
+        clean_shutdown=True,
+        budget=budget,
+        max_event_drop_ratio=0.01,
+        max_row_drop_ratio=0.02,
+    )
+
+    assert result["status"] == "complete"
+    assert result["raw_ids_included"] is False
+    assert calls == [
+        (
+            (tmp_path / "logs",),
+            {
+                "storage": tmp_path / "store",
+                "max_drop_ratio": 0.01,
+                "max_row_drop_ratio": 0.02,
+                "max_files": 1,
+                "max_total_bytes": 1,
+                "max_file_bytes": 1,
+                "_deadline_monotonic": 123.0,
+            },
+        )
+    ]
+    assert budget.reservations == [(0, 0)]
+    assert result["inspection"]["events"] == {"records": 9}
+
+    def fail(*_: object, **__: object) -> dict[str, object]:
+        raise throwdb.WorkloadLogError("synthetic corruption")
+
+    monkeypatch.setattr(BENCHMARK.throwdb, "inspect_workload_logs", fail)
+    failed = BENCHMARK._inspect_read_log_after_shutdown(
+        directory=logs,
+        storage=tmp_path / "store",
+        clean_shutdown=True,
+        budget=budget,
+        max_event_drop_ratio=0.01,
+        max_row_drop_ratio=0.02,
+    )
+    assert failed["status"] == "error"
+    assert failed["error"]["type"] == "WorkloadLogError"
+
+    class ExpiringBudget(BudgetProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checks = 0
+
+        def check(self) -> None:
+            self.checks += 1
+            if self.checks >= 2:
+                raise BENCHMARK.BenchmarkBudgetExceeded("deadline reached")
+
+    expired = BENCHMARK._inspect_read_log_after_shutdown(
+        directory=logs,
+        storage=tmp_path / "store",
+        clean_shutdown=True,
+        budget=ExpiringBudget(),
+        max_event_drop_ratio=0.01,
+        max_row_drop_ratio=0.02,
+    )
+    assert expired["status"] == "skipped_budget_exhausted"
+    assert expired["error"]["type"] == "BenchmarkBudgetExceeded"
+
+    skipped = BENCHMARK._inspect_read_log_after_shutdown(
+        directory=logs,
+        storage=tmp_path / "store",
+        clean_shutdown=False,
+        budget=budget,
+        max_event_drop_ratio=0.01,
+        max_row_drop_ratio=0.02,
+    )
+    assert skipped["status"] == "skipped_unclean_server_shutdown"
 
 
 def test_parser_accepts_external_endpoint_without_store_and_bounds_seed() -> None:
@@ -1357,6 +1648,7 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
     ids_path = tmp_path / "ids.npy"
     embeddings_path = tmp_path / "embeddings.npy"
     results = tmp_path / "results"
+    read_logs = tmp_path / "read-logs"
     ids = np.array([11, 22, 33, 44], dtype=np.uint32)
     embeddings = _vectors(ids.size, 8)
     np.save(ids_path, ids)
@@ -1369,60 +1661,88 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
     ) as builder:
         builder.add(ids, embeddings)
 
-    exit_code = BENCHMARK.main(
-        [
-            "--store",
-            str(store),
-            "--ids",
-            str(ids_path),
-            "--source-embeddings",
-            str(embeddings_path),
-            "--results",
-            str(results),
-            "--native-binary",
-            str(native),
-            "--prefix-dimensions",
-            "full,4",
-            "--batch-sizes",
-            "1,2",
-            "--calls",
-            "1",
-            "--warmup-calls",
-            "0",
-            "--cache-mode",
-            "warm",
-            "--repeats",
-            "1",
-            "--concurrency",
-            "1",
-            "--concurrent-batch-size",
-            "2",
-            "--concurrent-calls-per-worker",
-            "1",
-            "--mixed-workers",
-            "1",
-            "--mixed-small-batch",
-            "1",
-            "--mixed-large-batch",
-            "2",
-            "--mixed-small-calls",
-            "1",
-            "--mixed-large-calls",
-            "1",
-            "--correctness-rows",
-            "2",
-            "--scan-rows",
-            "2",
-            "--scan-batch-rows",
-            "2",
-            "--max-seconds",
-            "30",
-            "--max-transfer-gib",
-            "0.01",
-            "--max-client-memory-mib",
-            "64",
-        ]
-    )
+    benchmark_arguments = [
+        "--store",
+        str(store),
+        "--ids",
+        str(ids_path),
+        "--source-embeddings",
+        str(embeddings_path),
+        "--results",
+        str(results),
+        "--native-binary",
+        str(native),
+        "--prefix-dimensions",
+        "full,4",
+        "--batch-sizes",
+        "1,2",
+        "--calls",
+        "1",
+        "--warmup-calls",
+        "0",
+        "--cache-mode",
+        "warm",
+        "--repeats",
+        "1",
+        "--concurrency",
+        "1",
+        "--concurrent-batch-size",
+        "2",
+        "--concurrent-calls-per-worker",
+        "1",
+        "--mixed-workers",
+        "1",
+        "--mixed-small-batch",
+        "1",
+        "--mixed-large-batch",
+        "2",
+        "--mixed-small-calls",
+        "1",
+        "--mixed-large-calls",
+        "1",
+        "--correctness-rows",
+        "2",
+        "--scan-rows",
+        "2",
+        "--scan-batch-rows",
+        "2",
+        "--max-seconds",
+        "30",
+        "--max-transfer-gib",
+        "0.01",
+        "--max-client-memory-mib",
+        "64",
+    ]
+    logger_supported = b"--read-log-dir" in native.read_bytes()
+    if logger_supported:
+        benchmark_arguments.extend(
+            [
+                "--server-read-log-dir",
+                str(read_logs),
+                "--server-read-log-sample-ppm",
+                "1000000",
+                "--server-read-log-max-ids-per-event",
+                "4",
+                "--server-read-log-buffer-mib",
+                "1",
+                "--server-read-log-segment-mib",
+                "1",
+                "--server-read-log-rotate-seconds",
+                "3600",
+                "--server-read-log-retention-mib",
+                "8",
+                "--server-read-log-retention-seconds",
+                "86400",
+                "--server-read-log-min-free-mib",
+                "0",
+                "--server-read-log-max-write-mib-per-second",
+                "1",
+                "--server-read-log-max-retained-files",
+                "8",
+            ]
+        )
+
+    exit_code = BENCHMARK.main(benchmark_arguments)
 
     assert exit_code == 0
     report = BENCHMARK.json.loads(
@@ -1430,9 +1750,31 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
     )
     assert report["status"] == "complete"
     assert report["format"] == BENCHMARK.REPORT_FORMAT
-    assert report["revision"] == 2
+    assert report["revision"] == 3
     assert report["methodology"]["cache_modes"] == ["warm"]
     assert report["server"]["mode"] == "local_loopback"
+    assert report["server"]["final_describe"]["status"] == "complete"
+    if logger_supported:
+        assert report["server"]["description"]["read_logging"]["enabled"] is True
+        assert (
+            report["server"]["final_describe"]["description"][
+                "read_logging_stats"
+            ]["considered_events"]
+            > 0
+        )
+        assert report["server"]["read_log_inspection"]["status"] == "complete"
+        assert (
+            report["server"]["read_log_inspection"]["inspection"]["quality"][
+                "suitable"
+            ]
+            is True
+        )
+        assert (
+            report["server"]["read_log_inspection"]["inspection"]["events"][
+                "captured_ids"
+            ]
+            > 0
+        )
     assert report["phases"]["correctness"]["bit_exact"] is True
     assert report["phases"]["scan_ids"]["rows"] == 2
     assert report["phases"]["crud"]["status"] == "skipped"

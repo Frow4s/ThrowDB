@@ -807,6 +807,9 @@ def test_low_level_native_metadata_and_range_options(
     )
 
     metadata = NativeCollection.inspect_metadata(path)
+    collection_id_low = metadata.pop("collection_id_low")
+    collection_id_high = metadata.pop("collection_id_high")
+    assert collection_id_low != 0 or collection_id_high != 0
     assert metadata == {
         "format_version": 6,
         "dimension": dimension,

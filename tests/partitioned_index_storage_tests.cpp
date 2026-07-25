@@ -335,6 +335,10 @@ void test_float16_end_to_end_and_read_surface() {
 
     const throwdb::NativeCollectionMetadata metadata =
         throwdb::NativeCollection::inspect_metadata(temporary.path());
+    require(
+        metadata.collection_id_low != 0
+            || metadata.collection_id_high != 0,
+        "metadata collection identity is empty");
     require(metadata.format_version == 7, "metadata format is not 7");
     require(metadata.dimension == 4, "metadata dimension changed");
     require(metadata.dtype == throwdb::DType::Float16, "metadata dtype changed");

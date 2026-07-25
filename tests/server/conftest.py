@@ -38,6 +38,7 @@ def throwdb_server_binary(pytestconfig: pytest.Config) -> Path:
     candidates.extend(
         [
             installed_binary,
+            repository / "build" / "server-release" / "throwdbd",
             repository / "build-grpc" / "throwdbd",
             repository / "build-grpc-dev" / "throwdbd",
         ]

@@ -1,6 +1,7 @@
 # Workload-aware physical layout
 
-Status: accepted architecture for the first implementation slice.
+Status: implementation slice 1 is complete; planner/rebuild slices remain
+future work.
 
 ThrowDB can reduce point-read I/O by placing IDs that are commonly requested
 together near one another on disk. This is an offline optimization pipeline,
@@ -67,8 +68,9 @@ Every workload artifact and layout plan is anchored to:
 - optimizer name, version, configuration, and deterministic seed.
 
 The optimizer rejects mixed collection identities, incompatible schemas,
-corrupt frames, unbounded drop rates, and plans whose source identity has
-changed. Candidate construction always targets a new sibling directory.
+corrupt frames, mixed logger configurations, unbounded drop rates, and plans
+whose source identity has changed. Candidate construction always targets a new
+sibling directory.
 
 The current engine has no change stream that can bring a long-running rebuild
 forward from snapshot `S` to the latest mutation `T`. The first safe rebuild is
@@ -105,13 +107,16 @@ backup/restore from treating workload telemetry as authoritative data.
 
 The enabled hot path has these guarantees:
 
-- request-level Bernoulli sampling before any logging work;
+- request-level Bernoulli sampling before any ID copying or queue admission;
 - a configurable hard cap on captured IDs per event;
 - unbiased deterministic stratified sampling across oversized batches rather
   than retaining only their prefix;
 - a preallocated, byte-bounded producer queue;
 - nonblocking all-or-drop enqueue;
 - one sequential background writer;
+- a token-bucket write-rate ceiling debited for every sequential logger byte
+  before it is written (16 MiB/s by default);
+- age, byte, and retained-file-count limits (4096 files by default);
 - no read failure or delay caused by queue saturation or a runtime log-write
   error;
 - monotonic counters for considered, selected, written, dropped, truncated,
@@ -119,11 +124,45 @@ The enabled hot path has these guarantees:
 
 The first binary log version uses a collection/schema header and individually
 framed little-endian records. Headers and frames have strict size limits and
-CRC32C checksums. Rotation finalizes
-`<instance>.<sequence>.open` to `<instance>.<sequence>.tdbrl`; after a crash,
-the analyzer accepts the complete valid prefix of an open file and ignores a
-torn tail. Files and directories are private by default. Rotation, retention,
+CRC32C checksums. Every segment carries a process-instance ID and monotonic
+segment sequence. Its first frame is an opening counter baseline copied exactly
+from the preceding segment's terminal counters (or zero for a new process).
+A file is renamed from
+`<instance>.<sequence>.open` to `<instance>.<sequence>.tdbrl` only after a
+fresh terminal counter checkpoint and durable finalization succeed. A
+minimum-free-space refusal or runtime/finalization failure leaves `.open`;
+after a crash, the analyzer accepts only its complete valid prefix and ignores
+a torn final frame. A pre-bind file that never accepted an event is removed
+instead of being finalized empty. Files and directories are private by
+default. Rotation, retention, a write-rate ceiling, a retained-file ceiling,
 and a minimum-free-space guard bound telemetry's disk impact.
+Retention brings finalized and stale recognized files under both configured
+budgets. While running, the logger reserves one configured file slot for its
+current `.open`, so the total recognized file count remains bounded. Only the
+active segment may sit outside the retained-byte budget, so byte usage can
+overshoot by at most that one segment. Traffic and a periodic idle sweep
+(at least once every five minutes) enforce age retention.
+
+Event frames retain compact cumulative event-counter snapshots. Checkpoint
+extension v2 adds sampled, enqueued, written, and reason-specific dropped row
+counters plus writer-budget event/row drops, and marks the mandatory opening
+baseline. Adjacent retained segments must have an exact
+terminal-to-opening match; event snapshots may appear physically
+nonmonotonic because producers update independent saturating atomics. A
+rotated segment can end while already accepted work is waiting for the next
+segment, so exact written/drop partitions are required only from the latest
+retained terminal checkpoint for that process instance.
+
+Retention deletes an oldest-first prefix. Because the first remaining segment
+still contains its process-lifetime baseline, the inspector subtracts that
+baseline from the latest complete terminal checkpoint. Reported drop rates and
+resource counters therefore describe the retained counter window even when
+earlier files no longer exist. The loss denominator is the number of completed
+outcomes in that window (`written + all drop reasons`), not the delta of the
+independently sampled admission counter. This correctly assigns work whose
+sampling and final disposition straddle a rotation. Counter saturation fails
+closed. Sequence gaps, a missing/duplicate opening baseline, or a baseline that
+differs from the preceding retained terminal make the history unsuitable.
 
 Each point-read record contains at least:
 
@@ -154,12 +193,26 @@ reports, without printing raw IDs:
 - request-kind, batch-size, and prefix-dimension distributions;
 - configured and effective sampling;
 - captured/original row coverage;
-- producer drops and writer failures;
+- producer/writer-budget drops and writer failures, separately for events and
+  rows;
 - a machine-readable suitability verdict.
 
-The planner refuses logs with an incompatible identity or a configured maximum
-drop ratio violation. It warns on low time coverage, high truncation, workload
-drift, or insufficient hot-set coverage.
+The planner refuses logs with an incompatible identity, incomplete process
+coverage, or either configured maximum event-drop or row-drop ratio violation.
+Every `.open` file is an incomplete lower bound. A structurally valid finalized
+file without a fresh terminal checkpoint is incomplete, not corrupt. Duplicate
+or gapped `(instance, segment_sequence)` histories, checkpoint regressions, and
+terminal-to-opening discontinuities are also unsuitable; wall-clock timestamps
+are not used for ordering.
+
+Inspection is bounded before planning begins: by default it accepts at most
+65536 files, 64 GiB total, 4 GiB per file, 1024 per-file report entries, and
+4096 distinct prefix-dimension buckets. Prefix cardinality is a hard bound, not
+an unbounded JSON aggregation. Operators may explicitly raise byte, report,
+and prefix bounds for a larger retained history; the file bound may be lowered
+but cannot exceed the hard 65536-entry inventory ceiling. The planner may
+additionally warn on low time coverage, high truncation, workload drift, or
+insufficient hot-set coverage.
 
 ## Scalable layout candidates
 
@@ -241,9 +294,9 @@ pipeline proves the objective, but it is not the first data-movement primitive.
 
 ## Implementation slices
 
-1. Versioned binary log codec, bounded asynchronous C++ logger, server flags,
-   quality counters, format/security/failure tests, and
-   `throwdb workload inspect`.
+1. **Implemented:** versioned binary log codec, bounded asynchronous C++
+   logger, opt-in server flags, remote quality counters,
+   format/security/failure tests, and `throwdb workload inspect`.
 2. Pure no-I/O physical planner plus exact baseline replay and time-split
    workload reports.
 3. Bounded hot-frequency and hot-coaccess planners with deterministic artifacts
@@ -254,8 +307,10 @@ pipeline proves the objective, but it is not the first data-movement primitive.
 6. Later: WAL/CDC catch-up for online rebuild and bounded in-place
    multi-segment reclustering.
 
-The first slice is accepted only if disabled logging leaves the existing read
-path unchanged; enabled default sampling remains within an explicit overhead
-gate; queue saturation and injected I/O failures cannot fail reads; RSS and
-disk use remain within configured bounds; and truncated/corrupt logs are
-handled deterministically.
+The first slice now satisfies its functional safety gates: disabled logging
+does not allocate logger state, queue saturation and injected I/O failures
+cannot fail reads, memory and disk have explicit bounds, and
+truncated/corrupt logs are handled deterministically. A production-device A/B
+overhead measurement remains an acceptance run rather than an architectural
+prerequisite; it must compare disabled and enabled default sampling before the
+feature is enabled on a high-QPS deployment.

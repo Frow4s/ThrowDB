@@ -20,6 +20,7 @@
 #include "throwdb/native_collection.hpp"
 #include "throwdb/server/collection_engine.hpp"
 #include "throwdb/server/grpc_server.hpp"
+#include "read_workload_log.hpp"
 
 namespace {
 
@@ -40,6 +41,7 @@ struct Options {
     bool writable_flag_seen = false;
     bool read_only_flag_seen = false;
     bool reader_override_seen = false;
+    bool read_log_tuning_seen = false;
     std::uint32_t resolved_tuning_fields = 0;
 };
 
@@ -105,6 +107,17 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
           "[--no-orphan-reclaim]\n"
           "                [--orphan-min-age-seconds N] "
           "[--orphan-max-files N] [--orphan-max-mib N]\n"
+          "                [--read-log-dir PATH "
+          "[--read-log-sample-ppm N]]\n"
+          "                [--read-log-max-ids-per-event N] "
+          "[--read-log-buffer-mib N]\n"
+          "                [--read-log-segment-mib N] "
+          "[--read-log-rotate-seconds N]\n"
+          "                [--read-log-retention-mib N] "
+          "[--read-log-retention-seconds N]\n"
+          "                [--read-log-min-free-mib N]\n"
+          "                [--read-log-max-write-mib-per-second N] "
+          "[--read-log-max-retained-files N]\n"
           "reader options: --io-backend thread-pool|io-uring "
           "--io-workers N\n"
           "                --io-queue-capacity N --io-ranges-per-task N\n"
@@ -411,6 +424,52 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
         } else if (argument == "--orphan-max-mib") {
             result.maintenance.orphan_max_bytes = mib_to_bytes(
                 require_value(argc, argv, index), argument);
+        } else if (argument == "--read-log-dir") {
+            result.grpc.read_log_directory =
+                require_value(argc, argv, index);
+            if (result.grpc.read_log_directory.empty()) {
+                usage_error("--read-log-dir must not be empty");
+            }
+        } else if (argument == "--read-log-sample-ppm") {
+            result.grpc.read_log_sample_ppm = parse_u32(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-max-ids-per-event") {
+            result.grpc.read_log_max_ids_per_event = parse_u32(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-buffer-mib") {
+            result.grpc.read_log_buffer_bytes = mib_to_bytes(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-segment-mib") {
+            result.grpc.read_log_segment_bytes = mib_to_bytes(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-rotate-seconds") {
+            result.grpc.read_log_rotate_seconds = parse_u64(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-retention-mib") {
+            result.grpc.read_log_retention_bytes = mib_to_bytes(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-retention-seconds") {
+            result.grpc.read_log_retention_seconds = parse_u64(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-min-free-mib") {
+            result.grpc.read_log_min_free_bytes = mib_to_bytes(
+                require_value(argc, argv, index), argument, true);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-max-write-mib-per-second") {
+            result.grpc.read_log_max_write_bytes_per_second = mib_to_bytes(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
+        } else if (argument == "--read-log-max-retained-files") {
+            result.grpc.read_log_max_retained_files = parse_u64(
+                require_value(argc, argv, index), argument);
+            result.read_log_tuning_seen = true;
         } else if (argument == "--resolved-tuning-mode") {
             result.engine.tuning.mode = require_choice(
                 require_value(argc, argv, index), argument,
@@ -489,6 +548,62 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
     }
     if (result.writable_flag_seen && result.read_only_flag_seen) {
         usage_error("--writable and --read-only are mutually exclusive");
+    }
+    if (result.grpc.read_log_directory.empty()
+        && result.read_log_tuning_seen) {
+        usage_error(
+            "read-log tuning options require --read-log-dir; workload "
+            "logging is disabled unless its dedicated directory is explicit");
+    }
+    if (!result.grpc.read_log_directory.empty()) {
+        constexpr std::uint32_t maximum_ids_per_event = 65'536;
+        if (result.grpc.read_log_sample_ppm == 0
+            || result.grpc.read_log_sample_ppm > 1'000'000
+            || result.grpc.read_log_max_ids_per_event == 0
+            || result.grpc.read_log_max_ids_per_event
+                   > maximum_ids_per_event) {
+            usage_error(
+                "read-log sample ppm must be in [1, 1000000] and "
+                "max IDs per event must be in [1, 65536]");
+        }
+        const std::uint64_t maximum_event_bytes =
+            static_cast<std::uint64_t>(
+                throwdb::server::detail::kReadWorkloadRecordHeaderBytes)
+            + static_cast<std::uint64_t>(
+                  result.grpc.read_log_max_ids_per_event)
+                  * sizeof(std::uint64_t);
+        constexpr std::uint64_t terminal_checkpoint_bytes =
+            throwdb::server::detail::kReadWorkloadRecordHeaderBytes;
+        const std::uint64_t maximum_write_transaction =
+            throwdb::server::detail::kReadWorkloadLogHeaderBytes
+            + maximum_event_bytes + 2 * terminal_checkpoint_bytes;
+        if (result.grpc.read_log_buffer_bytes
+                < 2ULL * maximum_event_bytes
+            || result.grpc.read_log_segment_bytes
+                   < throwdb::server::detail::kReadWorkloadLogHeaderBytes
+                         + maximum_event_bytes
+                         + 2 * terminal_checkpoint_bytes
+            || result.grpc.read_log_retention_bytes
+                   < result.grpc.read_log_segment_bytes
+            || result.grpc.read_log_max_write_bytes_per_second
+                   < maximum_write_transaction
+            || result.grpc.read_log_max_retained_files == 0
+            || result.grpc.read_log_max_retained_files > 65'533
+            || result.grpc.read_log_rotate_seconds == 0
+            || result.grpc.read_log_rotate_seconds
+                   > static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+            || result.grpc.read_log_retention_seconds == 0) {
+            usage_error(
+                "read-log bounds are invalid: the buffer must hold two "
+                "maximum events, a segment must hold its header and one "
+                "opening checkpoint, one maximum event, and its terminal "
+                "checkpoint, retention must "
+                "cover one segment, the write rate must cover one maximum "
+                "event plus its segment header/checkpoints per second, and "
+                "time/file bounds must be in their "
+                "supported nonzero ranges (at most 65533 retained files)");
+        }
     }
     if (result.maintenance_interval_seconds
         > static_cast<std::uint64_t>(
@@ -1147,6 +1262,37 @@ int main(const int argc, char** argv) {
                   << options.grpc.scan_max_duration_millis
                   << ",\"scan_idle_timeout_millis\":"
                   << options.grpc.scan_idle_timeout_millis << "}"
+                  << ",\"read_logging\":{\"enabled\":"
+                  << (!options.grpc.read_log_directory.empty()
+                          ? "true" : "false");
+        if (!options.grpc.read_log_directory.empty()) {
+            std::cout
+                  << ",\"directory\":"
+                  << json_string(
+                         options.grpc.read_log_directory.generic_string())
+                  << ",\"sample_ppm\":"
+                  << options.grpc.read_log_sample_ppm
+                  << ",\"max_ids_per_event\":"
+                  << options.grpc.read_log_max_ids_per_event
+                  << ",\"buffer_bytes\":"
+                  << options.grpc.read_log_buffer_bytes
+                  << ",\"segment_bytes\":"
+                  << options.grpc.read_log_segment_bytes
+                  << ",\"rotate_seconds\":"
+                  << options.grpc.read_log_rotate_seconds
+                  << ",\"retention_bytes\":"
+                  << options.grpc.read_log_retention_bytes
+                  << ",\"retention_seconds\":"
+                  << options.grpc.read_log_retention_seconds
+                  << ",\"minimum_free_bytes\":"
+                  << options.grpc.read_log_min_free_bytes
+                  << ",\"max_write_bytes_per_second\":"
+                  << options.grpc.read_log_max_write_bytes_per_second
+                  << ",\"max_retained_files\":"
+                  << options.grpc.read_log_max_retained_files;
+        }
+        std::cout
+                  << "}"
                   << ",\"shutdown\":{\"grace_millis\":"
                   << options.grpc.shutdown_grace_millis
                   << ",\"hard_timeout_millis\":"

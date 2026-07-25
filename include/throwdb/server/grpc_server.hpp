@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -55,6 +56,21 @@ struct GrpcServerOptions {
     // has started successfully. Embedded servers keep the historical
     // start()-means-SERVING behaviour unless they opt into the same barrier.
     bool defer_serving_until_ready = false;
+    // Point-read workload logging is deliberately opt-in. An empty directory
+    // leaves the logger completely absent from the read path. Enabled logs
+    // must live outside the collection root so backups cannot mistake
+    // telemetry for authoritative collection state.
+    std::filesystem::path read_log_directory;
+    std::uint32_t read_log_sample_ppm = 10'000;
+    std::uint32_t read_log_max_ids_per_event = 4'096;
+    std::uint64_t read_log_buffer_bytes = 64ULL << 20;
+    std::uint64_t read_log_segment_bytes = 256ULL << 20;
+    std::uint64_t read_log_rotate_seconds = 3'600;
+    std::uint64_t read_log_retention_bytes = 10ULL << 30;
+    std::uint64_t read_log_retention_seconds = 7ULL * 24 * 60 * 60;
+    std::uint64_t read_log_min_free_bytes = 2ULL << 30;
+    std::uint64_t read_log_max_write_bytes_per_second = 16ULL << 20;
+    std::uint64_t read_log_max_retained_files = 4'096;
 };
 
 struct GrpcBoundEndpoint {

@@ -348,6 +348,282 @@ void set_ids(
     return result;
 }
 
+void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
+    TemporaryDirectory temporary;
+    const auto store = temporary.path() / "store";
+    const auto logs = temporary.path() / "read-logs";
+    constexpr std::uint32_t dimension = 2;
+    constexpr std::uint64_t record_size = 4;
+    const std::array<std::uint64_t, 3> ids{11, 22, 33};
+
+    throwdb::NativeBuilderOptions builder_options;
+    builder_options.format_version = 7;
+    builder_options.dimension = dimension;
+    builder_options.dtype = throwdb::DType::Float16;
+    auto builder = throwdb::NativeCollectionBuilder::create(
+        store, builder_options);
+    builder->append(ids, rows(ids.size(), record_size, 7));
+    builder->finish();
+
+    auto collection = throwdb::NativeCollection::open(store);
+    throwdb::server::SingleCollectionEngine engine(*collection, store);
+
+    // Pure validation must reject telemetry beneath the collection before the
+    // logger creates anything there.
+    {
+        throwdb::server::GrpcServerOptions unsafe;
+        unsafe.read_log_directory = store / "telemetry";
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer ignored(engine, {}, unsafe);
+        } catch (const throwdb::InvalidArgumentError&) {
+            rejected = true;
+        }
+        require(
+            rejected
+                && !std::filesystem::exists(unsafe.read_log_directory),
+            "gRPC server accepted or created a read log inside the "
+            "collection");
+    }
+    {
+        throwdb::server::GrpcServerOptions unsafe;
+        unsafe.read_log_directory = temporary.path();
+        const auto original_permissions =
+            std::filesystem::status(temporary.path()).permissions();
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer ignored(engine, {}, unsafe);
+        } catch (const throwdb::InvalidArgumentError&) {
+            rejected = true;
+        }
+        require(
+            rejected
+                && std::filesystem::status(temporary.path()).permissions()
+                       == original_permissions,
+            "gRPC server accepted a collection ancestor as its read-log "
+            "directory or changed ancestor permissions");
+    }
+    {
+        const auto foreign_logs = temporary.path() / "foreign-read-logs";
+        std::filesystem::create_directory(foreign_logs);
+        const auto foreign_file = foreign_logs / "owned-by-another-tool";
+        {
+            std::ofstream output(foreign_file);
+            output << "do not modify";
+        }
+        const auto original_permissions =
+            std::filesystem::status(foreign_logs).permissions();
+        throwdb::server::GrpcServerOptions unsafe;
+        unsafe.read_log_directory = foreign_logs;
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer server(engine, {}, unsafe);
+            static_cast<void>(server.start());
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        require(
+            rejected && std::filesystem::exists(foreign_file)
+                && std::filesystem::status(foreign_logs).permissions()
+                       == original_permissions,
+            "gRPC server claimed or changed a nonempty unmarked read-log "
+            "directory");
+    }
+    {
+        throwdb::server::GrpcServerOptions unbounded;
+        unbounded.read_log_directory = logs;
+        unbounded.read_log_max_write_bytes_per_second = 1;
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer ignored(engine, {}, unbounded);
+        } catch (const throwdb::InvalidArgumentError&) {
+            rejected = true;
+        }
+        require(
+            rejected && !std::filesystem::exists(logs),
+            "gRPC server accepted a write-rate budget below one maximum "
+            "read-log frame");
+    }
+    {
+        throwdb::server::GrpcServerOptions unfinalizable;
+        unfinalizable.read_log_directory = logs;
+        constexpr std::uint64_t read_log_header_bytes = 4'096;
+        constexpr std::uint64_t read_log_record_header_bytes = 256;
+        const auto maximum_event_bytes =
+            read_log_record_header_bytes
+            + static_cast<std::uint64_t>(
+                  unfinalizable.read_log_max_ids_per_event)
+                  * sizeof(std::uint64_t);
+        unfinalizable.read_log_segment_bytes =
+            read_log_header_bytes + read_log_record_header_bytes
+            + maximum_event_bytes;
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer ignored(
+                engine, {}, unfinalizable);
+        } catch (const throwdb::InvalidArgumentError&) {
+            rejected = true;
+        }
+        require(
+            rejected && !std::filesystem::exists(logs),
+            "gRPC server accepted a segment without space for a terminal "
+            "read-log checkpoint");
+    }
+    {
+        throwdb::server::GrpcServerOptions unbounded;
+        unbounded.read_log_directory = logs;
+        unbounded.read_log_rotate_seconds =
+            std::uint64_t{1} << 63U;
+        bool rejected = false;
+        try {
+            throwdb::server::GrpcServer ignored(engine, {}, unbounded);
+        } catch (const throwdb::InvalidArgumentError&) {
+            rejected = true;
+        }
+        require(
+            rejected && !std::filesystem::exists(logs),
+            "gRPC server accepted a read-log rotation interval that cannot "
+            "fit its steady-clock duration");
+    }
+
+    throwdb::server::GrpcServerOptions options;
+    options.max_worker_threads = 8;
+    options.max_concurrent_calls = 4;
+    options.read_log_directory = logs;
+    options.read_log_sample_ppm = 1'000'000;
+    options.read_log_buffer_bytes = 1ULL << 20;
+    options.read_log_segment_bytes = 1ULL << 20;
+    options.read_log_retention_bytes = 2ULL << 20;
+    options.read_log_retention_seconds = 3'600;
+    options.read_log_min_free_bytes = 0;
+    options.read_log_max_write_bytes_per_second = 1ULL << 20;
+    options.read_log_max_retained_files = 8;
+    throwdb::server::GrpcServer server(engine, {}, options);
+    const auto endpoint = server.start();
+
+    grpc::ChannelArguments channel_options;
+    channel_options.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+    auto channel = grpc::CreateCustomChannel(
+        endpoint.to_string(), grpc::InsecureChannelCredentials(),
+        channel_options);
+    require(
+        channel->WaitForConnected(
+            std::chrono::system_clock::now() + std::chrono::seconds(5)),
+        "read-log test channel did not become ready");
+    auto stub = wire::ThrowDB::NewStub(channel);
+
+    wire::GetRequest get_request;
+    const std::array<std::uint64_t, 2> get_ids{11, 22};
+    set_ids(*get_request.mutable_ids(), get_ids);
+    grpc::ClientContext get_context;
+    wire::GetResponse get_response;
+    require(
+        stub->Get(&get_context, get_request, &get_response).ok(),
+        "logged unary Get failed");
+
+    grpc::ClientContext stream_context;
+    auto stream = stub->StreamGet(&stream_context);
+    wire::StreamGetRequest open;
+    open.mutable_open()->set_max_batch_rows(2);
+    open.mutable_open()->set_max_batch_payload_bytes(64);
+    wire::StreamGetResponse stream_response;
+    require(
+        stream->Write(open) && stream->Read(&stream_response),
+        "logged StreamGet handshake failed");
+    wire::StreamGetRequest batch;
+    batch.mutable_batch()->set_sequence(0);
+    const std::array<std::uint64_t, 1> stream_ids{33};
+    set_ids(*batch.mutable_batch()->mutable_ids(), stream_ids);
+    require(
+        stream->Write(batch) && stream->WritesDone()
+            && stream->Read(&stream_response)
+            && !stream->Read(&stream_response)
+            && stream->Finish().ok(),
+        "logged StreamGet batch failed");
+
+    // Administrative physical scans must not enter layout-training logs.
+    wire::ScanIdsRequest scan_request;
+    scan_request.set_batch_rows(3);
+    grpc::ClientContext scan_context;
+    auto scan = stub->ScanIds(&scan_context, scan_request);
+    wire::ScanIdsResponse scan_response;
+    while (scan->Read(&scan_response)) {
+    }
+    require(scan->Finish().ok(), "read-log test ScanIds failed");
+
+    grpc::ClientContext describe_context;
+    wire::DescribeRequest describe_request;
+    wire::DescribeResponse description;
+    require(
+        stub->Describe(
+                &describe_context, describe_request, &description)
+            .ok(),
+        "read-log test Describe failed");
+    require(
+        description.read_logging().enabled()
+            && description.read_logging().sample_ppm() == 1'000'000
+            && description.read_logging().max_write_bytes_per_second()
+                   == options.read_log_max_write_bytes_per_second
+            && description.read_logging().max_retained_files()
+                   == options.read_log_max_retained_files
+            && description.read_logging_stats().enabled()
+            && description.read_logging_stats().considered_events() == 2
+            && description.read_logging_stats().sampled_events() == 2
+            && description.read_logging_stats().enqueued_events() == 2
+            && description.read_logging_stats().observed_ids() == 3
+            && description.read_logging_stats().captured_ids() == 3
+            && description.read_logging_stats().sampled_ids() == 3
+            && description.read_logging_stats().enqueued_ids() == 3
+            && description.read_logging_stats().dropped_queue_events() == 0
+            && description.read_logging_stats()
+                   .dropped_disk_pressure_events()
+                   == 0
+            && description.read_logging_stats().dropped_error_events() == 0
+            && description.read_logging_stats().dropped_busy_ids() == 0
+            && description.read_logging_stats().dropped_full_ids() == 0
+            && description.read_logging_stats().dropped_error_ids() == 0
+            && description.read_logging_stats()
+                   .dropped_disk_pressure_ids()
+                   == 0
+            && description.read_logging_stats()
+                   .dropped_io_budget_events()
+                   == 0
+            && description.read_logging_stats().dropped_io_budget_ids() == 0,
+        "Describe did not expose exact Get/StreamGet read-log hooks or "
+        "bounded logger state; enabled="
+            + std::to_string(description.read_logging_stats().enabled())
+            + " config_enabled="
+            + std::to_string(description.read_logging().enabled())
+            + " sample_ppm="
+            + std::to_string(description.read_logging().sample_ppm())
+            + " considered="
+            + std::to_string(
+                  description.read_logging_stats().considered_events())
+            + " sampled="
+            + std::to_string(
+                  description.read_logging_stats().sampled_events())
+            + " enqueued="
+            + std::to_string(
+                  description.read_logging_stats().enqueued_events())
+            + " observed_ids="
+            + std::to_string(
+                  description.read_logging_stats().observed_ids())
+            + " captured_ids="
+            + std::to_string(
+                  description.read_logging_stats().captured_ids())
+            + " dropped_queue="
+            + std::to_string(
+                  description.read_logging_stats().dropped_queue_events())
+            + " dropped_disk="
+            + std::to_string(
+                  description.read_logging_stats()
+                      .dropped_disk_pressure_events())
+            + " dropped_error="
+            + std::to_string(
+                  description.read_logging_stats().dropped_error_events()));
+    server.shutdown();
+}
+
 void test_grpc_crud_and_scan() {
     TemporaryDirectory temporary;
     const auto store = temporary.path() / "store";
@@ -468,7 +744,7 @@ void test_grpc_crud_and_scan() {
         status.ok()
             && health_response.status()
                    == wire::HealthResponse::SERVING_STATUS_SERVING
-            && health_response.protocol_minor() == 3,
+            && health_response.protocol_minor() == 4,
         "typed gRPC Health failed");
 
     grpc::ClientContext describe_context;
@@ -526,7 +802,9 @@ void test_grpc_crud_and_scan() {
             && !describe_response.admission_stats().terminal_faulted()
             && describe_response.engine_stats().catalog_generation() != 0
             && describe_response.engine_stats().mutation_disk_reserve_bytes()
-                   == engine_options.mutation_disk_reserve_bytes,
+                   == engine_options.mutation_disk_reserve_bytes
+            && !describe_response.read_logging().enabled()
+            && !describe_response.read_logging_stats().enabled(),
         "gRPC Describe returned wrong collection metadata");
 
     wire::MutationRequest insert_request;
@@ -1625,6 +1903,7 @@ int main() {
         test_daemon_terminal_exit_and_hard_shutdown_watchdog();
         test_grpc_rejects_legacy_storage_format();
         test_non_loopback_transport_is_fail_closed();
+        test_grpc_read_workload_logging_is_opt_in_and_bounded();
         test_get_is_rejected_before_native_read_or_allocation();
         test_streaming_negotiation_accounts_for_snapshot_and_backend_buffers();
         test_stalled_scan_is_cancelled_and_releases_admission();

@@ -36,6 +36,7 @@
 #include "throwdb/server/collection_engine.hpp"
 #include "throwdb/v1/throwdb.grpc.pb.h"
 #include "grpc_admission.hpp"
+#include "read_workload_log.hpp"
 
 namespace throwdb::server {
 namespace {
@@ -43,7 +44,7 @@ namespace {
 namespace wire = ::throwdb::v1;
 
 inline constexpr std::uint32_t kProtocolMajor = 1;
-inline constexpr std::uint32_t kProtocolMinor = 3;
+inline constexpr std::uint32_t kProtocolMinor = 4;
 inline constexpr std::uint64_t kScanEnvelopeAllowance = 512;
 inline constexpr std::uint64_t kStreamingEnvelopeAllowance = 1024;
 inline constexpr std::uint64_t kStreamRequestEnvelopeAllowance = 128;
@@ -857,6 +858,107 @@ random_scan_token() {
     return {high, low};
 }
 
+[[nodiscard]] std::filesystem::path normalized_absolute_path(
+    const std::filesystem::path& path,
+    const std::string_view option) {
+    std::error_code error;
+    const std::filesystem::path absolute =
+        std::filesystem::absolute(path, error);
+    if (error) {
+        throw InvalidArgumentError(
+            std::string(option) + " cannot be made absolute: "
+            + error.message());
+    }
+    const std::filesystem::path normalized =
+        std::filesystem::weakly_canonical(absolute, error);
+    if (error) {
+        throw InvalidArgumentError(
+            std::string(option) + " cannot be resolved safely: "
+            + error.message());
+    }
+    return normalized;
+}
+
+[[nodiscard]] bool path_is_equal_or_below(
+    const std::filesystem::path& root,
+    const std::filesystem::path& candidate) {
+    auto root_it = root.begin();
+    auto candidate_it = candidate.begin();
+    while (root_it != root.end() && candidate_it != candidate.end()
+           && *root_it == *candidate_it) {
+        ++root_it;
+        ++candidate_it;
+    }
+    return root_it == root.end();
+}
+
+void validate_read_log_path(
+    const SingleCollectionEngine& engine,
+    const GrpcServerOptions& options) {
+    if (options.read_log_directory.empty()) {
+        return;
+    }
+    if (engine.storage_path().empty()) {
+        throw InvalidArgumentError(
+            "read workload logging requires a known collection storage "
+            "path");
+    }
+    const auto collection = normalized_absolute_path(
+        engine.storage_path(), "collection storage path");
+    const auto logs = normalized_absolute_path(
+        options.read_log_directory, "--read-log-dir");
+    if (path_is_equal_or_below(collection, logs)
+        || path_is_equal_or_below(logs, collection)) {
+        throw InvalidArgumentError(
+            "--read-log-dir must be a dedicated directory disjoint from the "
+            "collection tree so telemetry cannot enter collection backup or "
+            "change permissions on a collection ancestor");
+    }
+}
+
+[[nodiscard]] std::unique_ptr<detail::ReadWorkloadLogger>
+open_read_workload_logger(
+    SingleCollectionEngine& engine,
+    const GrpcServerOptions& options) {
+    if (options.read_log_directory.empty()) {
+        return nullptr;
+    }
+    validate_read_log_path(engine, options);
+    const CollectionDescription description = engine.describe();
+    if (description.record_size
+        > std::numeric_limits<std::uint32_t>::max()) {
+        throw InvalidArgumentError(
+            "collection record size does not fit the read-log format");
+    }
+    const NativeCollectionIdentity identity =
+        engine.collection().identity();
+    detail::ReadWorkloadLogOptions log_options;
+    log_options.directory = options.read_log_directory;
+    log_options.sample_rate_ppm = options.read_log_sample_ppm;
+    log_options.max_ids_per_event =
+        options.read_log_max_ids_per_event;
+    log_options.buffer_bytes = options.read_log_buffer_bytes;
+    log_options.segment_bytes = options.read_log_segment_bytes;
+    log_options.rotate_seconds = options.read_log_rotate_seconds;
+    log_options.retention_bytes = options.read_log_retention_bytes;
+    log_options.retention_seconds = options.read_log_retention_seconds;
+    log_options.min_free_bytes = options.read_log_min_free_bytes;
+    log_options.max_write_bytes_per_second =
+        options.read_log_max_write_bytes_per_second;
+    log_options.max_retained_files = options.read_log_max_retained_files;
+    return detail::ReadWorkloadLogger::open(
+        std::move(log_options),
+        detail::ReadWorkloadCollectionInfo{
+            .collection_id_low = identity.collection_id_low,
+            .collection_id_high = identity.collection_id_high,
+            .format = description.format_version,
+            .dtype = static_cast<std::uint32_t>(description.dtype),
+            .dimension = description.dimension,
+            .record_size_bytes =
+                static_cast<std::uint32_t>(description.record_size),
+        });
+}
+
 class GrpcCollectionService final : public wire::ThrowDB::Service {
 public:
     GrpcCollectionService(
@@ -881,6 +983,11 @@ public:
           scan_max_duration_millis_(options.scan_max_duration_millis),
           scan_idle_timeout_millis_(options.scan_idle_timeout_millis) {
         health_->attach_admission(&admission_);
+    }
+
+    void attach_read_logger(
+        detail::ReadWorkloadLogger* const logger) noexcept {
+        read_logger_.store(logger, std::memory_order_release);
     }
 
     [[nodiscard]] detail::GrpcAdmissionSnapshot admission_snapshot() const {
@@ -1058,6 +1165,122 @@ public:
                 operational.mutation_disk_reserve_bytes);
             engine_stats->set_maintenance_active(
                 operational.maintenance_active);
+            wire::ReadLoggingConfiguration* read_logging =
+                response->mutable_read_logging();
+            detail::ReadWorkloadLogger* const read_logger =
+                read_logger_.load(std::memory_order_acquire);
+            const bool read_logging_enabled = read_logger != nullptr;
+            read_logging->set_enabled(read_logging_enabled);
+            wire::ReadLoggingStatistics* read_logging_stats =
+                response->mutable_read_logging_stats();
+            read_logging_stats->set_enabled(read_logging_enabled);
+            if (read_logging_enabled) {
+                read_logging->set_sample_ppm(
+                    options_.read_log_sample_ppm);
+                read_logging->set_max_ids_per_event(
+                    options_.read_log_max_ids_per_event);
+                read_logging->set_buffer_bytes(
+                    options_.read_log_buffer_bytes);
+                read_logging->set_segment_bytes(
+                    options_.read_log_segment_bytes);
+                read_logging->set_rotate_seconds(
+                    options_.read_log_rotate_seconds);
+                read_logging->set_retention_bytes(
+                    options_.read_log_retention_bytes);
+                read_logging->set_retention_seconds(
+                    options_.read_log_retention_seconds);
+                read_logging->set_minimum_free_bytes(
+                    options_.read_log_min_free_bytes);
+                read_logging->set_max_write_bytes_per_second(
+                    options_.read_log_max_write_bytes_per_second);
+                read_logging->set_max_retained_files(
+                    options_.read_log_max_retained_files);
+
+                const detail::ReadWorkloadLogStats stats =
+                    read_logger->stats();
+                const std::uint64_t dropped_queue =
+                    stats.dropped_full
+                            > std::numeric_limits<std::uint64_t>::max()
+                                  - stats.dropped_busy
+                        ? std::numeric_limits<std::uint64_t>::max()
+                        : stats.dropped_busy + stats.dropped_full;
+                read_logging_stats->set_considered_events(
+                    stats.observed_events);
+                read_logging_stats->set_sampled_events(
+                    stats.sampled_events);
+                read_logging_stats->set_enqueued_events(
+                    stats.enqueued_events);
+                read_logging_stats->set_written_events(
+                    stats.written_events);
+                read_logging_stats->set_truncated_events(
+                    stats.truncated_events);
+                read_logging_stats->set_captured_ids(
+                    stats.captured_ids);
+                read_logging_stats->set_dropped_queue_events(
+                    dropped_queue);
+                read_logging_stats->set_dropped_disk_pressure_events(
+                    stats.dropped_min_free);
+                read_logging_stats->set_dropped_error_events(
+                    stats.dropped_runtime_failure);
+                read_logging_stats->set_bytes_written(
+                    stats.bytes_written);
+                read_logging_stats->set_segments_created(
+                    stats.segments_created);
+                read_logging_stats->set_retained_bytes(
+                    stats.retained_bytes);
+                read_logging_stats->set_retained_segments(
+                    stats.retained_segments);
+                read_logging_stats->set_queue_bytes(
+                    stats.queued_bytes);
+                read_logging_stats->set_peak_queue_bytes(
+                    stats.peak_queued_bytes);
+                read_logging_stats->set_retention_deleted_bytes(
+                    stats.retention_deleted_bytes);
+                read_logging_stats->set_retention_deleted_segments(
+                    stats.retention_deleted_segments);
+                read_logging_stats->set_writer_errors(
+                    stats.write_errors);
+                read_logging_stats->set_observed_ids(
+                    stats.observed_ids);
+                read_logging_stats->set_unsampled_events(
+                    stats.unsampled_events);
+                read_logging_stats->set_dropped_busy_events(
+                    stats.dropped_busy);
+                read_logging_stats->set_dropped_full_events(
+                    stats.dropped_full);
+                read_logging_stats->set_rotated_segments(
+                    stats.rotated_segments);
+                read_logging_stats->set_queued_events(
+                    stats.queued_events);
+                read_logging_stats->set_buffer_capacity_bytes(
+                    stats.buffer_capacity_bytes);
+                read_logging_stats->set_last_error_number(
+                    stats.last_error_number);
+                read_logging_stats->set_paused_for_minimum_free_space(
+                    stats.paused_for_min_free);
+                read_logging_stats->set_runtime_failed(
+                    stats.runtime_failed);
+                read_logging_stats->set_shutting_down(
+                    stats.shutting_down);
+                read_logging_stats->set_sampled_ids(
+                    stats.sampled_ids);
+                read_logging_stats->set_enqueued_ids(
+                    stats.enqueued_ids);
+                read_logging_stats->set_written_ids(
+                    stats.written_ids);
+                read_logging_stats->set_dropped_busy_ids(
+                    stats.dropped_busy_ids);
+                read_logging_stats->set_dropped_full_ids(
+                    stats.dropped_full_ids);
+                read_logging_stats->set_dropped_error_ids(
+                    stats.dropped_runtime_failure_ids);
+                read_logging_stats->set_dropped_disk_pressure_ids(
+                    stats.dropped_min_free_ids);
+                read_logging_stats->set_dropped_io_budget_events(
+                    stats.dropped_io_budget);
+                read_logging_stats->set_dropped_io_budget_ids(
+                    stats.dropped_io_budget_ids);
+            }
             require_response_budget(*response, limits_);
             return grpc::Status::OK;
         } catch (...) {
@@ -1080,8 +1303,9 @@ public:
             }
             const std::uint64_t row_count =
                 validate_id_batch(request->ids(), limits_);
+            const CollectionDescription description = engine_.describe();
             const GetPreflight preflight = preflight_get(
-                *request, engine_.describe(), row_count, limits_);
+                *request, description, row_count, limits_);
             [[maybe_unused]] auto admission = require_admission(
                 admission_, preflight.estimated_peak_bytes);
             const std::vector<std::uint64_t> ids = decode_ids(
@@ -1090,6 +1314,23 @@ public:
                 ids, preflight.dimension);
             set_embedding_response(result, *response);
             require_response_budget(*response, limits_);
+            if (detail::ReadWorkloadLogger* const read_logger =
+                    read_logger_.load(std::memory_order_acquire);
+                read_logger != nullptr) {
+                // The legacy unary engine call does not expose its internally
+                // pinned view. Retain the count already fetched by preflight,
+                // but leave its generation/sequence anchor empty and inexact;
+                // another identity query would charge every Get even though
+                // the logger samples most events out internally. Logging is
+                // noexcept and never changes the completed RPC outcome.
+                static_cast<void>(read_logger->try_log(
+                    detail::ReadWorkloadMethod::Get,
+                    ids,
+                    detail::ReadWorkloadSnapshot{
+                        .row_count = description.count,
+                    },
+                    preflight.dimension));
+            }
             return grpc::Status::OK;
         } catch (...) {
             return exception_status(limits_, *health_);
@@ -1367,6 +1608,28 @@ public:
                             "StreamGet client stopped receiving"};
                 }
                 lifetime.mark_progress();
+                if (detail::ReadWorkloadLogger* const read_logger =
+                        read_logger_.load(std::memory_order_acquire);
+                    read_logger != nullptr) {
+                    // A batch enters workload history only after gRPC
+                    // accepted its response. Failed/cancelled delivery does
+                    // not teach the optimizer demand the client never saw.
+                    static_cast<void>(read_logger->try_log(
+                        detail::ReadWorkloadMethod::StreamGet,
+                        ids,
+                        detail::ReadWorkloadSnapshot{
+                            .catalog_generation =
+                                metadata.catalog_generation,
+                            .committed_sequence =
+                                metadata.committed_sequence,
+                            .row_count = metadata.live_count,
+                            .stream_id_low = token_low,
+                            .stream_id_high = token_high,
+                            .batch_sequence = expected_sequence,
+                            .exact = true,
+                        },
+                        dimension));
+                }
                 if (input_offset
                     > std::numeric_limits<std::uint64_t>::max() - count) {
                     throw std::length_error(
@@ -2041,6 +2304,7 @@ private:
     SingleCollectionEngine& engine_;
     ServiceLimits limits_;
     GrpcServerOptions options_;
+    std::atomic<detail::ReadWorkloadLogger*> read_logger_{nullptr};
     std::shared_ptr<GrpcHealthState> health_;
     detail::GrpcAdmissionController admission_;
     std::uint64_t scan_call_budget_ = 0;
@@ -2254,6 +2518,122 @@ server_credentials(const GrpcServerOptions& options) {
     return grpc::SslServerCredentials(tls);
 }
 
+[[nodiscard]] GrpcServerOptions validate_server_options(
+    SingleCollectionEngine& engine,
+    const ServiceLimits limits,
+    GrpcServerOptions options) {
+    const CollectionDescription description = engine.describe();
+    if (description.format_version != 7) {
+        throw InvalidArgumentError(
+            "throwdbd supports storage format 7 only; rebuild the "
+            "collection in the current format before starting the server");
+    }
+    if (options.listen_address.empty()
+        || options.max_worker_threads == 0
+        || options.max_concurrent_calls == 0
+        || options.max_inflight_bytes == 0
+        || options.max_scan_inflight_bytes == 0
+        || options.max_grpc_memory_bytes == 0
+        || options.max_concurrent_scans == 0
+        || options.max_concurrent_scans >= options.max_concurrent_calls
+        || options.max_concurrent_calls >= options.max_worker_threads
+        || options.scan_max_duration_millis == 0
+        || options.scan_idle_timeout_millis == 0
+        || options.shutdown_grace_millis == 0
+        || options.shutdown_hard_timeout_millis
+               < options.shutdown_grace_millis
+        || options.keepalive_time_millis == 0
+        || options.keepalive_timeout_millis == 0
+        || options.minimum_ping_interval_millis == 0) {
+        throw InvalidArgumentError(
+            "gRPC server options must be greater than zero and must reserve "
+            "worker/call slots outside scans; the hard shutdown timeout must "
+            "not be shorter than graceful drain");
+    }
+    if (options.max_grpc_memory_bytes
+        > std::numeric_limits<std::size_t>::max()) {
+        throw InvalidArgumentError(
+            "max_grpc_memory_bytes does not fit this process");
+    }
+    const auto fits_grpc_int = [](const std::uint32_t value) {
+        return value
+               <= static_cast<std::uint32_t>(
+                   std::numeric_limits<int>::max());
+    };
+    if (!fits_grpc_int(options.max_worker_threads)
+        || !fits_grpc_int(options.keepalive_time_millis)
+        || !fits_grpc_int(options.keepalive_timeout_millis)
+        || !fits_grpc_int(options.minimum_ping_interval_millis)) {
+        throw InvalidArgumentError(
+            "gRPC thread and keepalive options must fit int");
+    }
+    static_cast<void>(grpc_message_limit(
+        limits.max_request_bytes, "max_request_bytes"));
+    static_cast<void>(grpc_message_limit(
+        limits.max_response_bytes, "max_response_bytes"));
+    validate_transport_security(options);
+
+    if (!options.read_log_directory.empty()) {
+        validate_read_log_path(engine, options);
+        options.read_log_directory = normalized_absolute_path(
+            options.read_log_directory, "--read-log-dir");
+        constexpr std::uint32_t maximum_ids_per_event = 65'536;
+        if (options.read_log_sample_ppm == 0
+            || options.read_log_sample_ppm > 1'000'000
+            || options.read_log_max_ids_per_event == 0
+            || options.read_log_max_ids_per_event
+                   > maximum_ids_per_event
+            || options.read_log_rotate_seconds == 0
+            || options.read_log_rotate_seconds
+                   > static_cast<std::uint64_t>(
+                       std::numeric_limits<std::int64_t>::max())
+            || options.read_log_retention_seconds == 0) {
+            throw InvalidArgumentError(
+                "read-log sampling and time bounds are invalid");
+        }
+        const std::uint64_t maximum_event_bytes =
+            static_cast<std::uint64_t>(
+                detail::kReadWorkloadRecordHeaderBytes)
+            + static_cast<std::uint64_t>(
+                  options.read_log_max_ids_per_event)
+                  * sizeof(std::uint64_t);
+        constexpr std::uint64_t terminal_checkpoint_bytes =
+            detail::kReadWorkloadRecordHeaderBytes;
+        const std::uint64_t maximum_write_transaction =
+            detail::kReadWorkloadLogHeaderBytes + maximum_event_bytes
+            + 2 * terminal_checkpoint_bytes;
+        if (options.read_log_buffer_bytes
+                < 2ULL * maximum_event_bytes
+            || options.read_log_segment_bytes
+                   < detail::kReadWorkloadLogHeaderBytes
+                         + maximum_event_bytes
+                         + 2 * terminal_checkpoint_bytes
+            || options.read_log_retention_bytes
+                   < options.read_log_segment_bytes
+            || options.read_log_max_write_bytes_per_second
+                   < maximum_write_transaction
+            || options.read_log_max_retained_files == 0
+            || options.read_log_max_retained_files > 65'533) {
+            throw InvalidArgumentError(
+                "read-log buffer must hold two maximum events, a segment "
+                "must hold its header, opening checkpoint, one maximum "
+                "event, and terminal checkpoint, retention must cover at "
+                "least one segment, the "
+                "write rate must cover one maximum event plus its segment "
+                "header/checkpoints per second, and "
+                "retained files must be in [1, 65533]");
+        }
+        if (description.record_size
+            > std::numeric_limits<std::uint32_t>::max()) {
+            throw InvalidArgumentError(
+                "collection record size does not fit the read-log format");
+        }
+    }
+    return options;
+}
+
+struct ValidatedGrpcServerOptionsTag {};
+
 }  // namespace
 
 class GrpcServer::Impl {
@@ -2262,70 +2642,38 @@ public:
         SingleCollectionEngine& engine,
         const ServiceLimits limits,
         GrpcServerOptions options)
-        : health_(std::make_shared<GrpcHealthState>()),
+        : Impl(
+              engine,
+              limits,
+              validate_server_options(
+                  engine, limits, std::move(options)),
+              ValidatedGrpcServerOptionsTag{}) {}
+
+private:
+    Impl(
+        SingleCollectionEngine& engine,
+        const ServiceLimits limits,
+        GrpcServerOptions options,
+        ValidatedGrpcServerOptionsTag)
+        : engine_(engine),
+          health_(std::make_shared<GrpcHealthState>()),
           service_(engine, limits, options, health_),
           limits_(limits),
-          options_(std::move(options)) {
-        const CollectionDescription description = engine.describe();
-        if (description.format_version != 7) {
-            throw InvalidArgumentError(
-                "throwdbd supports storage format 7 only; rebuild the "
-                "collection in the current format before starting the "
-                "server");
-        }
-        if (options_.listen_address.empty()
-            || options_.max_worker_threads == 0
-            || options_.max_concurrent_calls == 0
-            || options_.max_inflight_bytes == 0
-            || options_.max_scan_inflight_bytes == 0
-            || options_.max_grpc_memory_bytes == 0
-            || options_.max_concurrent_scans == 0
-            || options_.max_concurrent_scans
-                   >= options_.max_concurrent_calls
-            || options_.max_concurrent_calls
-                   >= options_.max_worker_threads
-            || options_.scan_max_duration_millis == 0
-            || options_.scan_idle_timeout_millis == 0
-            || options_.shutdown_grace_millis == 0
-            || options_.shutdown_hard_timeout_millis
-                   < options_.shutdown_grace_millis
-            || options_.keepalive_time_millis == 0
-            || options_.keepalive_timeout_millis == 0
-            || options_.minimum_ping_interval_millis == 0) {
-            throw InvalidArgumentError(
-                "gRPC server options must be greater than zero and "
-                "must reserve worker/call slots outside scans; the hard "
-                "shutdown timeout must not be shorter than graceful drain");
-        }
-        if (options_.max_grpc_memory_bytes
-            > std::numeric_limits<std::size_t>::max()) {
-            throw InvalidArgumentError(
-                "max_grpc_memory_bytes does not fit this process");
-        }
-        const auto fits_grpc_int = [](const std::uint32_t value) {
-            return value
-                   <= static_cast<std::uint32_t>(
-                       std::numeric_limits<int>::max());
-        };
-        if (!fits_grpc_int(options_.max_worker_threads)
-            || !fits_grpc_int(options_.keepalive_time_millis)
-            || !fits_grpc_int(options_.keepalive_timeout_millis)
-            || !fits_grpc_int(options_.minimum_ping_interval_millis)) {
-            throw InvalidArgumentError(
-                "gRPC thread and keepalive options must fit int");
-        }
-        static_cast<void>(grpc_message_limit(
-            limits_.max_request_bytes, "max_request_bytes"));
-        static_cast<void>(grpc_message_limit(
-            limits_.max_response_bytes, "max_response_bytes"));
-        validate_transport_security(options_);
-    }
+          options_(std::move(options)) {}
+
+public:
 
     [[nodiscard]] GrpcBoundEndpoint start() {
         const std::lock_guard lock(state_mutex_);
         if (server_ != nullptr) {
             throw std::logic_error("gRPC server is already started");
         }
+        const auto credentials = server_credentials(options_);
+        // Validate and initialize explicit telemetry before any endpoint can
+        // transiently advertise gRPC health. Credential loading happens
+        // first, so a bad TLS file cannot create logger artifacts.
+        auto pending_read_logger =
+            open_read_workload_logger(engine_, options_);
 
         grpc::EnableDefaultHealthCheckService(true);
 #if defined(THROWDB_GRPC_ENABLE_REFLECTION)
@@ -2358,10 +2706,14 @@ public:
         int port = 0;
         builder.AddListeningPort(
             options_.listen_address,
-            server_credentials(options_), &port);
+            credentials, &port);
         server_ = builder.BuildAndStart();
         if (server_ == nullptr) {
             throw StorageError("could not start ThrowDB gRPC server");
+        }
+        read_logger_ = std::move(pending_read_logger);
+        if (read_logger_ != nullptr) {
+            service_.attach_read_logger(read_logger_.get());
         }
         endpoint_.address = selected_endpoint(options_.listen_address, port);
         health_->attach(server_->GetHealthCheckService());
@@ -2446,6 +2798,11 @@ public:
                                   options_.shutdown_grace_millis);
         server->Shutdown(deadline);
         server->Wait();
+        // No handler can enqueue after Wait(). Drain and finalize accepted
+        // telemetry only after the data plane has completely quiesced.
+        if (read_logger_ != nullptr) {
+            read_logger_->shutdown();
+        }
     }
 
     [[nodiscard]] bool started() const noexcept {
@@ -2453,7 +2810,9 @@ public:
     }
 
 private:
+    SingleCollectionEngine& engine_;
     std::shared_ptr<GrpcHealthState> health_;
+    std::unique_ptr<detail::ReadWorkloadLogger> read_logger_;
     GrpcCollectionService service_;
     ServiceLimits limits_;
     GrpcServerOptions options_;

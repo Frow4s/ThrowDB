@@ -12,12 +12,14 @@ import grpc
 import numpy as np
 import pytest
 
+from throwdb.collection import CollectionSchema
 from throwdb.remote import (
     AmbiguousCommitError,
     LocatedIdBatch,
     LocatedIds,
     RemoteAbortedError,
     RemoteCollection,
+    RemoteDescription,
     RemoteProtocolError,
     RemoteUnavailableError,
     _IndexedIds,
@@ -116,7 +118,7 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
         return throwdb_pb2.HealthResponse(
             status=throwdb_pb2.HealthResponse.SERVING_STATUS_SERVING,
             protocol_major=1,
-            protocol_minor=3,
+            protocol_minor=4,
         )
 
     def Describe(
@@ -203,6 +205,60 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
                 total_delta_segment_bytes=2048,
                 filesystem_available_bytes=100 << 20,
                 mutation_disk_reserve_bytes=10 << 20,
+            ),
+            read_logging=throwdb_pb2.ReadLoggingConfiguration(
+                enabled=True,
+                sample_ppm=10_000,
+                max_ids_per_event=4096,
+                buffer_bytes=64 << 20,
+                segment_bytes=256 << 20,
+                rotate_seconds=3600,
+                retention_bytes=10 << 30,
+                retention_seconds=7 * 24 * 60 * 60,
+                minimum_free_bytes=2 << 30,
+                max_write_bytes_per_second=16 << 20,
+                max_retained_files=4096,
+            ),
+            read_logging_stats=throwdb_pb2.ReadLoggingStatistics(
+                enabled=True,
+                considered_events=100,
+                sampled_events=10,
+                enqueued_events=9,
+                written_events=8,
+                truncated_events=2,
+                captured_ids=20_000,
+                dropped_queue_events=1,
+                dropped_disk_pressure_events=0,
+                dropped_error_events=0,
+                bytes_written=170_000,
+                segments_created=1,
+                retained_bytes=170_000,
+                retained_segments=1,
+                queue_bytes=1024,
+                peak_queue_bytes=2048,
+                retention_deleted_bytes=0,
+                retention_deleted_segments=0,
+                writer_errors=0,
+                observed_ids=50_000,
+                unsampled_events=90,
+                dropped_busy_events=0,
+                dropped_full_events=1,
+                rotated_segments=0,
+                queued_events=1,
+                buffer_capacity_bytes=64 << 20,
+                last_error_number=0,
+                paused_for_minimum_free_space=False,
+                runtime_failed=False,
+                shutting_down=False,
+                sampled_ids=6000,
+                enqueued_ids=5000,
+                written_ids=4500,
+                dropped_busy_ids=0,
+                dropped_full_ids=1000,
+                dropped_error_ids=0,
+                dropped_disk_pressure_ids=0,
+                dropped_io_budget_events=0,
+                dropped_io_budget_ids=0,
             ),
         )
 
@@ -645,6 +701,8 @@ class _OldGrpcService(_FakeGrpcService):
         response.ClearField("availability")
         response.ClearField("admission_stats")
         response.ClearField("engine_stats")
+        response.ClearField("read_logging")
+        response.ClearField("read_logging_stats")
         return response
 
     def Health(self, request, context):  # type: ignore[no-untyped-def]
@@ -660,6 +718,62 @@ class _MissingReplayDomainService(_FakeGrpcService):
         response = super().Describe(request, context)
         response.capabilities.durable_idempotency = True
         response.ClearField("idempotency_domain")
+        return response
+
+
+class _MissingReadLoggingDiagnosticsService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.ClearField("read_logging_stats")
+        return response
+
+
+class _InconsistentReadLoggingStatisticsService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.read_logging_stats.dropped_queue_events = 0
+        response.read_logging_stats.dropped_full_events = 1
+        return response
+
+
+class _InvalidReadLoggingConfigurationService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.read_logging.max_write_bytes_per_second = 1
+        return response
+
+
+class _MissingTerminalCheckpointCapacityService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        maximum_event_bytes = (
+            256 + 8 * response.read_logging.max_ids_per_event
+        )
+        response.read_logging.segment_bytes = (
+            4096 + 256 + maximum_event_bytes
+        )
+        response.read_logging.retention_bytes = (
+            response.read_logging.segment_bytes
+        )
+        return response
+
+
+class _MissingWriteTransactionCapacityService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.read_logging.max_write_bytes_per_second = (
+            4096
+            + 256
+            + 256
+            + 8 * response.read_logging.max_ids_per_event
+        )
+        return response
+
+
+class _UnboundedReadLoggingConfigurationService(_FakeGrpcService):
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.read_logging.max_retained_files = 65_534
         return response
 
 
@@ -722,6 +836,27 @@ class _RunningGrpcServer:
         return False
 
 
+def test_remote_description_preserves_pre_v1_4_constructor_shape() -> None:
+    replay_domain = uuid.uuid4()
+    description = RemoteDescription(
+        7,
+        CollectionSchema(dimension=5, dtype="float16"),
+        0,
+        10,
+        3,
+        None,
+        None,
+        None,
+        None,
+        None,
+        replay_domain,
+    )
+
+    assert description.idempotency_domain == replay_domain
+    assert description.read_logging is None
+    assert description.read_logging_stats is None
+
+
 def test_public_grpc_client_get_crud_scan_and_list(tmp_path: Path) -> None:
     del tmp_path
     with _RunningGrpcServer() as server, RemoteCollection.connect(
@@ -731,7 +866,7 @@ def test_public_grpc_client_get_crud_scan_and_list(tmp_path: Path) -> None:
         assert collection.health() == {
             "serving": True,
             "protocol_major": 1,
-            "protocol_minor": 3,
+            "protocol_minor": 4,
         }
         assert collection.dimension == 5
         assert collection.dtype == "float16"
@@ -781,6 +916,28 @@ def test_public_grpc_client_get_crud_scan_and_list(tmp_path: Path) -> None:
         assert collection.engine_stats.committed_sequence == 11
         assert collection.engine_stats.total_wal_bytes == 12288
         assert collection.engine_stats.filesystem_available_bytes == 100 << 20
+        assert collection.read_logging is not None
+        assert collection.read_logging.as_dict() == {
+            "enabled": True,
+            "sample_ppm": 10_000,
+            "max_ids_per_event": 4096,
+            "buffer_bytes": 64 << 20,
+            "segment_bytes": 256 << 20,
+            "rotate_seconds": 3600,
+            "retention_bytes": 10 << 30,
+            "retention_seconds": 7 * 24 * 60 * 60,
+            "minimum_free_bytes": 2 << 30,
+            "max_write_bytes_per_second": 16 << 20,
+            "max_retained_files": 4096,
+        }
+        assert collection.read_logging_stats is not None
+        assert collection.read_logging_stats.considered_events == 100
+        assert collection.read_logging_stats.sampled_events == 10
+        assert collection.read_logging_stats.dropped_queue_events == 1
+        assert collection.read_logging_stats.sampled_ids == 6000
+        assert collection.read_logging_stats.dropped_full_ids == 1000
+        assert collection.read_logging_stats.dropped_io_budget_events == 0
+        assert collection.read_logging_stats.runtime_failed is False
         assert collection.count == 3
 
         original = _vectors(3, 5, salt=1)
@@ -1519,6 +1676,8 @@ def test_protocol_v1_server_without_tuning_diagnostics_is_compatible() -> None:
         assert collection.availability is None
         assert collection.admission_stats is None
         assert collection.engine_stats is None
+        assert collection.read_logging is None
+        assert collection.read_logging_stats is None
         collection.insert([40], _vectors(1, 5, salt=404))
         np.testing.assert_array_equal(
             collection.get([40]),
@@ -1529,6 +1688,28 @@ def test_protocol_v1_server_without_tuning_diagnostics_is_compatible() -> None:
 def test_protocol_v1_1_durable_server_without_replay_domain_is_rejected() -> None:
     with _RunningGrpcServer(_MissingReplayDomainService()) as server:
         with pytest.raises(RemoteProtocolError, match="omitted.*replay domain"):
+            RemoteCollection.connect(server.endpoint, timeout=2)
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        _MissingReadLoggingDiagnosticsService,
+        _InconsistentReadLoggingStatisticsService,
+        _InvalidReadLoggingConfigurationService,
+        _MissingTerminalCheckpointCapacityService,
+        _MissingWriteTransactionCapacityService,
+        _UnboundedReadLoggingConfigurationService,
+    ],
+)
+def test_protocol_v1_4_rejects_invalid_read_logging_diagnostics(
+    service: type[_FakeGrpcService],
+) -> None:
+    with _RunningGrpcServer(service()) as server:
+        with pytest.raises(
+            RemoteProtocolError,
+            match="read-logging",
+        ):
             RemoteCollection.connect(server.endpoint, timeout=2)
 
 

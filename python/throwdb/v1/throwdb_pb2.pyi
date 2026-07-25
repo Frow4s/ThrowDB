@@ -285,8 +285,116 @@ class EngineStatistics(_message.Message):
     maintenance_active: bool
     def __init__(self, catalog_generation: _Optional[int] = ..., committed_sequence: _Optional[int] = ..., materialized_sequence: _Optional[int] = ..., active_wal_bytes: _Optional[int] = ..., active_wal_transactions: _Optional[int] = ..., active_wal_operations: _Optional[int] = ..., frozen_wal_count: _Optional[int] = ..., frozen_wal_bytes: _Optional[int] = ..., total_wal_bytes: _Optional[int] = ..., total_wal_operations: _Optional[int] = ..., overlay_entries: _Optional[int] = ..., estimated_overlay_bytes: _Optional[int] = ..., delta_run_count: _Optional[int] = ..., total_delta_run_bytes: _Optional[int] = ..., total_delta_segment_bytes: _Optional[int] = ..., idempotency_journal_bytes: _Optional[int] = ..., idempotency_completed_operations: _Optional[int] = ..., idempotency_aborted_operations: _Optional[int] = ..., idempotency_max_bytes: _Optional[int] = ..., idempotency_max_operations: _Optional[int] = ..., idempotency_generation: _Optional[int] = ..., filesystem_available_bytes: _Optional[int] = ..., mutation_disk_reserve_bytes: _Optional[int] = ..., maintenance_active: _Optional[bool] = ...) -> None: ...
 
+class ReadLoggingConfiguration(_message.Message):
+    __slots__ = ("enabled", "sample_ppm", "max_ids_per_event", "buffer_bytes", "segment_bytes", "rotate_seconds", "retention_bytes", "retention_seconds", "minimum_free_bytes", "max_write_bytes_per_second", "max_retained_files")
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    SAMPLE_PPM_FIELD_NUMBER: _ClassVar[int]
+    MAX_IDS_PER_EVENT_FIELD_NUMBER: _ClassVar[int]
+    BUFFER_BYTES_FIELD_NUMBER: _ClassVar[int]
+    SEGMENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    ROTATE_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_SECONDS_FIELD_NUMBER: _ClassVar[int]
+    MINIMUM_FREE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MAX_WRITE_BYTES_PER_SECOND_FIELD_NUMBER: _ClassVar[int]
+    MAX_RETAINED_FILES_FIELD_NUMBER: _ClassVar[int]
+    enabled: bool
+    sample_ppm: int
+    max_ids_per_event: int
+    buffer_bytes: int
+    segment_bytes: int
+    rotate_seconds: int
+    retention_bytes: int
+    retention_seconds: int
+    minimum_free_bytes: int
+    max_write_bytes_per_second: int
+    max_retained_files: int
+    def __init__(self, enabled: _Optional[bool] = ..., sample_ppm: _Optional[int] = ..., max_ids_per_event: _Optional[int] = ..., buffer_bytes: _Optional[int] = ..., segment_bytes: _Optional[int] = ..., rotate_seconds: _Optional[int] = ..., retention_bytes: _Optional[int] = ..., retention_seconds: _Optional[int] = ..., minimum_free_bytes: _Optional[int] = ..., max_write_bytes_per_second: _Optional[int] = ..., max_retained_files: _Optional[int] = ...) -> None: ...
+
+class ReadLoggingStatistics(_message.Message):
+    __slots__ = ("enabled", "considered_events", "sampled_events", "enqueued_events", "written_events", "truncated_events", "captured_ids", "dropped_queue_events", "dropped_disk_pressure_events", "dropped_error_events", "bytes_written", "segments_created", "retained_bytes", "retained_segments", "queue_bytes", "peak_queue_bytes", "retention_deleted_bytes", "retention_deleted_segments", "writer_errors", "observed_ids", "unsampled_events", "dropped_busy_events", "dropped_full_events", "rotated_segments", "queued_events", "buffer_capacity_bytes", "last_error_number", "paused_for_minimum_free_space", "runtime_failed", "shutting_down", "sampled_ids", "enqueued_ids", "written_ids", "dropped_busy_ids", "dropped_full_ids", "dropped_error_ids", "dropped_disk_pressure_ids", "dropped_io_budget_events", "dropped_io_budget_ids")
+    ENABLED_FIELD_NUMBER: _ClassVar[int]
+    CONSIDERED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    SAMPLED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    ENQUEUED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    WRITTEN_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    TRUNCATED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    CAPTURED_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_QUEUE_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_DISK_PRESSURE_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_ERROR_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    BYTES_WRITTEN_FIELD_NUMBER: _ClassVar[int]
+    SEGMENTS_CREATED_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RETAINED_SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    QUEUE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    PEAK_QUEUE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_DELETED_BYTES_FIELD_NUMBER: _ClassVar[int]
+    RETENTION_DELETED_SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    WRITER_ERRORS_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_IDS_FIELD_NUMBER: _ClassVar[int]
+    UNSAMPLED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_BUSY_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_FULL_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    ROTATED_SEGMENTS_FIELD_NUMBER: _ClassVar[int]
+    QUEUED_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    BUFFER_CAPACITY_BYTES_FIELD_NUMBER: _ClassVar[int]
+    LAST_ERROR_NUMBER_FIELD_NUMBER: _ClassVar[int]
+    PAUSED_FOR_MINIMUM_FREE_SPACE_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_FAILED_FIELD_NUMBER: _ClassVar[int]
+    SHUTTING_DOWN_FIELD_NUMBER: _ClassVar[int]
+    SAMPLED_IDS_FIELD_NUMBER: _ClassVar[int]
+    ENQUEUED_IDS_FIELD_NUMBER: _ClassVar[int]
+    WRITTEN_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_BUSY_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_FULL_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_ERROR_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_DISK_PRESSURE_IDS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_IO_BUDGET_EVENTS_FIELD_NUMBER: _ClassVar[int]
+    DROPPED_IO_BUDGET_IDS_FIELD_NUMBER: _ClassVar[int]
+    enabled: bool
+    considered_events: int
+    sampled_events: int
+    enqueued_events: int
+    written_events: int
+    truncated_events: int
+    captured_ids: int
+    dropped_queue_events: int
+    dropped_disk_pressure_events: int
+    dropped_error_events: int
+    bytes_written: int
+    segments_created: int
+    retained_bytes: int
+    retained_segments: int
+    queue_bytes: int
+    peak_queue_bytes: int
+    retention_deleted_bytes: int
+    retention_deleted_segments: int
+    writer_errors: int
+    observed_ids: int
+    unsampled_events: int
+    dropped_busy_events: int
+    dropped_full_events: int
+    rotated_segments: int
+    queued_events: int
+    buffer_capacity_bytes: int
+    last_error_number: int
+    paused_for_minimum_free_space: bool
+    runtime_failed: bool
+    shutting_down: bool
+    sampled_ids: int
+    enqueued_ids: int
+    written_ids: int
+    dropped_busy_ids: int
+    dropped_full_ids: int
+    dropped_error_ids: int
+    dropped_disk_pressure_ids: int
+    dropped_io_budget_events: int
+    dropped_io_budget_ids: int
+    def __init__(self, enabled: _Optional[bool] = ..., considered_events: _Optional[int] = ..., sampled_events: _Optional[int] = ..., enqueued_events: _Optional[int] = ..., written_events: _Optional[int] = ..., truncated_events: _Optional[int] = ..., captured_ids: _Optional[int] = ..., dropped_queue_events: _Optional[int] = ..., dropped_disk_pressure_events: _Optional[int] = ..., dropped_error_events: _Optional[int] = ..., bytes_written: _Optional[int] = ..., segments_created: _Optional[int] = ..., retained_bytes: _Optional[int] = ..., retained_segments: _Optional[int] = ..., queue_bytes: _Optional[int] = ..., peak_queue_bytes: _Optional[int] = ..., retention_deleted_bytes: _Optional[int] = ..., retention_deleted_segments: _Optional[int] = ..., writer_errors: _Optional[int] = ..., observed_ids: _Optional[int] = ..., unsampled_events: _Optional[int] = ..., dropped_busy_events: _Optional[int] = ..., dropped_full_events: _Optional[int] = ..., rotated_segments: _Optional[int] = ..., queued_events: _Optional[int] = ..., buffer_capacity_bytes: _Optional[int] = ..., last_error_number: _Optional[int] = ..., paused_for_minimum_free_space: _Optional[bool] = ..., runtime_failed: _Optional[bool] = ..., shutting_down: _Optional[bool] = ..., sampled_ids: _Optional[int] = ..., enqueued_ids: _Optional[int] = ..., written_ids: _Optional[int] = ..., dropped_busy_ids: _Optional[int] = ..., dropped_full_ids: _Optional[int] = ..., dropped_error_ids: _Optional[int] = ..., dropped_disk_pressure_ids: _Optional[int] = ..., dropped_io_budget_events: _Optional[int] = ..., dropped_io_budget_ids: _Optional[int] = ...) -> None: ...
+
 class DescribeResponse(_message.Message):
-    __slots__ = ("format_version", "schema", "record_size", "count", "capabilities", "reader", "tuning", "availability", "idempotency_domain", "admission_stats", "engine_stats")
+    __slots__ = ("format_version", "schema", "record_size", "count", "capabilities", "reader", "tuning", "availability", "idempotency_domain", "admission_stats", "engine_stats", "read_logging", "read_logging_stats")
     FORMAT_VERSION_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
     RECORD_SIZE_FIELD_NUMBER: _ClassVar[int]
@@ -298,6 +406,8 @@ class DescribeResponse(_message.Message):
     IDEMPOTENCY_DOMAIN_FIELD_NUMBER: _ClassVar[int]
     ADMISSION_STATS_FIELD_NUMBER: _ClassVar[int]
     ENGINE_STATS_FIELD_NUMBER: _ClassVar[int]
+    READ_LOGGING_FIELD_NUMBER: _ClassVar[int]
+    READ_LOGGING_STATS_FIELD_NUMBER: _ClassVar[int]
     format_version: int
     schema: CollectionSchema
     record_size: int
@@ -309,7 +419,9 @@ class DescribeResponse(_message.Message):
     idempotency_domain: OperationId
     admission_stats: AdmissionStatistics
     engine_stats: EngineStatistics
-    def __init__(self, format_version: _Optional[int] = ..., schema: _Optional[_Union[CollectionSchema, _Mapping]] = ..., record_size: _Optional[int] = ..., count: _Optional[int] = ..., capabilities: _Optional[_Union[Capabilities, _Mapping]] = ..., reader: _Optional[_Union[ReaderConfiguration, _Mapping]] = ..., tuning: _Optional[_Union[TuningSelection, _Mapping]] = ..., availability: _Optional[_Union[AvailabilityConfiguration, _Mapping]] = ..., idempotency_domain: _Optional[_Union[OperationId, _Mapping]] = ..., admission_stats: _Optional[_Union[AdmissionStatistics, _Mapping]] = ..., engine_stats: _Optional[_Union[EngineStatistics, _Mapping]] = ...) -> None: ...
+    read_logging: ReadLoggingConfiguration
+    read_logging_stats: ReadLoggingStatistics
+    def __init__(self, format_version: _Optional[int] = ..., schema: _Optional[_Union[CollectionSchema, _Mapping]] = ..., record_size: _Optional[int] = ..., count: _Optional[int] = ..., capabilities: _Optional[_Union[Capabilities, _Mapping]] = ..., reader: _Optional[_Union[ReaderConfiguration, _Mapping]] = ..., tuning: _Optional[_Union[TuningSelection, _Mapping]] = ..., availability: _Optional[_Union[AvailabilityConfiguration, _Mapping]] = ..., idempotency_domain: _Optional[_Union[OperationId, _Mapping]] = ..., admission_stats: _Optional[_Union[AdmissionStatistics, _Mapping]] = ..., engine_stats: _Optional[_Union[EngineStatistics, _Mapping]] = ..., read_logging: _Optional[_Union[ReadLoggingConfiguration, _Mapping]] = ..., read_logging_stats: _Optional[_Union[ReadLoggingStatistics, _Mapping]] = ...) -> None: ...
 
 class GetRequest(_message.Message):
     __slots__ = ("ids", "prefix_dimensions")

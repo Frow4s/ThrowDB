@@ -182,12 +182,14 @@ concurrent, and mixed-size Get workloads, streams a bounded physical-order ID
 prefix, and replays the identical sequential query stream against an embedded
 reader using the server's effective settings.
 
-Report revision 2 adds controlled cache states, three deterministic repetitions
-by default, exact-corpus mixed-workload references, and separate client queue,
-RPC, and sojourn timings. Quality-oriented defaults use 100 sequential calls,
-20 concurrent calls per worker, and 200 small plus 100 large mixed calls in
-each repetition. Use strict persisted selection and an explicit paired
-cache run for the main local-loopback result:
+Report revision 3 retains revision 2's controlled cache states, deterministic
+repetitions, exact-corpus mixed-workload references, and separate client queue,
+RPC, and sojourn timings. It additionally records optional read-logger
+configuration/counters and performs a resource-budgeted post-shutdown quality
+inspection. Quality-oriented defaults use 100 sequential calls, 20 concurrent
+calls per worker, and 200 small plus 100 large mixed calls in each repetition.
+Use strict persisted selection and an explicit paired cache run for the main
+local-loopback result:
 
 ```bash
 STORE=/nvme/store
@@ -1013,6 +1015,72 @@ client-sojourn P95 slowdown ratios. These matched references remove the earlier
 query-set, cache-state, and one-client-baseline confounders. They still do not
 constitute a server fairness SLA: client FIFO effects, transport, and all
 server work remain combined in the observed durations.
+
+## Read-workload logger qualification
+
+The native logger has a dedicated deterministic suite:
+
+```bash
+cmake --preset server-release
+cmake --build --preset server-release
+ctest --test-dir build/server-release \
+  --output-on-failure \
+  -R 'throwdb_(read_workload_log|grpc_server)_tests'
+```
+
+It covers the binary header/frame CRCs, crash-torn tails, bounded oversized
+request sampling, queue saturation, idle checkpoint stability, rotation,
+exact terminal-to-opening counter baselines, retained-window loss accounting,
+private permissions, exclusive ownership, minimum-free-space pause, runtime
+fail-open behavior, terminal-checkpoint finalization, write-rate and retained
+file-count limits, retention, and the actual unary/streaming gRPC hooks. It
+also verifies that an unused pre-bind segment is removed and that
+minimum-free-space or finalization failure never publishes `.tdbrl`.
+
+Functional tests do not establish the production overhead of shared atomic
+counters and sampled ID copying. Before enabling telemetry on a high-QPS
+collection, run the existing gRPC benchmark twice on the same isolated host,
+reader profile, deterministic corpus, cache mode, and repetition count:
+
+1. server without `--read-log-dir`;
+2. server with `--read-log-dir` and the intended sampling/cap settings.
+
+Use a new result directory for each run. Compare client throughput and
+P50/P95/P99 latency by identical query digest, plus server CPU, RSS, cgroup
+throttling, and disk telemetry. The enabled run must also satisfy:
+
+- no read correctness or RPC failures;
+- `runtime_failed=false` and `writer_errors=0`;
+- both completed-event and completed-row outcome drop ratios below their
+  deployment quality thresholds;
+- RSS within the configured queue plus normal measurement noise;
+- finalized/recoverable file count within its configured ceiling;
+- retained bytes within the configured retention contract, accounting only
+  for the documented active-segment allowance.
+
+Finally stop the server cleanly and run:
+
+```bash
+throwdb workload inspect \
+  --logs "$READ_LOG_DIR" \
+  --storage "$STORE" \
+  --max-drop-ratio 0.05 \
+  --max-row-drop-ratio 0.05 \
+  --require-suitable \
+  --output "$RESULTS/workload-inspection.json"
+```
+
+The optimizer must consume only a suitable report. `.open`, stale/missing
+terminal checkpoints, missing or discontinuous opening baselines, sequence
+gaps, counter regressions, excessive retained-window event or row loss, and
+corrupt finalized files all fail the suitability gate. Inspector
+inputs are themselves hard-bounded; use `--max-files`,
+`--max-total-bytes`, `--max-file-bytes`, `--max-report-entries`, and
+`--max-prefix-entries` when a deliberate test corpus exceeds the defaults.
+The file inventory has a non-overridable 65536-entry ceiling; split a larger
+offline corpus rather than making one inspection walk unbounded.
+A logger overhead regression does not justify relaxing fail-open or resource
+bounds; tune the sampling rate and maximum IDs per event instead.
 
 ## Internal I/O workers versus reader concurrency
 
