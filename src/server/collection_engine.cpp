@@ -417,10 +417,43 @@ public:
             throw InvalidArgumentError("prefix dimension is out of range");
         }
         auto full = collection_.get_bytes(ids);
+        return project_get_result(ids.size(), dimension, std::move(full));
+    }
+
+    [[nodiscard]] ProfiledGetResult get_profiled(
+        const std::span<const std::uint64_t> ids,
+        const std::uint32_t requested_prefix) const {
+        const auto dimension = requested_prefix == 0
+                                   ? collection_.dimension()
+                                   : requested_prefix;
+        if (dimension == 0 || dimension > collection_.dimension()) {
+            throw InvalidArgumentError("prefix dimension is out of range");
+        }
+        const std::uint64_t full_size =
+            checked_payload_size(ids.size(), collection_.record_size());
+        if (full_size > std::numeric_limits<std::size_t>::max()) {
+            throw InvalidArgumentError(
+                "profiled get output does not fit address space");
+        }
+        std::vector<std::byte> full(
+            static_cast<std::size_t>(full_size));
+        NativeReadStats stats =
+            collection_.get_into_profiled(ids, full);
+        return ProfiledGetResult{
+            .result = project_get_result(
+                ids.size(), dimension, std::move(full)),
+            .read = stats,
+        };
+    }
+
+    [[nodiscard]] GetResult project_get_result(
+        const std::size_t row_count,
+        const std::uint32_t dimension,
+        std::vector<std::byte> full) const {
         GetResult result;
         result.dimension = dimension;
         result.dtype = collection_.dtype();
-        result.row_count = ids.size();
+        result.row_count = row_count;
         if (dimension == collection_.dimension()) {
             result.embeddings = std::move(full);
             return result;
@@ -431,11 +464,12 @@ public:
         const auto prefix_bytes = static_cast<std::size_t>(
             static_cast<std::uint64_t>(dimension) * item_size);
         const auto full_bytes = static_cast<std::size_t>(collection_.record_size());
-        if (ids.size() > std::numeric_limits<std::size_t>::max() / prefix_bytes) {
+        if (row_count
+            > std::numeric_limits<std::size_t>::max() / prefix_bytes) {
             throw InvalidArgumentError("prefix result does not fit memory");
         }
-        result.embeddings.resize(ids.size() * prefix_bytes);
-        for (std::size_t row = 0; row != ids.size(); ++row) {
+        result.embeddings.resize(row_count * prefix_bytes);
+        for (std::size_t row = 0; row != row_count; ++row) {
             std::memcpy(
                 result.embeddings.data() + row * prefix_bytes,
                 full.data() + row * full_bytes,
@@ -1256,6 +1290,11 @@ GetResult SingleCollectionEngine::get(
     const std::span<const std::uint64_t> ids,
     const std::uint32_t prefix_dimension) const {
     return impl_->get(ids, prefix_dimension);
+}
+ProfiledGetResult SingleCollectionEngine::get_profiled(
+    const std::span<const std::uint64_t> ids,
+    const std::uint32_t prefix_dimension) const {
+    return impl_->get_profiled(ids, prefix_dimension);
 }
 MutationResult SingleCollectionEngine::mutate(
     const MutationKind kind,

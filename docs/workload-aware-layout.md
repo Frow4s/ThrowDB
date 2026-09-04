@@ -88,98 +88,103 @@ a lossless rollback target. The first rollout consequently uses:
 
 ## Read workload log
 
-The server logs logical point-read batches, not embeddings and not physical
-locations. Locations are derived from the collection snapshot during replay
-and would otherwise become stale after maintenance.
+The server records the workload it actually receives. It does not infer a
+category, a broad query, or an export. The only operation label is the real API
+method, `Get` or `StreamGet`. For every valid logical request the trace keeps
+all submitted numeric IDs, including duplicates, in original client order.
+There is no probabilistic sampling and no oversized-request truncation.
 
-Event boundaries are:
+A unary `Get` is one logical request. A `StreamGet` is also one logical request,
+even when it contains many client batches. Its ID sequence is split into
+physical log records of at most 8192 rows while retaining the logical offset,
+input-batch sequence, and chunk sequence. A successfully written streaming
+response records its global delivery sequence in the corresponding batch
+record. This chunking bounds producer work and record size; it does not change
+the request or select a subset of IDs. A valid request that later fails, is
+cancelled, or loses its client is retained as diagnostic demand but is not
+eligible for layout training.
 
-- one successfully completed unary `Get`;
-- one successfully completed application batch within `StreamGet`.
+`ScanIds` and `ScanRecords` are not point requests containing user-supplied ID
+sets, so this logger does not invent such a set for them. Embeddings and
+per-ID physical pointers are never logged. Raw IDs plus catalog generation are
+enough to resolve a candidate layout offline; recording old pointers would
+almost double the log and make it stale after maintenance.
 
-`ScanIds` and `ScanRecords` are physical-order administrative scans. They may
-contribute aggregate counters, but their IDs are excluded from layout training
-because a complete scan would create false uniform demand.
+Logging is disabled by default and enabled only with an explicit directory
+outside the collection root. The enabled path uses:
 
-Logging is disabled by default and enabled only by an explicit directory
-outside the collection root. Keeping logs outside the root prevents collection
-backup/restore from treating workload telemetry as authoritative data.
-
-The enabled hot path has these guarantees:
-
-- request-level Bernoulli sampling before any ID copying or queue admission;
-- a configurable hard cap on captured IDs per event;
-- unbiased deterministic stratified sampling across oversized batches rather
-  than retaining only their prefix;
-- a preallocated, byte-bounded producer queue;
-- nonblocking all-or-drop enqueue;
+- a preallocated bounded multi-producer/single-consumer queue;
+- nonblocking producer admission with no logger backpressure on a read RPC;
 - one sequential background writer;
-- a token-bucket write-rate ceiling debited for every sequential logger byte
-  before it is written (16 MiB/s by default);
-- age, byte, and retained-file-count limits (4096 files by default);
-- no read failure or delay caused by queue saturation or a runtime log-write
-  error;
-- monotonic counters for considered, selected, written, dropped, truncated,
-  and failed events and rows.
+- 256 MiB of queue memory, 256 MiB segments, and 50 GiB retention by default;
+- a 16 MiB/s sequential-write ceiling;
+- seven-day age, file-count, and 10 GiB minimum-free-space guards;
+- exact counters for logical requests, records, ID chunks, batches, IDs, and
+  every drop reason.
 
-The first binary log version uses a collection/schema header and individually
-framed little-endian records. Headers and frames have strict size limits and
-CRC32C checksums. Every segment carries a process-instance ID and monotonic
-segment sequence. Its first frame is an opening counter baseline copied exactly
-from the preceding segment's terminal counters (or zero for a new process).
-A file is renamed from
-`<instance>.<sequence>.open` to `<instance>.<sequence>.tdbrl` only after a
-fresh terminal counter checkpoint and durable finalization succeed. A
-minimum-free-space refusal or runtime/finalization failure leaves `.open`;
-after a crash, the analyzer accepts only its complete valid prefix and ignores
-a torn final frame. A pre-bind file that never accepted an event is removed
-instead of being finalized empty. Files and directories are private by
-default. Rotation, retention, a write-rate ceiling, a retained-file ceiling,
-and a minimum-free-space guard bound telemetry's disk impact.
-Retention brings finalized and stale recognized files under both configured
-budgets. While running, the logger reserves one configured file slot for its
-current `.open`, so the total recognized file count remains bounded. Only the
-active segment may sit outside the retained-byte budget, so byte usage can
-overshoot by at most that one segment. Traffic and a periodic idle sweep
-(at least once every five minutes) enforce age retention.
+This is exact workload telemetry when its quality counters report zero loss; it
+is not a durable audit WAL. Queue exhaustion, low free space, a write-budget
+limit, or a logger I/O failure never changes the RPC result. Instead the
+affected request becomes incomplete and the exact-capture quality gate fails.
+A blocking lossless mode would feed logger latency and availability back into
+the workload being measured and is deliberately not the production default.
 
-Event frames retain compact cumulative event-counter snapshots. Checkpoint
-extension v2 adds sampled, enqueued, written, and reason-specific dropped row
-counters plus writer-budget event/row drops, and marks the mandatory opening
-baseline. Adjacent retained segments must have an exact
-terminal-to-opening match; event snapshots may appear physically
-nonmonotonic because producers update independent saturating atomics. A
-rotated segment can end while already accepted work is waiting for the next
-segment, so exact written/drop partitions are required only from the latest
-retained terminal checkpoint for that process instance.
+Binary format v2 has a 4096-byte segment header and individually CRC32C-framed
+little-endian records:
 
-Retention deletes an oldest-first prefix. Because the first remaining segment
-still contains its process-lifetime baseline, the inspector subtracts that
-baseline from the latest complete terminal checkpoint. Reported drop rates and
-resource counters therefore describe the retained counter window even when
-earlier files no longer exist. The loss denominator is the number of completed
-outcomes in that window (`written + all drop reasons`), not the delta of the
-independently sampled admission counter. This correctly assigns work whose
-sampling and final disposition straddle a rotation. Counter saturation fails
-closed. Sequence gaps, a missing/duplicate opening baseline, or a baseline that
-differs from the preceding retained terminal make the history unsuitable.
+- `REQUEST_BEGIN` stores method, prefix dimension, snapshot identity, declared
+  size when known, and monotonic/wall-clock anchors;
+- `ID_CHUNK` stores the exact ordered IDs and their logical/batch offsets;
+- `BATCH_METRICS` stores timing and aggregate physical-plan telemetry;
+- `REQUEST_END` stores status, submitted/delivered rows, response bytes,
+  sequence digest, and request-local loss;
+- `CHECKPOINT` stores cumulative lifecycle and reason-specific loss counters.
 
-Each point-read record contains at least:
+Batch timing separates the phases currently observable without per-range
+allocation: lookup, physical sort/plan, backend execution, response
+construction, and transport delivery. Physical aggregates include storage-file
+fanout, requests, merged ranges, requested/useful/planned/completed bytes,
+merge-gap amplification, touched 4 KiB pages and 1 MiB chunks, page/chunk runs,
+input-order discontinuities/inversions, range geometry, and backend tasks.
+Unavailable sub-phases remain zero rather than being guessed. The segment
+header records the exact reader backend, range/gap policy, worker/queue/task
+settings, and `io_uring` topology used to obtain these measurements.
 
-- event sequence and coarse timestamp;
-- collection/schema identity from the file header;
-- operation kind (`Get` or `StreamGet` batch);
-- stream and batch sequence when applicable;
-- prefix dimension;
-- original row count and captured row count;
-- request and within-request sampling metadata;
-- captured uint64 IDs.
+The bounded MPSC queue preserves publication order, and the single writer
+assigns a strictly increasing physical record sequence. A random request
+token, per-request logical offsets and chunk sequences, streaming-delivery
+sequences, and monotonic timestamps reconstruct interleaved work from 8–16
+parallel clients. File order alone does not imply that IDs from different
+requests were semantically related: concurrent requests are not automatically
+turned into co-access edges merely because they overlapped. Their timeline is
+retained for queue-depth, cache, and device-contention replay.
 
-Raw IDs are sensitive application data. The initial explicit opt-in mode stores
-raw uint64 values with private permissions and documented retention. A later
-privacy mode may use collision-safe keyed 128-bit tokens plus an external join
-against live IDs; a 64-bit hash is not safe enough at hundreds of millions of
-IDs.
+Every segment carries the collection/schema identity, process-instance ID, and
+monotonic segment sequence. It begins with the exact preceding terminal
+counter baseline and is renamed from `.open` to `.tdbrl` only after its fresh
+terminal checkpoint, file fsync, rename, and directory fsync succeed. A crash
+may leave a torn `.open` suffix; only complete CRC-valid frames are readable.
+Retention removes an oldest finalized prefix. Requests crossing that oldest
+boundary are reported as left-censored and excluded. Requests unfinished at
+the newest recoverable tail are right-censored and excluded. A missing chunk
+between a retained begin and successful end is an interior gap and invalidates
+exact capture.
+
+The retention policy reserves one complete segment from the configured byte
+budget for the active writer, so recognized workload-log files remain within
+the 50-GiB default rather than overshooting it during rotation. At eight bytes
+per numeric ID, 50 GiB contains about 6.7 billion ID occurrences before
+framing overhead.
+One 25-million-ID request is roughly 192 MiB; one 600-million-ID request is
+roughly 4.5 GiB. Sixteen simultaneous 600-million-ID reads cannot all fit in a
+50-GiB retained window, and their ID rate can exceed the 16-MiB/s writer bound;
+the quality counters make that limitation explicit rather than silently
+sampling.
+
+Raw IDs are sensitive application data. The directory is private (`0700`,
+files `0600`), must be excluded from collection/S3 backup and routine
+diagnostic upload, and should live on an encrypted volume. Unlinking retained
+files is not secure erasure on SSD/NVMe media.
 
 ## Log quality gate
 
@@ -187,32 +192,26 @@ IDs.
 reports, without printing raw IDs:
 
 - collection and schema compatibility;
-- accepted and rejected files;
-- complete, torn-tail, and corrupt frame counts;
-- covered time interval;
-- request-kind, batch-size, and prefix-dimension distributions;
-- configured and effective sampling;
-- captured/original row coverage;
-- producer/writer-budget drops and writer failures, separately for events and
-  rows;
-- a machine-readable suitability verdict.
+- complete, failed, left/right-censored, and interior-incomplete requests;
+- contiguous chunk/batch/logical-offset reconstruction;
+- request-level FNV sequence digests and record CRC32C;
+- configured reader geometry and covered monotonic interval;
+- request method, size, prefix, timing, and physical-plan distributions;
+- producer, queue, disk-pressure, write-budget, and runtime loss;
+- a machine-readable `exact_capture` and suitability verdict.
 
-The planner refuses logs with an incompatible identity, incomplete process
-coverage, or either configured maximum event-drop or row-drop ratio violation.
-Every `.open` file is an incomplete lower bound. A structurally valid finalized
-file without a fresh terminal checkpoint is incomplete, not corrupt. Duplicate
-or gapped `(instance, segment_sequence)` histories, checkpoint regressions, and
-terminal-to-opening discontinuities are also unsuitable; wall-clock timestamps
-are not used for ordering.
+For v2, a layout corpus is suitable only when exact capture is true: no
+interior request gaps, corrupt frames, counter discontinuities, or retained
+window drops. Failed application requests and retention-boundary censoring are
+reported but excluded from training. Drop-ratio overrides remain available for
+legacy diagnostic logs; they cannot relabel a lossy v2 trace as exact.
 
 Inspection is bounded before planning begins: by default it accepts at most
 65536 files, 64 GiB total, 4 GiB per file, 1024 per-file report entries, and
-4096 distinct prefix-dimension buckets. Prefix cardinality is a hard bound, not
-an unbounded JSON aggregation. Operators may explicitly raise byte, report,
-and prefix bounds for a larger retained history; the file bound may be lowered
-but cannot exceed the hard 65536-entry inventory ceiling. The planner may
-additionally warn on low time coverage, high truncation, workload drift, or
-insufficient hot-set coverage.
+4096 active request states and distinct prefix-dimension buckets. IDs are
+hashed and validated through bounded `pread` buffers and are never placed in
+the JSON report. Operators may explicitly raise byte and metadata bounds for a
+larger retained history; the file inventory remains hard-capped at 65536.
 
 ## Scalable layout candidates
 
@@ -234,9 +233,11 @@ Requests are hyperedges, but expanding every request to every pair costs
 If the workload is effectively uniform, unstable, or too weakly covered, the
 valid result is `no_rebuild_recommended`.
 
-Large requests are normalized so a single export-like batch cannot dominate
-the physical layout. Cohorts by operation kind, batch size, and prefix
-dimension are evaluated independently.
+Large requests receive request-normalized weights so one very large ID set
+cannot dominate the physical layout merely through its cardinality. This is a
+mathematical weighting rule over the recorded size and boundaries, not an
+inferred semantic classification. Operation method, size, and prefix
+distributions remain independently visible in validation.
 
 ## Exact metadata-only replay
 
@@ -294,9 +295,10 @@ pipeline proves the objective, but it is not the first data-movement primitive.
 
 ## Implementation slices
 
-1. **Implemented:** versioned binary log codec, bounded asynchronous C++
-   logger, opt-in server flags, remote quality counters,
-   format/security/failure tests, and `throwdb workload inspect`.
+1. **Implemented:** exact-ID versioned binary log codec, logical request
+   lifecycle, bounded asynchronous C++ logger, profiled point-read path,
+   opt-in server flags, remote quality counters, format/security/failure
+   tests, and `throwdb workload inspect`.
 2. Pure no-I/O physical planner plus exact baseline replay and time-split
    workload reports.
 3. Bounded hot-frequency and hot-coaccess planners with deterministic artifacts
@@ -307,10 +309,10 @@ pipeline proves the objective, but it is not the first data-movement primitive.
 6. Later: WAL/CDC catch-up for online rebuild and bounded in-place
    multi-segment reclustering.
 
-The first slice now satisfies its functional safety gates: disabled logging
-does not allocate logger state, queue saturation and injected I/O failures
-cannot fail reads, memory and disk have explicit bounds, and
-truncated/corrupt logs are handled deterministically. A production-device A/B
-overhead measurement remains an acceptance run rather than an architectural
-prerequisite; it must compare disabled and enabled default sampling before the
-feature is enabled on a high-QPS deployment.
+The first slice satisfies its functional safety gates: disabled logging does
+not allocate logger state, queue saturation and injected I/O failures cannot
+fail reads, memory and disk have explicit bounds, and incomplete/corrupt logs
+are handled deterministically. A production-device A/B overhead measurement
+remains an acceptance run rather than an architectural prerequisite; it must
+compare disabled and enabled exact capture before the feature is enabled on a
+high-QPS deployment.

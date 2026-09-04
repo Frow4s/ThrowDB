@@ -207,8 +207,8 @@ throwdbd \
 throwdb workload inspect \
   --logs /data/throwdb-workload/example \
   --storage /data/example \
-  --max-drop-ratio 0.05 \
-  --max-row-drop-ratio 0.05 \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
   --require-suitable \
   --output workload-report.json
 ```
@@ -217,23 +217,17 @@ The dedicated log directory is bound to the collection ID. If the collection
 is rebuilt under a new ID, archive or remove that directory before enabling
 logging for the rebuilt collection.
 
-The native hot path samples complete successful `Get`/`StreamGet` batches into
-a preallocated nonblocking queue. Queue or disk pressure drops telemetry rather
-than failing reads. The default writer cap is 16 MiB/s and debits every
-sequential telemetry byte before it is written. Retention also has a 4096-file
-total ceiling, including the current active segment, in addition to age, byte,
-rotation, private-permission, and minimum-free-space bounds. A `.tdbrl` file
-exists only after a terminal counter checkpoint and fsync succeed; low-space
-or runtime failures leave `.open` for
-bounded-prefix recovery, and an unused pre-bind segment is removed rather than
-published as an empty finalized log. Every segment also carries an opening
-counter baseline, so offline event/row loss ratios remain scoped to the
-retained files after oldest-first retention removes an earlier prefix. Their
-denominator is completed outcomes (`written + dropped`), which remains correct
-when a request crosses a segment rotation.
-Version 1 logs raw numeric IDs, not
-embeddings, so these files are sensitive and deliberately live outside
-collection backup. See
+The native hot path records every submitted ID from valid `Get`/`StreamGet`
+requests in original order. It does not sample, truncate, or infer request
+categories. Large logical requests are split into exact 8192-ID records and
+written through a preallocated nonblocking MPSC queue. Queue or disk pressure
+marks telemetry incomplete rather than failing reads; only a zero-loss trace is
+suitable for layout training. The default bounds are a 256-MiB queue,
+256-MiB segments, 50-GiB retention, 10-GiB free-space reserve, and 16-MiB/s
+writer ceiling. Version 2 additionally records request/batch timing and
+aggregate range/page/chunk costs from the profiled native read path. Logs
+contain raw numeric IDs, not embeddings, so they are sensitive and deliberately
+live outside collection/S3 backup. See
 [`docs/workload-aware-layout.md`](docs/workload-aware-layout.md) and the
 [server runbook](docs/grpc-server.md#optional-bounded-read-workload-logging).
 

@@ -46,6 +46,7 @@ _GRPC_MAX_MESSAGE_BYTES: Final = (1 << 31) - 1
 _PROTOCOL_MAJOR: Final = 1
 _READ_LOG_HEADER_BYTES: Final = 4_096
 _READ_LOG_RECORD_HEADER_BYTES: Final = 256
+_READ_LOG_BATCH_RECORD_BYTES: Final = 384
 _READ_LOG_TERMINAL_CHECKPOINT_BYTES: Final = 256
 
 _DTYPE_TO_PROTO: Final = {
@@ -332,6 +333,8 @@ class RemoteEngineStatistics:
 @dataclass(frozen=True, slots=True)
 class RemoteReadLoggingConfiguration:
     enabled: bool
+    # Protocol-v1.4 compatibility aliases. A v1.5 logger always reports
+    # sample_ppm=1_000_000 and max_ids_per_event=id_chunk_rows.
     sample_ppm: int
     max_ids_per_event: int
     buffer_bytes: int
@@ -342,6 +345,8 @@ class RemoteReadLoggingConfiguration:
     minimum_free_bytes: int
     max_write_bytes_per_second: int
     max_retained_files: int
+    id_chunk_rows: int = 0
+    format_version: int = 1
 
     def as_dict(self) -> dict[str, int | str | bool]:
         return {
@@ -391,6 +396,28 @@ class RemoteReadLoggingStatistics:
     dropped_disk_pressure_ids: int
     dropped_io_budget_events: int
     dropped_io_budget_ids: int
+    # Protocol-v1.5 request-lifecycle and framed-record counters. Defaults
+    # preserve source compatibility for callers constructing the v1.4 model.
+    observed_requests: int = 0
+    begun_requests: int = 0
+    completed_requests: int = 0
+    complete_requests: int = 0
+    incomplete_requests: int = 0
+    observed_records: int = 0
+    enqueued_records: int = 0
+    written_records: int = 0
+    observed_id_chunks: int = 0
+    enqueued_id_chunks: int = 0
+    written_id_chunks: int = 0
+    observed_batches: int = 0
+    enqueued_batches: int = 0
+    written_batches: int = 0
+    dropped_full_records: int = 0
+    dropped_runtime_failure_records: int = 0
+    dropped_minimum_free_space_records: int = 0
+    dropped_io_budget_records: int = 0
+    queued_records: int = 0
+    active_requests: int = 0
 
     def as_dict(self) -> dict[str, int | bool]:
         return {
@@ -2272,9 +2299,20 @@ class RemoteCollection:
             )
         if has_read_logging:
             raw_logging = response.read_logging
-            maximum_event_bytes = (
-                _READ_LOG_RECORD_HEADER_BYTES
-                + 8 * raw_logging.max_ids_per_event
+            raw_format_version = int(raw_logging.format_version)
+            format_version = (
+                raw_format_version
+                if raw_format_version != 0
+                else (1 if raw_logging.enabled else 0)
+            )
+            id_chunk_rows = (
+                int(raw_logging.id_chunk_rows)
+                if format_version >= 2
+                else int(raw_logging.max_ids_per_event)
+            )
+            maximum_record_bytes = max(
+                _READ_LOG_BATCH_RECORD_BYTES,
+                _READ_LOG_RECORD_HEADER_BYTES + 8 * id_chunk_rows,
             )
             configured_values = (
                 raw_logging.sample_ppm,
@@ -2287,20 +2325,36 @@ class RemoteCollection:
                 raw_logging.minimum_free_bytes,
                 raw_logging.max_write_bytes_per_second,
                 raw_logging.max_retained_files,
+                raw_logging.id_chunk_rows,
+                raw_logging.format_version,
             )
             if (
                 raw_logging.enabled
                 and (
-                    raw_logging.sample_ppm < 1
+                    format_version not in {1, 2}
+                    or raw_logging.sample_ppm < 1
                     or raw_logging.sample_ppm > 1_000_000
                     or raw_logging.max_ids_per_event < 1
                     or raw_logging.max_ids_per_event > 65_536
+                    or id_chunk_rows < 1
+                    or id_chunk_rows > (
+                        8_192 if format_version >= 2 else 65_536
+                    )
+                    or (
+                        format_version >= 2
+                        and (
+                            raw_logging.sample_ppm != 1_000_000
+                            or raw_logging.max_ids_per_event
+                                != id_chunk_rows
+                            or raw_logging.id_chunk_rows != id_chunk_rows
+                        )
+                    )
                     or raw_logging.buffer_bytes
-                        < 2 * maximum_event_bytes
+                        < 2 * maximum_record_bytes
                     or raw_logging.segment_bytes
                         < (
                             _READ_LOG_HEADER_BYTES
-                            + maximum_event_bytes
+                            + maximum_record_bytes
                             + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
                         )
                     or raw_logging.rotate_seconds < 1
@@ -2311,7 +2365,7 @@ class RemoteCollection:
                     or raw_logging.max_write_bytes_per_second
                         < (
                             _READ_LOG_HEADER_BYTES
-                            + maximum_event_bytes
+                            + maximum_record_bytes
                             + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
                         )
                     or raw_logging.max_retained_files < 1
@@ -2323,13 +2377,13 @@ class RemoteCollection:
                 raise RemoteProtocolError(
                     "server returned invalid read-logging configuration"
                 )
-            read_logging = RemoteReadLoggingConfiguration(
-                **{
-                    field: getattr(raw_logging, field)
-                    for field in
-                    RemoteReadLoggingConfiguration.__dataclass_fields__
-                }
-            )
+            configuration = {
+                field: getattr(raw_logging, field)
+                for field in RemoteReadLoggingConfiguration.__dataclass_fields__
+            }
+            configuration["id_chunk_rows"] = id_chunk_rows
+            configuration["format_version"] = format_version
+            read_logging = RemoteReadLoggingConfiguration(**configuration)
         read_logging_stats: RemoteReadLoggingStatistics | None = None
         if has_read_logging_stats:
             raw_logging_stats = response.read_logging_stats
@@ -2338,6 +2392,42 @@ class RemoteCollection:
                 maximum_u64,
                 raw_logging_stats.dropped_busy_events
                 + raw_logging_stats.dropped_full_events,
+            )
+            lifecycle_v2 = (
+                read_logging is not None
+                and read_logging.enabled
+                and read_logging.format_version >= 2
+            )
+            completed_outcomes = min(
+                maximum_u64,
+                raw_logging_stats.complete_requests
+                + raw_logging_stats.incomplete_requests,
+            )
+            v2_counters_invalid = lifecycle_v2 and (
+                raw_logging_stats.begun_requests
+                    > raw_logging_stats.observed_requests
+                or raw_logging_stats.completed_requests
+                    > raw_logging_stats.observed_requests
+                or raw_logging_stats.complete_requests
+                    > raw_logging_stats.completed_requests
+                or raw_logging_stats.completed_requests
+                    != completed_outcomes
+                or raw_logging_stats.enqueued_records
+                    > raw_logging_stats.observed_records
+                or raw_logging_stats.written_records
+                    > raw_logging_stats.enqueued_records
+                or raw_logging_stats.enqueued_id_chunks
+                    > raw_logging_stats.observed_id_chunks
+                or raw_logging_stats.written_id_chunks
+                    > raw_logging_stats.enqueued_id_chunks
+                or raw_logging_stats.enqueued_batches
+                    > raw_logging_stats.observed_batches
+                or raw_logging_stats.written_batches
+                    > raw_logging_stats.enqueued_batches
+                or raw_logging_stats.enqueued_ids
+                    > raw_logging_stats.observed_ids
+                or raw_logging_stats.written_ids
+                    > raw_logging_stats.enqueued_ids
             )
             numeric_stats = (
                 getattr(raw_logging_stats, field)
@@ -2359,7 +2449,8 @@ class RemoteCollection:
             ) or (
                 raw_logging_stats.enabled
                 and (
-                    raw_logging_stats.buffer_capacity_bytes == 0
+                    v2_counters_invalid
+                    or raw_logging_stats.buffer_capacity_bytes == 0
                     or raw_logging_stats.buffer_capacity_bytes
                         > read_logging.buffer_bytes
                     or raw_logging_stats.queue_bytes
@@ -2379,13 +2470,63 @@ class RemoteCollection:
                 raise RemoteProtocolError(
                     "server returned inconsistent read-logging statistics"
                 )
-            read_logging_stats = RemoteReadLoggingStatistics(
-                **{
-                    field: getattr(raw_logging_stats, field)
-                    for field in
-                    RemoteReadLoggingStatistics.__dataclass_fields__
-                }
-            )
+            statistics = {
+                field: getattr(raw_logging_stats, field)
+                for field in RemoteReadLoggingStatistics.__dataclass_fields__
+            }
+            if (
+                read_logging is not None
+                and read_logging.enabled
+                and read_logging.format_version == 1
+            ):
+                incomplete = min(
+                    maximum_u64,
+                    raw_logging_stats.truncated_events
+                    + raw_logging_stats.dropped_queue_events
+                    + raw_logging_stats.dropped_disk_pressure_events
+                    + raw_logging_stats.dropped_error_events
+                    + raw_logging_stats.dropped_io_budget_events,
+                )
+                complete = int(raw_logging_stats.written_events)
+                statistics.update(
+                    observed_requests=int(
+                        raw_logging_stats.considered_events
+                    ),
+                    begun_requests=int(raw_logging_stats.sampled_events),
+                    completed_requests=min(
+                        maximum_u64, complete + incomplete
+                    ),
+                    complete_requests=complete,
+                    incomplete_requests=incomplete,
+                    observed_records=int(
+                        raw_logging_stats.sampled_events
+                    ),
+                    enqueued_records=int(
+                        raw_logging_stats.enqueued_events
+                    ),
+                    written_records=complete,
+                    observed_id_chunks=int(
+                        raw_logging_stats.sampled_events
+                    ),
+                    enqueued_id_chunks=int(
+                        raw_logging_stats.enqueued_events
+                    ),
+                    written_id_chunks=complete,
+                    dropped_full_records=int(
+                        raw_logging_stats.dropped_queue_events
+                    ),
+                    dropped_runtime_failure_records=int(
+                        raw_logging_stats.dropped_error_events
+                    ),
+                    dropped_minimum_free_space_records=int(
+                        raw_logging_stats.dropped_disk_pressure_events
+                    ),
+                    dropped_io_budget_records=int(
+                        raw_logging_stats.dropped_io_budget_events
+                    ),
+                    queued_records=int(raw_logging_stats.queued_events),
+                )
+            read_logging_stats = RemoteReadLoggingStatistics(**statistics)
         return RemoteDescription(
             format_version=response.format_version,
             schema=schema,

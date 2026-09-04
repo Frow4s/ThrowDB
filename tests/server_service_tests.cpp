@@ -226,6 +226,23 @@ void test_service_crud_get_and_scan() {
             get_bytes.end(),
             base_rows.begin()),
         "Get second prefix is not bit exact");
+    const throwdb::server::ProfiledGetResult profiled =
+        engine.get_profiled(get_ids, 2);
+    require(
+        profiled.result.dimension == 2
+            && profiled.result.row_count == get_ids.size()
+            && std::equal(
+                profiled.result.embeddings.begin(),
+                profiled.result.embeddings.end(),
+                get_bytes.begin(),
+                get_bytes.end()),
+        "profiled engine Get changed the projected response");
+    require(
+        profiled.read.requested_rows == get_ids.size()
+            && profiled.read.base_rows == get_ids.size()
+            && profiled.read.planned_ranges > 0
+            && profiled.read.completed_read_bytes > 0,
+        "profiled engine Get omitted physical read diagnostics");
 
     const std::array<std::uint64_t, 2> insert_ids{50, 60};
     const auto inserted_rows = rows(2, record_size, 71);

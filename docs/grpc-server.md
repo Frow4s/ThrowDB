@@ -303,9 +303,9 @@ disables only that client deadline, not the server bounds.
 
 ## Optional bounded read-workload logging
 
-The native server can record the logical shape of successful point reads for
-the offline layout optimizer. This is telemetry, not authoritative collection
-state. It is disabled unless `--read-log-dir` is supplied:
+The native server can record complete logical point-read traces for the offline
+layout optimizer. This is fail-open telemetry, not authoritative collection
+state or an audit WAL. It is disabled unless `--read-log-dir` is supplied:
 
 ```bash
 throwdbd \
@@ -323,30 +323,34 @@ The directory is permanently bound to the collection ID by its owner marker.
 After rebuilding the collection under a new ID, archive or remove the old
 dedicated log directory and start the new collection with a fresh one.
 
-Logging records one successfully completed unary `Get` and each successfully
-delivered `StreamGet` application batch. `ScanIds` and `ScanRecords` are
-deliberately excluded because their physical-order scans would create a false
-uniform workload. Embeddings are never logged. Version 1 records sampled raw
-`uint64` IDs, so the directory is sensitive and must not be uploaded with
-ordinary diagnostics.
+Logging creates one lifecycle for each unary `Get` and one for the complete
+bidirectional `StreamGet`. After a valid ID batch is decoded, every submitted
+`uint64` ID is retained in original order, including duplicates. A request is
+ended with its actual success, cancellation, deadline, client-close, or failure
+status. Only successful, fully captured requests are eligible for layout
+training. `ScanIds` and `ScanRecords` do not contain a user-supplied ID set and
+are excluded. Embeddings and per-ID physical pointers are never logged.
+
+The logger does not infer categories or label a request as broad/full. Its only
+operation value is the real `Get` or `StreamGet` method. Larger inputs are split
+into contiguous physical ID records, not sampled or truncated.
 
 The defaults after opt-in are:
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `--read-log-sample-ppm` | `10000` | sample 1% of complete point-read events |
-| `--read-log-max-ids-per-event` | `4096` | cap copied IDs; hard maximum is 65536 |
-| `--read-log-buffer-mib` | `64` | preallocated producer queue |
+| `--read-log-id-chunk-rows` | `8192` | exact ordered IDs per physical record; hard maximum is 8192 |
+| `--read-log-buffer-mib` | `256` | preallocated multi-producer queue |
 | `--read-log-segment-mib` | `256` | rotate sequential binary segments |
 | `--read-log-rotate-seconds` | `3600` | time-based rotation |
-| `--read-log-retention-mib` | `10240` | retained finalized/stale-tail byte budget |
+| `--read-log-retention-mib` | `51200` | total recognized-log budget, including the active segment |
 | `--read-log-retention-seconds` | `604800` | seven-day age bound |
-| `--read-log-min-free-mib` | `2048` | pause before consuming the filesystem reserve |
+| `--read-log-min-free-mib` | `10240` | pause before consuming the filesystem reserve |
 | `--read-log-max-write-mib-per-second` | `16` | token-bucket cap for all sequential logger bytes |
 | `--read-log-max-retained-files` | `4096` | total cap including the active segment; supported range is 1–65533 |
 
-The buffer must fit at least two maximum-sized events. A segment must fit its
-header, opening counter baseline, one maximum event, and terminal checkpoint.
+The buffer must fit at least two maximum-sized records. A segment must fit its
+header, opening counter baseline, one maximum record, and terminal checkpoint.
 Retention must cover at least one segment, and the write-rate cap must permit
 that complete bounded transaction in one token-bucket window.
 Tuning flags without `--read-log-dir` are rejected instead of silently enabling
@@ -356,25 +360,38 @@ Retention prunes recognized finalized files and stale `.open` tails
 oldest-first until both the byte and file-count budgets hold. While the logger
 is running it reserves one configured file slot for the current writer-owned
 `.open` segment, so the total recognized file count never exceeds the
-configured ceiling. The active segment is not a byte-retention candidate, so
-total directory usage may exceed the retained-byte budget by at most that one
-segment. Age retention is enforced during traffic and by a periodic idle sweep
-at least every five minutes.
+configured ceiling. It also reserves one full configured segment from the byte
+budget; finalized/stale files plus the active segment therefore stay within the
+configured retention bytes. Age retention is enforced during traffic and by a
+periodic idle sweep at least every five minutes.
 
 Disabled mode allocates no logger or queue and adds only an atomic null-pointer
-check to successful point reads. Enabled mode samples the whole event before
-copying IDs. A sampled producer uses a nonblocking `try_lock`; contention or a
-full queue drops the telemetry event rather than waiting. Oversized requests
-retain a bounded systematic sample across the complete request instead of only
-its prefix. One background thread writes private `0600` CRC32C-framed files in
-a `0700` directory. Only one process may own a log directory.
+check to point reads. Enabled reads call the explicitly profiled native path and
+enqueue fixed-capacity frames through a preallocated bounded MPSC ring. A
+producer never waits for the writer. One background thread writes private
+`0600` CRC32C-framed files in a `0700` directory. Only one process may own a
+log directory.
+
+Every trace contains:
+
+- request begin/end, exact snapshot anchor when available, prefix dimensions,
+  status, submitted/delivered rows, and response bytes;
+- exact ID chunks with logical offset and input-batch/chunk sequence, plus
+  successful streaming-delivery order in the corresponding batch record;
+- lookup, physical sort/plan/backend, construction, and transport timings;
+- range/task/file fanout, requested/useful/planned/completed bytes,
+  merge-gap amplification, 4 KiB page and 1 MiB chunk runs, and input-order
+  discontinuities;
+- the effective reader backend, merge geometry, workers, queue/task sizing,
+  and `io_uring` topology used by that server process.
 
 Explicit startup errors such as invalid geometry, an unsafe/unwritable path, or
 a conflicting writer lock fail server startup. After successful startup,
 queue pressure, the minimum-free-space guard, and log I/O failures never fail
 or delay the read RPC:
 
-- queue pressure increments busy/full drop counters;
+- queue pressure increments full-record/ID counters and marks the request
+  incomplete;
 - low free space pauses admission and is rechecked periodically;
 - a runtime filesystem error permanently disables that logger instance until
   server restart and leaves a recoverable `.open` tail;
@@ -390,10 +407,12 @@ or delay the read RPC:
 
 `RemoteCollection.describe()` exposes the effective bounded policy and
 process-local counters through `read_logging` and `read_logging_stats`, without
-disclosing the server-local path. Alert on `runtime_failed`, `writer_errors`,
-or growing event/row telemetry loss. Row loss separates large dropped batches
-from small ones; both completed-outcome ratios must pass the offline quality
-gate.
+disclosing the server-local path. Protocol v1.5 exposes request, record,
+ID-chunk, batch, ID, queue, and reason-specific loss counters. Deprecated v1.4
+sampling fields remain compatibility aliases; a v1.5 server reports
+`sample_ppm=1000000` and never reports truncation. Alert on
+`runtime_failed`, `writer_errors`, any incomplete request, or any dropped
+record/ID.
 
 Inspect logs offline before using them for optimization:
 
@@ -401,38 +420,40 @@ Inspect logs offline before using them for optimization:
 throwdb workload inspect \
   --logs /nvme/throwdb-workload/products \
   --storage /nvme/collections/products \
-  --max-drop-ratio 0.05 \
-  --max-row-drop-ratio 0.05 \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
   --require-suitable \
   --output workload-report.json
 ```
 
 The inspector validates collection/schema identity, strict frame geometry,
-CRC32C, crash-torn `.open` tails, cumulative counter consistency, configured
-resource bounds, exact baseline continuity between adjacent segments,
-terminal completeness, and separate event/row loss. Event and row loss ratios
-use completed retained-window outcomes: dropped divided by written-plus-dropped
-events or rows. This remains exact when a sampled request crosses a rotation
-boundary; independently sampled counter snapshots are still reported as
-deltas, but are not the quality denominator. Saturated counters fail closed.
-Mixing segments produced with different sampling or resource configurations
-also fails closed until a future inspector can preserve and weight those
-configurations as separate strata.
-The inspector reports aggregate distributions and never prints captured IDs.
-Any `.open` input is a lower bound and makes the input unsuitable for
-optimization, even when its last complete frame is a checkpoint. A
-structurally valid `.tdbrl` without a fresh terminal checkpoint is likewise
-incomplete rather than corrupt.
+CRC32C, request/chunk/batch sequence and offsets, the full-sequence digest,
+configured resource bounds, cumulative counter consistency, baseline
+continuity between adjacent segments, terminal completeness, and
+reason-specific loss. It reports aggregates and never prints captured IDs.
+Requests crossing an already-pruned oldest prefix are left-censored; requests
+unfinished in the newest recoverable tail are right-censored. Both are
+excluded. An interior missing chunk, counter/segment discontinuity, corrupt
+frame, or any retained-window logger drop makes `exact_capture=false` and the
+v2 corpus unsuitable for layout optimization.
 
 Inspection itself is bounded. Defaults are 65536 files, 64 GiB total input,
 4 GiB per file, 1024 per-file JSON reports, and 4096 distinct prefix-dimension
-buckets. Override them explicitly with `--max-files`, `--max-total-bytes`,
-`--max-file-bytes`, `--max-report-entries`, and `--max-prefix-entries`.
+buckets/active request states. Override them explicitly with `--max-files`,
+`--max-total-bytes`, `--max-file-bytes`, `--max-report-entries`,
+`--max-prefix-entries`, and the active-request bound.
+The latter is exposed as `--max-active-requests`.
 `--max-files` may be lowered but cannot exceed the hard 65536-entry directory
 inventory ceiling; the inspector also counts a small bounded allowance of
 service files and rejects directories that exceed it. Byte-valued inspector
 arguments are raw bytes. Exceeding any hard input or prefix bound aborts
 inspection instead of producing a partial suitable report.
+
+Raw IDs make this directory sensitive. Keep it off collection/S3 sync and
+routine support bundles, use an encrypted volume, and restrict access to the
+server/optimizer identity. Retention unlink is not secure erasure on SSD/NVMe.
+The 50-GiB budget stores approximately 6.7 billion raw numeric ID occurrences
+before framing overhead, including the reserved active segment.
 
 ## Processes and binaries
 

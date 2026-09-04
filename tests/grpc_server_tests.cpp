@@ -452,7 +452,7 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
         const auto maximum_event_bytes =
             read_log_record_header_bytes
             + static_cast<std::uint64_t>(
-                  unfinalizable.read_log_max_ids_per_event)
+                  unfinalizable.read_log_id_chunk_rows)
                   * sizeof(std::uint64_t);
         unfinalizable.read_log_segment_bytes =
             read_log_header_bytes + read_log_record_header_bytes
@@ -490,7 +490,7 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
     options.max_worker_threads = 8;
     options.max_concurrent_calls = 4;
     options.read_log_directory = logs;
-    options.read_log_sample_ppm = 1'000'000;
+    options.read_log_id_chunk_rows = 8'192;
     options.read_log_buffer_bytes = 1ULL << 20;
     options.read_log_segment_bytes = 1ULL << 20;
     options.read_log_retention_bytes = 2ULL << 20;
@@ -535,11 +535,19 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
     const std::array<std::uint64_t, 1> stream_ids{33};
     set_ids(*batch.mutable_batch()->mutable_ids(), stream_ids);
     require(
+        stream->Write(batch) && stream->Read(&stream_response),
+        "logged StreamGet first batch failed");
+    batch.mutable_batch()->set_sequence(1);
+    const std::array<std::uint64_t, 1> second_stream_ids{11};
+    set_ids(
+        *batch.mutable_batch()->mutable_ids(),
+        second_stream_ids);
+    require(
         stream->Write(batch) && stream->WritesDone()
             && stream->Read(&stream_response)
             && !stream->Read(&stream_response)
             && stream->Finish().ok(),
-        "logged StreamGet batch failed");
+        "logged StreamGet second batch failed");
 
     // Administrative physical scans must not enter layout-training logs.
     wire::ScanIdsRequest scan_request;
@@ -562,6 +570,8 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
     require(
         description.read_logging().enabled()
             && description.read_logging().sample_ppm() == 1'000'000
+            && description.read_logging().id_chunk_rows() == 8'192
+            && description.read_logging().format_version() == 2
             && description.read_logging().max_write_bytes_per_second()
                    == options.read_log_max_write_bytes_per_second
             && description.read_logging().max_retained_files()
@@ -570,10 +580,21 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
             && description.read_logging_stats().considered_events() == 2
             && description.read_logging_stats().sampled_events() == 2
             && description.read_logging_stats().enqueued_events() == 2
-            && description.read_logging_stats().observed_ids() == 3
-            && description.read_logging_stats().captured_ids() == 3
-            && description.read_logging_stats().sampled_ids() == 3
-            && description.read_logging_stats().enqueued_ids() == 3
+            && description.read_logging_stats().observed_requests() == 2
+            && description.read_logging_stats().begun_requests() == 2
+            && description.read_logging_stats().completed_requests() == 2
+            && description.read_logging_stats().complete_requests() == 2
+            && description.read_logging_stats().incomplete_requests() == 0
+            && description.read_logging_stats().observed_records() == 10
+            && description.read_logging_stats().enqueued_records() == 10
+            && description.read_logging_stats().observed_id_chunks() == 3
+            && description.read_logging_stats().enqueued_id_chunks() == 3
+            && description.read_logging_stats().observed_batches() == 3
+            && description.read_logging_stats().enqueued_batches() == 3
+            && description.read_logging_stats().observed_ids() == 4
+            && description.read_logging_stats().captured_ids() == 4
+            && description.read_logging_stats().sampled_ids() == 4
+            && description.read_logging_stats().enqueued_ids() == 4
             && description.read_logging_stats().dropped_queue_events() == 0
             && description.read_logging_stats()
                    .dropped_disk_pressure_events()
@@ -621,6 +642,37 @@ void test_grpc_read_workload_logging_is_opt_in_and_bounded() {
             + " dropped_error="
             + std::to_string(
                   description.read_logging_stats().dropped_error_events()));
+
+    // Valid decoded IDs enter one lifecycle before the native read, so a
+    // missing ID remains visible as an incomplete diagnostic request without
+    // becoming layout-training input.
+    wire::GetRequest missing_request;
+    const std::array<std::uint64_t, 1> missing_ids{999'999};
+    set_ids(*missing_request.mutable_ids(), missing_ids);
+    grpc::ClientContext missing_context;
+    wire::GetResponse missing_response;
+    const grpc::Status missing_status =
+        stub->Get(&missing_context, missing_request, &missing_response);
+    require(
+        missing_status.error_code() == grpc::StatusCode::NOT_FOUND,
+        "logged missing-ID Get returned the wrong status");
+
+    grpc::ClientContext after_failure_context;
+    wire::DescribeResponse after_failure;
+    require(
+        stub->Describe(
+                &after_failure_context, describe_request, &after_failure)
+            .ok(),
+        "post-failure read-log Describe failed");
+    require(
+        after_failure.read_logging_stats().observed_requests() == 3
+            && after_failure.read_logging_stats().completed_requests() == 3
+            && after_failure.read_logging_stats().complete_requests() == 2
+            && after_failure.read_logging_stats().incomplete_requests() == 1
+            && after_failure.read_logging_stats().observed_ids() == 5
+            && after_failure.read_logging_stats().observed_id_chunks() == 4
+            && after_failure.read_logging_stats().observed_batches() == 3,
+        "failed valid Get did not produce one incomplete lifecycle");
     server.shutdown();
 }
 
@@ -744,7 +796,7 @@ void test_grpc_crud_and_scan() {
         status.ok()
             && health_response.status()
                    == wire::HealthResponse::SERVING_STATUS_SERVING
-            && health_response.protocol_minor() == 4,
+            && health_response.protocol_minor() == 5,
         "typed gRPC Health failed");
 
     grpc::ClientContext describe_context;

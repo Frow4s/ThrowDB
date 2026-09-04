@@ -103,6 +103,7 @@ struct NativeReaderCapabilities {
 struct NativeReadStats {
     double total_seconds = 0.0;
     double lookup_seconds = 0.0;
+    double physical_sort_seconds = 0.0;
     double physical_plan_seconds = 0.0;
     // Queue/admission wait, physical I/O, and scatter copies currently share
     // one wall-clock phase because those operations overlap in parallel
@@ -111,8 +112,22 @@ struct NativeReadStats {
     std::uint64_t requested_rows = 0;
     std::uint64_t base_rows = 0;
     std::uint64_t mutation_rows = 0;
+    std::uint64_t unique_files = 0;
     std::uint64_t planned_ranges = 0;
+    std::uint64_t requested_bytes = 0;
     std::uint64_t planned_read_bytes = 0;
+    std::uint64_t completed_read_bytes = 0;
+    std::uint64_t useful_read_bytes = 0;
+    std::uint64_t gap_bytes = 0;
+    std::uint64_t overread_bytes = 0;
+    std::uint64_t pages_touched = 0;
+    std::uint64_t page_runs = 0;
+    std::uint64_t chunks_touched = 0;
+    std::uint64_t chunk_runs = 0;
+    std::uint64_t input_discontinuities = 0;
+    std::uint64_t input_inversions = 0;
+    std::uint64_t maximum_range_bytes = 0;
+    std::uint64_t mean_range_bytes = 0;
     std::uint64_t backend_tasks = 0;
     bool zero_delta_fast_path = false;
 };
@@ -435,6 +450,9 @@ public:
     [[nodiscard]] std::uint32_t output_dimension() const noexcept;
     [[nodiscard]] DType dtype() const noexcept;
     void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+    [[nodiscard]] NativeReadStats get_into_profiled(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const;
 

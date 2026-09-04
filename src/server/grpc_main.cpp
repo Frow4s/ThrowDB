@@ -108,9 +108,8 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
           "                [--orphan-min-age-seconds N] "
           "[--orphan-max-files N] [--orphan-max-mib N]\n"
           "                [--read-log-dir PATH "
-          "[--read-log-sample-ppm N]]\n"
-          "                [--read-log-max-ids-per-event N] "
-          "[--read-log-buffer-mib N]\n"
+          "[--read-log-id-chunk-rows N]]\n"
+          "                [--read-log-buffer-mib N]\n"
           "                [--read-log-segment-mib N] "
           "[--read-log-rotate-seconds N]\n"
           "                [--read-log-retention-mib N] "
@@ -430,12 +429,8 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
             if (result.grpc.read_log_directory.empty()) {
                 usage_error("--read-log-dir must not be empty");
             }
-        } else if (argument == "--read-log-sample-ppm") {
-            result.grpc.read_log_sample_ppm = parse_u32(
-                require_value(argc, argv, index), argument);
-            result.read_log_tuning_seen = true;
-        } else if (argument == "--read-log-max-ids-per-event") {
-            result.grpc.read_log_max_ids_per_event = parse_u32(
+        } else if (argument == "--read-log-id-chunk-rows") {
+            result.grpc.read_log_id_chunk_rows = parse_u32(
                 require_value(argc, argv, index), argument);
             result.read_log_tuning_seen = true;
         } else if (argument == "--read-log-buffer-mib") {
@@ -556,32 +551,32 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
             "logging is disabled unless its dedicated directory is explicit");
     }
     if (!result.grpc.read_log_directory.empty()) {
-        constexpr std::uint32_t maximum_ids_per_event = 65'536;
-        if (result.grpc.read_log_sample_ppm == 0
-            || result.grpc.read_log_sample_ppm > 1'000'000
-            || result.grpc.read_log_max_ids_per_event == 0
-            || result.grpc.read_log_max_ids_per_event
-                   > maximum_ids_per_event) {
+        constexpr std::uint32_t maximum_id_chunk_rows = 8'192;
+        if (result.grpc.read_log_id_chunk_rows == 0
+            || result.grpc.read_log_id_chunk_rows
+                   > maximum_id_chunk_rows) {
             usage_error(
-                "read-log sample ppm must be in [1, 1000000] and "
-                "max IDs per event must be in [1, 65536]");
+                "read-log ID chunk rows must be in [1, 8192]");
         }
-        const std::uint64_t maximum_event_bytes =
-            static_cast<std::uint64_t>(
-                throwdb::server::detail::kReadWorkloadRecordHeaderBytes)
-            + static_cast<std::uint64_t>(
-                  result.grpc.read_log_max_ids_per_event)
-                  * sizeof(std::uint64_t);
+        const std::uint64_t maximum_record_bytes =
+            std::max<std::uint64_t>(
+                throwdb::server::detail::kReadWorkloadBatchRecordBytes,
+                static_cast<std::uint64_t>(
+                    throwdb::server::detail::
+                        kReadWorkloadRecordHeaderBytes)
+                    + static_cast<std::uint64_t>(
+                          result.grpc.read_log_id_chunk_rows)
+                          * sizeof(std::uint64_t));
         constexpr std::uint64_t terminal_checkpoint_bytes =
             throwdb::server::detail::kReadWorkloadRecordHeaderBytes;
         const std::uint64_t maximum_write_transaction =
             throwdb::server::detail::kReadWorkloadLogHeaderBytes
-            + maximum_event_bytes + 2 * terminal_checkpoint_bytes;
+            + maximum_record_bytes + 2 * terminal_checkpoint_bytes;
         if (result.grpc.read_log_buffer_bytes
-                < 2ULL * maximum_event_bytes
+                < 2ULL * maximum_record_bytes
             || result.grpc.read_log_segment_bytes
                    < throwdb::server::detail::kReadWorkloadLogHeaderBytes
-                         + maximum_event_bytes
+                         + maximum_record_bytes
                          + 2 * terminal_checkpoint_bytes
             || result.grpc.read_log_retention_bytes
                    < result.grpc.read_log_segment_bytes
@@ -1270,10 +1265,12 @@ int main(const int argc, char** argv) {
                   << ",\"directory\":"
                   << json_string(
                          options.grpc.read_log_directory.generic_string())
-                  << ",\"sample_ppm\":"
-                  << options.grpc.read_log_sample_ppm
+                  << ",\"format_version\":2"
+                  << ",\"sample_ppm\":1000000"
+                  << ",\"id_chunk_rows\":"
+                  << options.grpc.read_log_id_chunk_rows
                   << ",\"max_ids_per_event\":"
-                  << options.grpc.read_log_max_ids_per_event
+                  << options.grpc.read_log_id_chunk_rows
                   << ",\"buffer_bytes\":"
                   << options.grpc.read_log_buffer_bytes
                   << ",\"segment_bytes\":"

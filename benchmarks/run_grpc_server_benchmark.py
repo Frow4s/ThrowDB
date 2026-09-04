@@ -56,14 +56,13 @@ _DEFAULT_SERVER_SHUTDOWN_GRACE_MS = 30_000
 _DEFAULT_SERVER_SHUTDOWN_HARD_TIMEOUT_MS = 60_000
 _DEFAULT_READ_LOG_MAX_EVENT_DROP_RATIO = 0.05
 _DEFAULT_READ_LOG_MAX_ROW_DROP_RATIO = 0.05
-_MAX_READ_LOG_IDS_PER_EVENT = 65_536
+_MAX_READ_LOG_ID_CHUNK_ROWS = 8_192
 _MAX_READ_LOG_RETAINED_FILES = 65_533
 _MAX_READ_LOG_ROTATE_SECONDS = (1 << 63) - 1
 _MAX_UINT64_MIB = UINT64_MASK >> 20
 _MAX_INSPECTED_READ_LOG_FILES = 65_536
 _SERVER_READ_LOG_TUNING_ARGUMENTS = (
-    "server_read_log_sample_ppm",
-    "server_read_log_max_ids_per_event",
+    "server_read_log_id_chunk_rows",
     "server_read_log_buffer_mib",
     "server_read_log_segment_mib",
     "server_read_log_rotate_seconds",
@@ -130,18 +129,11 @@ def _unit_interval(value: str) -> float:
     return parsed
 
 
-def _read_log_sample_ppm(value: str) -> int:
+def _read_log_id_chunk_rows(value: str) -> int:
     parsed = _positive_int(value)
-    if parsed > 1_000_000:
-        raise argparse.ArgumentTypeError("value must not exceed 1000000")
-    return parsed
-
-
-def _read_log_max_ids(value: str) -> int:
-    parsed = _positive_int(value)
-    if parsed > _MAX_READ_LOG_IDS_PER_EVENT:
+    if parsed > _MAX_READ_LOG_ID_CHUNK_ROWS:
         raise argparse.ArgumentTypeError(
-            f"value must not exceed {_MAX_READ_LOG_IDS_PER_EVENT}"
+            f"value must not exceed {_MAX_READ_LOG_ID_CHUNK_ROWS}"
         )
     return parsed
 
@@ -547,8 +539,7 @@ def _local_server_stop_timeout_seconds(
 def _read_log_server_arguments(
     *,
     directory: Path | None,
-    sample_ppm: int | None,
-    max_ids_per_event: int | None,
+    id_chunk_rows: int | None,
     buffer_mib: int | None,
     segment_mib: int | None,
     rotate_seconds: int | None,
@@ -561,8 +552,7 @@ def _read_log_server_arguments(
     """Build the explicit public-launcher arguments for read logging."""
 
     configured = (
-        sample_ppm,
-        max_ids_per_event,
+        id_chunk_rows,
         buffer_mib,
         segment_mib,
         rotate_seconds,
@@ -580,8 +570,7 @@ def _read_log_server_arguments(
         return []
     result = ["--read-log-dir", str(directory)]
     for option, value in (
-        ("--read-log-sample-ppm", sample_ppm),
-        ("--read-log-max-ids-per-event", max_ids_per_event),
+        ("--read-log-id-chunk-rows", id_chunk_rows),
         ("--read-log-buffer-mib", buffer_mib),
         ("--read-log-segment-mib", segment_mib),
         ("--read-log-rotate-seconds", rotate_seconds),
@@ -640,8 +629,7 @@ class LocalServer:
         shutdown_grace_ms: int | None = None,
         shutdown_hard_timeout_ms: int | None = None,
         read_log_directory: Path | None = None,
-        read_log_sample_ppm: int | None = None,
-        read_log_max_ids_per_event: int | None = None,
+        read_log_id_chunk_rows: int | None = None,
         read_log_buffer_mib: int | None = None,
         read_log_segment_mib: int | None = None,
         read_log_rotate_seconds: int | None = None,
@@ -685,8 +673,7 @@ class LocalServer:
         command.extend(
             _read_log_server_arguments(
                 directory=read_log_directory,
-                sample_ppm=read_log_sample_ppm,
-                max_ids_per_event=read_log_max_ids_per_event,
+                id_chunk_rows=read_log_id_chunk_rows,
                 buffer_mib=read_log_buffer_mib,
                 segment_mib=read_log_segment_mib,
                 rotate_seconds=read_log_rotate_seconds,
@@ -2504,12 +2491,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--server-read-log-sample-ppm",
-        type=_read_log_sample_ppm,
-    )
-    parser.add_argument(
-        "--server-read-log-max-ids-per-event",
-        type=_read_log_max_ids,
+        "--server-read-log-id-chunk-rows",
+        type=_read_log_id_chunk_rows,
     )
     parser.add_argument("--server-read-log-buffer-mib", type=_positive_int)
     parser.add_argument("--server-read-log-segment-mib", type=_positive_int)
@@ -2819,9 +2802,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         args.server_no_auto_maintenance
                     ),
                     read_log_directory=args.server_read_log_dir,
-                    read_log_sample_ppm=args.server_read_log_sample_ppm,
-                    read_log_max_ids_per_event=(
-                        args.server_read_log_max_ids_per_event
+                    read_log_id_chunk_rows=(
+                        args.server_read_log_id_chunk_rows
                     ),
                     read_log_buffer_mib=args.server_read_log_buffer_mib,
                     read_log_segment_mib=args.server_read_log_segment_mib,

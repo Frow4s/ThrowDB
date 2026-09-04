@@ -35,23 +35,23 @@ _DEFAULT_MAX_CONCURRENT_CALLS: Final = 32
 _DEFAULT_MAX_CONCURRENT_SCANS: Final = 2
 _DEFAULT_SHUTDOWN_GRACE_MS: Final = 30_000
 _DEFAULT_SHUTDOWN_HARD_TIMEOUT_MS: Final = 60_000
-_DEFAULT_READ_LOG_MAX_IDS_PER_EVENT: Final = 4_096
-_DEFAULT_READ_LOG_BUFFER_MIB: Final = 64
+_DEFAULT_READ_LOG_ID_CHUNK_ROWS: Final = 8_192
+_DEFAULT_READ_LOG_BUFFER_MIB: Final = 256
 _DEFAULT_READ_LOG_SEGMENT_MIB: Final = 256
-_DEFAULT_READ_LOG_RETENTION_MIB: Final = 10 * 1_024
+_DEFAULT_READ_LOG_RETENTION_MIB: Final = 50 * 1_024
 _DEFAULT_READ_LOG_MAX_WRITE_MIB_PER_SECOND: Final = 16
 _DEFAULT_READ_LOG_MAX_RETAINED_FILES: Final = 4_096
-_MAX_READ_LOG_IDS_PER_EVENT: Final = 65_536
+_MAX_READ_LOG_ID_CHUNK_ROWS: Final = 8_192
 _MAX_READ_LOG_RETAINED_FILES: Final = 65_533
 _MAX_READ_LOG_ROTATE_SECONDS: Final = (1 << 63) - 1
 _MAX_UINT64: Final = (1 << 64) - 1
 _MAX_UINT64_MIB: Final = _MAX_UINT64 >> 20
 _READ_LOG_HEADER_BYTES: Final = 4_096
 _READ_LOG_RECORD_HEADER_BYTES: Final = 256
+_READ_LOG_BATCH_RECORD_BYTES: Final = 384
 _READ_LOG_TERMINAL_CHECKPOINT_BYTES: Final = 256
 _READ_LOG_ARGUMENTS: Final = (
-    "read_log_sample_ppm",
-    "read_log_max_ids_per_event",
+    "read_log_id_chunk_rows",
     "read_log_buffer_mib",
     "read_log_segment_mib",
     "read_log_rotate_seconds",
@@ -155,8 +155,7 @@ _NATIVE_VALUE_ARGUMENTS: Final = (
     ("orphan_max_files", "--orphan-max-files"),
     ("orphan_max_mib", "--orphan-max-mib"),
     ("read_log_dir", "--read-log-dir"),
-    ("read_log_sample_ppm", "--read-log-sample-ppm"),
-    ("read_log_max_ids_per_event", "--read-log-max-ids-per-event"),
+    ("read_log_id_chunk_rows", "--read-log-id-chunk-rows"),
     ("read_log_buffer_mib", "--read-log-buffer-mib"),
     ("read_log_segment_mib", "--read-log-segment-mib"),
     ("read_log_rotate_seconds", "--read-log-rotate-seconds"),
@@ -226,20 +225,11 @@ def _nonnegative_int(value: str) -> int:
     return parsed
 
 
-def _read_log_sample_ppm(value: str) -> int:
+def _read_log_id_chunk_rows(value: str) -> int:
     parsed = int(value)
-    if parsed < 1 or parsed > 1_000_000:
+    if parsed < 1 or parsed > _MAX_READ_LOG_ID_CHUNK_ROWS:
         raise argparse.ArgumentTypeError(
-            "value must be between 1 and 1000000"
-        )
-    return parsed
-
-
-def _read_log_max_ids(value: str) -> int:
-    parsed = int(value)
-    if parsed < 1 or parsed > _MAX_READ_LOG_IDS_PER_EVENT:
-        raise argparse.ArgumentTypeError(
-            f"value must be between 1 and {_MAX_READ_LOG_IDS_PER_EVENT}"
+            f"value must be between 1 and {_MAX_READ_LOG_ID_CHUNK_ROWS}"
         )
     return parsed
 
@@ -467,14 +457,12 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--read-log-sample-ppm",
-        type=_read_log_sample_ppm,
-        help="sample successful point-read batches in parts per million",
-    )
-    parser.add_argument(
-        "--read-log-max-ids-per-event",
-        type=_read_log_max_ids,
-        help="hard cap for IDs captured from one sampled batch",
+        "--read-log-id-chunk-rows",
+        type=_read_log_id_chunk_rows,
+        help=(
+            "maximum ordered ID rows per workload-log record; requests "
+            "larger than this are recorded as multiple contiguous chunks"
+        ),
     )
     parser.add_argument("--read-log-buffer-mib", type=_positive_int)
     parser.add_argument("--read-log-segment-mib", type=_positive_int)
@@ -682,10 +670,10 @@ def _validate_read_log_arguments(args: argparse.Namespace) -> None:
             "permissions or enter collection backup and restore"
         )
 
-    maximum_ids = (
-        args.read_log_max_ids_per_event
-        if args.read_log_max_ids_per_event is not None
-        else _DEFAULT_READ_LOG_MAX_IDS_PER_EVENT
+    id_chunk_rows = (
+        args.read_log_id_chunk_rows
+        if args.read_log_id_chunk_rows is not None
+        else _DEFAULT_READ_LOG_ID_CHUNK_ROWS
     )
     buffer_mib = (
         args.read_log_buffer_mib
@@ -717,25 +705,26 @@ def _validate_read_log_arguments(args: argparse.Namespace) -> None:
         if args.read_log_rotate_seconds is not None
         else 3_600
     )
-    # The native queue keeps at least two complete fixed-capacity events.
+    # The native queue keeps at least two complete fixed-capacity records.
     # Validate the same lower bound before exec so a dry-run is authoritative.
-    maximum_event_bytes = (
-        _READ_LOG_RECORD_HEADER_BYTES + maximum_ids * 8
+    maximum_record_bytes = max(
+        _READ_LOG_BATCH_RECORD_BYTES,
+        _READ_LOG_RECORD_HEADER_BYTES + id_chunk_rows * 8,
     )
-    minimum_buffer_bytes = 2 * maximum_event_bytes
+    minimum_buffer_bytes = 2 * maximum_record_bytes
     if buffer_mib * (1 << 20) < minimum_buffer_bytes:
         raise ServerLaunchError(
-            "--read-log-buffer-mib cannot hold two maximum-sized log events"
+            "--read-log-buffer-mib cannot hold two maximum-sized log records"
         )
     minimum_segment_bytes = (
         _READ_LOG_HEADER_BYTES
-        + maximum_event_bytes
+        + maximum_record_bytes
         + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
     )
     if segment_mib * (1 << 20) < minimum_segment_bytes:
         raise ServerLaunchError(
             "--read-log-segment-mib cannot hold the log header and one "
-            "opening checkpoint, maximum-sized event, and terminal "
+            "opening checkpoint, maximum-sized record, and terminal "
             "checkpoint"
         )
     if retention_mib < segment_mib:
@@ -745,7 +734,7 @@ def _validate_read_log_arguments(args: argparse.Namespace) -> None:
         )
     maximum_write_transaction = (
         _READ_LOG_HEADER_BYTES
-        + maximum_event_bytes
+        + maximum_record_bytes
         + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
     )
     if (
@@ -754,7 +743,7 @@ def _validate_read_log_arguments(args: argparse.Namespace) -> None:
     ):
         raise ServerLaunchError(
             "--read-log-max-write-mib-per-second must cover at least one "
-            "maximum-sized event plus its segment header, opening "
+            "maximum-sized record plus its segment header, opening "
             "checkpoint, and terminal checkpoint per second"
         )
     if not 1 <= maximum_retained_files <= _MAX_READ_LOG_RETAINED_FILES:

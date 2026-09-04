@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cctype>
@@ -44,12 +45,17 @@ namespace {
 namespace wire = ::throwdb::v1;
 
 inline constexpr std::uint32_t kProtocolMajor = 1;
-inline constexpr std::uint32_t kProtocolMinor = 4;
+inline constexpr std::uint32_t kProtocolMinor = 5;
 inline constexpr std::uint64_t kScanEnvelopeAllowance = 512;
 inline constexpr std::uint64_t kStreamingEnvelopeAllowance = 1024;
 inline constexpr std::uint64_t kStreamRequestEnvelopeAllowance = 128;
 inline constexpr std::uint64_t kMutationResponseUpperBound = 32;
 inline constexpr std::uint64_t kDeleteResponseEnvelopeAllowance = 64;
+// Keep every produced log inspectable with the public inspector's bounded
+// lifecycle state. Higher RPC admission remains valid: logging rejects excess
+// concurrent lifecycles fail-open, and its completeness counters expose that
+// the resulting capture is unsuitable for exact layout training.
+inline constexpr std::uint32_t kReadLogMaximumActiveRequests = 4'096;
 // Per-row application-memory estimates deliberately include native planning
 // containers, not only protobuf payloads. Physical reads can simultaneously
 // retain PhysicalReadRequest, sorted Request, PlannedRange, scheduler work,
@@ -221,6 +227,25 @@ public:
     }
     result = left + right;
     return true;
+}
+
+[[nodiscard]] std::uint64_t next_monotonic_sequence(
+    std::atomic<std::uint64_t>& sequence) noexcept {
+    auto current = sequence.load(std::memory_order_relaxed);
+    while (current != std::numeric_limits<std::uint64_t>::max()) {
+        const auto next = current + 1;
+        if (sequence.compare_exchange_weak(
+                current,
+                next,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return next;
+        }
+    }
+    // Zero is the wire/log sentinel for an unavailable ordinal. Reusing
+    // UINT64_MAX would violate strict monotonicity in the (theoretical)
+    // exhaustion case.
+    return 0;
 }
 
 [[nodiscard]] std::uint64_t protobuf_varint_size(
@@ -635,6 +660,110 @@ struct GetPreflight {
     throw InvalidArgumentError("unknown native reader backend");
 }
 
+[[nodiscard]] detail::ReadWorkloadBackend read_workload_backend(
+    const IoBackend backend) {
+    switch (backend) {
+        case IoBackend::ThreadPool:
+            return detail::ReadWorkloadBackend::ThreadPool;
+        case IoBackend::IoUring:
+            return detail::ReadWorkloadBackend::IoUring;
+    }
+    return detail::ReadWorkloadBackend::Unknown;
+}
+
+[[nodiscard]] std::uint64_t seconds_to_nanoseconds(
+    const double seconds) noexcept {
+    if (!std::isfinite(seconds) || seconds <= 0.0) {
+        return 0;
+    }
+    constexpr long double nanos_per_second = 1'000'000'000.0L;
+    const long double nanoseconds =
+        static_cast<long double>(seconds) * nanos_per_second;
+    if (nanoseconds
+        >= static_cast<long double>(
+            std::numeric_limits<std::uint64_t>::max())) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return static_cast<std::uint64_t>(nanoseconds);
+}
+
+[[nodiscard]] std::uint64_t elapsed_nanoseconds(
+    const std::chrono::steady_clock::time_point started) noexcept {
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    if (elapsed <= std::chrono::steady_clock::duration::zero()) {
+        return 0;
+    }
+    const auto nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
+    return static_cast<std::uint64_t>(nanoseconds.count());
+}
+
+[[nodiscard]] detail::ReadWorkloadRequestStatus read_workload_status(
+    const grpc::Status& status,
+    const bool client_closed = false) noexcept {
+    if (client_closed) {
+        return detail::ReadWorkloadRequestStatus::ClientClosed;
+    }
+    switch (status.error_code()) {
+        case grpc::StatusCode::OK:
+            return detail::ReadWorkloadRequestStatus::Success;
+        case grpc::StatusCode::CANCELLED:
+            return detail::ReadWorkloadRequestStatus::Cancelled;
+        case grpc::StatusCode::DEADLINE_EXCEEDED:
+            return detail::ReadWorkloadRequestStatus::DeadlineExceeded;
+        default:
+            return detail::ReadWorkloadRequestStatus::Failed;
+    }
+}
+
+[[nodiscard]] detail::ReadWorkloadBatchMetrics read_workload_metrics(
+    const NativeReadStats& read,
+    const IoBackend backend,
+    const std::uint64_t batch_sequence,
+    const std::uint64_t delivery_sequence,
+    const std::uint64_t logical_offset,
+    const std::uint64_t rows,
+    const std::uint64_t response_bytes,
+    const std::uint64_t total_ns,
+    const std::uint64_t encode_ns,
+    const std::uint64_t write_ns,
+    const std::uint64_t logger_queue_ns) noexcept {
+    return detail::ReadWorkloadBatchMetrics{
+        .backend = read_workload_backend(backend),
+        .batch_sequence = batch_sequence,
+        .delivery_sequence = delivery_sequence,
+        .logical_offset = logical_offset,
+        .rows = rows,
+        .response_bytes = response_bytes,
+        .total_ns = total_ns,
+        .lookup_ns = seconds_to_nanoseconds(read.lookup_seconds),
+        .sort_ns = seconds_to_nanoseconds(read.physical_sort_seconds),
+        .plan_ns = seconds_to_nanoseconds(read.physical_plan_seconds),
+        .io_ns = seconds_to_nanoseconds(read.physical_backend_seconds),
+        .encode_ns = encode_ns,
+        .write_ns = write_ns,
+        .logger_queue_ns = logger_queue_ns,
+        .unique_storage_segments = read.unique_files,
+        .physical_requests = read.requested_rows,
+        .merged_ranges = read.planned_ranges,
+        .requested_bytes = read.requested_bytes,
+        .useful_read_bytes = read.useful_read_bytes,
+        .planned_bytes = read.planned_read_bytes,
+        .completed_bytes = read.completed_read_bytes,
+        .gap_bytes = read.gap_bytes,
+        .overread_bytes = read.overread_bytes,
+        .pages_touched = read.pages_touched,
+        .page_runs = read.page_runs,
+        .layout_chunks_touched = read.chunks_touched,
+        .layout_chunk_runs = read.chunk_runs,
+        .discontinuities = read.input_discontinuities,
+        .inversions = read.input_inversions,
+        .max_range_bytes = read.maximum_range_bytes,
+        .mean_range_bytes = read.mean_range_bytes,
+        .backend_tasks = read.backend_tasks,
+    };
+}
+
 [[nodiscard]] DType native_dtype(const wire::EmbeddingDType dtype) {
     switch (dtype) {
         case wire::EMBEDDING_DTYPE_FLOAT16:
@@ -934,9 +1063,15 @@ open_read_workload_logger(
         engine.collection().identity();
     detail::ReadWorkloadLogOptions log_options;
     log_options.directory = options.read_log_directory;
-    log_options.sample_rate_ppm = options.read_log_sample_ppm;
-    log_options.max_ids_per_event =
-        options.read_log_max_ids_per_event;
+    log_options.id_chunk_rows = options.read_log_id_chunk_rows;
+    log_options.max_active_requests = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(
+            kReadLogMaximumActiveRequests,
+            std::max<std::uint64_t>(
+                1,
+                static_cast<std::uint64_t>(
+                    options.max_concurrent_calls)
+                    + options.max_concurrent_scans)));
     log_options.buffer_bytes = options.read_log_buffer_bytes;
     log_options.segment_bytes = options.read_log_segment_bytes;
     log_options.rotate_seconds = options.read_log_rotate_seconds;
@@ -956,6 +1091,23 @@ open_read_workload_logger(
             .dimension = description.dimension,
             .record_size_bytes =
                 static_cast<std::uint32_t>(description.record_size),
+            .reader_backend = static_cast<std::uint32_t>(
+                read_workload_backend(
+                    description.reader.io_backend)),
+            .io_workers = description.reader.io_workers,
+            .io_queue_capacity =
+                description.reader.io_queue_capacity,
+            .io_ranges_per_task =
+                description.reader.io_ranges_per_task,
+            .max_read_range_bytes =
+                description.reader.max_read_range_bytes,
+            .max_gap_bytes = description.reader.max_gap_bytes,
+            .io_uring_queue_depth =
+                description.reader.io_uring_queue_depth,
+            .io_uring_workers =
+                description.reader.io_uring_workers,
+            .tuning_explicit_overrides =
+                description.tuning.explicit_overrides ? 1U : 0U,
         });
 }
 
@@ -1175,10 +1327,10 @@ public:
                 response->mutable_read_logging_stats();
             read_logging_stats->set_enabled(read_logging_enabled);
             if (read_logging_enabled) {
-                read_logging->set_sample_ppm(
-                    options_.read_log_sample_ppm);
+                // Protocol-v1.4 aliases remain populated for rolling clients.
+                read_logging->set_sample_ppm(1'000'000);
                 read_logging->set_max_ids_per_event(
-                    options_.read_log_max_ids_per_event);
+                    options_.read_log_id_chunk_rows);
                 read_logging->set_buffer_bytes(
                     options_.read_log_buffer_bytes);
                 read_logging->set_segment_bytes(
@@ -1195,33 +1347,31 @@ public:
                     options_.read_log_max_write_bytes_per_second);
                 read_logging->set_max_retained_files(
                     options_.read_log_max_retained_files);
+                read_logging->set_id_chunk_rows(
+                    options_.read_log_id_chunk_rows);
+                read_logging->set_format_version(2);
 
                 const detail::ReadWorkloadLogStats stats =
                     read_logger->stats();
-                const std::uint64_t dropped_queue =
-                    stats.dropped_full
-                            > std::numeric_limits<std::uint64_t>::max()
-                                  - stats.dropped_busy
-                        ? std::numeric_limits<std::uint64_t>::max()
-                        : stats.dropped_busy + stats.dropped_full;
+                // Legacy event counters conservatively project the richer
+                // lifecycle without reintroducing sampling or truncation.
                 read_logging_stats->set_considered_events(
-                    stats.observed_events);
+                    stats.observed_requests);
                 read_logging_stats->set_sampled_events(
-                    stats.sampled_events);
+                    stats.observed_requests);
                 read_logging_stats->set_enqueued_events(
-                    stats.enqueued_events);
+                    stats.begun_requests);
                 read_logging_stats->set_written_events(
-                    stats.written_events);
-                read_logging_stats->set_truncated_events(
-                    stats.truncated_events);
+                    stats.complete_requests);
+                read_logging_stats->set_truncated_events(0);
                 read_logging_stats->set_captured_ids(
-                    stats.captured_ids);
+                    stats.enqueued_ids);
                 read_logging_stats->set_dropped_queue_events(
-                    dropped_queue);
+                    stats.dropped_full_records);
                 read_logging_stats->set_dropped_disk_pressure_events(
-                    stats.dropped_min_free);
+                    stats.dropped_min_free_records);
                 read_logging_stats->set_dropped_error_events(
-                    stats.dropped_runtime_failure);
+                    stats.dropped_runtime_failure_records);
                 read_logging_stats->set_bytes_written(
                     stats.bytes_written);
                 read_logging_stats->set_segments_created(
@@ -1242,16 +1392,14 @@ public:
                     stats.write_errors);
                 read_logging_stats->set_observed_ids(
                     stats.observed_ids);
-                read_logging_stats->set_unsampled_events(
-                    stats.unsampled_events);
-                read_logging_stats->set_dropped_busy_events(
-                    stats.dropped_busy);
+                read_logging_stats->set_unsampled_events(0);
+                read_logging_stats->set_dropped_busy_events(0);
                 read_logging_stats->set_dropped_full_events(
-                    stats.dropped_full);
+                    stats.dropped_full_records);
                 read_logging_stats->set_rotated_segments(
                     stats.rotated_segments);
                 read_logging_stats->set_queued_events(
-                    stats.queued_events);
+                    stats.queued_records);
                 read_logging_stats->set_buffer_capacity_bytes(
                     stats.buffer_capacity_bytes);
                 read_logging_stats->set_last_error_number(
@@ -1263,13 +1411,12 @@ public:
                 read_logging_stats->set_shutting_down(
                     stats.shutting_down);
                 read_logging_stats->set_sampled_ids(
-                    stats.sampled_ids);
+                    stats.observed_ids);
                 read_logging_stats->set_enqueued_ids(
                     stats.enqueued_ids);
                 read_logging_stats->set_written_ids(
                     stats.written_ids);
-                read_logging_stats->set_dropped_busy_ids(
-                    stats.dropped_busy_ids);
+                read_logging_stats->set_dropped_busy_ids(0);
                 read_logging_stats->set_dropped_full_ids(
                     stats.dropped_full_ids);
                 read_logging_stats->set_dropped_error_ids(
@@ -1277,9 +1424,50 @@ public:
                 read_logging_stats->set_dropped_disk_pressure_ids(
                     stats.dropped_min_free_ids);
                 read_logging_stats->set_dropped_io_budget_events(
-                    stats.dropped_io_budget);
+                    stats.dropped_io_budget_records);
                 read_logging_stats->set_dropped_io_budget_ids(
                     stats.dropped_io_budget_ids);
+                read_logging_stats->set_observed_requests(
+                    stats.observed_requests);
+                read_logging_stats->set_begun_requests(
+                    stats.begun_requests);
+                read_logging_stats->set_completed_requests(
+                    stats.completed_requests);
+                read_logging_stats->set_complete_requests(
+                    stats.complete_requests);
+                read_logging_stats->set_incomplete_requests(
+                    stats.incomplete_requests);
+                read_logging_stats->set_observed_records(
+                    stats.observed_records);
+                read_logging_stats->set_enqueued_records(
+                    stats.enqueued_records);
+                read_logging_stats->set_written_records(
+                    stats.written_records);
+                read_logging_stats->set_observed_id_chunks(
+                    stats.observed_id_chunks);
+                read_logging_stats->set_enqueued_id_chunks(
+                    stats.enqueued_id_chunks);
+                read_logging_stats->set_written_id_chunks(
+                    stats.written_id_chunks);
+                read_logging_stats->set_observed_batches(
+                    stats.observed_batches);
+                read_logging_stats->set_enqueued_batches(
+                    stats.enqueued_batches);
+                read_logging_stats->set_written_batches(
+                    stats.written_batches);
+                read_logging_stats->set_dropped_full_records(
+                    stats.dropped_full_records);
+                read_logging_stats->set_dropped_runtime_failure_records(
+                    stats.dropped_runtime_failure_records);
+                read_logging_stats
+                    ->set_dropped_minimum_free_space_records(
+                        stats.dropped_min_free_records);
+                read_logging_stats->set_dropped_io_budget_records(
+                    stats.dropped_io_budget_records);
+                read_logging_stats->set_queued_records(
+                    stats.queued_records);
+                read_logging_stats->set_active_requests(
+                    stats.active_requests);
             }
             require_response_budget(*response, limits_);
             return grpc::Status::OK;
@@ -1292,6 +1480,30 @@ public:
         grpc::ServerContext* context,
         const wire::GetRequest* request,
         wire::GetResponse* response) override {
+        detail::ReadWorkloadLogger* read_logger = nullptr;
+        detail::ReadWorkloadRequestHandle logged_request;
+        std::uint64_t logged_response_bytes = 0;
+        std::uint64_t logged_delivered_ids = 0;
+        const auto finish_logging =
+            [&](const grpc::Status& status) noexcept {
+                if (read_logger != nullptr && logged_request) {
+                    const auto outcome =
+                        status.error_code()
+                                    == grpc::StatusCode::CANCELLED
+                                && health_->draining()
+                            ? detail::ReadWorkloadRequestStatus::Shutdown
+                            : read_workload_status(status);
+                    read_logger->end_request(
+                        logged_request,
+                        detail::ReadWorkloadRequestEnd{
+                            .status = outcome,
+                            .error_code = static_cast<std::uint32_t>(
+                                status.error_code()),
+                            .delivered_ids = logged_delivered_ids,
+                            .response_bytes = logged_response_bytes,
+                        });
+                }
+            };
         try {
             require_request_budget(*request, limits_);
             if (!health_->serving()) {
@@ -1310,30 +1522,87 @@ public:
                 admission_, preflight.estimated_peak_bytes);
             const std::vector<std::uint64_t> ids = decode_ids(
                 request->ids(), limits_);
-            const GetResult result = engine_.get(
-                ids, preflight.dimension);
+            read_logger =
+                read_logger_.load(std::memory_order_acquire);
+            if (read_logger != nullptr) {
+                const NativeCollectionIdentity identity =
+                    engine_.collection().identity();
+                logged_request = read_logger->begin_request(
+                    detail::ReadWorkloadRequestInfo{
+                        .method = detail::ReadWorkloadMethod::Get,
+                        // Unary Get does not yet expose the internally pinned
+                        // view. Retain an honest inexact row-count anchor.
+                        .snapshot =
+                            detail::ReadWorkloadSnapshot{
+                                .catalog_generation =
+                                    identity.catalog_generation,
+                                .committed_sequence =
+                                    identity.committed_sequence,
+                                .row_count = description.count,
+                                .exact = false,
+                            },
+                        .prefix_dimensions = preflight.dimension,
+                        .declared_ids = row_count,
+                    });
+            }
+
+            const auto batch_started =
+                std::chrono::steady_clock::now();
+            std::uint64_t logger_queue_ns = 0;
+            if (logged_request) {
+                const auto logger_started =
+                    std::chrono::steady_clock::now();
+                static_cast<void>(read_logger->try_append_ids(
+                    logged_request,
+                    ids,
+                    detail::ReadWorkloadIdChunkInfo{
+                        .logical_offset = 0,
+                        .batch_sequence = 0,
+                    }));
+                logger_queue_ns = elapsed_nanoseconds(logger_started);
+            }
+
+            GetResult result;
+            NativeReadStats read_stats;
+            if (logged_request) {
+                ProfiledGetResult profiled = engine_.get_profiled(
+                    ids, preflight.dimension);
+                result = std::move(profiled.result);
+                read_stats = profiled.read;
+            } else {
+                result = engine_.get(ids, preflight.dimension);
+            }
+            const auto encode_started =
+                std::chrono::steady_clock::now();
             set_embedding_response(result, *response);
             require_response_budget(*response, limits_);
-            if (detail::ReadWorkloadLogger* const read_logger =
-                    read_logger_.load(std::memory_order_acquire);
-                read_logger != nullptr) {
-                // The legacy unary engine call does not expose its internally
-                // pinned view. Retain the count already fetched by preflight,
-                // but leave its generation/sequence anchor empty and inexact;
-                // another identity query would charge every Get even though
-                // the logger samples most events out internally. Logging is
-                // noexcept and never changes the completed RPC outcome.
-                static_cast<void>(read_logger->try_log(
-                    detail::ReadWorkloadMethod::Get,
-                    ids,
-                    detail::ReadWorkloadSnapshot{
-                        .row_count = description.count,
-                    },
-                    preflight.dimension));
+            const std::uint64_t encode_ns =
+                elapsed_nanoseconds(encode_started);
+            logged_response_bytes = response->ByteSizeLong();
+            logged_delivered_ids = row_count;
+            if (logged_request) {
+                static_cast<void>(read_logger->try_append_batch(
+                    logged_request,
+                    read_workload_metrics(
+                        read_stats,
+                        description.reader.io_backend,
+                        0,
+                        0,
+                        0,
+                        row_count,
+                        logged_response_bytes,
+                        elapsed_nanoseconds(batch_started),
+                        encode_ns,
+                        0,
+                        logger_queue_ns)));
             }
+            finish_logging(grpc::Status::OK);
             return grpc::Status::OK;
         } catch (...) {
-            return exception_status(limits_, *health_);
+            const grpc::Status status =
+                exception_status(limits_, *health_);
+            finish_logging(status);
+            return status;
         }
     }
 
@@ -1342,6 +1611,33 @@ public:
         grpc::ServerReaderWriter<
             wire::StreamGetResponse,
             wire::StreamGetRequest>* stream) override {
+        detail::ReadWorkloadLogger* read_logger = nullptr;
+        detail::ReadWorkloadRequestHandle logged_request;
+        bool logging_begin_attempted = false;
+        std::uint64_t logged_delivered_ids = 0;
+        std::uint64_t logged_response_bytes = 0;
+        const auto finish_logging =
+            [&](const grpc::Status& status,
+                const bool client_closed = false) noexcept {
+                if (read_logger != nullptr && logged_request) {
+                    const auto outcome =
+                        status.error_code()
+                                    == grpc::StatusCode::CANCELLED
+                                && health_->draining()
+                            ? detail::ReadWorkloadRequestStatus::Shutdown
+                            : read_workload_status(
+                                  status, client_closed);
+                    read_logger->end_request(
+                        logged_request,
+                        detail::ReadWorkloadRequestEnd{
+                            .status = outcome,
+                            .error_code = static_cast<std::uint32_t>(
+                                status.error_code()),
+                            .delivered_ids = logged_delivered_ids,
+                            .response_bytes = logged_response_bytes,
+                        });
+                }
+            };
         try {
             if (!health_->serving()) {
                 return {grpc::StatusCode::UNAVAILABLE,
@@ -1523,6 +1819,8 @@ public:
                         "StreamGet client stopped receiving"};
             }
             lifetime.mark_progress();
+            read_logger =
+                read_logger_.load(std::memory_order_acquire);
 
             std::uint64_t expected_sequence = 0;
             std::uint64_t input_offset = 0;
@@ -1530,6 +1828,7 @@ public:
                 lifetime.mark_progress();
                 if (const auto cancelled = cancellation_status();
                     cancelled.has_value()) {
+                    finish_logging(*cancelled);
                     return *cancelled;
                 }
                 require_request_budget(request, limits_);
@@ -1574,14 +1873,68 @@ public:
 
                 const std::vector<std::uint64_t> ids =
                     decode_ids(input.ids(), limits_);
+                if (read_logger != nullptr
+                    && !logging_begin_attempted) {
+                    logging_begin_attempted = true;
+                    logged_request = read_logger->begin_request(
+                        detail::ReadWorkloadRequestInfo{
+                            .method =
+                                detail::ReadWorkloadMethod::StreamGet,
+                            .snapshot =
+                                detail::ReadWorkloadSnapshot{
+                                    .catalog_generation =
+                                        metadata.catalog_generation,
+                                    .committed_sequence =
+                                        metadata.committed_sequence,
+                                    .row_count = metadata.live_count,
+                                    .exact = true,
+                                },
+                            .prefix_dimensions = dimension,
+                            .request_id_low = token_low,
+                            .request_id_high = token_high,
+                        });
+                    if (logged_request) {
+                        logged_response_bytes =
+                            opened_response.ByteSizeLong();
+                    }
+                }
+                if (input_offset
+                    > std::numeric_limits<std::uint64_t>::max() - count) {
+                    throw std::length_error(
+                        "StreamGet input offset overflow");
+                }
+                const auto batch_started =
+                    std::chrono::steady_clock::now();
+                std::uint64_t logger_queue_ns = 0;
+                if (logged_request) {
+                    const auto logger_started =
+                        std::chrono::steady_clock::now();
+                    static_cast<void>(read_logger->try_append_ids(
+                        logged_request,
+                        ids,
+                        detail::ReadWorkloadIdChunkInfo{
+                            .logical_offset = input_offset,
+                            .batch_sequence = expected_sequence,
+                        }));
+                    logger_queue_ns =
+                        elapsed_nanoseconds(logger_started);
+                }
                 std::vector<std::byte> values(
                     static_cast<std::size_t>(values_size));
-                view->get_into(ids, values);
+                NativeReadStats read_stats;
+                if (logged_request) {
+                    read_stats = view->get_into_profiled(ids, values);
+                } else {
+                    view->get_into(ids, values);
+                }
                 if (const auto cancelled = cancellation_status();
                     cancelled.has_value()) {
+                    finish_logging(*cancelled);
                     return *cancelled;
                 }
 
+                const auto encode_started =
+                    std::chrono::steady_clock::now();
                 wire::StreamGetResponse response;
                 set_read_snapshot(
                     metadata,
@@ -1599,52 +1952,73 @@ public:
                     values,
                     *output->mutable_embeddings());
                 require_response_budget(response, limits_);
-                if (!stream->Write(response)) {
+                const std::uint64_t encode_ns =
+                    elapsed_nanoseconds(encode_started);
+                const std::uint64_t response_bytes =
+                    response.ByteSizeLong();
+                const auto write_started =
+                    std::chrono::steady_clock::now();
+                const bool wrote_response = stream->Write(response);
+                const std::uint64_t write_ns =
+                    elapsed_nanoseconds(write_started);
+                if (!wrote_response) {
                     if (const auto cancelled = cancellation_status();
                         cancelled.has_value()) {
+                        finish_logging(*cancelled);
                         return *cancelled;
                     }
-                    return {grpc::StatusCode::CANCELLED,
-                            "StreamGet client stopped receiving"};
+                    const grpc::Status client_closed{
+                        grpc::StatusCode::CANCELLED,
+                        "StreamGet client stopped receiving"};
+                    finish_logging(client_closed, true);
+                    return client_closed;
                 }
                 lifetime.mark_progress();
-                if (detail::ReadWorkloadLogger* const read_logger =
-                        read_logger_.load(std::memory_order_acquire);
-                    read_logger != nullptr) {
-                    // A batch enters workload history only after gRPC
-                    // accepted its response. Failed/cancelled delivery does
-                    // not teach the optimizer demand the client never saw.
-                    static_cast<void>(read_logger->try_log(
-                        detail::ReadWorkloadMethod::StreamGet,
-                        ids,
-                        detail::ReadWorkloadSnapshot{
-                            .catalog_generation =
-                                metadata.catalog_generation,
-                            .committed_sequence =
-                                metadata.committed_sequence,
-                            .row_count = metadata.live_count,
-                            .stream_id_low = token_low,
-                            .stream_id_high = token_high,
-                            .batch_sequence = expected_sequence,
-                            .exact = true,
-                        },
-                        dimension));
+                const std::uint64_t delivery_sequence =
+                    read_logger != nullptr
+                        ? next_monotonic_sequence(
+                              read_delivery_sequence_)
+                        : 0;
+                logged_delivered_ids += count;
+                if (response_bytes
+                    > std::numeric_limits<std::uint64_t>::max()
+                          - logged_response_bytes) {
+                    logged_response_bytes =
+                        std::numeric_limits<std::uint64_t>::max();
+                } else {
+                    logged_response_bytes += response_bytes;
                 }
-                if (input_offset
-                    > std::numeric_limits<std::uint64_t>::max() - count) {
-                    throw std::length_error(
-                        "StreamGet input offset overflow");
+                if (logged_request) {
+                    static_cast<void>(read_logger->try_append_batch(
+                        logged_request,
+                        read_workload_metrics(
+                            read_stats,
+                            description.reader.io_backend,
+                            expected_sequence,
+                            delivery_sequence,
+                            input_offset,
+                            count,
+                            response_bytes,
+                            elapsed_nanoseconds(batch_started),
+                            encode_ns,
+                            write_ns,
+                            logger_queue_ns)));
                 }
                 input_offset += count;
                 ++expected_sequence;
             }
             if (const auto cancelled = cancellation_status();
                 cancelled.has_value()) {
+                finish_logging(*cancelled);
                 return *cancelled;
             }
+            finish_logging(grpc::Status::OK);
             return grpc::Status::OK;
         } catch (...) {
-            return exception_status(limits_, *health_);
+            const grpc::Status status =
+                exception_status(limits_, *health_);
+            finish_logging(status);
+            return status;
         }
     }
 
@@ -2305,6 +2679,7 @@ private:
     ServiceLimits limits_;
     GrpcServerOptions options_;
     std::atomic<detail::ReadWorkloadLogger*> read_logger_{nullptr};
+    std::atomic<std::uint64_t> read_delivery_sequence_{0};
     std::shared_ptr<GrpcHealthState> health_;
     detail::GrpcAdmissionController admission_;
     std::uint64_t scan_call_budget_ = 0;
@@ -2577,36 +2952,35 @@ server_credentials(const GrpcServerOptions& options) {
         validate_read_log_path(engine, options);
         options.read_log_directory = normalized_absolute_path(
             options.read_log_directory, "--read-log-dir");
-        constexpr std::uint32_t maximum_ids_per_event = 65'536;
-        if (options.read_log_sample_ppm == 0
-            || options.read_log_sample_ppm > 1'000'000
-            || options.read_log_max_ids_per_event == 0
-            || options.read_log_max_ids_per_event
-                   > maximum_ids_per_event
+        if (options.read_log_id_chunk_rows == 0
+            || options.read_log_id_chunk_rows
+                   > detail::kReadWorkloadMaximumIdChunkRows
             || options.read_log_rotate_seconds == 0
             || options.read_log_rotate_seconds
                    > static_cast<std::uint64_t>(
                        std::numeric_limits<std::int64_t>::max())
             || options.read_log_retention_seconds == 0) {
             throw InvalidArgumentError(
-                "read-log sampling and time bounds are invalid");
+                "read-log chunk and time bounds are invalid");
         }
-        const std::uint64_t maximum_event_bytes =
-            static_cast<std::uint64_t>(
-                detail::kReadWorkloadRecordHeaderBytes)
-            + static_cast<std::uint64_t>(
-                  options.read_log_max_ids_per_event)
-                  * sizeof(std::uint64_t);
+        const std::uint64_t maximum_record_bytes =
+            std::max<std::uint64_t>(
+                detail::kReadWorkloadBatchRecordBytes,
+                static_cast<std::uint64_t>(
+                    detail::kReadWorkloadRecordHeaderBytes)
+                    + static_cast<std::uint64_t>(
+                          options.read_log_id_chunk_rows)
+                          * sizeof(std::uint64_t));
         constexpr std::uint64_t terminal_checkpoint_bytes =
             detail::kReadWorkloadRecordHeaderBytes;
         const std::uint64_t maximum_write_transaction =
-            detail::kReadWorkloadLogHeaderBytes + maximum_event_bytes
+            detail::kReadWorkloadLogHeaderBytes + maximum_record_bytes
             + 2 * terminal_checkpoint_bytes;
         if (options.read_log_buffer_bytes
-                < 2ULL * maximum_event_bytes
+                < 2ULL * maximum_record_bytes
             || options.read_log_segment_bytes
                    < detail::kReadWorkloadLogHeaderBytes
-                         + maximum_event_bytes
+                         + maximum_record_bytes
                          + 2 * terminal_checkpoint_bytes
             || options.read_log_retention_bytes
                    < options.read_log_segment_bytes
@@ -2615,11 +2989,11 @@ server_credentials(const GrpcServerOptions& options) {
             || options.read_log_max_retained_files == 0
             || options.read_log_max_retained_files > 65'533) {
             throw InvalidArgumentError(
-                "read-log buffer must hold two maximum events, a segment "
+                "read-log buffer must hold two maximum records, a segment "
                 "must hold its header, opening checkpoint, one maximum "
-                "event, and terminal checkpoint, retention must cover at "
+                "record, and terminal checkpoint, retention must cover at "
                 "least one segment, the "
-                "write rate must cover one maximum event plus its segment "
+                "write rate must cover one maximum record plus its segment "
                 "header/checkpoints per second, and "
                 "retained files must be in [1, 65533]");
         }

@@ -128,9 +128,7 @@ def test_parser_forwards_every_explicit_read_log_control() -> None:
             "/results",
             "--server-read-log-dir",
             "/logs",
-            "--server-read-log-sample-ppm",
-            "12345",
-            "--server-read-log-max-ids-per-event",
+            "--server-read-log-id-chunk-rows",
             "2048",
             "--server-read-log-buffer-mib",
             "32",
@@ -158,8 +156,7 @@ def test_parser_forwards_every_explicit_read_log_control() -> None:
     BENCHMARK._validate_server_read_log_arguments(args)
     assert BENCHMARK._read_log_server_arguments(
         directory=args.server_read_log_dir,
-        sample_ppm=args.server_read_log_sample_ppm,
-        max_ids_per_event=args.server_read_log_max_ids_per_event,
+        id_chunk_rows=args.server_read_log_id_chunk_rows,
         buffer_mib=args.server_read_log_buffer_mib,
         segment_mib=args.server_read_log_segment_mib,
         rotate_seconds=args.server_read_log_rotate_seconds,
@@ -173,9 +170,7 @@ def test_parser_forwards_every_explicit_read_log_control() -> None:
     ) == [
         "--read-log-dir",
         "/logs",
-        "--read-log-sample-ppm",
-        "12345",
-        "--read-log-max-ids-per-event",
+        "--read-log-id-chunk-rows",
         "2048",
         "--read-log-buffer-mib",
         "32",
@@ -221,8 +216,8 @@ def test_read_log_options_reject_external_or_implicit_enablement() -> None:
             "/ids.npy",
             "--results",
             "/results",
-            "--server-read-log-sample-ppm",
-            "10000",
+            "--server-read-log-id-chunk-rows",
+            "8192",
         ]
     )
     with pytest.raises(ValueError, match="require --server-read-log-dir"):
@@ -265,7 +260,7 @@ def test_read_log_options_reject_external_or_implicit_enablement() -> None:
 
 def test_description_dict_includes_read_logging_diagnostics() -> None:
     read_logging = SimpleNamespace(
-        as_dict=lambda: {"enabled": True, "sample_ppm": 10_000}
+        as_dict=lambda: {"enabled": True, "id_chunk_rows": 8_192}
     )
     read_logging_stats = SimpleNamespace(
         as_dict=lambda: {"enabled": True, "written_events": 17}
@@ -290,7 +285,7 @@ def test_description_dict_includes_read_logging_diagnostics() -> None:
 
     assert result["read_logging"] == {
         "enabled": True,
-        "sample_ppm": 10_000,
+        "id_chunk_rows": 8_192,
     }
     assert result["read_logging_stats"] == {
         "enabled": True,
@@ -1713,15 +1708,15 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
         "--max-client-memory-mib",
         "64",
     ]
-    logger_supported = b"--read-log-dir" in native.read_bytes()
+    logger_supported = (
+        b"--read-log-id-chunk-rows" in native.read_bytes()
+    )
     if logger_supported:
         benchmark_arguments.extend(
             [
                 "--server-read-log-dir",
                 str(read_logs),
-                "--server-read-log-sample-ppm",
-                "1000000",
-                "--server-read-log-max-ids-per-event",
+                "--server-read-log-id-chunk-rows",
                 "4",
                 "--server-read-log-buffer-mib",
                 "1",
@@ -1770,8 +1765,8 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
             is True
         )
         assert (
-            report["server"]["read_log_inspection"]["inspection"]["events"][
-                "captured_ids"
+            report["server"]["read_log_inspection"]["inspection"]["id_chunks"][
+                "ids_for_complete_requests"
             ]
             > 0
         )

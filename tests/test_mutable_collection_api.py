@@ -405,8 +405,18 @@ def test_profiled_read_reports_zero_delta_and_mutation_paths(
         assert clean["requested_rows"] == 2
         assert clean["base_rows"] == 2
         assert clean["mutation_rows"] == 0
+        assert clean["unique_files"] == 1
         assert clean["planned_ranges"] == 1
+        assert clean["requested_bytes"] == base.nbytes
         assert clean["planned_read_bytes"] == base.nbytes
+        assert clean["completed_read_bytes"] == base.nbytes
+        assert clean["useful_read_bytes"] == base.nbytes
+        assert clean["gap_bytes"] == 0
+        assert clean["overread_bytes"] == 0
+        assert clean["pages_touched"] >= 1
+        assert clean["page_runs"] >= 1
+        assert clean["chunks_touched"] >= 1
+        assert clean["chunk_runs"] >= 1
         assert clean["backend_tasks"] == 1
 
         collection.update([22], replacement)
@@ -423,6 +433,7 @@ def test_profiled_read_reports_zero_delta_and_mutation_paths(
         for key in (
             "total_seconds",
             "lookup_seconds",
+            "physical_sort_seconds",
             "physical_plan_seconds",
             "physical_backend_seconds",
         ):

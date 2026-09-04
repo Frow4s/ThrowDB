@@ -174,6 +174,31 @@ void require_disjoint_record_scan_outputs(
     return std::chrono::duration<double>(SteadyClock::now() - started).count();
 }
 
+void apply_physical_read_stats(
+    NativeReadStats& target,
+    const PhysicalReadStats& source) noexcept {
+    target.physical_sort_seconds = source.sort_seconds;
+    target.physical_plan_seconds = source.plan_seconds;
+    target.physical_backend_seconds = source.backend_seconds;
+    target.unique_files = source.unique_file_count;
+    target.planned_ranges = source.range_count;
+    target.requested_bytes = source.requested_bytes;
+    target.planned_read_bytes = source.planned_read_bytes;
+    target.completed_read_bytes = source.completed_read_bytes;
+    target.useful_read_bytes = source.useful_read_bytes;
+    target.gap_bytes = source.gap_bytes;
+    target.overread_bytes = source.overread_bytes;
+    target.pages_touched = source.pages_touched;
+    target.page_runs = source.page_runs;
+    target.chunks_touched = source.chunks_touched;
+    target.chunk_runs = source.chunk_runs;
+    target.input_discontinuities = source.input_discontinuities;
+    target.input_inversions = source.input_inversions;
+    target.maximum_range_bytes = source.maximum_range_bytes;
+    target.mean_range_bytes = source.mean_range_bytes;
+    target.backend_tasks = source.task_count;
+}
+
 [[nodiscard]] int nofollow_flag() noexcept {
 #if defined(O_NOFOLLOW)
     return O_NOFOLLOW;
@@ -1411,11 +1436,7 @@ public:
             stats->lookup_seconds = elapsed_seconds(lookup_started);
             const PhysicalReadStats physical = reader.execute_profiled(
                 manifest_.record_size, requests, output);
-            stats->physical_plan_seconds = physical.plan_seconds;
-            stats->physical_backend_seconds = physical.backend_seconds;
-            stats->planned_ranges = physical.range_count;
-            stats->planned_read_bytes = physical.planned_read_bytes;
-            stats->backend_tasks = physical.task_count;
+            apply_physical_read_stats(*stats, physical);
             stats->total_seconds = elapsed_seconds(total_started);
         } else {
             reader.execute(manifest_.record_size, requests, output);
@@ -3597,9 +3618,16 @@ private:
             physical_reader_->execute(output_record_size_, requests, output);
         }
 
-        void get_into(
+        template <bool Profiled>
+        void get_into_impl(
             const std::span<const std::uint64_t> ids,
-            const std::span<std::byte> output) const override {
+            const std::span<std::byte> output,
+            NativeReadStats* const stats) const {
+            SteadyClock::time_point total_started;
+            if constexpr (Profiled) {
+                total_started = SteadyClock::now();
+                stats->requested_rows = ids.size();
+            }
             ensure_owner();
             const std::uint64_t expected = checked_multiply(
                 ids.size(), output_record_size_, "read view output");
@@ -3610,16 +3638,56 @@ private:
                     "prefix_record_size");
             }
             if (ids.empty()) {
+                if constexpr (Profiled) {
+                    stats->zero_delta_fast_path =
+                        resources_->runs.empty() && overlay_.empty();
+                    stats->total_seconds = elapsed_seconds(total_started);
+                }
                 return;
+            }
+            SteadyClock::time_point lookup_started;
+            if constexpr (Profiled) {
+                lookup_started = SteadyClock::now();
             }
             std::vector<PhysicalReadRequest> requests;
             requests.reserve(ids.size());
             // Resolve the complete batch before execute() can touch output.
             for (std::size_t index = 0; index != ids.size(); ++index) {
+                bool mutation = false;
                 requests.push_back(resolve_id(
-                    ids[index], static_cast<std::uint64_t>(index)));
+                    ids[index],
+                    static_cast<std::uint64_t>(index),
+                    Profiled ? &mutation : nullptr));
+                if constexpr (Profiled) {
+                    mutation ? ++stats->mutation_rows : ++stats->base_rows;
+                }
             }
-            execute(requests, output);
+            if constexpr (Profiled) {
+                stats->zero_delta_fast_path =
+                    resources_->runs.empty() && overlay_.empty();
+                stats->lookup_seconds = elapsed_seconds(lookup_started);
+                const PhysicalReadStats physical =
+                    physical_reader_->execute_profiled(
+                        output_record_size_, requests, output);
+                apply_physical_read_stats(*stats, physical);
+                stats->total_seconds = elapsed_seconds(total_started);
+            } else {
+                execute(requests, output);
+            }
+        }
+
+        void get_into(
+            const std::span<const std::uint64_t> ids,
+            const std::span<std::byte> output) const override {
+            get_into_impl<false>(ids, output, nullptr);
+        }
+
+        [[nodiscard]] NativeReadStats get_into_profiled(
+            const std::span<const std::uint64_t> ids,
+            const std::span<std::byte> output) const override {
+            NativeReadStats stats;
+            get_into_impl<true>(ids, output, &stats);
+            return stats;
         }
 
         [[nodiscard]] bool is_authoritative(
@@ -3826,11 +3894,15 @@ private:
 
         [[nodiscard]] PhysicalReadRequest resolve_id(
             const std::uint64_t id,
-            const std::uint64_t output_index) const {
+            const std::uint64_t output_index,
+            bool* const mutation = nullptr) const {
             const OverlayEntry* overlay = overlay_entry(id);
             if (overlay != nullptr) {
                 if (!overlay->value.is_put()) {
                     throw MissingIdError(id);
+                }
+                if (mutation != nullptr) {
+                    *mutation = true;
                 }
                 PhysicalReadRequest result = overlay->request;
                 result.output_index = output_index;
@@ -3840,7 +3912,12 @@ private:
             if (!winner.has_value() || winner->tombstone()) {
                 throw MissingIdError(id);
             }
-            return resolve_indexed(*winner->row_ref(), output_index);
+            const RowRef row = *winner->row_ref();
+            if (mutation != nullptr) {
+                *mutation = !resources_->initial_segment_indices.contains(
+                    row.segment_id().value());
+            }
+            return resolve_indexed(row, output_index);
         }
 
         PartitionedManifestV2 manifest_;
@@ -6045,6 +6122,11 @@ void PartitionedReadView::get_into(
     const std::span<const std::uint64_t> ids,
     const std::span<std::byte> output) const {
     state_->get_into(ids, output);
+}
+NativeReadStats PartitionedReadView::get_into_profiled(
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    return state_->get_into_profiled(ids, output);
 }
 
 PartitionedRecordScan::PartitionedRecordScan(

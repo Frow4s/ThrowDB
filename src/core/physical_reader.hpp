@@ -28,11 +28,26 @@ struct PhysicalReadRequest {
 // does not pretend that they are independent wall-clock phases.
 struct PhysicalReadStats {
     double plan_seconds{0.0};
+    double sort_seconds{0.0};
     double backend_seconds{0.0};
     std::uint64_t request_count{0};
+    std::uint64_t unique_file_count{0};
     std::uint64_t range_count{0};
     std::uint64_t task_count{0};
+    std::uint64_t requested_bytes{0};
     std::uint64_t planned_read_bytes{0};
+    std::uint64_t completed_read_bytes{0};
+    std::uint64_t useful_read_bytes{0};
+    std::uint64_t gap_bytes{0};
+    std::uint64_t overread_bytes{0};
+    std::uint64_t pages_touched{0};
+    std::uint64_t page_runs{0};
+    std::uint64_t chunks_touched{0};
+    std::uint64_t chunk_runs{0};
+    std::uint64_t input_discontinuities{0};
+    std::uint64_t input_inversions{0};
+    std::uint64_t maximum_range_bytes{0};
+    std::uint64_t mean_range_bytes{0};
 };
 
 // Private deterministic test seam for the thread-pool coordinator. Production

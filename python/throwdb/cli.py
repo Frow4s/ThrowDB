@@ -18,6 +18,7 @@ from .collection import Collection, CollectionSchema, _normalize_numeric_ids
 from .s3_backup import S3BackupError, backup_to_s3, restore_from_s3
 from .server import add_server_arguments, run_server
 from .workload import (
+    DEFAULT_MAX_ACTIVE_REQUESTS,
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_FILES,
     DEFAULT_MAX_PREFIX_ENTRIES,
@@ -517,6 +518,7 @@ def _workload_inspect(args: argparse.Namespace) -> None:
         max_file_bytes=args.max_file_bytes,
         max_report_entries=args.max_report_entries,
         max_prefix_entries=args.max_prefix_entries,
+        max_active_requests=args.max_active_requests,
     )
     serialized = json.dumps(
         report,
@@ -793,6 +795,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "hard maximum distinct prefix-dimension buckets "
             f"(default: {DEFAULT_MAX_PREFIX_ENTRIES})"
+        ),
+    )
+    workload_inspect.add_argument(
+        "--max-active-requests",
+        type=_positive_int,
+        default=DEFAULT_MAX_ACTIVE_REQUESTS,
+        help=(
+            "hard maximum concurrently open v2 request lifecycles during "
+            f"bounded reconstruction (default: {DEFAULT_MAX_ACTIVE_REQUESTS})"
         ),
     )
     workload_inspect.add_argument(

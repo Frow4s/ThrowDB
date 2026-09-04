@@ -57,6 +57,11 @@ struct GetResult {
     std::vector<std::byte> embeddings;
 };
 
+struct ProfiledGetResult {
+    GetResult result;
+    NativeReadStats read;
+};
+
 struct MutationResult {
     std::uint64_t commit_sequence = 0;
     std::uint64_t row_count = 0;
@@ -235,6 +240,11 @@ public:
 
     [[nodiscard]] CollectionDescription describe() const;
     [[nodiscard]] GetResult get(
+        std::span<const std::uint64_t> ids,
+        std::uint32_t prefix_dimension = 0) const;
+    // Used only by explicitly enabled telemetry/calibration paths. The
+    // ordinary Get avoids clock reads and physical-plan counters.
+    [[nodiscard]] ProfiledGetResult get_profiled(
         std::span<const std::uint64_t> ids,
         std::uint32_t prefix_dimension = 0) const;
     [[nodiscard]] MutationResult mutate(

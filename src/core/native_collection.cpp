@@ -969,6 +969,11 @@ public:
         const std::span<std::byte> output) const {
         view_->get_into(ids, output);
     }
+    [[nodiscard]] NativeReadStats get_into_profiled(
+        const std::span<const std::uint64_t> ids,
+        const std::span<std::byte> output) const {
+        return view_->get_into_profiled(ids, output);
+    }
 
 private:
     std::unique_ptr<detail::PartitionedReadView> view_;
@@ -2710,10 +2715,28 @@ private:
             const detail::PhysicalReadStats physical =
                 physical_reader.execute_profiled(
                     manifest_.record_size, requests, output);
+            stats->physical_sort_seconds = physical.sort_seconds;
             stats->physical_plan_seconds = physical.plan_seconds;
             stats->physical_backend_seconds = physical.backend_seconds;
+            stats->unique_files = physical.unique_file_count;
             stats->planned_ranges = physical.range_count;
+            stats->requested_bytes = physical.requested_bytes;
             stats->planned_read_bytes = physical.planned_read_bytes;
+            stats->completed_read_bytes =
+                physical.completed_read_bytes;
+            stats->useful_read_bytes = physical.useful_read_bytes;
+            stats->gap_bytes = physical.gap_bytes;
+            stats->overread_bytes = physical.overread_bytes;
+            stats->pages_touched = physical.pages_touched;
+            stats->page_runs = physical.page_runs;
+            stats->chunks_touched = physical.chunks_touched;
+            stats->chunk_runs = physical.chunk_runs;
+            stats->input_discontinuities =
+                physical.input_discontinuities;
+            stats->input_inversions = physical.input_inversions;
+            stats->maximum_range_bytes =
+                physical.maximum_range_bytes;
+            stats->mean_range_bytes = physical.mean_range_bytes;
             stats->backend_tasks = physical.task_count;
             stats->total_seconds = elapsed_seconds(total_started);
         } else {
@@ -3964,6 +3987,11 @@ void NativeReadView::get_into(
     const std::span<const std::uint64_t> ids,
     const std::span<std::byte> output) const {
     impl_->get_into(ids, output);
+}
+NativeReadStats NativeReadView::get_into_profiled(
+    const std::span<const std::uint64_t> ids,
+    const std::span<std::byte> output) const {
+    return impl_->get_into_profiled(ids, output);
 }
 
 NativeRecordScan::NativeRecordScan(std::unique_ptr<Impl> impl)

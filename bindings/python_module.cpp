@@ -319,13 +319,28 @@ struct DTypeInfo {
     py::dict result;
     result["total_seconds"] = stats.total_seconds;
     result["lookup_seconds"] = stats.lookup_seconds;
+    result["physical_sort_seconds"] = stats.physical_sort_seconds;
     result["physical_plan_seconds"] = stats.physical_plan_seconds;
     result["physical_backend_seconds"] = stats.physical_backend_seconds;
     result["requested_rows"] = stats.requested_rows;
     result["base_rows"] = stats.base_rows;
     result["mutation_rows"] = stats.mutation_rows;
+    result["unique_files"] = stats.unique_files;
     result["planned_ranges"] = stats.planned_ranges;
+    result["requested_bytes"] = stats.requested_bytes;
     result["planned_read_bytes"] = stats.planned_read_bytes;
+    result["completed_read_bytes"] = stats.completed_read_bytes;
+    result["useful_read_bytes"] = stats.useful_read_bytes;
+    result["gap_bytes"] = stats.gap_bytes;
+    result["overread_bytes"] = stats.overread_bytes;
+    result["pages_touched"] = stats.pages_touched;
+    result["page_runs"] = stats.page_runs;
+    result["chunks_touched"] = stats.chunks_touched;
+    result["chunk_runs"] = stats.chunk_runs;
+    result["input_discontinuities"] = stats.input_discontinuities;
+    result["input_inversions"] = stats.input_inversions;
+    result["maximum_range_bytes"] = stats.maximum_range_bytes;
+    result["mean_range_bytes"] = stats.mean_range_bytes;
     result["backend_tasks"] = stats.backend_tasks;
     result["zero_delta_fast_path"] = stats.zero_delta_fast_path;
     return result;
@@ -2083,6 +2098,36 @@ PYBIND11_MODULE(_throwdb, module) {
         py::arg("zero_offset") = 0,
         py::arg("zero_size") = 0,
         "Compute CRC32C while treating one byte range as zero.");
+    module.def(
+        "_fnv1a64",
+        [](const py::buffer& input, std::uint64_t state) {
+            const py::buffer_info info = input.request();
+            if (info.ndim != 1 || info.itemsize != 1
+                || info.strides.empty() || info.strides[0] != 1
+                || !info.readonly) {
+                throw py::value_error(
+                    "FNV-1a input must be a contiguous, read-only, one-byte "
+                    "buffer");
+            }
+            if (info.size < 0) {
+                throw py::value_error("FNV-1a input size is invalid");
+            }
+            const auto size = static_cast<std::size_t>(info.size);
+            const auto* data =
+                static_cast<const std::uint8_t*>(info.ptr);
+            constexpr std::uint64_t prime = 0x100000001b3ULL;
+            {
+                py::gil_scoped_release release;
+                for (std::size_t index = 0; index != size; ++index) {
+                    state ^= data[index];
+                    state *= prime;
+                }
+            }
+            return state;
+        },
+        py::arg("input"),
+        py::arg("state"),
+        "Continue a 64-bit FNV-1a digest over a contiguous byte buffer.");
     PYBIND11_NUMPY_DTYPE(
         throwdb::NativeIdLocation, segment_id, row_index);
     py::register_exception<throwdb::ReaderBackendError>(

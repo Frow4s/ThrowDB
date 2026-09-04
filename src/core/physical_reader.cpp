@@ -693,6 +693,7 @@ private:
         }
         if (input.empty()) {
             if constexpr (Profiled) {
+                stats->requested_bytes = expected_bytes;
                 stats->plan_seconds = std::chrono::duration<double>(
                     Clock::now() - plan_started).count();
             }
@@ -729,6 +730,34 @@ private:
                 request.output_index});
         }
 
+        if constexpr (Profiled) {
+            stats->requested_bytes = expected_bytes;
+            for (std::size_t index = 1; index != input.size(); ++index) {
+                const PhysicalReadRequest& previous = input[index - 1];
+                const PhysicalReadRequest& current = input[index];
+                const bool contiguous =
+                    current.fd == previous.fd
+                    && previous.absolute_offset
+                           <= std::numeric_limits<std::uint64_t>::max()
+                                  - record_size
+                    && current.absolute_offset
+                           == previous.absolute_offset + record_size;
+                if (!contiguous) {
+                    ++stats->input_discontinuities;
+                }
+                if (current.fd < previous.fd
+                    || (current.fd == previous.fd
+                        && current.absolute_offset
+                               < previous.absolute_offset)) {
+                    ++stats->input_inversions;
+                }
+            }
+        }
+
+        Clock::time_point sort_started;
+        if constexpr (Profiled) {
+            sort_started = Clock::now();
+        }
         std::sort(
             requests.begin(), requests.end(),
             [](const Request& left, const Request& right) {
@@ -740,6 +769,10 @@ private:
                 }
                 return left.output_index < right.output_index;
             });
+        if constexpr (Profiled) {
+            stats->sort_seconds = std::chrono::duration<double>(
+                Clock::now() - sort_started).count();
+        }
 
         std::vector<PlannedRange> ranges;
         ranges.reserve(requests.size());
@@ -799,6 +832,26 @@ private:
             stats->request_count = input.size();
             stats->range_count = ranges.size();
             stats->task_count = task_count;
+            int previous_file = -1;
+            int useful_file = -1;
+            std::uint64_t useful_end = 0;
+            for (const Request& request : requests) {
+                if (request.fd != previous_file) {
+                    ++stats->unique_file_count;
+                    previous_file = request.fd;
+                }
+                const std::uint64_t request_end =
+                    request.absolute_offset + record_size;
+                if (request.fd != useful_file
+                    || request.absolute_offset >= useful_end) {
+                    stats->useful_read_bytes += record_size;
+                    useful_file = request.fd;
+                    useful_end = request_end;
+                } else if (request_end > useful_end) {
+                    stats->useful_read_bytes += request_end - useful_end;
+                    useful_end = request_end;
+                }
+            }
             for (const PlannedRange& range : ranges) {
                 const std::uint64_t range_bytes =
                     range.end_offset - range.first_offset;
@@ -810,7 +863,53 @@ private:
                     break;
                 }
                 stats->planned_read_bytes += range_bytes;
+                stats->maximum_range_bytes =
+                    std::max(stats->maximum_range_bytes, range_bytes);
             }
+            if (!ranges.empty()) {
+                stats->mean_range_bytes =
+                    stats->planned_read_bytes / ranges.size();
+            }
+            stats->gap_bytes =
+                stats->planned_read_bytes > stats->useful_read_bytes
+                    ? stats->planned_read_bytes
+                          - stats->useful_read_bytes
+                    : 0;
+            // PhysicalReader issues exact byte ranges. Consequently all
+            // overread in this layer is merge-gap amplification; filesystem
+            // page-cache/device amplification is modelled separately.
+            stats->overread_bytes = stats->gap_bytes;
+            const auto measure_units =
+                [&ranges](const std::uint64_t unit_bytes) {
+                    std::pair<std::uint64_t, std::uint64_t> result{0, 0};
+                    int current_file = -1;
+                    std::uint64_t current_end = 0;
+                    for (const PlannedRange& range : ranges) {
+                        const std::uint64_t first =
+                            range.first_offset / unit_bytes;
+                        const std::uint64_t end =
+                            (range.end_offset - 1) / unit_bytes + 1;
+                        if (range.fd != current_file
+                            || first > current_end) {
+                            ++result.second;
+                            result.first += end - first;
+                            current_file = range.fd;
+                            current_end = end;
+                        } else if (end > current_end) {
+                            result.first += end - current_end;
+                            current_end = end;
+                        }
+                    }
+                    return result;
+                };
+            constexpr std::uint64_t page_bytes = 4ULL << 10;
+            constexpr std::uint64_t chunk_bytes = 1ULL << 20;
+            const auto [pages, page_runs] = measure_units(page_bytes);
+            const auto [chunks, chunk_runs] = measure_units(chunk_bytes);
+            stats->pages_touched = pages;
+            stats->page_runs = page_runs;
+            stats->chunks_touched = chunks;
+            stats->chunk_runs = chunk_runs;
             stats->plan_seconds = std::chrono::duration<double>(
                 Clock::now() - plan_started).count();
         }
@@ -823,6 +922,7 @@ private:
             if constexpr (Profiled) {
                 stats->backend_seconds = std::chrono::duration<double>(
                     Clock::now() - backend_started).count();
+                stats->completed_read_bytes = stats->planned_read_bytes;
             }
         };
 

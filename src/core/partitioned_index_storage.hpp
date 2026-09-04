@@ -68,6 +68,9 @@ public:
     virtual void get_into(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const = 0;
+    [[nodiscard]] virtual NativeReadStats get_into_profiled(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const = 0;
 };
 
 class PartitionedReadView {
@@ -83,6 +86,9 @@ public:
     [[nodiscard]] std::uint32_t output_dimension() const noexcept;
     [[nodiscard]] DType dtype() const noexcept;
     void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+    [[nodiscard]] NativeReadStats get_into_profiled(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const;
 

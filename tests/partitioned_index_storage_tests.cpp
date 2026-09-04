@@ -776,6 +776,30 @@ void test_read_view_and_record_scan_prefix_budget_and_concurrency() {
     require(
         output == expected,
         "read view prefix was not bit-exact or lost order/duplicates");
+    std::fill(output.begin(), output.end(), std::byte{0});
+    const throwdb::NativeReadStats view_stats =
+        view->get_into_profiled(requested, output);
+    require(
+        output == expected,
+        "profiled read view prefix was not bit-exact");
+    require(
+        view_stats.requested_rows == requested.size()
+            && view_stats.base_rows == 1
+            && view_stats.mutation_rows == 3
+            && view_stats.planned_ranges > 0
+            && view_stats.planned_read_bytes
+                   >= 3 * prefix_size
+            && view_stats.backend_tasks > 0
+            && !view_stats.zero_delta_fast_path
+            && view_stats.total_seconds
+                   >= view_stats.lookup_seconds,
+        "profiled read view did not expose its logical/physical plan: "
+            + std::to_string(view_stats.requested_rows) + "/"
+            + std::to_string(view_stats.base_rows) + "/"
+            + std::to_string(view_stats.mutation_rows) + " rows, "
+            + std::to_string(view_stats.planned_ranges) + " ranges, "
+            + std::to_string(view_stats.planned_read_bytes) + " bytes, "
+            + std::to_string(view_stats.backend_tasks) + " tasks");
 
     const std::array<std::uint64_t, 2> with_missing{1, 999};
     std::vector<std::byte> untouched(

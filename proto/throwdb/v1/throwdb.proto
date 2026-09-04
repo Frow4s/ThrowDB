@@ -226,6 +226,8 @@ message ReadLoggingConfiguration {
   // Reserved: local filesystem paths are process diagnostics and must not be
   // disclosed to remote data-plane clients.
   reserved 2;
+  // Protocol v1.4 compatibility aliases. A v1.5 server always reports full
+  // selection and maps the physical chunk bound to max_ids_per_event.
   uint32 sample_ppm = 3;
   uint32 max_ids_per_event = 4;
   uint64 buffer_bytes = 5;
@@ -236,6 +238,11 @@ message ReadLoggingConfiguration {
   uint64 minimum_free_bytes = 10;
   uint64 max_write_bytes_per_second = 11;
   uint64 max_retained_files = 12;
+  // Maximum ordered IDs in one physical log record. Logical requests may
+  // span any number of contiguous records without sampling or truncation.
+  uint32 id_chunk_rows = 13;
+  // Native workload-log schema written by this process.
+  uint32 format_version = 14;
 }
 
 // Monotonic process-local counters plus the current bounded queue/disk state.
@@ -243,6 +250,10 @@ message ReadLoggingConfiguration {
 // non-fatal writer error; those failures never fail the read RPC itself.
 message ReadLoggingStatistics {
   bool enabled = 1;
+  // Protocol-v1.4 compatibility counters. Protocol-v1.5 servers populate
+  // these from the request-lifecycle counters below without sampling:
+  // considered and sampled map to observed_requests, enqueued maps to
+  // begun_requests, written maps to complete_requests, and truncated is zero.
   uint64 considered_events = 2;
   uint64 sampled_events = 3;
   uint64 enqueued_events = 4;
@@ -281,6 +292,33 @@ message ReadLoggingStatistics {
   uint64 dropped_disk_pressure_ids = 37;
   uint64 dropped_io_budget_events = 38;
   uint64 dropped_io_budget_ids = 39;
+
+  // Protocol-v1.5 logical-request lifecycle. A request is observed after its
+  // first valid ID batch is decoded, and completed when its single terminal
+  // outcome is submitted. Only complete_requests are eligible for training.
+  uint64 observed_requests = 40;
+  uint64 begun_requests = 41;
+  uint64 completed_requests = 42;
+  uint64 complete_requests = 43;
+  uint64 incomplete_requests = 44;
+
+  // Physical framed-record pipeline. One logical request contains one begin,
+  // any number of ordered ID chunks and batch-metric records, and one end.
+  uint64 observed_records = 45;
+  uint64 enqueued_records = 46;
+  uint64 written_records = 47;
+  uint64 observed_id_chunks = 48;
+  uint64 enqueued_id_chunks = 49;
+  uint64 written_id_chunks = 50;
+  uint64 observed_batches = 51;
+  uint64 enqueued_batches = 52;
+  uint64 written_batches = 53;
+  uint64 dropped_full_records = 54;
+  uint64 dropped_runtime_failure_records = 55;
+  uint64 dropped_minimum_free_space_records = 56;
+  uint64 dropped_io_budget_records = 57;
+  uint64 queued_records = 58;
+  uint64 active_requests = 59;
 }
 
 message DescribeResponse {

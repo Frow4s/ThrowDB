@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 
 import throwdb
+import throwdb.workload as workload_module
 from throwdb.cli import main
 from throwdb._throwdb import NativeCollection
 from throwdb.workload import (
     WorkloadLogError,
     _crc32c,
+    _v2_fnv_update,
     inspect_workload_logs,
 )
 
@@ -662,6 +664,8 @@ def test_inspector_rejects_impossible_event_and_writer_error_states(
         ("max_file_bytes", False),
         ("max_report_entries", -1),
         ("max_prefix_entries", 0),
+        ("max_active_requests", 0),
+        ("max_active_requests", 65_537),
     ),
 )
 def test_inspector_rejects_invalid_hard_bounds(
@@ -1248,3 +1252,1576 @@ def test_inspector_rejects_invalid_drop_ratio_bounds(
 
     with pytest.raises(WorkloadLogError, match=argument):
         inspect_workload_logs(logs, **{argument: value})
+
+
+V2_TOKEN = (0xA11CE, 0xB0B)
+V2_UNIX_NS = 1_800_000_000_000_000_000
+V2_COUNTER_NAMES = (
+    "observed_requests",
+    "begun_requests",
+    "completed_requests",
+    "complete_requests",
+    "incomplete_requests",
+    "observed_records",
+    "enqueued_records",
+    "written_records",
+    "observed_ids",
+    "enqueued_ids",
+    "written_ids",
+    "observed_chunks",
+    "enqueued_chunks",
+    "written_chunks",
+    "observed_batches",
+    "enqueued_batches",
+    "written_batches",
+    "dropped_full_records",
+    "dropped_full_ids",
+    "dropped_runtime_records",
+    "dropped_runtime_ids",
+    "dropped_minimum_free_records",
+    "dropped_minimum_free_ids",
+    "dropped_io_budget_records",
+    "dropped_io_budget_ids",
+)
+
+
+def _v2_header(
+    *,
+    instance_low: int = 33,
+    instance_high: int = 44,
+    segment_sequence: int = 0,
+    reader_backend: int = 1,
+    id_chunk_rows: int = 8192,
+    max_active_requests: int = 64,
+    buffer_bytes: int = 64 << 20,
+    segment_bytes: int = 256 << 20,
+    retention_bytes: int = 10 << 30,
+    max_write_bytes_per_second: int = 16 << 20,
+    io_workers: int | None = None,
+    io_queue_capacity: int | None = None,
+    io_ranges_per_task: int = 8,
+    max_read_range_bytes: int = 8 << 20,
+    max_gap_bytes: int = 64 << 10,
+    io_uring_queue_depth: int | None = None,
+    io_uring_workers: int | None = None,
+) -> bytes:
+    output = bytearray(HEADER_BYTES)
+    output[:8] = b"TDBRLOG2"
+    _put_u32(output, 8, 2)
+    _put_u32(output, 12, HEADER_BYTES)
+    _put_u32(output, 16, 232)
+    _put_u64(output, 32, 11)
+    _put_u64(output, 40, 22)
+    _put_u32(output, 48, 7)
+    _put_u32(output, 52, 1)
+    _put_u32(output, 56, 1024)
+    _put_u32(output, 60, 2048)
+    _put_u64(output, 64, instance_low)
+    _put_u64(output, 72, instance_high)
+    _put_u64(output, 80, V2_UNIX_NS)
+    _put_u32(output, 88, id_chunk_rows)
+    _put_u32(output, 92, max_active_requests)
+    _put_u64(output, 96, buffer_bytes)
+    _put_u64(output, 104, segment_bytes)
+    _put_u64(output, 112, 3600)
+    _put_u64(output, 120, retention_bytes)
+    _put_u64(output, 128, 7 * 24 * 60 * 60)
+    _put_u64(output, 136, 2 << 30)
+    _put_u64(output, 144, 1234)
+    _put_u64(output, 152, segment_sequence)
+    _put_u64(output, 160, max_write_bytes_per_second)
+    _put_u64(output, 168, 4096)
+    _put_u32(output, 176, reader_backend)
+    if reader_backend == 1:
+        _put_u32(output, 180, 8 if io_workers is None else io_workers)
+        _put_u32(
+            output,
+            184,
+            1024 if io_queue_capacity is None else io_queue_capacity,
+        )
+        _put_u32(output, 188, io_ranges_per_task)
+        _put_u64(output, 192, max_read_range_bytes)
+        _put_u64(output, 200, max_gap_bytes)
+        _put_u32(
+            output,
+            208,
+            32
+            if io_uring_queue_depth is None
+            else io_uring_queue_depth,
+        )
+        _put_u32(
+            output,
+            212,
+            1 if io_uring_workers is None else io_uring_workers,
+        )
+    elif reader_backend == 2:
+        _put_u32(output, 180, 0 if io_workers is None else io_workers)
+        _put_u32(
+            output,
+            184,
+            0 if io_queue_capacity is None else io_queue_capacity,
+        )
+        _put_u32(output, 188, io_ranges_per_task)
+        _put_u64(output, 192, max_read_range_bytes)
+        _put_u64(output, 200, max_gap_bytes)
+        _put_u32(
+            output,
+            208,
+            32
+            if io_uring_queue_depth is None
+            else io_uring_queue_depth,
+        )
+        _put_u32(
+            output,
+            212,
+            2 if io_uring_workers is None else io_uring_workers,
+        )
+    _put_u32(output, 216, 4096)
+    _put_u32(output, 220, 1 << 20)
+    _put_u32(output, 224, 3)
+    return _finish_crc(output)
+
+
+def _v2_record(
+    kind: int,
+    frame_bytes: int,
+    *,
+    sequence: int,
+    steady_ns: int,
+    token: tuple[int, int] = V2_TOKEN,
+) -> bytearray:
+    output = bytearray(frame_bytes)
+    output[:8] = b"TDBRREC2"
+    _put_u32(output, 8, 2)
+    _put_u32(output, 12, FRAME_BYTES)
+    _put_u32(output, 16, frame_bytes)
+    _put_u32(output, 20, kind)
+    _put_u64(output, 40, sequence)
+    _put_u64(output, 48, V2_UNIX_NS + sequence + 1)
+    _put_u64(output, 56, steady_ns)
+    _put_u64(output, 64, token[0])
+    _put_u64(output, 72, token[1])
+    return output
+
+
+def _v2_begin(
+    *,
+    sequence: int,
+    declared_ids: int,
+    method: int = 1,
+    prefix: int = 1024,
+    token: tuple[int, int] = V2_TOKEN,
+    steady_ns: int = 1_000,
+    exact_snapshot: bool = True,
+    catalog_generation: int = 7,
+    committed_sequence: int = 9,
+) -> bytes:
+    output = _v2_record(
+        1,
+        FRAME_BYTES,
+        sequence=sequence,
+        steady_ns=steady_ns,
+        token=token,
+    )
+    _put_u32(
+        output,
+        28,
+        (1 if exact_snapshot else 0) | (2 if declared_ids else 0),
+    )
+    _put_u32(output, 32, method)
+    _put_u32(output, 36, prefix)
+    _put_u64(output, 80, catalog_generation)
+    _put_u64(output, 88, committed_sequence)
+    _put_u64(output, 96, 1_000_000)
+    _put_u64(output, 104, declared_ids)
+    _put_u64(output, 112, 1)
+    return _finish_crc(output)
+
+
+def _v2_chunk(
+    ids: list[int],
+    *,
+    sequence: int,
+    logical_offset: int,
+    batch_sequence: int,
+    chunk_sequence: int,
+    delivery_sequence: int,
+    token: tuple[int, int] = V2_TOKEN,
+) -> bytes:
+    output = _v2_record(
+        2,
+        FRAME_BYTES + len(ids) * 8,
+        sequence=sequence,
+        steady_ns=1_100 + sequence,
+        token=token,
+    )
+    _put_u32(output, 32, len(ids))
+    _put_u64(output, 80, logical_offset)
+    _put_u64(output, 88, batch_sequence)
+    assert delivery_sequence >= 0
+    _put_u64(output, 96, 0)
+    _put_u64(output, 104, chunk_sequence)
+    for index, identifier in enumerate(ids):
+        _put_u64(output, FRAME_BYTES + index * 8, identifier)
+    return _finish_crc(output)
+
+
+def _v2_batch(
+    *,
+    sequence: int,
+    logical_offset: int,
+    batch_sequence: int,
+    rows: int,
+    response_bytes: int,
+    token: tuple[int, int] = V2_TOKEN,
+    delivery_sequence: int = 0,
+) -> bytes:
+    output = _v2_record(
+        3,
+        384,
+        sequence=sequence,
+        steady_ns=1_200 + sequence,
+        token=token,
+    )
+    _put_u32(output, 32, 1)
+    _put_u64(output, 80, batch_sequence)
+    _put_u64(output, 88, logical_offset)
+    _put_u64(output, 96, rows)
+    _put_u64(output, 104, response_bytes)
+    for index in range(10):
+        _put_u64(output, 112 + index * 8, index + 1)
+    for index in range(16):
+        _put_u64(output, 256 + index * 8, (index + 1) * 10)
+    _put_u64(output, 224, delivery_sequence)
+    _put_u64(output, 232, rows * 2048)
+    _put_u64(output, 240, 2)
+    return _finish_crc(output)
+
+
+def _v2_digest(ids: list[int]) -> tuple[int, int]:
+    low = 0xCBF29CE484222325
+    high = 0x84222325CBF29CE4
+    for identifier in ids:
+        for byte in struct.pack("<Q", identifier):
+            low = ((low ^ byte) * 0x100000001B3) & ((1 << 64) - 1)
+            high = ((high ^ byte) * 0x100000001B3) & ((1 << 64) - 1)
+    return low, high
+
+
+def _v2_end(
+    ids: list[int],
+    *,
+    sequence: int,
+    chunks: int,
+    batches: int,
+    response_bytes: int,
+    token: tuple[int, int] = V2_TOKEN,
+    complete: bool = True,
+    status: int = 1,
+    error_code: int = 0,
+    delivered_ids: int | None = None,
+    digest: tuple[int, int] | None = None,
+    started_steady_ns: int = 1_000,
+) -> bytes:
+    output = _v2_record(
+        4,
+        FRAME_BYTES,
+        sequence=sequence,
+        steady_ns=2_000,
+        token=token,
+    )
+    _put_u32(output, 28, 1 if complete else 0)
+    _put_u32(output, 32, status)
+    _put_u32(output, 36, error_code)
+    _put_u64(output, 80, len(ids))
+    _put_u64(
+        output,
+        88,
+        len(ids) if delivered_ids is None else delivered_ids,
+    )
+    _put_u64(output, 96, chunks)
+    _put_u64(output, 104, batches)
+    _put_u64(output, 112, response_bytes)
+    _put_u64(output, 136, 2_000 - started_steady_ns)
+    low, high = digest or _v2_digest(ids)
+    _put_u64(output, 208, low)
+    _put_u64(output, 216, high)
+    return _finish_crc(output)
+
+
+def _v2_checkpoint(
+    *,
+    opening: bool,
+    counters: dict[str, int] | None = None,
+) -> bytes:
+    output = bytearray(FRAME_BYTES)
+    output[:8] = b"TDBRREC2"
+    _put_u32(output, 8, 2)
+    _put_u32(output, 12, FRAME_BYTES)
+    _put_u32(output, 16, FRAME_BYTES)
+    _put_u32(output, 20, 5)
+    _put_u32(output, 28, 1)
+    _put_u32(output, 32, 1 if opening else 0)
+    _put_u64(output, 48, V2_UNIX_NS + (1 if opening else 10_000))
+    values = {name: 0 for name in V2_COUNTER_NAMES}
+    values.update(counters or {})
+    for index, name in enumerate(V2_COUNTER_NAMES):
+        _put_u64(output, 56 + index * 8, values[name])
+    return _finish_crc(output)
+
+
+def _v2_complete_counters(
+    *,
+    records: int,
+    ids: int,
+    chunks: int,
+    batches: int,
+    requests: int = 1,
+    complete_requests: int | None = None,
+) -> dict[str, int]:
+    complete = (
+        requests if complete_requests is None else complete_requests
+    )
+    return {
+        "observed_requests": requests,
+        "begun_requests": requests,
+        "completed_requests": requests,
+        "complete_requests": complete,
+        "incomplete_requests": requests - complete,
+        "observed_records": records,
+        "enqueued_records": records,
+        "written_records": records,
+        "observed_ids": ids,
+        "enqueued_ids": ids,
+        "written_ids": ids,
+        "observed_chunks": chunks,
+        "enqueued_chunks": chunks,
+        "written_chunks": chunks,
+        "observed_batches": batches,
+        "enqueued_batches": batches,
+        "written_batches": batches,
+    }
+
+
+def _v2_write_log(
+    path: Path,
+    frames: tuple[bytes, ...],
+    *,
+    opening_counters: dict[str, int] | None = None,
+    terminal_counters: dict[str, int] | None = None,
+) -> None:
+    terminal = (
+        (_v2_checkpoint(opening=False, counters=terminal_counters),)
+        if terminal_counters is not None
+        else ()
+    )
+    path.write_bytes(
+        _v2_header()
+        + _v2_checkpoint(opening=True, counters=opening_counters)
+        + b"".join((*frames, *terminal))
+    )
+
+
+def test_v2_reconstructs_exact_get_without_serializing_ids(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [9_182_736_451, 8_172_635_409, 7_162_534_807]
+    frames = (
+        _v2_begin(sequence=1, declared_ids=len(ids)),
+        _v2_chunk(
+            ids,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=1,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=len(ids),
+            response_bytes=6144,
+        ),
+        _v2_end(
+            ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=6144,
+        ),
+    )
+    _v2_write_log(
+        logs / "exact.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=4,
+            ids=3,
+            chunks=1,
+            batches=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["version"] == 2
+    assert report["quality"] == {
+        "suitable": True,
+        "exact_capture": True,
+        "reasons": [],
+        "warnings": [],
+    }
+    assert report["requests"]["complete_for_training"] == 1
+    assert report["requests"]["methods"] == {"get": 1}
+    assert report["id_chunks"]["ids_for_complete_requests"] == 3
+    assert report["batches"]["physical_metric_totals"][
+        "physical_requests"
+    ] == 20
+    assert report["batches"]["physical_metric_totals"][
+        "useful_read_bytes"
+    ] == 6144
+    assert report["batches"]["physical_metric_totals"][
+        "backend_tasks"
+    ] == 2
+    assert report["configuration"]["reader_backend"] == "thread_pool"
+    serialized = json.dumps(report, sort_keys=True)
+    assert all(str(identifier) not in serialized for identifier in ids)
+    assert "digest" not in serialized
+    assert "request_id" not in serialized
+
+
+def test_v2_native_and_fallback_digest_match_fragmented_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = memoryview(
+        struct.pack("<QQQ", 0, (1 << 64) - 1, 0x123456789ABCDEF0)
+    )
+    initial = 0xCBF29CE484222325
+    native_or_default = _v2_fnv_update(initial, payload)
+    monkeypatch.setattr(workload_module, "_native", None)
+    fallback = _v2_fnv_update(initial, payload)
+    fragmented = initial
+    for start, end in ((0, 3), (3, 17), (17, len(payload))):
+        fragmented = _v2_fnv_update(
+            fragmented,
+            payload[start:end],
+        )
+
+    assert native_or_default == fallback == fragmented
+
+
+def test_v2_accepts_unary_inexact_observation_anchor(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [71, 72]
+    frames = (
+        _v2_begin(
+            sequence=1,
+            declared_ids=len(ids),
+            exact_snapshot=False,
+            catalog_generation=17,
+            committed_sequence=19,
+        ),
+        _v2_chunk(
+            ids,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=len(ids),
+            response_bytes=4096,
+        ),
+        _v2_end(
+            ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=4096,
+        ),
+    )
+    _v2_write_log(
+        logs / "unary.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=4,
+            ids=2,
+            chunks=1,
+            batches=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["files"]["valid"] == 1
+    assert report["quality"]["suitable"] is True
+    assert report["requests"]["complete_for_training"] == 1
+    assert report["requests"]["reports"][0]["exact_snapshot"] is False
+
+
+def test_v2_fully_captured_non_success_is_diagnostic_not_telemetry_loss(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    success_ids = [101]
+    cancelled_ids = [202, 203]
+    success_token = (11, 12)
+    cancelled_token = (21, 22)
+    frames = (
+        _v2_begin(
+            sequence=1,
+            declared_ids=1,
+            token=success_token,
+        ),
+        _v2_chunk(
+            success_ids,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+            token=success_token,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=1,
+            response_bytes=2048,
+            token=success_token,
+        ),
+        _v2_end(
+            success_ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=2048,
+            token=success_token,
+        ),
+        _v2_begin(
+            sequence=5,
+            declared_ids=2,
+            token=cancelled_token,
+        ),
+        _v2_chunk(
+            cancelled_ids,
+            sequence=6,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+            token=cancelled_token,
+        ),
+        _v2_end(
+            cancelled_ids,
+            sequence=7,
+            chunks=1,
+            batches=0,
+            response_bytes=0,
+            token=cancelled_token,
+            complete=False,
+            status=2,
+            error_code=1,
+            delivered_ids=0,
+        ),
+    )
+    _v2_write_log(
+        logs / "mixed-outcomes.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=7,
+            ids=3,
+            chunks=2,
+            batches=1,
+            requests=2,
+            complete_requests=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["exact_capture"] is True
+    assert report["quality"]["suitable"] is True
+    assert report["quality"]["reasons"] == []
+    assert report["quality"]["warnings"] == [
+        "non_success_request_outcomes"
+    ]
+    assert report["requests"]["complete_for_training"] == 1
+    assert report["requests"]["non_success_outcomes"] == 1
+    assert report["requests"]["incomplete_outcomes"] == 0
+    assert report["requests"]["methods"] == {"get": 1}
+    assert report["requests"]["statuses"] == {
+        "cancelled": 1,
+        "success": 1,
+    }
+
+
+def test_v2_reconstructs_multibatch_stream_in_original_order(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    first = [101, 202]
+    second = [303, 404, 505]
+    ids = first + second
+    frames = (
+        _v2_begin(
+            sequence=1,
+            declared_ids=len(ids),
+            method=2,
+            prefix=128,
+        ),
+        _v2_chunk(
+            first,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=9,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=2,
+            response_bytes=512,
+            delivery_sequence=9,
+        ),
+        _v2_chunk(
+            second,
+            sequence=4,
+            logical_offset=2,
+            batch_sequence=1,
+            chunk_sequence=1,
+            delivery_sequence=10,
+        ),
+        _v2_batch(
+            sequence=5,
+            logical_offset=2,
+            batch_sequence=1,
+            rows=3,
+            response_bytes=768,
+            delivery_sequence=10,
+        ),
+        _v2_end(
+            ids,
+            sequence=6,
+            chunks=2,
+            batches=2,
+            response_bytes=1280,
+        ),
+    )
+    _v2_write_log(
+        logs / "stream.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=6,
+            ids=5,
+            chunks=2,
+            batches=2,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["exact_capture"] is True
+    assert report["requests"]["methods"] == {"stream_get": 1}
+    assert report["requests"]["prefix_dimensions"] == {"128": 1}
+    assert report["requests"]["reports"][0]["batches"] == 2
+    assert report["batches"]["rows_for_complete_requests"] == 5
+
+
+@pytest.mark.parametrize("failure", ("missing_chunk", "bad_digest"))
+def test_v2_fails_closed_on_interior_gap_or_digest_mismatch(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    logs = tmp_path / failure
+    logs.mkdir()
+    ids = [11, 22, 33]
+    chunk = _v2_chunk(
+        ids,
+        sequence=2,
+        logical_offset=0,
+        batch_sequence=0,
+        chunk_sequence=0,
+        delivery_sequence=1,
+    )
+    frames = (
+        _v2_begin(sequence=1, declared_ids=3),
+        *(() if failure == "missing_chunk" else (chunk,)),
+        _v2_batch(
+            sequence=3 if failure == "missing_chunk" else 3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=3,
+            response_bytes=6144,
+        ),
+        _v2_end(
+            ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=6144,
+            digest=(
+                (1, 2)
+                if failure == "bad_digest"
+                else _v2_digest(ids)
+            ),
+        ),
+    )
+    records = 3 if failure == "missing_chunk" else 4
+    _v2_write_log(
+        logs / "bad.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=records,
+            ids=0 if failure == "missing_chunk" else 3,
+            chunks=0 if failure == "missing_chunk" else 1,
+            batches=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["suitable"] is False
+    assert report["quality"]["exact_capture"] is False
+    assert report["files"]["invalid_finalized"] == 1
+    assert "corrupt_finalized_files" in report["quality"]["reasons"]
+
+
+def test_v2_retention_left_censor_is_excluded_from_training(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    left_ids = [41, 42]
+    kept_ids = [51, 52, 53]
+    kept_token = (123, 456)
+    opening = {
+        **_v2_complete_counters(
+            records=1,
+            ids=0,
+            chunks=0,
+            batches=0,
+        ),
+        "completed_requests": 0,
+        "complete_requests": 0,
+    }
+    frames = (
+        _v2_chunk(
+            left_ids,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=1,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=2,
+            response_bytes=4096,
+        ),
+        _v2_end(
+            left_ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=4096,
+        ),
+        _v2_begin(
+            sequence=5,
+            declared_ids=3,
+            token=kept_token,
+        ),
+        _v2_chunk(
+            kept_ids,
+            sequence=6,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=2,
+            token=kept_token,
+        ),
+        _v2_batch(
+            sequence=7,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=3,
+            response_bytes=6144,
+            token=kept_token,
+        ),
+        _v2_end(
+            kept_ids,
+            sequence=8,
+            chunks=1,
+            batches=1,
+            response_bytes=6144,
+            token=kept_token,
+        ),
+    )
+    terminal = _v2_complete_counters(
+        records=8,
+        ids=5,
+        chunks=2,
+        batches=2,
+        requests=2,
+    )
+    _v2_write_log(
+        logs / "retained.tdbrl",
+        frames,
+        opening_counters=opening,
+        terminal_counters=terminal,
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["suitable"] is True
+    assert report["requests"]["left_censored"] == 1
+    assert report["requests"]["begun"] == 1
+    assert report["requests"]["complete_for_training"] == 1
+    assert report["id_chunks"]["ids_for_complete_requests"] == 3
+
+
+def test_v2_right_censor_and_active_request_bound_are_fail_closed(
+    tmp_path: Path,
+) -> None:
+    open_logs = tmp_path / "open"
+    open_logs.mkdir()
+    ids = [1, 2]
+    _v2_write_log(
+        open_logs / "active.open",
+        (
+            _v2_begin(sequence=1, declared_ids=2),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=1,
+            ),
+        ),
+    )
+
+    report = inspect_workload_logs(open_logs)
+
+    assert report["requests"]["right_censored"] == 1
+    assert report["requests"]["interior_incomplete"] == 0
+    assert report["quality"]["exact_capture"] is False
+    assert report["quality"]["suitable"] is False
+    assert report["quality"]["reasons"] == [
+        "incomplete_counter_coverage",
+        "no_complete_point_read_requests",
+    ]
+    assert report["files"]["reports"][0]["counter_coverage"] == (
+        "lower_bound"
+    )
+
+    bounded = tmp_path / "bounded"
+    bounded.mkdir()
+    second_token = (777, 888)
+    frames = (
+        _v2_begin(sequence=1, declared_ids=1),
+        _v2_begin(
+            sequence=2,
+            declared_ids=1,
+            token=second_token,
+        ),
+    )
+    _v2_write_log(
+        bounded / "too-many.tdbrl",
+        frames,
+        terminal_counters={
+            "observed_requests": 2,
+            "begun_requests": 2,
+            "observed_records": 2,
+            "enqueued_records": 2,
+            "written_records": 2,
+        },
+    )
+
+    with pytest.raises(WorkloadLogError, match="max_active_requests"):
+        inspect_workload_logs(bounded, max_active_requests=1)
+
+
+def test_v2_open_file_keeps_verified_prefix_and_excludes_tail(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [61, 62]
+    tail_token = (900, 901)
+    verified = _v2_complete_counters(
+        records=4,
+        ids=2,
+        chunks=1,
+        batches=1,
+    )
+    _v2_write_log(
+        logs / "active.open",
+        (
+            _v2_begin(sequence=1, declared_ids=2),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=0,
+            ),
+            _v2_batch(
+                sequence=3,
+                logical_offset=0,
+                batch_sequence=0,
+                rows=2,
+                response_bytes=4096,
+            ),
+            _v2_end(
+                ids,
+                sequence=4,
+                chunks=1,
+                batches=1,
+                response_bytes=4096,
+            ),
+            _v2_checkpoint(opening=False, counters=verified),
+            _v2_begin(
+                sequence=5,
+                declared_ids=1,
+                token=tail_token,
+            ),
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["suitable"] is False
+    assert report["quality"]["exact_capture"] is False
+    assert report["quality"]["reasons"] == [
+        "incomplete_counter_coverage"
+    ]
+    assert report["requests"]["complete_for_training"] == 1
+    assert report["requests"]["right_censored"] == 1
+    assert report["requests"]["begun"] == 2
+    assert report["counters"]["written_records"] == 4
+
+
+def test_v2_writer_drops_ignore_legacy_thresholds_and_fail_exactness(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [71]
+    frames = (
+        _v2_begin(sequence=1, declared_ids=1),
+        _v2_chunk(
+            ids,
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=1,
+            response_bytes=2048,
+        ),
+        _v2_end(
+            ids,
+            sequence=4,
+            chunks=1,
+            batches=1,
+            response_bytes=2048,
+        ),
+    )
+    counters = _v2_complete_counters(
+        records=4,
+        ids=1,
+        chunks=1,
+        batches=1,
+    )
+    counters.update(
+        {
+            "observed_requests": 2,
+            "completed_requests": 2,
+            "incomplete_requests": 1,
+            "observed_records": 5,
+            "dropped_full_records": 1,
+        }
+    )
+    _v2_write_log(
+        logs / "drops.tdbrl",
+        frames,
+        terminal_counters=counters,
+    )
+
+    report = inspect_workload_logs(
+        logs,
+        max_drop_ratio=1.0,
+        max_row_drop_ratio=1.0,
+    )
+
+    assert report["quality"]["exact_capture"] is False
+    assert report["quality"]["suitable"] is False
+    assert "exact_records_dropped" in report["quality"]["reasons"]
+    assert "drop_ratio_exceeds_limit" not in report["quality"]["reasons"]
+
+
+def test_v2_intermediate_checkpoint_may_have_inflight_pipeline(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [75]
+    intermediate = {
+        "observed_requests": 1,
+        "begun_requests": 1,
+        "observed_records": 2,
+        "enqueued_records": 2,
+        "written_records": 1,
+    }
+    _v2_write_log(
+        logs / "inflight.tdbrl",
+        (
+            _v2_begin(sequence=1, declared_ids=1),
+            _v2_checkpoint(
+                opening=False,
+                counters=intermediate,
+            ),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=0,
+            ),
+            _v2_batch(
+                sequence=3,
+                logical_offset=0,
+                batch_sequence=0,
+                rows=1,
+                response_bytes=2048,
+            ),
+            _v2_end(
+                ids,
+                sequence=4,
+                chunks=1,
+                batches=1,
+                response_bytes=2048,
+            ),
+        ),
+        terminal_counters=_v2_complete_counters(
+            records=4,
+            ids=1,
+            chunks=1,
+            batches=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["files"]["valid"] == 1
+    assert report["quality"]["suitable"] is True
+    assert report["files"]["reports"][0]["checkpoint_records"] == 3
+
+
+def test_v2_final_terminal_requires_complete_counter_partitions(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [76]
+    terminal = _v2_complete_counters(
+        records=4,
+        ids=1,
+        chunks=1,
+        batches=1,
+    )
+    terminal["observed_records"] = 5
+    _v2_write_log(
+        logs / "incomplete-terminal.tdbrl",
+        (
+            _v2_begin(sequence=1, declared_ids=1),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=0,
+            ),
+            _v2_batch(
+                sequence=3,
+                logical_offset=0,
+                batch_sequence=0,
+                rows=1,
+                response_bytes=2048,
+            ),
+            _v2_end(
+                ids,
+                sequence=4,
+                chunks=1,
+                batches=1,
+                response_bytes=2048,
+            ),
+        ),
+        terminal_counters=terminal,
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["files"]["invalid_finalized"] == 0
+    assert report["quality"]["exact_capture"] is False
+    assert "incomplete_terminal_counter_partition" in (
+        report["quality"]["reasons"]
+    )
+    assert (
+        report["counters"]["incomplete_terminal_partition_instances"]
+        == 1
+    )
+
+
+def test_v2_minimum_chunk_geometry_still_accounts_for_batch_frame(
+    tmp_path: Path,
+) -> None:
+    valid_logs = tmp_path / "valid"
+    valid_logs.mkdir()
+    minimum_transaction = HEADER_BYTES + 2 * FRAME_BYTES + 384
+    frames = (
+        _v2_checkpoint(opening=True),
+        _v2_checkpoint(opening=False),
+    )
+    (valid_logs / "minimum.tdbrl").write_bytes(
+        _v2_header(
+            id_chunk_rows=1,
+            buffer_bytes=2 * 384,
+            segment_bytes=minimum_transaction,
+            retention_bytes=minimum_transaction,
+            max_write_bytes_per_second=minimum_transaction,
+        )
+        + b"".join(frames)
+    )
+
+    valid_report = inspect_workload_logs(valid_logs)
+
+    assert valid_report["files"]["valid"] == 1
+    assert valid_report["files"]["invalid_finalized"] == 0
+
+    invalid_logs = tmp_path / "invalid"
+    invalid_logs.mkdir()
+    (invalid_logs / "undersized-buffer.tdbrl").write_bytes(
+        _v2_header(
+            id_chunk_rows=1,
+            buffer_bytes=2 * 384 - 1,
+            segment_bytes=minimum_transaction,
+            retention_bytes=minimum_transaction,
+            max_write_bytes_per_second=minimum_transaction,
+        )
+        + b"".join(frames)
+    )
+
+    invalid_report = inspect_workload_logs(invalid_logs)
+
+    assert invalid_report["files"]["invalid_finalized"] == 1
+
+
+def test_v2_accepts_default_sequential_thread_pool_reader_context(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    frames = (
+        _v2_checkpoint(opening=True),
+        _v2_checkpoint(opening=False),
+    )
+    (logs / "sequential.tdbrl").write_bytes(
+        _v2_header(
+            reader_backend=1,
+            io_workers=0,
+            io_queue_capacity=0,
+            io_uring_queue_depth=32,
+            io_uring_workers=1,
+        )
+        + b"".join(frames)
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["files"]["valid"] == 1
+    assert report["files"]["invalid_finalized"] == 0
+    assert report["configuration"]["reader_backend"] == "thread_pool"
+    assert report["configuration"]["io_workers"] == 0
+    assert report["configuration"]["io_queue_capacity"] == 0
+    assert report["configuration"]["io_uring_queue_depth"] == 32
+    assert report["configuration"]["io_uring_workers"] == 1
+
+
+@pytest.mark.parametrize(
+    "header_overrides",
+    [
+        {
+            "reader_backend": 1,
+            "io_workers": 0,
+            "io_queue_capacity": 1,
+        },
+        {
+            "reader_backend": 1,
+            "io_uring_queue_depth": 0,
+            "io_uring_workers": 1,
+        },
+        {
+            "reader_backend": 2,
+            "io_workers": 1,
+            "io_queue_capacity": 0,
+        },
+        {
+            "reader_backend": 1,
+            "max_active_requests": 65_537,
+        },
+    ],
+)
+def test_v2_rejects_impossible_native_logger_context(
+    tmp_path: Path,
+    header_overrides: dict[str, int],
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "invalid-reader.tdbrl").write_bytes(
+        _v2_header(**header_overrides)
+        + _v2_checkpoint(opening=True)
+        + _v2_checkpoint(opening=False)
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["files"]["valid"] == 0
+    assert report["files"]["invalid_finalized"] == 1
+    assert "corrupt_finalized_files" in report["quality"]["reasons"]
+
+
+def test_v2_pending_metadata_bounds_are_global_across_instances() -> None:
+    accumulator = workload_module._V2Accumulator(
+        max_active_requests=4,
+        max_report_entries=1,
+        max_prefix_entries=1,
+    )
+    first = accumulator._pending((1, 1))
+    second = accumulator._pending((2, 2))
+    accumulator._record_pending_prefix(first, 128)
+    accumulator._reserve_pending_report(first, {"instance": 1})
+
+    with pytest.raises(
+        WorkloadLogError,
+        match="max_prefix_entries",
+    ):
+        accumulator._record_pending_prefix(second, 256)
+    accumulator._reserve_pending_report(second, {"instance": 2})
+
+    assert accumulator.pending_request_report_entries == 1
+    assert len(first.request_reports) == 1
+    assert len(second.request_reports) == 0
+    assert second.request_reports_omitted == 1
+
+    accumulator.finish_instance((1, 1), complete_terminal=False)
+    assert accumulator.pending_request_report_entries == 0
+    assert accumulator.pending_prefix_references == {}
+
+
+def test_v2_file_report_memory_is_bounded_before_return(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for index in range(3):
+        (logs / f"{index}.tdbrl").write_bytes(
+            _v2_header(
+                instance_low=index + 1,
+                instance_high=index + 10,
+            )
+            + _v2_checkpoint(opening=True)
+            + _v2_checkpoint(opening=False)
+        )
+
+    report = inspect_workload_logs(
+        logs,
+        max_report_entries=1,
+    )
+
+    assert len(report["files"]["reports"]) == 1
+    assert report["files"]["reports_omitted"] == 2
+
+
+def test_v2_lifecycle_and_delivery_sequences_fail_closed(
+    tmp_path: Path,
+) -> None:
+    lifecycle = tmp_path / "lifecycle"
+    lifecycle.mkdir()
+    ids = [81]
+    _v2_write_log(
+        lifecycle / "gap.tdbrl",
+        (
+            _v2_begin(sequence=1, declared_ids=1),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=0,
+            ),
+            _v2_batch(
+                sequence=4,
+                logical_offset=0,
+                batch_sequence=0,
+                rows=1,
+                response_bytes=2048,
+            ),
+            _v2_end(
+                ids,
+                sequence=5,
+                chunks=1,
+                batches=1,
+                response_bytes=2048,
+            ),
+        ),
+        terminal_counters=_v2_complete_counters(
+            records=4,
+            ids=1,
+            chunks=1,
+            batches=1,
+        ),
+    )
+
+    gap_report = inspect_workload_logs(lifecycle)
+
+    assert gap_report["quality"]["exact_capture"] is False
+    assert "lifecycle_sequence_gap" in gap_report["quality"]["reasons"]
+
+    delivery = tmp_path / "delivery"
+    delivery.mkdir()
+    stream_ids = [91, 92]
+    frames = (
+        _v2_begin(sequence=1, declared_ids=2, method=2),
+        _v2_chunk(
+            [91],
+            sequence=2,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+        ),
+        _v2_batch(
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=1,
+            response_bytes=2048,
+            delivery_sequence=10,
+        ),
+        _v2_chunk(
+            [92],
+            sequence=4,
+            logical_offset=1,
+            batch_sequence=1,
+            chunk_sequence=1,
+            delivery_sequence=0,
+        ),
+        _v2_batch(
+            sequence=5,
+            logical_offset=1,
+            batch_sequence=1,
+            rows=1,
+            response_bytes=2048,
+            delivery_sequence=9,
+        ),
+        _v2_end(
+            stream_ids,
+            sequence=6,
+            chunks=2,
+            batches=2,
+            response_bytes=4096,
+        ),
+    )
+    _v2_write_log(
+        delivery / "reordered.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=6,
+            ids=2,
+            chunks=2,
+            batches=2,
+        ),
+    )
+
+    delivery_report = inspect_workload_logs(delivery)
+
+    assert delivery_report["quality"]["exact_capture"] is False
+    assert "delivery_sequence_order" in (
+        delivery_report["quality"]["reasons"]
+    )
+
+
+def test_v2_stream_batch_requires_delivery_sequence(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    ids = [501]
+    _v2_write_log(
+        logs / "missing-delivery.tdbrl",
+        (
+            _v2_begin(
+                sequence=1,
+                declared_ids=1,
+                method=2,
+            ),
+            _v2_chunk(
+                ids,
+                sequence=2,
+                logical_offset=0,
+                batch_sequence=0,
+                chunk_sequence=0,
+                delivery_sequence=0,
+            ),
+            _v2_batch(
+                sequence=3,
+                logical_offset=0,
+                batch_sequence=0,
+                rows=1,
+                response_bytes=2048,
+                delivery_sequence=0,
+            ),
+            _v2_end(
+                ids,
+                sequence=4,
+                chunks=1,
+                batches=1,
+                response_bytes=2048,
+            ),
+        ),
+        terminal_counters=_v2_complete_counters(
+            records=4,
+            ids=1,
+            chunks=1,
+            batches=1,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["exact_capture"] is False
+    assert "delivery_sequence_order" in report["quality"]["reasons"]
+
+
+def test_v2_global_delivery_inversion_across_requests_is_diagnostic(
+    tmp_path: Path,
+) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    first_token = (1_001, 1_002)
+    second_token = (2_001, 2_002)
+    frames = (
+        _v2_begin(
+            sequence=1,
+            declared_ids=1,
+            method=2,
+            token=first_token,
+        ),
+        _v2_begin(
+            sequence=2,
+            declared_ids=1,
+            method=2,
+            token=second_token,
+        ),
+        _v2_chunk(
+            [101],
+            sequence=3,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+            token=first_token,
+        ),
+        _v2_batch(
+            sequence=4,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=1,
+            response_bytes=2048,
+            delivery_sequence=10,
+            token=first_token,
+        ),
+        _v2_chunk(
+            [202],
+            sequence=5,
+            logical_offset=0,
+            batch_sequence=0,
+            chunk_sequence=0,
+            delivery_sequence=0,
+            token=second_token,
+        ),
+        _v2_batch(
+            sequence=6,
+            logical_offset=0,
+            batch_sequence=0,
+            rows=1,
+            response_bytes=2048,
+            delivery_sequence=9,
+            token=second_token,
+        ),
+        _v2_end(
+            [101],
+            sequence=7,
+            chunks=1,
+            batches=1,
+            response_bytes=2048,
+            token=first_token,
+        ),
+        _v2_end(
+            [202],
+            sequence=8,
+            chunks=1,
+            batches=1,
+            response_bytes=2048,
+            token=second_token,
+        ),
+    )
+    _v2_write_log(
+        logs / "concurrent.tdbrl",
+        frames,
+        terminal_counters=_v2_complete_counters(
+            records=8,
+            ids=2,
+            chunks=2,
+            batches=2,
+            requests=2,
+        ),
+    )
+
+    report = inspect_workload_logs(logs)
+
+    assert report["quality"]["suitable"] is True
+    assert report["batches"]["delivery_sequence"] == {
+        "nonzero_count": 2,
+        "minimum": 9,
+        "maximum": 10,
+        "span": 2,
+        "unobserved_within_span": 0,
+        "physical_inversions": 1,
+    }

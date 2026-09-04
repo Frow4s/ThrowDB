@@ -1028,22 +1028,25 @@ ctest --test-dir build/server-release \
   -R 'throwdb_(read_workload_log|grpc_server)_tests'
 ```
 
-It covers the binary header/frame CRCs, crash-torn tails, bounded oversized
-request sampling, queue saturation, idle checkpoint stability, rotation,
-exact terminal-to-opening counter baselines, retained-window loss accounting,
-private permissions, exclusive ownership, minimum-free-space pause, runtime
-fail-open behavior, terminal-checkpoint finalization, write-rate and retained
-file-count limits, retention, and the actual unary/streaming gRPC hooks. It
-also verifies that an unused pre-bind segment is removed and that
-minimum-free-space or finalization failure never publishes `.tdbrl`.
+It covers binary header/frame CRCs, exact multi-chunk request reconstruction,
+original ID order and digests, concurrent producer admission, request
+completion/failure/cancellation, queue saturation, crash-torn tails, idle
+checkpoint stability, rotation, exact terminal-to-opening baselines,
+retained-window loss accounting, private permissions, exclusive ownership,
+minimum-free-space pause, runtime fail-open behavior, terminal-checkpoint
+finalization, write-rate/file-count/retention bounds, and the actual
+unary/streaming gRPC hooks. It also verifies that an unused pre-bind segment is
+removed and that minimum-free-space or finalization failure never publishes
+`.tdbrl`.
 
 Functional tests do not establish the production overhead of shared atomic
-counters and sampled ID copying. Before enabling telemetry on a high-QPS
+counters, exact ID copying, and profiled native reads. Before enabling
+telemetry on a high-QPS
 collection, run the existing gRPC benchmark twice on the same isolated host,
 reader profile, deterministic corpus, cache mode, and repetition count:
 
 1. server without `--read-log-dir`;
-2. server with `--read-log-dir` and the intended sampling/cap settings.
+2. server with `--read-log-dir` and the intended chunk/resource bounds.
 
 Use a new result directory for each run. Compare client throughput and
 P50/P95/P99 latency by identical query digest, plus server CPU, RSS, cgroup
@@ -1064,23 +1067,27 @@ Finally stop the server cleanly and run:
 throwdb workload inspect \
   --logs "$READ_LOG_DIR" \
   --storage "$STORE" \
-  --max-drop-ratio 0.05 \
-  --max-row-drop-ratio 0.05 \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
   --require-suitable \
   --output "$RESULTS/workload-inspection.json"
 ```
 
-The optimizer must consume only a suitable report. `.open`, stale/missing
-terminal checkpoints, missing or discontinuous opening baselines, sequence
-gaps, counter regressions, excessive retained-window event or row loss, and
-corrupt finalized files all fail the suitability gate. Inspector
-inputs are themselves hard-bounded; use `--max-files`,
+The optimizer must consume only a suitable, exact-capture report. Interior
+request/chunk gaps, stale/missing terminal checkpoints, missing or
+discontinuous opening baselines, sequence gaps, counter regressions, any
+retained-window record/row loss, and corrupt finalized files fail the
+suitability gate. Retention-boundary left/right censoring is reported and
+excluded rather than used as a partial request. Inspector inputs are themselves
+hard-bounded; use `--max-files`,
 `--max-total-bytes`, `--max-file-bytes`, `--max-report-entries`, and
-`--max-prefix-entries` when a deliberate test corpus exceeds the defaults.
+`--max-prefix-entries` (plus the active-request bound) when a deliberate test
+corpus exceeds the defaults.
 The file inventory has a non-overridable 65536-entry ceiling; split a larger
 offline corpus rather than making one inspection walk unbounded.
 A logger overhead regression does not justify relaxing fail-open or resource
-bounds; tune the sampling rate and maximum IDs per event instead.
+bounds. Adjust ID chunk size, queue/write/retention capacity, or leave
+telemetry disabled while investigating.
 
 ## Internal I/O workers versus reader concurrency
 

@@ -226,7 +226,28 @@ void test_profiled_execute_reports_plan_and_matches_default_output() {
     require(
         stats.planned_read_bytes == 4 * kRecordSize,
         "merged planned byte count is wrong");
+    require(
+        stats.requested_bytes == 3 * kRecordSize
+            && stats.completed_read_bytes == 4 * kRecordSize
+            && stats.useful_read_bytes == 3 * kRecordSize
+            && stats.gap_bytes == kRecordSize
+            && stats.overread_bytes == kRecordSize,
+        "profiled byte amplification metrics are wrong");
+    require(
+        stats.unique_file_count == 1
+            && stats.pages_touched == 1
+            && stats.page_runs == 1
+            && stats.chunks_touched == 1
+            && stats.chunk_runs == 1,
+        "profiled file/page/chunk metrics are wrong");
+    require(
+        stats.input_discontinuities == 2
+            && stats.input_inversions == 2
+            && stats.maximum_range_bytes == 4 * kRecordSize
+            && stats.mean_range_bytes == 4 * kRecordSize,
+        "profiled input-order/range metrics are wrong");
     require(stats.plan_seconds >= 0.0, "plan duration is negative");
+    require(stats.sort_seconds >= 0.0, "sort duration is negative");
     require(stats.backend_seconds >= 0.0, "backend duration is negative");
 }
 

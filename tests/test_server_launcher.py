@@ -329,9 +329,7 @@ def test_launcher_forwards_explicit_bounded_read_logging(
             native,
             "--read-log-dir",
             str(logs),
-            "--read-log-sample-ppm",
-            "25000",
-            "--read-log-max-ids-per-event",
+            "--read-log-id-chunk-rows",
             "8192",
             "--read-log-buffer-mib",
             "96",
@@ -354,8 +352,7 @@ def test_launcher_forwards_explicit_bounded_read_logging(
 
     expected = {
         "--read-log-dir": str(logs),
-        "--read-log-sample-ppm": "25000",
-        "--read-log-max-ids-per-event": "8192",
+        "--read-log-id-chunk-rows": "8192",
         "--read-log-buffer-mib": "96",
         "--read-log-segment-mib": "128",
         "--read-log-rotate-seconds": "900",
@@ -381,7 +378,7 @@ def test_launcher_keeps_read_logging_disabled_without_directory(
 
     assert not any(argument.startswith("--read-log-") for argument in plan.argv)
     for option, value in (
-        ("--read-log-sample-ppm", "1000"),
+        ("--read-log-id-chunk-rows", "8192"),
         ("--read-log-max-write-mib-per-second", "32"),
         ("--read-log-max-retained-files", "2048"),
     ):
@@ -414,21 +411,14 @@ def test_launcher_rejects_unsafe_or_unbounded_read_log_geometry(
                     str(unsafe),
                 )
             )
-    with pytest.raises(
-        server_module.ServerLaunchError,
-        match="hold two maximum-sized",
-    ):
-        server_module.build_server_launch_plan(
-            _args(
-                store,
-                native,
-                "--read-log-dir",
-                str(tmp_path / "logs"),
-                "--read-log-max-ids-per-event",
-                "65536",
-                "--read-log-buffer-mib",
-                "1",
-            )
+    with pytest.raises(SystemExit):
+        _args(
+            store,
+            native,
+            "--read-log-dir",
+            str(tmp_path / "logs"),
+            "--read-log-id-chunk-rows",
+            "8193",
         )
     with pytest.raises(
         server_module.ServerLaunchError,

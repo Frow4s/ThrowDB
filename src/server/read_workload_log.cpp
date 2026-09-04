@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <semaphore>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -34,25 +35,23 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr std::array<char, 8> kLogMagic{
-    'T', 'D', 'B', 'R', 'L', 'O', 'G', '1'};
+    'T', 'D', 'B', 'R', 'L', 'O', 'G', '2'};
 constexpr std::array<char, 8> kRecordMagic{
-    'T', 'D', 'B', 'R', 'R', 'E', 'C', '1'};
-constexpr std::uint32_t kLogVersion = 1;
-constexpr std::uint32_t kLogHeaderUsedBytes = 176;
-constexpr std::uint32_t kRecordVersion = 1;
-constexpr std::uint32_t kEventRecordKind = 1;
-constexpr std::uint32_t kCheckpointRecordKind = 2;
-constexpr std::uint32_t kCheckpointExtensionVersion = 2;
+    'T', 'D', 'B', 'R', 'R', 'E', 'C', '2'};
+constexpr std::uint32_t kLogVersion = 2;
+constexpr std::uint32_t kLogHeaderUsedBytes = 232;
+constexpr std::uint32_t kRecordVersion = 2;
+constexpr std::uint32_t kRequestBeginRecordKind = 1;
+constexpr std::uint32_t kIdChunkRecordKind = 2;
+constexpr std::uint32_t kBatchMetricRecordKind = 3;
+constexpr std::uint32_t kRequestEndRecordKind = 4;
+constexpr std::uint32_t kCheckpointRecordKind = 5;
+constexpr std::uint32_t kCheckpointExtensionVersion = 1;
 constexpr std::uint32_t kCheckpointFlagOpeningBaseline = 1U << 0U;
 constexpr std::uint32_t kRecordFlagExactSnapshot = 1U << 0U;
-constexpr std::uint32_t kRecordFlagTruncatedIds = 1U << 1U;
+constexpr std::uint32_t kRecordFlagDeclaredIdsKnown = 1U << 1U;
+constexpr std::uint32_t kRecordFlagCompleteForTraining = 1U << 0U;
 constexpr std::size_t kLogHeaderCrcOffset = 24;
-constexpr std::uint32_t kMaximumIdsPerEvent = 65'536;
-constexpr std::uint64_t kSampleDenominator = 1'000'000;
-constexpr std::uint64_t kEventSamplingDomain =
-    0x45564e5453414d50ULL;
-constexpr std::uint64_t kIdSelectionDomain =
-    0x494453454c454354ULL;
 constexpr std::uint64_t kCheckpointEventInterval = 1'024;
 constexpr std::uint64_t kMaximumScannedDirectoryEntries = 65'536;
 constexpr std::uint64_t kMaximumRetainedFiles =
@@ -123,6 +122,24 @@ private:
     const auto count =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     return count <= 0 ? 0 : static_cast<std::uint64_t>(count);
+}
+
+[[nodiscard]] std::uint64_t steady_time_ns() noexcept {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto count =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    return count <= 0 ? 0 : static_cast<std::uint64_t>(count);
+}
+
+[[nodiscard]] constexpr std::uint64_t steady_clock_resolution_ns() noexcept {
+    constexpr auto numerator =
+        std::uint64_t{1'000'000'000}
+        * static_cast<std::uint64_t>(std::chrono::steady_clock::period::num);
+    constexpr auto denominator =
+        static_cast<std::uint64_t>(
+            std::chrono::steady_clock::period::den);
+    return std::max<std::uint64_t>(
+        1, (numerator + denominator - 1) / denominator);
 }
 
 [[nodiscard]] std::uint64_t saturating_add_value(
@@ -230,23 +247,6 @@ void put_u64(
     return value ^ (value >> 31U);
 }
 
-[[nodiscard]] std::uint64_t uniform_below(
-    std::uint64_t value,
-    const std::uint64_t bound) noexcept {
-    // At most two rejection attempts keep request-path CPU strictly bounded.
-    // The multiply-high fallback has per-bucket bias below 1 / 2^64 and is
-    // reached only through the already tiny double-rejection tail.
-    const auto threshold = (std::uint64_t{0} - bound) % bound;
-    for (unsigned int attempt = 0; attempt != 2; ++attempt) {
-        if (value >= threshold) {
-            return value % bound;
-        }
-        value = splitmix64(value);
-    }
-    return static_cast<std::uint64_t>(
-        (static_cast<unsigned __int128>(value) * bound) >> 64U);
-}
-
 [[nodiscard]] std::string hex_u64(const std::uint64_t value) {
     std::ostringstream output;
     output << std::hex << std::setfill('0') << std::setw(16) << value;
@@ -331,6 +331,18 @@ void sync_file(const int fd, const std::filesystem::path& path) {
     }
 }
 
+void evict_file_cache_best_effort(const int fd) noexcept {
+#if defined(POSIX_FADV_DONTNEED)
+    // Telemetry is consumed offline and should not displace collection data
+    // from the page cache. The hint is deliberately non-fatal and is issued
+    // only after fsync has made the segment durable.
+    static_cast<void>(
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED));
+#else
+    static_cast<void>(fd);
+#endif
+}
+
 void sync_directory(
     const int fd,
     const std::filesystem::path& path) {
@@ -389,19 +401,22 @@ void validate_options(
         throw InvalidArgumentError(
             "read-workload log directory must not be empty");
     }
-    if (options.sample_rate_ppm == 0
-        || options.sample_rate_ppm > kSampleDenominator) {
+    if (options.id_chunk_rows == 0
+        || options.id_chunk_rows > kReadWorkloadMaximumIdChunkRows) {
         throw InvalidArgumentError(
-            "read-workload sample rate must be in [1, 1000000] ppm");
+            "read-workload ID chunk rows must be in [1, 8192]");
     }
-    if (options.max_ids_per_event == 0
-        || options.max_ids_per_event > kMaximumIdsPerEvent) {
+    if (options.max_active_requests == 0
+        || options.max_active_requests
+               > kReadWorkloadMaximumActiveRequests) {
         throw InvalidArgumentError(
-            "read-workload max IDs per event must be in [1, 65536]");
+            "read-workload max active requests must be in [1, 65536]");
     }
-    const auto maximum_frame =
+    const auto maximum_frame = std::max<std::uint64_t>(
+        kReadWorkloadBatchRecordBytes,
         kReadWorkloadRecordHeaderBytes
-        + std::uint64_t{options.max_ids_per_event} * sizeof(std::uint64_t);
+            + std::uint64_t{options.id_chunk_rows}
+                  * sizeof(std::uint64_t));
     if (maximum_frame
             > std::numeric_limits<std::uint64_t>::max() / 2
         || options.buffer_bytes < maximum_frame * 2
@@ -409,14 +424,14 @@ void validate_options(
                > static_cast<std::uint64_t>(
                    std::numeric_limits<std::size_t>::max())) {
         throw InvalidArgumentError(
-            "read-workload buffer must hold at least two maximum events");
+            "read-workload buffer must hold at least two maximum records");
     }
     if (options.segment_bytes
         < kReadWorkloadLogHeaderBytes
               + 2 * kReadWorkloadRecordHeaderBytes + maximum_frame) {
         throw InvalidArgumentError(
             "read-workload segment must hold its header, opening checkpoint, "
-            "one maximum event, and terminal checkpoint");
+            "one maximum record, and terminal checkpoint");
     }
     if (options.rotate_seconds == 0
         || options.rotate_seconds
@@ -436,7 +451,7 @@ void validate_options(
         + 2 * kReadWorkloadRecordHeaderBytes;
     if (options.max_write_bytes_per_second < maximum_write_transaction) {
         throw InvalidArgumentError(
-            "read-workload write budget must cover one maximum event, a "
+            "read-workload write budget must cover one maximum record, a "
             "segment header, opening checkpoint, and terminal checkpoint "
             "per second");
     }
@@ -460,6 +475,54 @@ void validate_options(
         != std::uint64_t{collection.dimension} * item_size) {
         throw InvalidArgumentError(
             "read-workload record size does not match dimension and dtype");
+    }
+    if (collection.reader_backend > 2
+        || collection.metric_page_bytes == 0
+        || (collection.metric_page_bytes
+            & (collection.metric_page_bytes - 1))
+               != 0
+        || collection.metric_chunk_bytes < collection.metric_page_bytes
+        || (collection.metric_chunk_bytes
+            & (collection.metric_chunk_bytes - 1))
+               != 0
+        || collection.tuning_explicit_overrides > 0xffU) {
+        throw InvalidArgumentError(
+            "read-workload reader context is invalid");
+    }
+    constexpr std::uint32_t maximum_io_workers = 1'024;
+    constexpr std::uint32_t maximum_io_queue_capacity = 1U << 20;
+    constexpr std::uint32_t maximum_io_ranges_per_task = 1U << 20;
+    constexpr std::uint32_t maximum_io_uring_queue_depth = 4'096;
+    constexpr std::uint32_t maximum_io_uring_workers = 64;
+    if ((collection.reader_backend == 1 || collection.reader_backend == 2)
+        && (collection.io_ranges_per_task == 0
+            || collection.io_ranges_per_task
+                   > maximum_io_ranges_per_task
+            || collection.max_read_range_bytes
+                   < collection.record_size_bytes
+            || collection.io_uring_queue_depth == 0
+            || collection.io_uring_queue_depth
+                   > maximum_io_uring_queue_depth
+            || collection.io_uring_workers == 0
+            || collection.io_uring_workers > maximum_io_uring_workers
+            || collection.io_uring_queue_depth
+                   < collection.io_uring_workers)) {
+        throw InvalidArgumentError(
+            "read-workload reader context is invalid");
+    }
+    if (collection.reader_backend == 1
+        && (collection.io_workers > maximum_io_workers
+            || collection.io_queue_capacity > maximum_io_queue_capacity
+            || (collection.io_workers == 0
+                && collection.io_queue_capacity != 0))) {
+        throw InvalidArgumentError(
+            "read-workload thread-pool context is invalid");
+    }
+    if (collection.reader_backend == 2
+        && (collection.io_workers != 0
+            || collection.io_queue_capacity != 0)) {
+        throw InvalidArgumentError(
+            "read-workload io_uring context is invalid");
     }
 }
 
@@ -494,8 +557,8 @@ encode_log_header(
     put_u64(header, 64, instance_low);
     put_u64(header, 72, instance_high);
     put_u64(header, 80, created_ns);
-    put_u32(header, 88, options.sample_rate_ppm);
-    put_u32(header, 92, options.max_ids_per_event);
+    put_u32(header, 88, options.id_chunk_rows);
+    put_u32(header, 92, options.max_active_requests);
     put_u64(header, 96, options.buffer_bytes);
     put_u64(header, 104, options.segment_bytes);
     put_u64(header, 112, options.rotate_seconds);
@@ -506,6 +569,17 @@ encode_log_header(
     put_u64(header, 152, segment_sequence);
     put_u64(header, 160, options.max_write_bytes_per_second);
     put_u64(header, 168, options.max_retained_files);
+    put_u32(header, 176, collection.reader_backend);
+    put_u32(header, 180, collection.io_workers);
+    put_u32(header, 184, collection.io_queue_capacity);
+    put_u32(header, 188, collection.io_ranges_per_task);
+    put_u64(header, 192, collection.max_read_range_bytes);
+    put_u64(header, 200, collection.max_gap_bytes);
+    put_u32(header, 208, collection.io_uring_queue_depth);
+    put_u32(header, 212, collection.io_uring_workers);
+    put_u32(header, 216, collection.metric_page_bytes);
+    put_u32(header, 220, collection.metric_chunk_bytes);
+    put_u32(header, 224, collection.tuning_explicit_overrides);
     put_u32(
         header,
         kLogHeaderCrcOffset,
@@ -562,26 +636,30 @@ encode_directory_marker(
 }
 
 struct AtomicStats {
-    std::atomic<std::uint64_t> observed_events{0};
+    std::atomic<std::uint64_t> observed_requests{0};
+    std::atomic<std::uint64_t> begun_requests{0};
+    std::atomic<std::uint64_t> completed_requests{0};
+    std::atomic<std::uint64_t> complete_requests{0};
+    std::atomic<std::uint64_t> incomplete_requests{0};
+    std::atomic<std::uint64_t> observed_records{0};
+    std::atomic<std::uint64_t> enqueued_records{0};
+    std::atomic<std::uint64_t> written_records{0};
+    std::atomic<std::uint64_t> observed_id_chunks{0};
+    std::atomic<std::uint64_t> enqueued_id_chunks{0};
+    std::atomic<std::uint64_t> written_id_chunks{0};
+    std::atomic<std::uint64_t> observed_batches{0};
+    std::atomic<std::uint64_t> enqueued_batches{0};
+    std::atomic<std::uint64_t> written_batches{0};
     std::atomic<std::uint64_t> observed_ids{0};
-    std::atomic<std::uint64_t> unsampled_events{0};
-    std::atomic<std::uint64_t> sampled_events{0};
-    std::atomic<std::uint64_t> enqueued_events{0};
-    std::atomic<std::uint64_t> written_events{0};
-    std::atomic<std::uint64_t> captured_ids{0};
-    std::atomic<std::uint64_t> truncated_events{0};
-    std::atomic<std::uint64_t> sampled_ids{0};
     std::atomic<std::uint64_t> enqueued_ids{0};
     std::atomic<std::uint64_t> written_ids{0};
-    std::atomic<std::uint64_t> dropped_busy{0};
-    std::atomic<std::uint64_t> dropped_busy_ids{0};
-    std::atomic<std::uint64_t> dropped_full{0};
+    std::atomic<std::uint64_t> dropped_full_records{0};
     std::atomic<std::uint64_t> dropped_full_ids{0};
-    std::atomic<std::uint64_t> dropped_runtime_failure{0};
+    std::atomic<std::uint64_t> dropped_runtime_failure_records{0};
     std::atomic<std::uint64_t> dropped_runtime_failure_ids{0};
-    std::atomic<std::uint64_t> dropped_min_free{0};
+    std::atomic<std::uint64_t> dropped_min_free_records{0};
     std::atomic<std::uint64_t> dropped_min_free_ids{0};
-    std::atomic<std::uint64_t> dropped_io_budget{0};
+    std::atomic<std::uint64_t> dropped_io_budget_records{0};
     std::atomic<std::uint64_t> dropped_io_budget_ids{0};
     std::atomic<std::uint64_t> write_errors{0};
     std::atomic<std::uint64_t> bytes_written{0};
@@ -591,9 +669,10 @@ struct AtomicStats {
     std::atomic<std::uint64_t> retained_segments{0};
     std::atomic<std::uint64_t> retention_deleted_bytes{0};
     std::atomic<std::uint64_t> retention_deleted_segments{0};
-    std::atomic<std::uint64_t> queued_events{0};
+    std::atomic<std::uint64_t> queued_records{0};
     std::atomic<std::uint64_t> queued_bytes{0};
     std::atomic<std::uint64_t> peak_queued_bytes{0};
+    std::atomic<std::uint64_t> active_requests{0};
     std::atomic<int> last_error_number{0};
     std::atomic<bool> paused_for_min_free{false};
     std::atomic<bool> runtime_failed{false};
@@ -601,26 +680,30 @@ struct AtomicStats {
 };
 
 struct CounterSnapshot {
-    std::uint64_t observed_events = 0;
+    std::uint64_t observed_requests = 0;
+    std::uint64_t begun_requests = 0;
+    std::uint64_t completed_requests = 0;
+    std::uint64_t complete_requests = 0;
+    std::uint64_t incomplete_requests = 0;
+    std::uint64_t observed_records = 0;
+    std::uint64_t enqueued_records = 0;
+    std::uint64_t written_records = 0;
     std::uint64_t observed_ids = 0;
-    std::uint64_t unsampled_events = 0;
-    std::uint64_t sampled_events = 0;
-    std::uint64_t enqueued_events = 0;
-    std::uint64_t written_events = 0;
-    std::uint64_t captured_ids = 0;
-    std::uint64_t truncated_events = 0;
-    std::uint64_t sampled_ids = 0;
     std::uint64_t enqueued_ids = 0;
     std::uint64_t written_ids = 0;
-    std::uint64_t dropped_busy = 0;
-    std::uint64_t dropped_busy_ids = 0;
-    std::uint64_t dropped_full = 0;
+    std::uint64_t observed_id_chunks = 0;
+    std::uint64_t enqueued_id_chunks = 0;
+    std::uint64_t written_id_chunks = 0;
+    std::uint64_t observed_batches = 0;
+    std::uint64_t enqueued_batches = 0;
+    std::uint64_t written_batches = 0;
+    std::uint64_t dropped_full_records = 0;
     std::uint64_t dropped_full_ids = 0;
-    std::uint64_t dropped_runtime_failure = 0;
+    std::uint64_t dropped_runtime_failure_records = 0;
     std::uint64_t dropped_runtime_failure_ids = 0;
-    std::uint64_t dropped_min_free = 0;
+    std::uint64_t dropped_min_free_records = 0;
     std::uint64_t dropped_min_free_ids = 0;
-    std::uint64_t dropped_io_budget = 0;
+    std::uint64_t dropped_io_budget_records = 0;
     std::uint64_t dropped_io_budget_ids = 0;
     std::uint64_t write_errors = 0;
     std::uint64_t bytes_written = 0;
@@ -633,47 +716,56 @@ struct CounterSnapshot {
 [[nodiscard]] CounterSnapshot counter_snapshot(
     const AtomicStats& stats) noexcept {
     CounterSnapshot result;
-    result.observed_events =
-        stats.observed_events.load(std::memory_order_relaxed);
+    result.observed_requests =
+        stats.observed_requests.load(std::memory_order_relaxed);
+    result.begun_requests =
+        stats.begun_requests.load(std::memory_order_relaxed);
+    result.completed_requests =
+        stats.completed_requests.load(std::memory_order_relaxed);
+    result.complete_requests =
+        stats.complete_requests.load(std::memory_order_relaxed);
+    result.incomplete_requests =
+        stats.incomplete_requests.load(std::memory_order_relaxed);
+    result.observed_records =
+        stats.observed_records.load(std::memory_order_relaxed);
+    result.enqueued_records =
+        stats.enqueued_records.load(std::memory_order_relaxed);
+    result.written_records =
+        stats.written_records.load(std::memory_order_relaxed);
     result.observed_ids =
         stats.observed_ids.load(std::memory_order_relaxed);
-    result.unsampled_events =
-        stats.unsampled_events.load(std::memory_order_relaxed);
-    result.sampled_events =
-        stats.sampled_events.load(std::memory_order_relaxed);
-    result.enqueued_events =
-        stats.enqueued_events.load(std::memory_order_relaxed);
-    result.written_events =
-        stats.written_events.load(std::memory_order_relaxed);
-    result.captured_ids =
-        stats.captured_ids.load(std::memory_order_relaxed);
-    result.truncated_events =
-        stats.truncated_events.load(std::memory_order_relaxed);
-    result.sampled_ids =
-        stats.sampled_ids.load(std::memory_order_relaxed);
     result.enqueued_ids =
         stats.enqueued_ids.load(std::memory_order_relaxed);
     result.written_ids =
         stats.written_ids.load(std::memory_order_relaxed);
-    result.dropped_busy =
-        stats.dropped_busy.load(std::memory_order_relaxed);
-    result.dropped_busy_ids =
-        stats.dropped_busy_ids.load(std::memory_order_relaxed);
-    result.dropped_full =
-        stats.dropped_full.load(std::memory_order_relaxed);
+    result.observed_id_chunks =
+        stats.observed_id_chunks.load(std::memory_order_relaxed);
+    result.enqueued_id_chunks =
+        stats.enqueued_id_chunks.load(std::memory_order_relaxed);
+    result.written_id_chunks =
+        stats.written_id_chunks.load(std::memory_order_relaxed);
+    result.observed_batches =
+        stats.observed_batches.load(std::memory_order_relaxed);
+    result.enqueued_batches =
+        stats.enqueued_batches.load(std::memory_order_relaxed);
+    result.written_batches =
+        stats.written_batches.load(std::memory_order_relaxed);
+    result.dropped_full_records =
+        stats.dropped_full_records.load(std::memory_order_relaxed);
     result.dropped_full_ids =
         stats.dropped_full_ids.load(std::memory_order_relaxed);
-    result.dropped_runtime_failure =
-        stats.dropped_runtime_failure.load(std::memory_order_relaxed);
+    result.dropped_runtime_failure_records =
+        stats.dropped_runtime_failure_records.load(
+            std::memory_order_relaxed);
     result.dropped_runtime_failure_ids =
         stats.dropped_runtime_failure_ids.load(
             std::memory_order_relaxed);
-    result.dropped_min_free =
-        stats.dropped_min_free.load(std::memory_order_relaxed);
+    result.dropped_min_free_records =
+        stats.dropped_min_free_records.load(std::memory_order_relaxed);
     result.dropped_min_free_ids =
         stats.dropped_min_free_ids.load(std::memory_order_relaxed);
-    result.dropped_io_budget =
-        stats.dropped_io_budget.load(std::memory_order_relaxed);
+    result.dropped_io_budget_records =
+        stats.dropped_io_budget_records.load(std::memory_order_relaxed);
     result.dropped_io_budget_ids =
         stats.dropped_io_budget_ids.load(std::memory_order_relaxed);
     result.write_errors =
@@ -685,46 +777,28 @@ struct CounterSnapshot {
     result.rotated_segments =
         stats.rotated_segments.load(std::memory_order_relaxed);
 
-    // Producers update several independent saturating atomics without a
-    // global lock. A raw relaxed snapshot may therefore observe a child
-    // counter after its parent was loaded (for example enqueued=11 while
-    // sampled=10). Preserve the hot path and normalize only the serialized
-    // snapshot into conservative monotonic lower bounds. This also makes
-    // periodic checkpoints semantically valid while requests are active.
-    const auto dropped = saturating_add_value(
-        saturating_add_value(
-            result.dropped_busy, result.dropped_full),
-        saturating_add_value(
-            saturating_add_value(
-                result.dropped_runtime_failure,
-                result.dropped_min_free),
-            result.dropped_io_budget));
-    const auto dropped_ids = saturating_add_value(
-        saturating_add_value(
-            result.dropped_busy_ids, result.dropped_full_ids),
-        saturating_add_value(
-            saturating_add_value(
-                result.dropped_runtime_failure_ids,
-                result.dropped_min_free_ids),
-            result.dropped_io_budget_ids));
-    result.enqueued_events = std::max(
-        {result.enqueued_events,
-         result.written_events,
-         result.truncated_events});
-    result.sampled_events = std::max(
-        {result.sampled_events, result.enqueued_events, dropped});
-    result.enqueued_ids = std::max(
-        {result.enqueued_ids,
-         result.written_ids,
-         result.captured_ids});
-    result.sampled_ids = std::max(
-        {result.sampled_ids, result.enqueued_ids, dropped_ids});
-    result.observed_events = std::max(
-        result.observed_events,
-        saturating_add_value(
-            result.sampled_events, result.unsampled_events));
-    result.observed_ids = std::max(
-        {result.observed_ids, result.captured_ids, result.sampled_ids});
+    result.completed_requests = saturating_add_value(
+        result.complete_requests, result.incomplete_requests);
+    result.observed_requests = std::max(
+        {result.observed_requests,
+         result.begun_requests,
+         result.completed_requests});
+    result.enqueued_records =
+        std::max(result.enqueued_records, result.written_records);
+    result.observed_records =
+        std::max(result.observed_records, result.enqueued_records);
+    result.enqueued_ids =
+        std::max(result.enqueued_ids, result.written_ids);
+    result.observed_ids =
+        std::max(result.observed_ids, result.enqueued_ids);
+    result.enqueued_id_chunks =
+        std::max(result.enqueued_id_chunks, result.written_id_chunks);
+    result.observed_id_chunks =
+        std::max(result.observed_id_chunks, result.enqueued_id_chunks);
+    result.enqueued_batches =
+        std::max(result.enqueued_batches, result.written_batches);
+    result.observed_batches =
+        std::max(result.observed_batches, result.enqueued_batches);
     result.segments_created =
         std::max(result.segments_created, result.rotated_segments);
     return result;
@@ -733,42 +807,31 @@ struct CounterSnapshot {
 void encode_counter_snapshot(
     const std::span<std::byte> output,
     const CounterSnapshot& counters) noexcept {
-    put_u64(output, 128, counters.observed_events);
-    put_u64(output, 136, counters.observed_ids);
-    put_u64(output, 144, counters.unsampled_events);
-    put_u64(output, 152, counters.sampled_events);
-    put_u64(output, 160, counters.enqueued_events);
-    put_u64(output, 168, counters.written_events);
-    put_u64(output, 176, counters.captured_ids);
-    put_u64(output, 184, counters.truncated_events);
-    put_u64(output, 192, counters.dropped_busy);
-    put_u64(output, 200, counters.dropped_full);
-    put_u64(output, 208, counters.dropped_runtime_failure);
-    put_u64(output, 216, counters.dropped_min_free);
-    put_u64(output, 224, counters.write_errors);
-    put_u64(output, 232, counters.bytes_written);
-    put_u64(output, 240, counters.segments_created);
-    put_u64(output, 248, counters.rotated_segments);
-}
-
-void encode_checkpoint_extension(
-    const std::span<std::byte> output,
-    const CounterSnapshot& counters,
-    const bool opening_baseline) noexcept {
-    put_u32(output, 28, kCheckpointExtensionVersion);
-    put_u32(
-        output,
-        32,
-        opening_baseline ? kCheckpointFlagOpeningBaseline : 0);
-    put_u64(output, 56, counters.sampled_ids);
-    put_u64(output, 64, counters.enqueued_ids);
-    put_u64(output, 72, counters.written_ids);
-    put_u64(output, 80, counters.dropped_busy_ids);
-    put_u64(output, 88, counters.dropped_full_ids);
-    put_u64(output, 96, counters.dropped_runtime_failure_ids);
-    put_u64(output, 104, counters.dropped_min_free_ids);
-    put_u64(output, 112, counters.dropped_io_budget);
-    put_u64(output, 120, counters.dropped_io_budget_ids);
+    put_u64(output, 56, counters.observed_requests);
+    put_u64(output, 64, counters.begun_requests);
+    put_u64(output, 72, counters.completed_requests);
+    put_u64(output, 80, counters.complete_requests);
+    put_u64(output, 88, counters.incomplete_requests);
+    put_u64(output, 96, counters.observed_records);
+    put_u64(output, 104, counters.enqueued_records);
+    put_u64(output, 112, counters.written_records);
+    put_u64(output, 120, counters.observed_ids);
+    put_u64(output, 128, counters.enqueued_ids);
+    put_u64(output, 136, counters.written_ids);
+    put_u64(output, 144, counters.observed_id_chunks);
+    put_u64(output, 152, counters.enqueued_id_chunks);
+    put_u64(output, 160, counters.written_id_chunks);
+    put_u64(output, 168, counters.observed_batches);
+    put_u64(output, 176, counters.enqueued_batches);
+    put_u64(output, 184, counters.written_batches);
+    put_u64(output, 192, counters.dropped_full_records);
+    put_u64(output, 200, counters.dropped_full_ids);
+    put_u64(output, 208, counters.dropped_runtime_failure_records);
+    put_u64(output, 216, counters.dropped_runtime_failure_ids);
+    put_u64(output, 224, counters.dropped_min_free_records);
+    put_u64(output, 232, counters.dropped_min_free_ids);
+    put_u64(output, 240, counters.dropped_io_budget_records);
+    put_u64(output, 248, counters.dropped_io_budget_ids);
 }
 
 [[nodiscard]] bool counters_equal(
@@ -776,28 +839,35 @@ void encode_checkpoint_extension(
     const CounterSnapshot& right) noexcept {
     // Storage bookkeeping changes when a checkpoint is appended. It must not
     // make that same checkpoint look dirty forever during an idle period.
-    return left.observed_events == right.observed_events
+    return left.observed_requests == right.observed_requests
+           && left.begun_requests == right.begun_requests
+           && left.completed_requests == right.completed_requests
+           && left.complete_requests == right.complete_requests
+           && left.incomplete_requests == right.incomplete_requests
+           && left.observed_records == right.observed_records
+           && left.enqueued_records == right.enqueued_records
+           && left.written_records == right.written_records
            && left.observed_ids == right.observed_ids
-           && left.unsampled_events == right.unsampled_events
-           && left.sampled_events == right.sampled_events
-           && left.enqueued_events == right.enqueued_events
-           && left.written_events == right.written_events
-           && left.captured_ids == right.captured_ids
-           && left.truncated_events == right.truncated_events
-           && left.sampled_ids == right.sampled_ids
            && left.enqueued_ids == right.enqueued_ids
            && left.written_ids == right.written_ids
-           && left.dropped_busy == right.dropped_busy
-           && left.dropped_busy_ids == right.dropped_busy_ids
-           && left.dropped_full == right.dropped_full
+           && left.observed_id_chunks == right.observed_id_chunks
+           && left.enqueued_id_chunks == right.enqueued_id_chunks
+           && left.written_id_chunks == right.written_id_chunks
+           && left.observed_batches == right.observed_batches
+           && left.enqueued_batches == right.enqueued_batches
+           && left.written_batches == right.written_batches
+           && left.dropped_full_records
+                  == right.dropped_full_records
            && left.dropped_full_ids == right.dropped_full_ids
-           && left.dropped_runtime_failure
-                  == right.dropped_runtime_failure
+           && left.dropped_runtime_failure_records
+                  == right.dropped_runtime_failure_records
            && left.dropped_runtime_failure_ids
                   == right.dropped_runtime_failure_ids
-           && left.dropped_min_free == right.dropped_min_free
+           && left.dropped_min_free_records
+                  == right.dropped_min_free_records
            && left.dropped_min_free_ids == right.dropped_min_free_ids
-           && left.dropped_io_budget == right.dropped_io_budget
+           && left.dropped_io_budget_records
+                  == right.dropped_io_budget_records
            && left.dropped_io_budget_ids == right.dropped_io_budget_ids
            && left.write_errors == right.write_errors;
 }
@@ -836,31 +906,34 @@ enum class PrepareEventResult {
 
 }  // namespace
 
-class ReadWorkloadLogger::Impl {
+class ReadWorkloadLogImpl {
 public:
-    Impl(
+    ReadWorkloadLogImpl(
         ReadWorkloadLogOptions options,
         ReadWorkloadCollectionInfo collection)
         : options_(validated_options(std::move(options), collection)),
           collection_(collection),
-          maximum_frame_bytes_(
+          maximum_frame_bytes_(std::max<std::size_t>(
+              kReadWorkloadBatchRecordBytes,
               kReadWorkloadRecordHeaderBytes
-              + std::size_t{options_.max_ids_per_event}
-                    * sizeof(std::uint64_t)),
+                  + std::size_t{options_.id_chunk_rows}
+                        * sizeof(std::uint64_t))),
           slot_count_(
               static_cast<std::size_t>(
                   options_.buffer_bytes / maximum_frame_bytes_)),
           queue_storage_(slot_count_ * maximum_frame_bytes_),
-          slot_sizes_(slot_count_, 0),
+          queue_slots_(std::make_unique<QueueSlot[]>(slot_count_)),
           retention_sweep_interval_(std::chrono::seconds(
               std::min(
                   options_.retention_seconds,
                   kMaximumRetentionSweepSeconds))) {
+        for (std::size_t index = 0; index != slot_count_; ++index) {
+            queue_slots_[index].sequence.store(
+                index, std::memory_order_relaxed);
+        }
         const auto ids = random_instance_id();
         instance_low_ = ids.first;
         instance_high_ = ids.second;
-        random_seed_ = splitmix64(
-            instance_low_ ^ splitmix64(instance_high_) ^ unix_time_ns());
         prepare_directory_and_lock();
         prune_retention();
         constexpr std::uint64_t segment_bootstrap_bytes =
@@ -872,7 +945,7 @@ public:
         }
     }
 
-    ~Impl() {
+    ~ReadWorkloadLogImpl() {
         shutdown();
     }
 
@@ -880,209 +953,414 @@ public:
         worker_ = std::thread([this] { run(); });
     }
 
-    [[nodiscard]] bool try_log(
-        const ReadWorkloadMethod method,
-        const std::span<const std::uint64_t> ids,
-        const ReadWorkloadSnapshot snapshot,
-        const std::uint32_t prefix_dimensions) noexcept {
+    [[nodiscard]] bool begin_request(
+        ReadWorkloadRequestHandle& request,
+        const ReadWorkloadRequestInfo& info) noexcept {
+        if ((info.method != ReadWorkloadMethod::Get
+             && info.method != ReadWorkloadMethod::StreamGet)
+            || info.prefix_dimensions == 0
+            || info.prefix_dimensions > collection_.dimension) {
+            return false;
+        }
+        ProducerGuard producer_guard(producers_inflight_);
+        bool active_admitted = false;
+        bool lifecycle_begun = false;
+        const auto reject_before_begin =
+            [this]() noexcept {
+                atomic_add_saturating(stats_.incomplete_requests);
+                atomic_add_saturating(stats_.completed_requests);
+                atomic_add_saturating(stats_.observed_requests);
+            };
         try {
-            // Empty Gets carry no locality signal and the v1 record contract
-            // reserves event frames for non-empty requests.
-            if (ids.empty() || prefix_dimensions == 0
-                || prefix_dimensions > collection_.dimension) {
-                return false;
-            }
             if (stats_.runtime_failed.load(std::memory_order_acquire)
                 || stats_.shutting_down.load(std::memory_order_acquire)) {
-                return false;
-            }
-            const auto original_ids =
-                static_cast<std::uint64_t>(ids.size());
-            const auto sequence =
-                event_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-            atomic_add_saturating(stats_.observed_events);
-            atomic_add_saturating(
-                stats_.observed_ids,
-                original_ids);
-            const auto event_sample_seed = splitmix64(
-                random_seed_
-                ^ splitmix64(sequence ^ kEventSamplingDomain));
-            const auto selection_seed = splitmix64(
-                random_seed_
-                ^ splitmix64(sequence ^ kIdSelectionDomain));
-            if (!sampled(event_sample_seed)) {
-                atomic_add_saturating(stats_.unsampled_events);
-                return false;
-            }
-            atomic_add_saturating(stats_.sampled_events);
-            atomic_add_saturating(stats_.sampled_ids, original_ids);
-
-            if (stats_.shutting_down.load(std::memory_order_acquire)
-                || stats_.runtime_failed.load(std::memory_order_acquire)) {
-                atomic_add_saturating(stats_.dropped_runtime_failure);
+                reject_before_begin();
+                atomic_add_saturating(stats_.observed_records);
                 atomic_add_saturating(
-                    stats_.dropped_runtime_failure_ids, original_ids);
+                    stats_.dropped_runtime_failure_records);
                 return false;
             }
             if (stats_.paused_for_min_free.load(
-                    std::memory_order_acquire)) {
-                atomic_add_saturating(stats_.dropped_min_free);
-                atomic_add_saturating(
-                    stats_.dropped_min_free_ids, original_ids);
+                std::memory_order_acquire)) {
+                reject_before_begin();
+                atomic_add_saturating(stats_.observed_records);
+                atomic_add_saturating(stats_.dropped_min_free_records);
                 return false;
             }
+            auto active =
+                stats_.active_requests.load(std::memory_order_relaxed);
+            while (true) {
+                if (active >= options_.max_active_requests) {
+                    reject_before_begin();
+                    atomic_add_saturating(stats_.observed_records);
+                    atomic_add_saturating(stats_.dropped_full_records);
+                    return false;
+                }
+                if (stats_.active_requests.compare_exchange_weak(
+                        active,
+                        active + 1,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    active_admitted = true;
+                    break;
+                }
+            }
+            // Publish lifecycle admission before the BEGIN queue slot becomes
+            // visible to the writer. A rotation checkpoint can therefore
+            // always derive the correct number of requests whose BEGIN lies
+            // just before the retained window, without waiting for every
+            // producer to become quiescent.
+            atomic_add_saturating(stats_.begun_requests);
+            atomic_add_saturating(stats_.observed_requests);
+            lifecycle_begun = true;
 
-            const auto captured = std::min<std::size_t>(
-                ids.size(), options_.max_ids_per_event);
-            const bool truncated = captured != ids.size();
-            const auto frame_bytes =
-                kReadWorkloadRecordHeaderBytes
-                + captured * sizeof(std::uint64_t);
+            request.request_id_low_ = info.request_id_low;
+            request.request_id_high_ = info.request_id_high;
+            if (request.request_id_low_ == 0
+                && request.request_id_high_ == 0) {
+                const auto number = request_sequence_.fetch_add(
+                                        1, std::memory_order_relaxed)
+                                    + 1;
+                request.request_id_low_ =
+                    splitmix64(instance_low_ ^ number);
+                request.request_id_high_ =
+                    splitmix64(instance_high_ + number);
+                if (request.request_id_low_ == 0
+                    && request.request_id_high_ == 0) {
+                    request.request_id_low_ = number;
+                }
+            }
+            request.started_steady_ns_ = steady_time_ns();
+            request.declared_ids_ = info.declared_ids;
 
-            if (!queue_mutex_.try_lock()) {
-                atomic_add_saturating(stats_.dropped_busy);
-                atomic_add_saturating(stats_.dropped_busy_ids, original_ids);
-                return false;
-            }
-            std::unique_lock queue_lock(queue_mutex_, std::adopt_lock);
-            if (queued_count_ == slot_count_) {
-                atomic_add_saturating(stats_.dropped_full);
-                atomic_add_saturating(stats_.dropped_full_ids, original_ids);
-                return false;
-            }
-            if (stats_.shutting_down.load(std::memory_order_relaxed)
-                || stats_.runtime_failed.load(std::memory_order_relaxed)) {
-                atomic_add_saturating(stats_.dropped_runtime_failure);
-                atomic_add_saturating(
-                    stats_.dropped_runtime_failure_ids, original_ids);
-                return false;
-            }
-            if (stats_.paused_for_min_free.load(
-                    std::memory_order_relaxed)) {
-                atomic_add_saturating(stats_.dropped_min_free);
-                atomic_add_saturating(
-                    stats_.dropped_min_free_ids, original_ids);
-                return false;
-            }
-
-            auto frame = std::span<std::byte>(
-                queue_storage_.data() + queue_tail_ * maximum_frame_bytes_,
-                frame_bytes);
-            std::fill(frame.begin(), frame.end(), std::byte{0});
-            std::memcpy(
-                frame.data(), kRecordMagic.data(), kRecordMagic.size());
-            put_u32(frame, 8, kRecordVersion);
-            put_u32(
-                frame,
-                12,
-                static_cast<std::uint32_t>(
-                    kReadWorkloadRecordHeaderBytes));
-            put_u32(frame, 16, static_cast<std::uint32_t>(frame_bytes));
-            put_u32(frame, 20, kEventRecordKind);
-            put_u32(frame, 28, static_cast<std::uint32_t>(method));
+            std::array<std::byte, kReadWorkloadRecordHeaderBytes> frame{};
+            initialize_record(frame, kRequestBeginRecordKind);
             std::uint32_t flags = 0;
-            if (snapshot.exact) {
+            if (info.snapshot.exact) {
                 flags |= kRecordFlagExactSnapshot;
             }
-            if (truncated) {
-                flags |= kRecordFlagTruncatedIds;
+            if (info.declared_ids != 0) {
+                flags |= kRecordFlagDeclaredIdsKnown;
             }
-            put_u32(frame, 32, flags);
-            put_u32(frame, 36, prefix_dimensions);
-            put_u64(frame, 40, sequence);
-            put_u64(frame, 48, unix_time_ns());
-            put_u64(frame, 56, snapshot.catalog_generation);
-            put_u64(frame, 64, snapshot.committed_sequence);
-            put_u64(frame, 72, snapshot.row_count);
-            put_u64(frame, 80, snapshot.stream_id_low);
-            put_u64(frame, 88, snapshot.stream_id_high);
-            put_u64(frame, 96, snapshot.batch_sequence);
-            put_u64(frame, 104, static_cast<std::uint64_t>(ids.size()));
-            put_u32(frame, 112, static_cast<std::uint32_t>(captured));
-            put_u32(frame, 116, options_.sample_rate_ppm);
-            put_u64(frame, 120, selection_seed);
-
-            if (truncated) {
-                atomic_add_saturating(stats_.truncated_events);
-            }
-            atomic_add_saturating(stats_.enqueued_events);
-            atomic_add_saturating(stats_.enqueued_ids, original_ids);
-            atomic_add_saturating(
-                stats_.captured_ids,
-                static_cast<std::uint64_t>(captured));
-            encode_counter_snapshot(frame, counter_snapshot(stats_));
-            encode_ids(frame, ids, captured, selection_seed);
+            put_u32(frame, 28, flags);
             put_u32(
-                frame,
-                kReadWorkloadRecordCrcOffset,
-                crc32c_with_zeroed_field(
-                    frame, kReadWorkloadRecordCrcOffset));
-
-            slot_sizes_[queue_tail_] = frame_bytes;
-            queue_tail_ = (queue_tail_ + 1) % slot_count_;
-            ++queued_count_;
-            queued_bytes_ += frame_bytes;
-            stats_.queued_events.store(
-                queued_count_, std::memory_order_relaxed);
-            stats_.queued_bytes.store(
-                queued_bytes_, std::memory_order_relaxed);
-            atomic_max(stats_.peak_queued_bytes, queued_bytes_);
-            queue_lock.unlock();
-            queue_condition_.notify_one();
+                frame, 32, static_cast<std::uint32_t>(info.method));
+            put_u32(frame, 36, info.prefix_dimensions);
+            put_u64(frame, 56, request.started_steady_ns_);
+            put_u64(frame, 64, request.request_id_low_);
+            put_u64(frame, 72, request.request_id_high_);
+            put_u64(frame, 80, info.snapshot.catalog_generation);
+            put_u64(frame, 88, info.snapshot.committed_sequence);
+            put_u64(frame, 96, info.snapshot.row_count);
+            put_u64(frame, 104, info.declared_ids);
+            put_u64(frame, 112, steady_clock_resolution_ns());
+            const auto result = enqueue_record(
+                frame, kRequestBeginRecordKind, 0);
+            if (result != EnqueueResult::Enqueued) {
+                note_global_drop(result, 1, 0);
+                atomic_add_saturating(stats_.incomplete_requests);
+                atomic_add_saturating(stats_.completed_requests);
+                stats_.active_requests.fetch_sub(
+                    1, std::memory_order_release);
+                active_admitted = false;
+                return false;
+            }
             return true;
         } catch (...) {
-            // No exception from optional telemetry may escape into a request.
-            atomic_add_saturating(stats_.dropped_runtime_failure);
+            if (active_admitted) {
+                stats_.active_requests.fetch_sub(
+                    1, std::memory_order_release);
+            }
+            atomic_add_saturating(stats_.incomplete_requests);
+            atomic_add_saturating(stats_.completed_requests);
+            if (!lifecycle_begun) {
+                atomic_add_saturating(stats_.observed_requests);
+            }
+            atomic_add_saturating(stats_.observed_records);
             atomic_add_saturating(
-                stats_.dropped_runtime_failure_ids,
+                stats_.dropped_runtime_failure_records);
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool append_ids(
+        ReadWorkloadRequestHandle& request,
+        const std::span<const std::uint64_t> ids,
+        const ReadWorkloadIdChunkInfo& info) noexcept {
+        if (ids.empty()) {
+            return true;
+        }
+        ProducerGuard producer_guard(producers_inflight_);
+        try {
+            if (info.logical_offset != request.submitted_ids_) {
+                request.logical_offsets_contiguous_ = false;
+            }
+            update_digest(request.digest_low_, ids);
+            update_digest(request.digest_high_, ids);
+            request.submitted_ids_ = saturating_add_value(
+                request.submitted_ids_,
+                static_cast<std::uint64_t>(ids.size()));
+
+            std::array<
+                std::byte,
+                kReadWorkloadRecordHeaderBytes
+                    + std::size_t{kReadWorkloadMaximumIdChunkRows}
+                          * sizeof(std::uint64_t)>
+                frame{};
+            bool complete = true;
+            std::size_t cursor = 0;
+            while (cursor != ids.size()) {
+                const auto count = std::min<std::size_t>(
+                    options_.id_chunk_rows, ids.size() - cursor);
+                const auto frame_bytes =
+                    kReadWorkloadRecordHeaderBytes
+                    + count * sizeof(std::uint64_t);
+                auto output =
+                    std::span<std::byte>(frame).first(frame_bytes);
+                std::fill(output.begin(), output.end(), std::byte{0});
+                initialize_record(output, kIdChunkRecordKind);
+                put_u32(output, 32, static_cast<std::uint32_t>(count));
+                put_u64(output, 64, request.request_id_low_);
+                put_u64(output, 72, request.request_id_high_);
+                put_u64(
+                    output,
+                    80,
+                    saturating_add_value(
+                        info.logical_offset,
+                        static_cast<std::uint64_t>(cursor)));
+                put_u64(output, 88, info.batch_sequence);
+                // Delivery is only known after the response write succeeds
+                // and is therefore carried by BATCH_METRICS, not by the
+                // pre-read ID chunk.
+                put_u64(output, 96, 0);
+                put_u64(
+                    output, 104, request.next_chunk_sequence_++);
+                for (std::size_t index = 0; index != count; ++index) {
+                    put_u64(
+                        output,
+                        kReadWorkloadRecordHeaderBytes
+                            + index * sizeof(std::uint64_t),
+                        ids[cursor + index]);
+                }
+                ++request.id_chunks_;
+                const auto result = enqueue_record(
+                    output,
+                    kIdChunkRecordKind,
+                    static_cast<std::uint64_t>(count));
+                if (result == EnqueueResult::Enqueued) {
+                    request.enqueued_ids_ = saturating_add_value(
+                        request.enqueued_ids_,
+                        static_cast<std::uint64_t>(count));
+                } else {
+                    complete = false;
+                    note_request_drop(
+                        request,
+                        result,
+                        1,
+                        static_cast<std::uint64_t>(count));
+                }
+                cursor += count;
+            }
+            return complete;
+        } catch (...) {
+            note_request_drop(
+                request,
+                EnqueueResult::RuntimeFailure,
+                1,
                 static_cast<std::uint64_t>(ids.size()));
             return false;
         }
     }
 
+    [[nodiscard]] bool append_batch(
+        ReadWorkloadRequestHandle& request,
+        const ReadWorkloadBatchMetrics& metrics) noexcept {
+        ProducerGuard producer_guard(producers_inflight_);
+        try {
+            std::array<std::byte, kReadWorkloadBatchRecordBytes> frame{};
+            initialize_record(frame, kBatchMetricRecordKind);
+            put_u32(
+                frame,
+                32,
+                static_cast<std::uint32_t>(metrics.backend));
+            put_u64(frame, 64, request.request_id_low_);
+            put_u64(frame, 72, request.request_id_high_);
+            put_u64(frame, 80, metrics.batch_sequence);
+            put_u64(frame, 88, metrics.logical_offset);
+            put_u64(frame, 96, metrics.rows);
+            put_u64(frame, 104, metrics.response_bytes);
+            put_u64(frame, 112, metrics.total_ns);
+            put_u64(frame, 120, metrics.lookup_ns);
+            put_u64(frame, 128, metrics.sort_ns);
+            put_u64(frame, 136, metrics.plan_ns);
+            put_u64(frame, 144, metrics.scheduler_wait_ns);
+            put_u64(frame, 152, metrics.io_ns);
+            put_u64(frame, 160, metrics.scatter_ns);
+            put_u64(frame, 168, metrics.encode_ns);
+            put_u64(frame, 176, metrics.write_ns);
+            put_u64(frame, 184, metrics.logger_queue_ns);
+            put_u64(frame, 224, metrics.delivery_sequence);
+            put_u64(frame, 232, metrics.useful_read_bytes);
+            put_u64(frame, 240, metrics.backend_tasks);
+            put_u64(frame, 256, metrics.unique_storage_segments);
+            put_u64(frame, 264, metrics.physical_requests);
+            put_u64(frame, 272, metrics.merged_ranges);
+            put_u64(frame, 280, metrics.requested_bytes);
+            put_u64(frame, 288, metrics.planned_bytes);
+            put_u64(frame, 296, metrics.completed_bytes);
+            put_u64(frame, 304, metrics.gap_bytes);
+            put_u64(frame, 312, metrics.overread_bytes);
+            put_u64(frame, 320, metrics.pages_touched);
+            put_u64(frame, 328, metrics.page_runs);
+            put_u64(frame, 336, metrics.layout_chunks_touched);
+            put_u64(frame, 344, metrics.layout_chunk_runs);
+            put_u64(frame, 352, metrics.discontinuities);
+            put_u64(frame, 360, metrics.inversions);
+            put_u64(frame, 368, metrics.max_range_bytes);
+            put_u64(frame, 376, metrics.mean_range_bytes);
+            ++request.batches_;
+            request.response_bytes_ = saturating_add_value(
+                request.response_bytes_, metrics.response_bytes);
+            const auto result =
+                enqueue_record(frame, kBatchMetricRecordKind, 0);
+            if (result != EnqueueResult::Enqueued) {
+                note_request_drop(request, result, 1, 0);
+                return false;
+            }
+            return true;
+        } catch (...) {
+            note_request_drop(
+                request, EnqueueResult::RuntimeFailure, 1, 0);
+            return false;
+        }
+    }
+
+    void end_request(
+        ReadWorkloadRequestHandle& request,
+        const ReadWorkloadRequestEnd& end) noexcept {
+        ProducerGuard producer_guard(producers_inflight_);
+        try {
+            const bool complete =
+                end.status == ReadWorkloadRequestStatus::Success
+                && end.delivered_ids == request.submitted_ids_
+                && (request.declared_ids_ == 0
+                    || request.declared_ids_ == request.submitted_ids_)
+                && request.dropped_records_ == 0
+                && request.logical_offsets_contiguous_;
+            std::array<std::byte, kReadWorkloadRecordHeaderBytes> frame{};
+            initialize_record(frame, kRequestEndRecordKind);
+            put_u32(
+                frame,
+                28,
+                complete ? kRecordFlagCompleteForTraining : 0);
+            put_u32(
+                frame, 32, static_cast<std::uint32_t>(end.status));
+            put_u32(frame, 36, end.error_code);
+            put_u64(frame, 64, request.request_id_low_);
+            put_u64(frame, 72, request.request_id_high_);
+            put_u64(frame, 80, request.submitted_ids_);
+            put_u64(frame, 88, end.delivered_ids);
+            put_u64(frame, 96, request.id_chunks_);
+            put_u64(frame, 104, request.batches_);
+            put_u64(
+                frame,
+                112,
+                end.response_bytes != 0 ? end.response_bytes
+                                        : request.response_bytes_);
+            put_u64(frame, 120, request.dropped_records_);
+            put_u64(frame, 128, request.dropped_ids_);
+            const auto finished = steady_time_ns();
+            put_u64(
+                frame,
+                136,
+                finished >= request.started_steady_ns_
+                    ? finished - request.started_steady_ns_
+                    : 0);
+            put_u64(frame, 144, request.dropped_full_records_);
+            put_u64(frame, 152, request.dropped_full_ids_);
+            put_u64(frame, 160, request.dropped_runtime_records_);
+            put_u64(frame, 168, request.dropped_runtime_ids_);
+            put_u64(frame, 176, request.dropped_min_free_records_);
+            put_u64(frame, 184, request.dropped_min_free_ids_);
+            put_u64(frame, 192, request.dropped_io_budget_records_);
+            put_u64(frame, 200, request.dropped_io_budget_ids_);
+            put_u64(frame, 208, request.digest_low_);
+            put_u64(frame, 216, request.digest_high_);
+
+            atomic_add_saturating(stats_.completed_requests);
+            const auto result =
+                enqueue_record(frame, kRequestEndRecordKind, 0);
+            if (result == EnqueueResult::Enqueued && complete) {
+                atomic_add_saturating(stats_.complete_requests);
+            } else {
+                if (result != EnqueueResult::Enqueued) {
+                    note_global_drop(result, 1, 0);
+                }
+                atomic_add_saturating(stats_.incomplete_requests);
+            }
+        } catch (...) {
+            atomic_add_saturating(stats_.incomplete_requests);
+            atomic_add_saturating(stats_.observed_records);
+            atomic_add_saturating(
+                stats_.dropped_runtime_failure_records);
+        }
+        release_request(request);
+    }
+
     [[nodiscard]] ReadWorkloadLogStats stats() const noexcept {
         ReadWorkloadLogStats result;
-        result.observed_events =
-            stats_.observed_events.load(std::memory_order_relaxed);
+        result.observed_requests =
+            stats_.observed_requests.load(std::memory_order_relaxed);
+        result.begun_requests =
+            stats_.begun_requests.load(std::memory_order_relaxed);
+        result.completed_requests =
+            stats_.completed_requests.load(std::memory_order_relaxed);
+        result.complete_requests =
+            stats_.complete_requests.load(std::memory_order_relaxed);
+        result.incomplete_requests =
+            stats_.incomplete_requests.load(std::memory_order_relaxed);
+        result.observed_records =
+            stats_.observed_records.load(std::memory_order_relaxed);
+        result.enqueued_records =
+            stats_.enqueued_records.load(std::memory_order_relaxed);
+        result.written_records =
+            stats_.written_records.load(std::memory_order_relaxed);
         result.observed_ids =
             stats_.observed_ids.load(std::memory_order_relaxed);
-        result.unsampled_events =
-            stats_.unsampled_events.load(std::memory_order_relaxed);
-        result.sampled_events =
-            stats_.sampled_events.load(std::memory_order_relaxed);
-        result.enqueued_events =
-            stats_.enqueued_events.load(std::memory_order_relaxed);
-        result.written_events =
-            stats_.written_events.load(std::memory_order_relaxed);
-        result.captured_ids =
-            stats_.captured_ids.load(std::memory_order_relaxed);
-        result.truncated_events =
-            stats_.truncated_events.load(std::memory_order_relaxed);
-        result.sampled_ids =
-            stats_.sampled_ids.load(std::memory_order_relaxed);
         result.enqueued_ids =
             stats_.enqueued_ids.load(std::memory_order_relaxed);
         result.written_ids =
             stats_.written_ids.load(std::memory_order_relaxed);
-        result.dropped_busy =
-            stats_.dropped_busy.load(std::memory_order_relaxed);
-        result.dropped_busy_ids =
-            stats_.dropped_busy_ids.load(std::memory_order_relaxed);
-        result.dropped_full =
-            stats_.dropped_full.load(std::memory_order_relaxed);
+        result.observed_id_chunks =
+            stats_.observed_id_chunks.load(std::memory_order_relaxed);
+        result.enqueued_id_chunks =
+            stats_.enqueued_id_chunks.load(std::memory_order_relaxed);
+        result.written_id_chunks =
+            stats_.written_id_chunks.load(std::memory_order_relaxed);
+        result.observed_batches =
+            stats_.observed_batches.load(std::memory_order_relaxed);
+        result.enqueued_batches =
+            stats_.enqueued_batches.load(std::memory_order_relaxed);
+        result.written_batches =
+            stats_.written_batches.load(std::memory_order_relaxed);
+        result.dropped_full_records =
+            stats_.dropped_full_records.load(std::memory_order_relaxed);
         result.dropped_full_ids =
             stats_.dropped_full_ids.load(std::memory_order_relaxed);
-        result.dropped_runtime_failure =
-            stats_.dropped_runtime_failure.load(std::memory_order_relaxed);
+        result.dropped_runtime_failure_records =
+            stats_.dropped_runtime_failure_records.load(
+                std::memory_order_relaxed);
         result.dropped_runtime_failure_ids =
             stats_.dropped_runtime_failure_ids.load(
                 std::memory_order_relaxed);
-        result.dropped_min_free =
-            stats_.dropped_min_free.load(std::memory_order_relaxed);
+        result.dropped_min_free_records =
+            stats_.dropped_min_free_records.load(
+                std::memory_order_relaxed);
         result.dropped_min_free_ids =
             stats_.dropped_min_free_ids.load(std::memory_order_relaxed);
-        result.dropped_io_budget =
-            stats_.dropped_io_budget.load(std::memory_order_relaxed);
+        result.dropped_io_budget_records =
+            stats_.dropped_io_budget_records.load(
+                std::memory_order_relaxed);
         result.dropped_io_budget_ids =
             stats_.dropped_io_budget_ids.load(std::memory_order_relaxed);
         result.write_errors =
@@ -1102,14 +1380,16 @@ public:
         result.retention_deleted_segments =
             stats_.retention_deleted_segments.load(
                 std::memory_order_relaxed);
-        result.queued_events =
-            stats_.queued_events.load(std::memory_order_relaxed);
+        result.queued_records =
+            stats_.queued_records.load(std::memory_order_relaxed);
         result.queued_bytes =
             stats_.queued_bytes.load(std::memory_order_relaxed);
         result.peak_queued_bytes =
             stats_.peak_queued_bytes.load(std::memory_order_relaxed);
         result.buffer_capacity_bytes =
             slot_count_ * maximum_frame_bytes_;
+        result.active_requests =
+            stats_.active_requests.load(std::memory_order_relaxed);
         result.last_error_number =
             stats_.last_error_number.load(std::memory_order_relaxed);
         result.paused_for_min_free =
@@ -1118,6 +1398,24 @@ public:
             stats_.runtime_failed.load(std::memory_order_relaxed);
         result.shutting_down =
             stats_.shutting_down.load(std::memory_order_relaxed);
+        const auto normalized = counter_snapshot(stats_);
+        result.observed_requests = normalized.observed_requests;
+        result.begun_requests = normalized.begun_requests;
+        result.completed_requests = normalized.completed_requests;
+        result.complete_requests = normalized.complete_requests;
+        result.incomplete_requests = normalized.incomplete_requests;
+        result.observed_records = normalized.observed_records;
+        result.enqueued_records = normalized.enqueued_records;
+        result.written_records = normalized.written_records;
+        result.observed_ids = normalized.observed_ids;
+        result.enqueued_ids = normalized.enqueued_ids;
+        result.written_ids = normalized.written_ids;
+        result.observed_id_chunks = normalized.observed_id_chunks;
+        result.enqueued_id_chunks = normalized.enqueued_id_chunks;
+        result.written_id_chunks = normalized.written_id_chunks;
+        result.observed_batches = normalized.observed_batches;
+        result.enqueued_batches = normalized.enqueued_batches;
+        result.written_batches = normalized.written_batches;
         return result;
     }
 
@@ -1131,7 +1429,7 @@ public:
             }
             return;
         }
-        queue_condition_.notify_all();
+        ready_records_.release();
         if (worker_.joinable()
             && worker_.get_id() != std::this_thread::get_id()) {
             worker_.join();
@@ -1139,49 +1437,237 @@ public:
     }
 
 private:
-    [[nodiscard]] bool sampled(const std::uint64_t seed) const noexcept {
-        if (options_.sample_rate_ppm == kSampleDenominator) {
-            return true;
+    enum class EnqueueResult {
+        Enqueued,
+        Full,
+        RuntimeFailure,
+        MinimumFreeSpace,
+        IoBudget,
+    };
+
+    struct QueueSlot {
+        // A producer owns ticket T when sequence == T and publishes it by
+        // storing T + 1. The sole consumer releases it for the next ring lap
+        // by storing T + slot_count. This preserves reservation order even
+        // when a later producer finishes its memcpy first.
+        std::atomic<std::uint64_t> sequence{0};
+        std::uint32_t size = 0;
+        std::uint32_t kind = 0;
+        std::uint64_t ids = 0;
+    };
+
+    class ProducerGuard {
+    public:
+        explicit ProducerGuard(
+            std::atomic<std::uint64_t>& producers) noexcept
+            : producers_(producers) {
+            producers_.fetch_add(1, std::memory_order_acq_rel);
         }
-        const auto bucket = uniform_below(seed, kSampleDenominator);
-        return bucket < options_.sample_rate_ppm;
+        ~ProducerGuard() {
+            producers_.fetch_sub(1, std::memory_order_release);
+        }
+        ProducerGuard(const ProducerGuard&) = delete;
+        ProducerGuard& operator=(const ProducerGuard&) = delete;
+
+    private:
+        std::atomic<std::uint64_t>& producers_;
+    };
+
+    static void initialize_record(
+        const std::span<std::byte> frame,
+        const std::uint32_t kind) noexcept {
+        std::memcpy(
+            frame.data(), kRecordMagic.data(), kRecordMagic.size());
+        put_u32(frame, 8, kRecordVersion);
+        put_u32(
+            frame,
+            12,
+            static_cast<std::uint32_t>(
+                kReadWorkloadRecordHeaderBytes));
+        put_u32(
+            frame, 16, static_cast<std::uint32_t>(frame.size()));
+        put_u32(frame, 20, kind);
     }
 
-    static void encode_ids(
-        const std::span<std::byte> frame,
-        const std::span<const std::uint64_t> ids,
-        const std::size_t captured,
-        const std::uint64_t seed) noexcept {
-        if (captured == ids.size()) {
-            for (std::size_t index = 0; index != captured; ++index) {
-                put_u64(
-                    frame,
-                    kReadWorkloadRecordHeaderBytes
-                        + index * sizeof(std::uint64_t),
-                    ids[index]);
+    static void update_digest(
+        std::uint64_t& state,
+        const std::span<const std::uint64_t> ids) noexcept {
+        constexpr std::uint64_t prime = 0x100000001b3ULL;
+        for (const auto id : ids) {
+            for (unsigned int shift = 0; shift != 64; shift += 8) {
+                state ^= (id >> shift) & 0xffU;
+                state *= prime;
             }
-            return;
+        }
+    }
+
+    [[nodiscard]] EnqueueResult enqueue_record(
+        const std::span<std::byte> frame,
+        const std::uint32_t kind,
+        const std::uint64_t ids) noexcept {
+        atomic_add_saturating(stats_.observed_records);
+        if (kind == kIdChunkRecordKind) {
+            atomic_add_saturating(stats_.observed_id_chunks);
+            atomic_add_saturating(stats_.observed_ids, ids);
+        } else if (kind == kBatchMetricRecordKind) {
+            atomic_add_saturating(stats_.observed_batches);
+        }
+        if (stats_.runtime_failed.load(std::memory_order_acquire)
+            || stats_.shutting_down.load(std::memory_order_acquire)) {
+            return EnqueueResult::RuntimeFailure;
+        }
+        if (stats_.paused_for_min_free.load(
+                std::memory_order_acquire)) {
+            return EnqueueResult::MinimumFreeSpace;
         }
 
-        // A random circular translation of K nearly-even base points has
-        // exact inclusion probability K/N for every input position, avoids
-        // O(N) work and retains coverage across the complete request.
-        const auto count = ids.size();
-        const auto quotient = count / captured;
-        const auto remainder = count % captured;
-        const auto offset = static_cast<std::size_t>(uniform_below(
-            seed, static_cast<std::uint64_t>(count)));
-        for (std::size_t index = 0; index != captured; ++index) {
-            const auto base =
-                index * quotient + (index * remainder) / captured;
-            const auto position =
-                base >= count - offset ? base - (count - offset)
-                                       : base + offset;
-            put_u64(
-                frame,
-                kReadWorkloadRecordHeaderBytes
-                    + index * sizeof(std::uint64_t),
-                ids[position]);
+        put_u64(
+            frame, 40, 0);
+        put_u64(frame, 48, unix_time_ns());
+        if (get_u64(frame, 56) == 0) {
+            put_u64(frame, 56, steady_time_ns());
+        }
+        put_u32(frame, kReadWorkloadRecordCrcOffset, 0);
+
+        auto ticket = enqueue_ticket_.load(std::memory_order_relaxed);
+        while (true) {
+            const auto consumed =
+                dequeue_ticket_.load(std::memory_order_acquire);
+            // A relaxed producer load may lag the consumer's acquired
+            // position. Do not let unsigned subtraction turn that harmless
+            // stale observation into a false queue-full result; the CAS will
+            // refresh `ticket` from the enqueue modification order.
+            if (ticket >= consumed
+                && ticket - consumed
+                       >= static_cast<std::uint64_t>(slot_count_)) {
+                return EnqueueResult::Full;
+            }
+            if (enqueue_ticket_.compare_exchange_weak(
+                    ticket,
+                    ticket + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        const auto slot_index =
+            static_cast<std::size_t>(ticket % slot_count_);
+        auto& slot = queue_slots_[slot_index];
+        while (slot.sequence.load(std::memory_order_acquire) != ticket) {
+            // Capacity was checked before reservation. The previous lap has
+            // already advanced dequeue_ticket_, so this loop is only a
+            // memory-publication handoff and never waits for disk I/O.
+            std::this_thread::yield();
+        }
+
+        std::memcpy(
+            queue_storage_.data()
+                + slot_index * maximum_frame_bytes_,
+            frame.data(),
+            frame.size());
+        slot.size = static_cast<std::uint32_t>(frame.size());
+        slot.kind = kind;
+        slot.ids = ids;
+        const auto queued_records =
+            queued_records_.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto queued_bytes =
+            queued_bytes_.fetch_add(
+                frame.size(), std::memory_order_relaxed)
+            + frame.size();
+        stats_.queued_records.store(
+            queued_records, std::memory_order_relaxed);
+        stats_.queued_bytes.store(
+            queued_bytes, std::memory_order_relaxed);
+        atomic_max(stats_.peak_queued_bytes, queued_bytes);
+        atomic_add_saturating(stats_.enqueued_records);
+        if (kind == kIdChunkRecordKind) {
+            atomic_add_saturating(stats_.enqueued_id_chunks);
+            atomic_add_saturating(stats_.enqueued_ids, ids);
+        } else if (kind == kBatchMetricRecordKind) {
+            atomic_add_saturating(stats_.enqueued_batches);
+        }
+        slot.sequence.store(ticket + 1, std::memory_order_release);
+        ready_records_.release();
+        return EnqueueResult::Enqueued;
+    }
+
+    static void add_request_drop(
+        std::uint64_t& destination,
+        const std::uint64_t amount) noexcept {
+        destination = saturating_add_value(destination, amount);
+    }
+
+    void note_global_drop(
+        const EnqueueResult result,
+        const std::uint64_t records,
+        const std::uint64_t ids) noexcept {
+        switch (result) {
+            case EnqueueResult::Full:
+                atomic_add_saturating(
+                    stats_.dropped_full_records, records);
+                atomic_add_saturating(stats_.dropped_full_ids, ids);
+                return;
+            case EnqueueResult::MinimumFreeSpace:
+                atomic_add_saturating(
+                    stats_.dropped_min_free_records, records);
+                atomic_add_saturating(stats_.dropped_min_free_ids, ids);
+                return;
+            case EnqueueResult::IoBudget:
+                atomic_add_saturating(
+                    stats_.dropped_io_budget_records, records);
+                atomic_add_saturating(stats_.dropped_io_budget_ids, ids);
+                return;
+            case EnqueueResult::RuntimeFailure:
+                atomic_add_saturating(
+                    stats_.dropped_runtime_failure_records, records);
+                atomic_add_saturating(
+                    stats_.dropped_runtime_failure_ids, ids);
+                return;
+            case EnqueueResult::Enqueued:
+                return;
+        }
+    }
+
+    void note_request_drop(
+        ReadWorkloadRequestHandle& request,
+        const EnqueueResult result,
+        const std::uint64_t records,
+        const std::uint64_t ids) noexcept {
+        add_request_drop(request.dropped_records_, records);
+        add_request_drop(request.dropped_ids_, ids);
+        switch (result) {
+            case EnqueueResult::Full:
+                add_request_drop(request.dropped_full_records_, records);
+                add_request_drop(request.dropped_full_ids_, ids);
+                break;
+            case EnqueueResult::RuntimeFailure:
+                add_request_drop(
+                    request.dropped_runtime_records_, records);
+                add_request_drop(request.dropped_runtime_ids_, ids);
+                break;
+            case EnqueueResult::MinimumFreeSpace:
+                add_request_drop(
+                    request.dropped_min_free_records_, records);
+                add_request_drop(request.dropped_min_free_ids_, ids);
+                break;
+            case EnqueueResult::IoBudget:
+                add_request_drop(
+                    request.dropped_io_budget_records_, records);
+                add_request_drop(request.dropped_io_budget_ids_, ids);
+                break;
+            case EnqueueResult::Enqueued:
+                break;
+        }
+        note_global_drop(result, records, ids);
+    }
+
+    void release_request(ReadWorkloadRequestHandle& request) noexcept {
+        request.logger_ = nullptr;
+        const auto active =
+            stats_.active_requests.load(std::memory_order_relaxed);
+        if (active != 0) {
+            stats_.active_requests.fetch_sub(
+                1, std::memory_order_release);
         }
     }
 
@@ -1563,6 +2049,18 @@ private:
         return files;
     }
 
+    void refresh_retained_stats() noexcept {
+        stats_.retained_bytes.store(
+            saturating_add_value(
+                retained_historical_bytes_, active_bytes_),
+            std::memory_order_relaxed);
+        stats_.retained_segments.store(
+            saturating_add_value(
+                retained_historical_segments_,
+                active_fd_ ? 1 : 0),
+            std::memory_order_relaxed);
+    }
+
     void prune_retention() {
         auto files = retained_files();
         std::sort(
@@ -1599,19 +2097,26 @@ private:
                 ? std::numeric_limits<std::int64_t>::max()
                 : static_cast<std::int64_t>(
                       options_.retention_seconds * 1'000'000'000);
-        // Keep one slot available for the active segment while the logger is
-        // running. During final shutdown there is no successor segment, so
-        // the full configured count may remain finalized.
+        // Reserve one complete successor while running, and retain that
+        // reserve for the current active file during shutdown. Only after
+        // finalization leaves no active writer may the full configured
+        // budget remain as finalized history.
+        const bool reserve_active =
+            active_fd_
+            || !stats_.shutting_down.load(std::memory_order_relaxed);
+        const auto historical_byte_limit =
+            options_.retention_bytes
+            - (reserve_active ? options_.segment_bytes : 0);
         const auto retained_file_limit =
             options_.max_retained_files
-            - (stats_.shutting_down.load(std::memory_order_relaxed) ? 0 : 1);
+            - (reserve_active ? 1 : 0);
 
         for (const auto& file : files) {
             const bool aged =
                 file.modified_ns <= now
                 && now - file.modified_ns >= retention_ns;
             const bool over_budget =
-                total_bytes > options_.retention_bytes;
+                total_bytes > historical_byte_limit;
             const bool over_file_limit =
                 total_segments > retained_file_limit;
             // The exclusive directory lock proves every non-active .open is
@@ -1641,7 +2146,7 @@ private:
                 retention_removed_any_ = true;
             }
         }
-        if (total_bytes > options_.retention_bytes
+        if (total_bytes > historical_byte_limit
             || total_segments > retained_file_limit) {
             throw StorageError(
                 "read-workload retention bounds remain violated after "
@@ -1652,10 +2157,9 @@ private:
             sync_directory(directory_fd_.get(), options_.directory);
             retention_removed_any_ = false;
         }
-        stats_.retained_bytes.store(
-            total_bytes, std::memory_order_relaxed);
-        stats_.retained_segments.store(
-            total_segments, std::memory_order_relaxed);
+        retained_historical_bytes_ = total_bytes;
+        retained_historical_segments_ = total_segments;
+        refresh_retained_stats();
         next_retention_sweep_ =
             std::chrono::steady_clock::now()
             + retention_sweep_interval_;
@@ -1724,6 +2228,7 @@ private:
         active_bytes_ =
             kReadWorkloadLogHeaderBytes
             + kReadWorkloadRecordHeaderBytes;
+        refresh_retained_stats();
         active_started_ = std::chrono::steady_clock::now();
         active_has_records_ = false;
         active_terminal_checkpoint_ = true;
@@ -1745,6 +2250,7 @@ private:
                 "terminal checkpoint");
         }
         sync_file(active_fd_.get(), active_path_);
+        evict_file_cache_best_effort(active_fd_.get());
         active_fd_.reset();
         std::filesystem::path finalized_name = active_name_;
         finalized_name.replace_extension(kFinalizedExtension);
@@ -1763,6 +2269,7 @@ private:
         active_path_.clear();
         active_name_.clear();
         active_bytes_ = 0;
+        refresh_retained_stats();
         active_has_records_ = false;
         active_terminal_checkpoint_ = false;
         atomic_add_saturating(stats_.rotated_segments);
@@ -1788,6 +2295,7 @@ private:
             active_path_.clear();
         }
         active_bytes_ = 0;
+        refresh_retained_stats();
         active_has_records_ = false;
         active_terminal_checkpoint_ = false;
     }
@@ -1826,6 +2334,7 @@ private:
     void append_bytes(const std::span<const std::byte> bytes) {
         write_all(active_fd_.get(), bytes, active_path_);
         active_bytes_ += bytes.size();
+        refresh_retained_stats();
         atomic_add_saturating(stats_.bytes_written, bytes.size());
     }
 
@@ -1849,10 +2358,13 @@ private:
             16,
             static_cast<std::uint32_t>(frame.size()));
         put_u32(frame, 20, kCheckpointRecordKind);
+        put_u32(frame, 28, kCheckpointExtensionVersion);
+        put_u32(
+            frame,
+            32,
+            opening_baseline ? kCheckpointFlagOpeningBaseline : 0);
         put_u64(frame, 48, unix_time_ns());
         encode_counter_snapshot(frame, counters);
-        encode_checkpoint_extension(
-            frame, counters, opening_baseline);
         put_u32(
             frame,
             kReadWorkloadRecordCrcOffset,
@@ -1999,7 +2511,7 @@ private:
         // Debit the complete immediate write transaction before rotating or
         // creating any file. A budget-dropped event therefore cannot cause
         // uncharged segment churn.
-        if (!consume_write_budget(immediate_write_bytes)) {
+        if (!wait_for_write_budget(immediate_write_bytes)) {
             return PrepareEventResult::WriteBudget;
         }
         if (!active_fd_) {
@@ -2025,41 +2537,64 @@ private:
         return PrepareEventResult::Ready;
     }
 
-    void remove_head_locked() noexcept {
-        const auto bytes = slot_sizes_[queue_head_];
-        slot_sizes_[queue_head_] = 0;
-        queue_head_ = (queue_head_ + 1) % slot_count_;
-        --queued_count_;
-        queued_bytes_ -= bytes;
-        stats_.queued_events.store(
-            queued_count_, std::memory_order_relaxed);
+    [[nodiscard]] std::size_t take_ready_slot() noexcept {
+        const auto ticket =
+            dequeue_ticket_.load(std::memory_order_relaxed);
+        const auto index =
+            static_cast<std::size_t>(ticket % slot_count_);
+        return queue_slots_[index].sequence.load(
+                   std::memory_order_acquire)
+                       == ticket + 1
+                   ? index
+                   : slot_count_;
+    }
+
+    void release_slot(const std::size_t index) noexcept {
+        auto& slot = queue_slots_[index];
+        const auto ticket =
+            dequeue_ticket_.load(std::memory_order_relaxed);
+        const auto bytes = slot.size;
+        slot.size = 0;
+        slot.kind = 0;
+        slot.ids = 0;
+        const auto records =
+            queued_records_.fetch_sub(1, std::memory_order_relaxed) - 1;
+        const auto queued_bytes =
+            queued_bytes_.fetch_sub(bytes, std::memory_order_relaxed)
+            - bytes;
+        stats_.queued_records.store(records, std::memory_order_relaxed);
         stats_.queued_bytes.store(
-            queued_bytes_, std::memory_order_relaxed);
+            queued_bytes, std::memory_order_relaxed);
+        slot.sequence.store(
+            ticket + static_cast<std::uint64_t>(slot_count_),
+            std::memory_order_release);
+        dequeue_ticket_.store(ticket + 1, std::memory_order_release);
     }
 
-    [[nodiscard]] std::uint64_t head_original_ids_locked() const noexcept {
-        const auto frame = std::span<const std::byte>(
-            queue_storage_.data()
-                + queue_head_ * maximum_frame_bytes_,
-            slot_sizes_[queue_head_]);
-        return get_u64(frame, 104);
+    void drop_slot(
+        const std::size_t index,
+        const EnqueueResult reason) noexcept {
+        const auto& slot = queue_slots_[index];
+        note_global_drop(reason, 1, slot.ids);
+        release_slot(index);
     }
 
-    void drop_head_locked(
-        std::atomic<std::uint64_t>& event_destination,
-        std::atomic<std::uint64_t>& id_destination) noexcept {
-        atomic_add_saturating(event_destination);
-        atomic_add_saturating(
-            id_destination, head_original_ids_locked());
-        remove_head_locked();
+    void wait_for_producers() noexcept {
+        while (producers_inflight_.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
     }
 
-    void drop_queue(
-        std::atomic<std::uint64_t>& event_destination,
-        std::atomic<std::uint64_t>& id_destination) noexcept {
-        const std::lock_guard lock(queue_mutex_);
-        while (queued_count_ != 0) {
-            drop_head_locked(event_destination, id_destination);
+    void drop_queue(const EnqueueResult reason) noexcept {
+        wait_for_producers();
+        while (dequeue_ticket_.load(std::memory_order_acquire)
+               != enqueue_ticket_.load(std::memory_order_acquire)) {
+            const auto index = take_ready_slot();
+            if (index == slot_count_) {
+                std::this_thread::yield();
+                continue;
+            }
+            drop_slot(index, reason);
         }
     }
 
@@ -2070,7 +2605,7 @@ private:
         atomic_add_saturating(stats_.write_errors);
         stats_.runtime_failed.store(true, std::memory_order_release);
         stats_.paused_for_min_free.store(false, std::memory_order_release);
-        queue_condition_.notify_all();
+        ready_records_.release();
     }
 
     [[nodiscard]] bool consume_write_budget(
@@ -2116,24 +2651,52 @@ private:
     void run() noexcept {
         try {
             while (true) {
-                std::unique_lock lock(queue_mutex_);
-                queue_condition_.wait_for(lock, 1s, [&] {
-                    return queued_count_ != 0
-                           || stats_.runtime_failed.load(
-                               std::memory_order_acquire)
-                           || stats_.shutting_down.load(
-                               std::memory_order_acquire);
-                });
+                static_cast<void>(
+                    ready_records_.try_acquire_for(100ms));
                 if (stats_.runtime_failed.load(
                         std::memory_order_acquire)) {
-                    lock.unlock();
                     break;
                 }
                 const bool stopping =
                     stats_.shutting_down.load(std::memory_order_acquire);
-                if (queued_count_ == 0) {
-                    lock.unlock();
-                    if (stopping) {
+                auto slot_index = take_ready_slot();
+                while (slot_index == slot_count_
+                       && dequeue_ticket_.load(std::memory_order_acquire)
+                              != enqueue_ticket_.load(
+                                  std::memory_order_acquire)) {
+                    if (producers_inflight_.load(
+                            std::memory_order_acquire)
+                        == 0) {
+                        // The last producer may have published the head and
+                        // decremented producers_inflight_ between the first
+                        // slot probe and this load. Its release plus this
+                        // acquire makes a second probe authoritative.
+                        slot_index = take_ready_slot();
+                        if (slot_index != slot_count_) {
+                            break;
+                        }
+                        if (dequeue_ticket_.load(
+                                std::memory_order_acquire)
+                            == enqueue_ticket_.load(
+                                std::memory_order_acquire)) {
+                            break;
+                        }
+                        throw StorageError(
+                            "read-workload FIFO head was reserved but never "
+                            "published");
+                    }
+                    std::this_thread::yield();
+                    slot_index = take_ready_slot();
+                }
+                if (slot_index == slot_count_) {
+                    if (stopping
+                        && dequeue_ticket_.load(
+                               std::memory_order_acquire)
+                               == enqueue_ticket_.load(
+                                   std::memory_order_acquire)
+                        && producers_inflight_.load(
+                               std::memory_order_acquire)
+                               == 0) {
                         break;
                     }
                     if (retention_sweep_due()) {
@@ -2150,12 +2713,12 @@ private:
                     }
                     continue;
                 }
-                const auto frame_size = slot_sizes_[queue_head_];
-                const auto frame = std::span<const std::byte>(
+                const auto frame_size =
+                    queue_slots_[slot_index].size;
+                auto frame = std::span<std::byte>(
                     queue_storage_.data()
-                        + queue_head_ * maximum_frame_bytes_,
+                        + slot_index * maximum_frame_bytes_,
                     frame_size);
-                lock.unlock();
                 if (retention_sweep_due()) {
                     prune_retention();
                 }
@@ -2163,10 +2726,7 @@ private:
                 const PrepareEventResult prepared =
                     prepare_event_append(frame_size);
                 if (prepared == PrepareEventResult::WriteBudget) {
-                    const std::lock_guard pop_lock(queue_mutex_);
-                    drop_head_locked(
-                        stats_.dropped_io_budget,
-                        stats_.dropped_io_budget_ids);
+                    drop_slot(slot_index, EnqueueResult::IoBudget);
                     continue;
                 }
                 if (prepared == PrepareEventResult::MinimumFreeSpace) {
@@ -2175,26 +2735,45 @@ private:
                         break;
                     }
                     if (stopping) {
-                        drop_queue(
-                            stats_.dropped_min_free,
-                            stats_.dropped_min_free_ids);
+                        drop_slot(
+                            slot_index,
+                            EnqueueResult::MinimumFreeSpace);
+                        drop_queue(EnqueueResult::MinimumFreeSpace);
                         break;
                     }
-                    std::unique_lock wait_lock(queue_mutex_);
-                    queue_condition_.wait_for(wait_lock, 1s);
+                    std::this_thread::sleep_for(100ms);
+                    ready_records_.release();
                     continue;
                 }
+                if (record_sequence_
+                    == std::numeric_limits<std::uint64_t>::max()) {
+                    throw StorageError(
+                        "read-workload physical record sequence overflow");
+                }
+                put_u64(frame, 40, ++record_sequence_);
+                put_u32(frame, kReadWorkloadRecordCrcOffset, 0);
+                put_u32(
+                    frame,
+                    kReadWorkloadRecordCrcOffset,
+                    crc32c_with_zeroed_field(
+                        frame, kReadWorkloadRecordCrcOffset));
                 append_bytes(frame);
                 active_has_records_ = true;
                 active_terminal_checkpoint_ = false;
-                atomic_add_saturating(stats_.written_events);
-                atomic_add_saturating(
-                    stats_.written_ids, get_u64(frame, 104));
-                ++events_since_checkpoint_;
-                {
-                    const std::lock_guard pop_lock(queue_mutex_);
-                    remove_head_locked();
+                atomic_add_saturating(stats_.written_records);
+                if (queue_slots_[slot_index].kind
+                    == kIdChunkRecordKind) {
+                    atomic_add_saturating(stats_.written_id_chunks);
+                    atomic_add_saturating(
+                        stats_.written_ids,
+                        queue_slots_[slot_index].ids);
+                } else if (
+                    queue_slots_[slot_index].kind
+                    == kBatchMetricRecordKind) {
+                    atomic_add_saturating(stats_.written_batches);
                 }
+                ++events_since_checkpoint_;
+                release_slot(slot_index);
                 if (events_since_checkpoint_
                     >= kCheckpointEventInterval) {
                     static_cast<void>(
@@ -2233,9 +2812,7 @@ private:
                 error_number != 0 ? error_number : EIO);
         }
         if (stats_.runtime_failed.load(std::memory_order_acquire)) {
-            drop_queue(
-                stats_.dropped_runtime_failure,
-                stats_.dropped_runtime_failure_ids);
+            drop_queue(EnqueueResult::RuntimeFailure);
             active_fd_.reset();
         }
     }
@@ -2245,13 +2822,13 @@ private:
     const std::size_t maximum_frame_bytes_;
     const std::size_t slot_count_;
     std::vector<std::byte> queue_storage_;
-    std::vector<std::size_t> slot_sizes_;
-    mutable std::mutex queue_mutex_;
-    std::condition_variable queue_condition_;
-    std::size_t queue_head_ = 0;
-    std::size_t queue_tail_ = 0;
-    std::size_t queued_count_ = 0;
-    std::uint64_t queued_bytes_ = 0;
+    std::unique_ptr<QueueSlot[]> queue_slots_;
+    std::counting_semaphore<> ready_records_{0};
+    std::atomic<std::uint64_t> enqueue_ticket_{0};
+    std::atomic<std::uint64_t> dequeue_ticket_{0};
+    std::atomic<std::uint64_t> queued_records_{0};
+    std::atomic<std::uint64_t> queued_bytes_{0};
+    std::atomic<std::uint64_t> producers_inflight_{0};
     std::thread worker_;
     AtomicStats stats_;
     FileDescriptor writer_lock_;
@@ -2260,19 +2837,21 @@ private:
     std::string active_name_;
     std::filesystem::path active_path_;
     std::uint64_t active_bytes_ = 0;
+    std::uint64_t retained_historical_bytes_ = 0;
+    std::uint64_t retained_historical_segments_ = 0;
     std::chrono::steady_clock::time_point active_started_{};
     bool active_has_records_ = false;
     bool active_terminal_checkpoint_ = false;
     std::uint64_t segment_sequence_ = 0;
     std::uint64_t instance_low_ = 0;
     std::uint64_t instance_high_ = 0;
-    std::uint64_t random_seed_ = 0;
     std::uint64_t write_budget_tokens_ =
         options_.max_write_bytes_per_second;
     std::uint64_t write_budget_remainder_ = 0;
     std::chrono::steady_clock::time_point write_budget_updated_ =
         std::chrono::steady_clock::now();
-    std::atomic<std::uint64_t> event_sequence_{0};
+    std::atomic<std::uint64_t> request_sequence_{0};
+    std::uint64_t record_sequence_ = 0;
     std::uint64_t events_since_checkpoint_ = 0;
     CounterSnapshot last_checkpoint_;
     bool retention_removed_any_ = false;
@@ -2284,23 +2863,49 @@ std::unique_ptr<ReadWorkloadLogger> ReadWorkloadLogger::open(
     ReadWorkloadLogOptions options,
     const ReadWorkloadCollectionInfo collection) {
     auto impl =
-        std::make_unique<Impl>(std::move(options), collection);
+        std::make_unique<ReadWorkloadLogImpl>(
+            std::move(options), collection);
     impl->start();
     return std::unique_ptr<ReadWorkloadLogger>(
         new ReadWorkloadLogger(std::move(impl)));
 }
 
-ReadWorkloadLogger::ReadWorkloadLogger(std::unique_ptr<Impl> impl)
+ReadWorkloadLogger::ReadWorkloadLogger(
+    std::unique_ptr<ReadWorkloadLogImpl> impl)
     : impl_(std::move(impl)) {}
 
 ReadWorkloadLogger::~ReadWorkloadLogger() = default;
 
-bool ReadWorkloadLogger::try_log(
-    const ReadWorkloadMethod method,
+ReadWorkloadRequestHandle ReadWorkloadLogger::begin_request(
+    const ReadWorkloadRequestInfo& info) noexcept {
+    ReadWorkloadRequestHandle result;
+    if (impl_->begin_request(result, info)) {
+        result.logger_ = this;
+    }
+    return result;
+}
+
+bool ReadWorkloadLogger::try_append_ids(
+    ReadWorkloadRequestHandle& request,
     const std::span<const std::uint64_t> ids,
-    const ReadWorkloadSnapshot snapshot,
-    const std::uint32_t prefix_dimensions) noexcept {
-    return impl_->try_log(method, ids, snapshot, prefix_dimensions);
+    const ReadWorkloadIdChunkInfo& info) noexcept {
+    return request.logger_ == this
+           && impl_->append_ids(request, ids, info);
+}
+
+bool ReadWorkloadLogger::try_append_batch(
+    ReadWorkloadRequestHandle& request,
+    const ReadWorkloadBatchMetrics& metrics) noexcept {
+    return request.logger_ == this
+           && impl_->append_batch(request, metrics);
+}
+
+void ReadWorkloadLogger::end_request(
+    ReadWorkloadRequestHandle& request,
+    const ReadWorkloadRequestEnd& end) noexcept {
+    if (request.logger_ == this) {
+        impl_->end_request(request, end);
+    }
 }
 
 ReadWorkloadLogStats ReadWorkloadLogger::stats() const noexcept {
@@ -2309,6 +2914,72 @@ ReadWorkloadLogStats ReadWorkloadLogger::stats() const noexcept {
 
 void ReadWorkloadLogger::shutdown() noexcept {
     impl_->shutdown();
+}
+
+void ReadWorkloadLogger::abandon_request(
+    ReadWorkloadRequestHandle& request) noexcept {
+    end_request(
+        request,
+        ReadWorkloadRequestEnd{
+            .status = ReadWorkloadRequestStatus::Shutdown,
+        });
+}
+
+ReadWorkloadRequestHandle::~ReadWorkloadRequestHandle() {
+    if (logger_ != nullptr) {
+        logger_->abandon_request(*this);
+    }
+}
+
+ReadWorkloadRequestHandle::ReadWorkloadRequestHandle(
+    ReadWorkloadRequestHandle&& other) noexcept {
+    *this = std::move(other);
+}
+
+ReadWorkloadRequestHandle& ReadWorkloadRequestHandle::operator=(
+    ReadWorkloadRequestHandle&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (logger_ != nullptr) {
+        logger_->abandon_request(*this);
+    }
+    logger_ = std::exchange(other.logger_, nullptr);
+    request_id_low_ = std::exchange(other.request_id_low_, 0);
+    request_id_high_ = std::exchange(other.request_id_high_, 0);
+    started_steady_ns_ = std::exchange(other.started_steady_ns_, 0);
+    declared_ids_ = std::exchange(other.declared_ids_, 0);
+    submitted_ids_ = std::exchange(other.submitted_ids_, 0);
+    enqueued_ids_ = std::exchange(other.enqueued_ids_, 0);
+    id_chunks_ = std::exchange(other.id_chunks_, 0);
+    batches_ = std::exchange(other.batches_, 0);
+    response_bytes_ = std::exchange(other.response_bytes_, 0);
+    dropped_records_ = std::exchange(other.dropped_records_, 0);
+    dropped_ids_ = std::exchange(other.dropped_ids_, 0);
+    dropped_full_records_ =
+        std::exchange(other.dropped_full_records_, 0);
+    dropped_full_ids_ = std::exchange(other.dropped_full_ids_, 0);
+    dropped_runtime_records_ =
+        std::exchange(other.dropped_runtime_records_, 0);
+    dropped_runtime_ids_ =
+        std::exchange(other.dropped_runtime_ids_, 0);
+    dropped_min_free_records_ =
+        std::exchange(other.dropped_min_free_records_, 0);
+    dropped_min_free_ids_ =
+        std::exchange(other.dropped_min_free_ids_, 0);
+    dropped_io_budget_records_ =
+        std::exchange(other.dropped_io_budget_records_, 0);
+    dropped_io_budget_ids_ =
+        std::exchange(other.dropped_io_budget_ids_, 0);
+    digest_low_ = std::exchange(
+        other.digest_low_, 0xcbf29ce484222325ULL);
+    digest_high_ = std::exchange(
+        other.digest_high_, 0x84222325cbf29ce4ULL);
+    next_chunk_sequence_ =
+        std::exchange(other.next_chunk_sequence_, 0);
+    logical_offsets_contiguous_ =
+        std::exchange(other.logical_offsets_contiguous_, true);
+    return *this;
 }
 
 }  // namespace throwdb::server::detail
