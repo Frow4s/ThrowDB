@@ -202,9 +202,9 @@ class _FakeGrpcService(throwdb_pb2_grpc.ThrowDBServicer):
                 total_wal_operations=5,
                 overlay_entries=4,
                 estimated_overlay_bytes=256,
-                delta_run_count=2,
-                total_delta_run_bytes=1024,
-                total_delta_segment_bytes=2048,
+                index_run_count=2,
+                index_run_bytes=1024,
+                materialized_segment_bytes=2048,
                 filesystem_available_bytes=100 << 20,
                 mutation_disk_reserve_bytes=10 << 20,
             ),
@@ -1008,6 +1008,9 @@ def test_public_grpc_client_get_crud_scan_and_list(tmp_path: Path) -> None:
         assert collection.engine_stats.catalog_generation == 7
         assert collection.engine_stats.committed_sequence == 11
         assert collection.engine_stats.total_wal_bytes == 12288
+        assert collection.engine_stats.index_run_count == 2
+        assert collection.engine_stats.index_run_bytes == 1024
+        assert collection.engine_stats.materialized_segment_bytes == 2048
         assert collection.engine_stats.filesystem_available_bytes == 100 << 20
         assert collection.read_logging is not None
         assert collection.read_logging.as_dict() == {

@@ -220,7 +220,7 @@ def local_partition_source(
     return source
 
 
-def test_probe_uses_data_shard_mount_and_returns_only_redacted_identity() -> None:
+def test_probe_uses_segment_mount_and_returns_only_redacted_identity() -> None:
     source = local_partition_source()
     result = probe_collection_storage(
         "/collection",

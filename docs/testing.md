@@ -8,6 +8,11 @@ scrub, native full-index verification, and atomic local publication. Tests use
 small dimensions and segment sizes, but exercise the same format, WAL framing,
 and address arithmetic as a production `float16[1024]` store.
 
+For a disposable format-7 fixture, explicit pread/thread-pool/io_uring
+comparisons, and a bounded gRPC restart run, follow
+[Linux validation](linux-validation.md). It records the effective backend and
+distinguishes an unavailable ring from a completed io_uring check.
+
 ## io_uring environment probe
 
 The optional Linux probe calls `io_uring_setup` directly through the kernel ABI;
@@ -29,7 +34,7 @@ container policy must be changed before an io_uring backend can be tested.
 | --- | --- | --- |
 | Round trip | Arbitrary `uint64` IDs and bit-exact `float16` vectors | Reopened reader returns identical bits |
 | Ordering | Query IDs in a different order, including repeated query IDs | Rows follow query order; repeated IDs repeat rows |
-| Segmentation | Force several segments with a tiny configured `shard_size_bytes` | Reads across segment boundaries are correct |
+| Segmentation | Force several segments with a tiny configured `segment_size_bytes` | Reads across segment boundaries are correct |
 | Duplicate input | Add the same ID twice, in one or separate batches | Build fails and is not published |
 | Missing input | Query at least one ID absent from the index | Entire call fails; MVP does not return a partial result |
 | Validation | Wrong ID dtype/rank, vector dtype/rank/dimension, or row count | Call fails before writing the batch |
@@ -832,7 +837,7 @@ counters; safe workload milestones also include Health, admission,
 engine/WAL/overlay, journal, free-space, and maintenance state. Automatic
 maintenance is exercised as ambient server behavior. The `maintenance`
 section checks persistent engine invariants and reports publication evidence
-inferred from materialized-sequence, delta-run, and frozen-WAL transitions.
+inferred from materialized-sequence, index-run, and frozen-WAL transitions.
 There is still no completed-cycle counter, so a normal run does not claim that
 a particular policy action ran. Use `--require-maintenance-progress` only when
 the collection and server thresholds are intentionally configured to make such

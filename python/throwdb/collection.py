@@ -59,13 +59,13 @@ from .record_scan import RecordBatch
 _UINT32_MAX: Final = (1 << 32) - 1
 _ROW_REF_SEGMENT_ID_MAX: Final = _UINT32_MAX - 1
 _UINT64_MAX: Final = (1 << 64) - 1
-_DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
+_DEFAULT_SEGMENT_SIZE_BYTES: Final = 16 << 30
 _DEFAULT_ID_SCAN_BATCH_ROWS: Final = 65_536
 _DEFAULT_STREAM_BATCH_BYTES: Final = 64 << 20
 _DEFAULT_STREAM_SNAPSHOT_BYTES: Final = 256 << 20
 _MAX_PARTITIONED_FOLD_RUNS: Final = 4096
-_DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES: Final = 8 << 30
-_DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES: Final = 1_000_000
+_DEFAULT_FOLD_MAX_INPUT_BYTES: Final = 8 << 30
+_DEFAULT_FOLD_MAX_INPUT_ENTRIES: Final = 1_000_000
 _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS: Final = 8
 _DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES: Final = 1 << 30
 _DEFAULT_CLEAN_MAX_SOURCE_BYTES: Final = 32 << 30
@@ -354,16 +354,16 @@ def _validate_prefix_dimensions(value: object, dimension: int) -> int:
     return prefix
 
 
-def _validate_shard_size_bytes(value: object) -> int:
+def _validate_segment_size_bytes(value: object) -> int:
     if isinstance(value, (bool, np.bool_)):
-        raise TypeError("shard_size_bytes must be an integer, not bool")
+        raise TypeError("segment_size_bytes must be an integer, not bool")
     try:
         size = operator.index(value)
     except TypeError as error:
-        raise TypeError("shard_size_bytes must be an integer") from error
+        raise TypeError("segment_size_bytes must be an integer") from error
     if not 1 <= size <= _UINT64_MAX:
         raise ValueError(
-            "shard_size_bytes must be between 1 and 2**64-1"
+            "segment_size_bytes must be between 1 and 2**64-1"
         )
     return size
 
@@ -380,7 +380,7 @@ def _validate_format_version(value: object) -> int:
     return version
 
 
-def _validate_delta_compaction_limit(
+def _validate_resource_limit(
     value: object,
     *,
     name: str,
@@ -424,10 +424,10 @@ def _validate_orphan_options(
         raise ValueError(
             "min_age_seconds must be finite and zero or greater"
         )
-    validated_max_files = _validate_delta_compaction_limit(
+    validated_max_files = _validate_resource_limit(
         max_files, name="max_files"
     )
-    validated_max_bytes = _validate_delta_compaction_limit(
+    validated_max_bytes = _validate_resource_limit(
         max_bytes, name="max_bytes"
     )
     return seconds, validated_max_files, validated_max_bytes
@@ -820,7 +820,6 @@ def _orphan_execution_report(
                 ".",
                 "catalogs",
                 "wal",
-                "deltas",
                 "segments",
                 "index/partitions",
                 "index/runs",
@@ -1232,7 +1231,7 @@ def _validate_id_scan_batch_rows(value: object) -> int:
 
 
 def _validate_stream_byte_limit(value: object, *, name: str) -> int:
-    return _validate_delta_compaction_limit(value, name=name)
+    return _validate_resource_limit(value, name=name)
 
 
 def _effective_stream_batch_rows(
@@ -1889,7 +1888,7 @@ class Collection:
         path: str | bytes | PathLike[str] | PathLike[bytes],
         *,
         schema: CollectionSchema | None = None,
-        shard_size_bytes: int = _DEFAULT_SHARD_SIZE_BYTES,
+        segment_size_bytes: int = _DEFAULT_SEGMENT_SIZE_BYTES,
         format_version: int = 7,
     ) -> Collection:
         if schema is None:
@@ -1900,12 +1899,12 @@ class Collection:
             raise NotImplementedError(
                 "utf8 IDs are not implemented by the numeric collection format"
             )
-        validated_shard_size = _validate_shard_size_bytes(shard_size_bytes)
+        validated_segment_size = _validate_segment_size_bytes(segment_size_bytes)
         validated_format_version = _validate_format_version(format_version)
         builder = NativeCollectionBuilder.create(
             path,
             dimension=schema.dimension,
-            shard_size_bytes=validated_shard_size,
+            segment_size_bytes=validated_segment_size,
             dtype=schema.dtype,
             format_version=validated_format_version,
         )
@@ -1931,17 +1930,17 @@ class Collection:
         if not isinstance(verify_index, bool):
             raise TypeError("verify_index must be a bool")
         open_bounds = {
-            "max_wal_bytes": _validate_delta_compaction_limit(
+            "max_wal_bytes": _validate_resource_limit(
                 max_wal_backlog_bytes, name="max_wal_backlog_bytes"
             ),
-            "max_wal_operations": _validate_delta_compaction_limit(
+            "max_wal_operations": _validate_resource_limit(
                 max_wal_backlog_operations,
                 name="max_wal_backlog_operations",
             ),
-            "max_overlay_entries": _validate_delta_compaction_limit(
+            "max_overlay_entries": _validate_resource_limit(
                 max_overlay_entries, name="max_overlay_entries"
             ),
-            "max_overlay_bytes": _validate_delta_compaction_limit(
+            "max_overlay_bytes": _validate_resource_limit(
                 max_overlay_memory_bytes, name="max_overlay_memory_bytes"
             ),
         }
@@ -3219,7 +3218,7 @@ class Collection:
         max_input_entries: int | None = None,
         max_memory_bytes: int | None = None,
     ) -> dict[str, object]:
-        """Replace the frozen WAL prefix with an immutable delta run.
+        """Replace the frozen WAL prefix with segments and an immutable index run.
 
         The durable catalog is switched atomically. Referenced WAL files are
         reclaimed only after the new view is published.
@@ -3229,28 +3228,28 @@ class Collection:
         validated_max_wals = (
             _UINT64_MAX
             if max_wals is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_wals, name="max_wals"
             )
         )
         validated_max_input_bytes = (
             _UINT64_MAX
             if max_input_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_input_bytes, name="max_input_bytes"
             )
         )
         validated_max_input_entries = (
             _UINT64_MAX
             if max_input_entries is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_input_entries, name="max_input_entries"
             )
         )
         validated_max_memory_bytes = (
             _UINT64_MAX
             if max_memory_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_memory_bytes, name="max_memory_bytes"
             )
         )
@@ -3266,44 +3265,46 @@ class Collection:
             )
         return dict(stats)
 
-    def compact_deltas(
+    def fold_partitions(
         self,
         *,
         max_runs: int | None = None,
-        max_input_bytes: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES,
-        max_input_entries: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+        max_input_bytes: int = _DEFAULT_FOLD_MAX_INPUT_BYTES,
+        max_input_entries: int = _DEFAULT_FOLD_MAX_INPUT_ENTRIES,
     ) -> dict[str, object]:
-        """Compact bounded immutable index state.
+        """Fold bounded immutable index state into partition snapshots.
 
         Fold complete per-partition run sections into authoritative snapshots.
-        The operation never rewrites embedding segments.
+        ``max_runs`` bounds the active run files contributing to each partition;
+        its existing snapshot is not counted. The operation never rewrites
+        embedding segments.
         """
 
-        native = self._ensure_mutable("compact immutable mutation deltas")
-        validated_max_runs = _validate_delta_compaction_limit(
+        native = self._ensure_mutable("fold index partitions")
+        validated_max_runs = _validate_resource_limit(
             _MAX_PARTITIONED_FOLD_RUNS
             if max_runs is None
             else max_runs,
             name="max_runs",
-            minimum=2,
+            minimum=1,
             maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        validated_max_input_bytes = _validate_delta_compaction_limit(
+        validated_max_input_bytes = _validate_resource_limit(
             max_input_bytes,
             name="max_input_bytes",
         )
-        validated_max_input_entries = _validate_delta_compaction_limit(
+        validated_max_input_entries = _validate_resource_limit(
             max_input_entries,
             name="max_input_entries",
         )
-        stats = native.compact_delta_runs(
+        stats = native.fold_partitions(
             validated_max_runs,
             validated_max_input_bytes,
             validated_max_input_entries,
         )
         if not isinstance(stats, dict):
             raise RuntimeError(
-                "native delta compaction returned invalid diagnostics"
+                "native partition folding returned invalid diagnostics"
             )
         return dict(stats)
 
@@ -3362,13 +3363,13 @@ class Collection:
         ),
         materialize_max_input_entries: int | None = None,
         materialize_max_memory_bytes: int | None = None,
-        compact_min_runs: int | None = None,
-        compact_max_runs: int | None = None,
-        compact_max_input_bytes: int = (
-            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES
+        fold_min_runs: int | None = None,
+        fold_max_runs: int | None = None,
+        fold_max_input_bytes: int = (
+            _DEFAULT_FOLD_MAX_INPUT_BYTES
         ),
-        compact_max_input_entries: int = (
-            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES
+        fold_max_input_entries: int = (
+            _DEFAULT_FOLD_MAX_INPUT_ENTRIES
         ),
         clean_max_candidate_segments: int = (
             _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS
@@ -3407,23 +3408,23 @@ class Collection:
         seconds = float(max_seconds)
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("max_seconds must be finite and zero or greater")
-        validated_max_actions = _validate_delta_compaction_limit(
+        validated_max_actions = _validate_resource_limit(
             max_actions, name="max_actions", maximum=5
         )
-        validated_rotate_bytes = _validate_delta_compaction_limit(
+        validated_rotate_bytes = _validate_resource_limit(
             rotate_wal_bytes, name="rotate_wal_bytes"
         )
-        validated_materialize_wals = _validate_delta_compaction_limit(
+        validated_materialize_wals = _validate_resource_limit(
             materialize_max_wals, name="materialize_max_wals"
         )
-        validated_materialize_bytes = _validate_delta_compaction_limit(
+        validated_materialize_bytes = _validate_resource_limit(
             materialize_max_input_bytes,
             name="materialize_max_input_bytes",
         )
         validated_materialize_entries = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES
             if materialize_max_input_entries is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 materialize_max_input_entries,
                 name="materialize_max_input_entries",
             )
@@ -3431,34 +3432,34 @@ class Collection:
         validated_materialize_memory = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES
             if materialize_max_memory_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 materialize_max_memory_bytes,
                 name="materialize_max_memory_bytes",
             )
         )
-        validated_compact_min_runs = _validate_delta_compaction_limit(
+        validated_fold_min_runs = _validate_resource_limit(
             1
-            if compact_min_runs is None
-            else compact_min_runs,
-            name="compact_min_runs",
+            if fold_min_runs is None
+            else fold_min_runs,
+            name="fold_min_runs",
             minimum=1,
             maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        validated_compact_max_runs = _validate_delta_compaction_limit(
+        validated_fold_max_runs = _validate_resource_limit(
             _MAX_PARTITIONED_FOLD_RUNS
-            if compact_max_runs is None
-            else compact_max_runs,
-            name="compact_max_runs",
-            minimum=2,
+            if fold_max_runs is None
+            else fold_max_runs,
+            name="fold_max_runs",
+            minimum=1,
             maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        if validated_compact_max_runs < validated_compact_min_runs:
-            raise ValueError("compact_max_runs must be >= compact_min_runs")
-        validated_compact_bytes = _validate_delta_compaction_limit(
-            compact_max_input_bytes, name="compact_max_input_bytes"
+        if validated_fold_max_runs < validated_fold_min_runs:
+            raise ValueError("fold_max_runs must be >= fold_min_runs")
+        validated_fold_bytes = _validate_resource_limit(
+            fold_max_input_bytes, name="fold_max_input_bytes"
         )
-        validated_compact_entries = _validate_delta_compaction_limit(
-            compact_max_input_entries, name="compact_max_input_entries"
+        validated_fold_entries = _validate_resource_limit(
+            fold_max_input_entries, name="fold_max_input_entries"
         )
         clean_limits = {
             "clean_max_candidate_segments": clean_max_candidate_segments,
@@ -3469,15 +3470,15 @@ class Collection:
             "clean_min_garbage_rows": clean_min_garbage_rows,
         }
         validated_clean = {
-            name: _validate_delta_compaction_limit(value, name=name)
+            name: _validate_resource_limit(value, name=name)
             for name, value in clean_limits.items()
         }
-        validated_clean_reclaimable = _validate_delta_compaction_limit(
+        validated_clean_reclaimable = _validate_resource_limit(
             clean_min_reclaimable_bytes,
             name="clean_min_reclaimable_bytes",
             minimum=0,
         )
-        validated_clean_ratio = _validate_delta_compaction_limit(
+        validated_clean_ratio = _validate_resource_limit(
             clean_min_garbage_ratio_ppm,
             name="clean_min_garbage_ratio_ppm",
             minimum=0,
@@ -3486,7 +3487,7 @@ class Collection:
         validated_clean_cursor = (
             self._cleaning_cursor
             if clean_start_after_segment_id is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 clean_start_after_segment_id,
                 name="clean_start_after_segment_id",
                 minimum=0,
@@ -3509,10 +3510,10 @@ class Collection:
             "materialize_max_input_bytes": validated_materialize_bytes,
             "materialize_max_input_entries": validated_materialize_entries,
             "materialize_max_memory_bytes": validated_materialize_memory,
-            "compact_min_runs": validated_compact_min_runs,
-            "compact_max_runs": validated_compact_max_runs,
-            "compact_max_input_bytes": validated_compact_bytes,
-            "compact_max_input_entries": validated_compact_entries,
+            "fold_min_runs": validated_fold_min_runs,
+            "fold_max_runs": validated_fold_max_runs,
+            "fold_max_input_bytes": validated_fold_bytes,
+            "fold_max_input_entries": validated_fold_entries,
             **validated_clean,
             "clean_min_reclaimable_bytes": validated_clean_reclaimable,
             "clean_min_garbage_ratio_ppm": validated_clean_ratio,
@@ -3629,37 +3630,37 @@ class Collection:
                             "reason": reason, "before": action_before,
                             "after": dict(current), "result": result})
 
-        compact_planned = (
-            stat_int(current, "delta_run_count")
-            >= validated_compact_min_runs
+        fold_planned = (
+            stat_int(current, "index_run_count")
+            >= validated_fold_min_runs
         )
         if dry_run:
             record_skipped(
-                "compact_deltas", compact_planned,
-                "threshold_reached" if compact_planned else "below_threshold",
+                "fold_partitions", fold_planned,
+                "threshold_reached" if fold_planned else "below_threshold",
             )
-        elif not compact_planned:
-            record_skipped("compact_deltas", False, "below_threshold")
+        elif not fold_planned:
+            record_skipped("fold_partitions", False, "below_threshold")
         elif not may_attempt():
-            record_skipped("compact_deltas", True, "maintenance_budget_reached")
+            record_skipped("fold_partitions", True, "maintenance_budget_reached")
         else:
             actions_attempted += 1
             action_before = dict(current)
-            result = self.compact_deltas(
-                max_runs=validated_compact_max_runs,
-                max_input_bytes=validated_compact_bytes,
-                max_input_entries=validated_compact_entries,
+            result = self.fold_partitions(
+                max_runs=validated_fold_max_runs,
+                max_input_bytes=validated_fold_bytes,
+                max_input_entries=validated_fold_entries,
             )
-            performed = bool(result.get("compacted"))
+            performed = bool(result.get("folded"))
             actions_performed += int(performed)
             current = stats_snapshot()
-            actions.append({"name": "compact_deltas", "planned": True,
+            actions.append({"name": "fold_partitions", "planned": True,
                             "attempted": True, "performed": performed,
                             "reason": (
                                 "completed" if performed
                                 else (
                                     "input_exceeds_budget"
-                                    if result.get("compaction_budget_blocked")
+                                    if result.get("fold_budget_blocked")
                                     else "no_eligible_partition"
                                 )
                             ), "before": action_before,
@@ -4131,15 +4132,15 @@ class Collection:
             "min_garbage_rows": min_garbage_rows,
         }
         validated = {
-            name: _validate_delta_compaction_limit(value, name=name)
+            name: _validate_resource_limit(value, name=name)
             for name, value in limits.items()
         }
-        validated_reclaimable = _validate_delta_compaction_limit(
+        validated_reclaimable = _validate_resource_limit(
             min_reclaimable_bytes,
             name="min_reclaimable_bytes",
             minimum=0,
         )
-        validated_ratio = _validate_delta_compaction_limit(
+        validated_ratio = _validate_resource_limit(
             min_garbage_ratio_ppm,
             name="min_garbage_ratio_ppm",
             minimum=0,
@@ -4148,7 +4149,7 @@ class Collection:
         cursor = (
             self._cleaning_cursor
             if start_after_segment_id is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 start_after_segment_id,
                 name="start_after_segment_id",
                 minimum=0,

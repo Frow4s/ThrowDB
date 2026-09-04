@@ -90,8 +90,8 @@ folding сокращает слои индекса. Segment cleaning перен�
 Версии внутренних структур независимы от версии коллекции: manifest v2,
 catalog v3, WAL v1, protobuf v1 и версии workload logs используются текущим
 форматом 7. Они не являются оставшимися читателями старых коллекций.
-Названия действующих API `shard_size_bytes` и `compact_deltas` сохранены;
-сейчас они задают размер сегмента и запускают partition folding.
+Публичные имена API приведены к этим структурам на следующем этапе,
+описанном ниже; прежние имена не сохранены как aliases.
 
 ## Исправления корректности
 
@@ -164,7 +164,7 @@ pread, thread pool, io_uring и действующие benchmarks сохране
 Лицензия, application authorization, HA, online backup, ANN и новые типы ID
 остаются отдельными продуктовыми решениями.
 
-## Проверка окончательного состояния
+## Проверки предыдущего этапа — 2026-09-04
 
 Окружение: macOS ARM64, Python 3.10.13, AppleClang 15, CMake 4.4.0,
 закреплённый native gRPC 1.81.0.
@@ -195,3 +195,64 @@ Linux-ветка `close(EINTR)` и настоящий io_uring требуют Li
 Сам удалённый GitHub workflow не запускался; выполнены локальные эквиваленты
 его команд. Результаты не являются замером production throughput,
 многосуточным soak или восстановлением настоящего S3-бэкапа.
+
+## Уточнение публичного API — 2026-09-05
+
+Имена C++, Python, CLI, protobuf diagnostics и benchmark reports теперь
+описывают текущий partitioned layout. Это намеренно несовместимое изменение
+API: aliases старых имён отсутствуют. Формат существующих коллекций 7 и байты
+хранимых векторов не меняются.
+
+| Прежнее имя | Текущее имя и смысл |
+|---|---|
+| `shard_size_bytes`, `--shard-size-gib` | `segment_size_bytes`, `--segment-size-gib`: целевой размер immutable сегмента |
+| `compact_deltas()`, C++ `compact_delta_runs()`, CLI `compact-deltas` | `fold_partitions()`, CLI `fold-partitions`: сведение полных разделов индекса в snapshots |
+| Параметры `compact_*`, CLI `--compact-*` | `fold_*`, `--fold-*`: бюджеты и пороги partition folding в maintenance |
+| `delta_run_count`, `delta_entry_count`, `total_delta_run_bytes` | `index_run_count`, `index_run_entry_count`, `index_run_bytes`: удерживаемые immutable runs |
+| `delta_put_rows`, `total_delta_segment_bytes`, `total_delta_bytes` | `materialized_segment_rows`, `materialized_segment_bytes`, `mutation_resource_bytes`: строки и объём materialized ресурсов |
+| `compacted`, `compacted_delta_input_entries`, `compacted_delta_input_bytes`, `compaction_budget_blocked` | `folded`, `folded_run_input_entries`, `folded_run_input_bytes`, `fold_budget_blocked`: результат и затраты одного fold |
+| `zero_delta_fast_path` | `snapshot_only_fast_path`: чтение без активных index runs и WAL overlay |
+
+Удалены метрики, оставшиеся от несуществующих веток lifecycle:
+`catalog_managed`, `delta_managed`, `reclaimed_wal_count`,
+`reclaimed_wal_bytes`, `compacted_delta_run_count`,
+`reclaimed_delta_run_count`, `reclaimed_delta_bytes`.
+Реальные результаты orphan collection и показатели folding остаются в своих
+отчётах. Maintenance action теперь называется `fold_partitions`.
+
+Примеры создания, embedded maintenance, CLI и installed-wheel smoke обновлены
+вместе с API. Историческая таблица от 4 сентября выше относится к предыдущему
+этапу. Ограниченный сценарий для настоящего Linux/io_uring и mixed restart
+приведён в [Linux validation](linux-validation.md); наличие сценария само по
+себе не означает, что он выполнен. Результаты текущего этапа фиксируются
+отдельно по фактическим проверкам.
+
+Убрано оставшееся ограничение `max_runs >= 2`: folding принимает бюджет от
+1 до 4096 runs на выбранный partition. Snapshot в это число не входит.
+Если у partition два активных runs, бюджет 1 оставляет его без изменения;
+частичное сведение раздела не разрешается. Это проверяется через C++, Python,
+CLI и автоматическое серверное обслуживание.
+
+### Проверки этапа 5 сентября
+
+Локальное окружение — macOS ARM64; Linux-результаты в эту таблицу не включены.
+
+| Проверка | Результат |
+|---|---|
+| Полный Python-набор после переименования API, с настоящим daemon | 702 passed, без пропусков |
+| Повтор затронутых Python-наборов после разрешения `max_runs=1` | 185 passed: Collection, mutation lifecycle, maintenance, CLI, calibration |
+| Окончательная Release-сборка C++/gRPC, `-Werror` | 21/21 тестовых программ |
+| ASan/UBSan после переименований | 19/19 тестовых программ |
+| Повтор затронутых native suites под ASan/UBSan после `max_runs=1` | Partitioned index storage и server idempotency: 2/2 |
+| Окончательный wheel | Установлен отдельно; новые API без aliases, folding с `max_runs=1`, CRUD/maintenance/CLI/gRPC smoke прошли |
+| Backend benchmark на временной коллекции | 32 768 × 256 float16, pread и thread pool с 4 workers: bit-exact oracle прошёл, конкурентные вызовы 1/2/4/8 выполнены |
+| Дополнительная mixed gRPC нагрузка на той же тестовой коллекции | Acceptance и streaming gates прошли; выполнен один graceful restart с проверкой replay и восстановления |
+| Protobuf diagnostics | Изменены только имена полей 13–15; номера, типы и сериализованные байты проверены |
+| Linux/io_uring на целевой машине | Не выполнено: SSH/Teleport недоступен, прокси возвращает HTTP 502 |
+
+185 Python-проверок пересекаются с полным набором; их нельзя прибавлять к 702
+как уникальные тесты. Маленькая локальная коллекция и короткая mixed нагрузка
+проверяют корректность сценариев, но не производительность целевого NVMe,
+ENOSPC или длительную работу на данных больше RAM. Настоящий Linux/io_uring,
+нагрузка на рабочем объёме и изолированная проверка заполненного filesystem
+остаются непроверенными до восстановления доступа к Linux-машине.

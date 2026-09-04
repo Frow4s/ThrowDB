@@ -482,7 +482,7 @@ public:
             *physical_reader_, max_wals, max_input_bytes, max_input_entries,
             max_memory_bytes);
     }
-    [[nodiscard]] NativeMutationLogStats compact_delta_runs(
+    [[nodiscard]] NativeMutationLogStats fold_partitions(
         const std::uint64_t max_runs, const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
         return reader_.fold_partitions(max_runs, max_input_bytes, max_input_entries);
@@ -1003,14 +1003,14 @@ NativeMutationLogStats NativeCollection::materialize_frozen_wals(
     return impl_->materialize_frozen_wals(
         max_wals, max_input_bytes, max_input_entries, max_memory_bytes);
 }
-NativeMutationLogStats NativeCollection::compact_delta_runs() {
-    return impl_->compact_delta_runs(4096, 8ULL << 30, 1'000'000);
+NativeMutationLogStats NativeCollection::fold_partitions() {
+    return impl_->fold_partitions(4096, 8ULL << 30, 1'000'000);
 }
-NativeMutationLogStats NativeCollection::compact_delta_runs(
+NativeMutationLogStats NativeCollection::fold_partitions(
     const std::uint64_t max_runs,
     const std::uint64_t max_input_bytes,
     const std::uint64_t max_input_entries) {
-    return impl_->compact_delta_runs(
+    return impl_->fold_partitions(
         max_runs, max_input_bytes, max_input_entries);
 }
 NativeSegmentCleaningStats NativeCollection::clean_segments(

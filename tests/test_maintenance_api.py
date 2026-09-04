@@ -18,7 +18,7 @@ def _build(path: Path) -> None:
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=4, dtype="float16"),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ) as builder:
         builder.add([1, 2], _vectors(1))
@@ -34,7 +34,7 @@ def _build_default_v7(path: Path) -> tuple[np.ndarray, np.ndarray]:
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=1024, dtype="float16"),
-        shard_size_bytes=vectors.nbytes,
+        segment_size_bytes=vectors.nbytes,
     ) as builder:
         assert builder.format_version == 7
         builder.add(ids, vectors)
@@ -65,7 +65,7 @@ def test_maintain_dry_run_is_non_mutating_and_explains_policy(
     assert [action["name"] for action in report["actions"]] == [
         "rotate_wal",
         "materialize_frozen_wals",
-        "compact_deltas",
+        "fold_partitions",
         "clean_segments",
         "collect_orphans",
     ]
@@ -86,7 +86,7 @@ def test_maintain_executes_rotate_then_bounded_materialization(
             rotate_wal_bytes=1,
             materialize_max_wals=1,
             materialize_max_input_bytes=1 << 20,
-            compact_min_runs=8,
+            fold_min_runs=8,
             orphan_min_age_seconds=0,
         )
         np.testing.assert_array_equal(
@@ -96,16 +96,16 @@ def test_maintain_executes_rotate_then_bounded_materialization(
     assert report["dry_run"] is False
     assert report["actions_performed"] == 3
     assert report["work_performed"] is True
-    rotate, materialize, compact, clean, collect = report["actions"]
+    rotate, materialize, fold, clean, collect = report["actions"]
     assert rotate["performed"] is True
     assert materialize["performed"] is True
     assert materialize["result"]["materialized_wal_count"] == 1
-    assert compact["attempted"] is False
+    assert fold["attempted"] is False
     assert clean["performed"] is False
     assert collect["attempted"] is True
     assert collect["performed"] is True
     assert report["after"]["frozen_wal_count"] == 0
-    assert report["after"]["delta_run_count"] == 1
+    assert report["after"]["index_run_count"] == 1
 
 
 def test_maintain_hard_action_and_cooperative_time_budgets(
@@ -169,12 +169,12 @@ def test_format7_maintain_completes_selective_lifecycle_in_two_passes(
         )
         assert plan["version"] == 2
         assert plan["before"] == plan["after"] == before
-        assert plan["policy"]["compact_min_runs"] == 1
-        assert plan["policy"]["compact_max_runs"] == 4096
+        assert plan["policy"]["fold_min_runs"] == 1
+        assert plan["policy"]["fold_max_runs"] == 4096
         assert [action["name"] for action in plan["actions"]] == [
             "rotate_wal",
             "materialize_frozen_wals",
-            "compact_deltas",
+            "fold_partitions",
             "clean_segments",
             "collect_orphans",
         ]
@@ -187,15 +187,16 @@ def test_format7_maintain_completes_selective_lifecycle_in_two_passes(
             rotate_wal_bytes=1,
             materialize_max_wals=1,
             materialize_max_input_bytes=1 << 20,
-            compact_max_input_bytes=8 << 20,
-            compact_max_input_entries=1_000,
+            fold_max_runs=1,
+            fold_max_input_bytes=8 << 20,
+            fold_max_input_entries=1_000,
             orphan_min_age_seconds=0,
             **cleaner_policy,
         )
         assert [action["name"] for action in first["actions"]] == [
             "rotate_wal",
             "materialize_frozen_wals",
-            "compact_deltas",
+            "fold_partitions",
             "clean_segments",
             "collect_orphans",
         ]
@@ -205,7 +206,7 @@ def test_format7_maintain_completes_selective_lifecycle_in_two_passes(
         assert first["actions"][4]["reason"] == "maintenance_budget_reached"
         assert first["actions_performed"] == 4
         assert first["action_budget_reached"] is True
-        assert first["after"]["delta_run_count"] == 1
+        assert first["after"]["index_run_count"] == 1
         assert (
             collection._cleaning_cursor
             == first["actions"][3]["result"]["next_start_after_segment_id"]
@@ -218,14 +219,15 @@ def test_format7_maintain_completes_selective_lifecycle_in_two_passes(
         second = collection.maintain(
             dry_run=False,
             max_actions=5,
-            compact_max_input_bytes=8 << 20,
-            compact_max_input_entries=1_000,
+            fold_max_runs=1,
+            fold_max_input_bytes=8 << 20,
+            fold_max_input_entries=1_000,
             orphan_min_age_seconds=0,
             **cleaner_policy,
         )
-        assert second["actions"][2]["name"] == "compact_deltas"
+        assert second["actions"][2]["name"] == "fold_partitions"
         assert second["actions"][2]["performed"] is True
-        assert second["after"]["delta_run_count"] == 0
+        assert second["after"]["index_run_count"] == 0
         assert second["actions"][4]["name"] == "collect_orphans"
         assert second["actions"][4]["attempted"] is True
         np.testing.assert_array_equal(

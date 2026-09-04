@@ -297,7 +297,7 @@ void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
     }
 }
 
-void test_zero_delta_read_path_transitions_on_first_commit() {
+void test_snapshot_only_read_path_transitions_on_first_commit() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     constexpr std::uint32_t dimension = 4;
@@ -323,7 +323,7 @@ void test_zero_delta_read_path_transitions_on_first_commit() {
     auto writer = throwdb::NativeCollection::open(store, {}, true);
     require_equal(
         writer->get_bytes(ids), base,
-        "zero-delta base-only read is not bit exact");
+        "snapshot-only read is not bit exact");
 
     std::atomic<bool> start{false};
     std::atomic<bool> finished{false};
@@ -948,8 +948,8 @@ int main() {
             "active_wal_tail_is_ignored_and_writer_repairs_it",
             test_active_wal_tail_is_ignored_and_writer_repairs_it},
         TestCase{
-            "zero_delta_read_path_transitions_on_first_commit",
-            test_zero_delta_read_path_transitions_on_first_commit},
+            "snapshot_only_read_path_transitions_on_first_commit",
+            test_snapshot_only_read_path_transitions_on_first_commit},
         TestCase{
             "empty_collection_and_empty_batches",
             test_empty_collection_and_empty_batches},

@@ -615,7 +615,7 @@ inline constexpr std::uint32_t kAllResolvedTuningFields = 0x1fU;
         || result.maintenance.materialize_max_input_entries == 0
         || result.maintenance.materialize_max_memory_bytes == 0
         || result.maintenance.fold_min_runs == 0
-        || result.maintenance.fold_max_runs < 2
+        || result.maintenance.fold_max_runs == 0
         || result.maintenance.fold_max_runs > 4096
         || result.maintenance.fold_min_runs
                > result.maintenance.fold_max_runs
@@ -809,9 +809,9 @@ private:
                 aggregate.materialization_disk_budget_blocked
                 || result.materialization_disk_budget_blocked;
             aggregate.folded = aggregate.folded || result.folded;
-            aggregate.compaction_budget_blocked =
-                aggregate.compaction_budget_blocked
-                || result.compaction_budget_blocked;
+            aggregate.fold_budget_blocked =
+                aggregate.fold_budget_blocked
+                || result.fold_budget_blocked;
             aggregate.fold_disk_budget_blocked =
                 aggregate.fold_disk_budget_blocked
                 || result.fold_disk_budget_blocked;
@@ -848,7 +848,7 @@ private:
                 || result.materialization_entry_budget_blocked
                 || result.materialization_memory_budget_blocked
                 || result.materialization_disk_budget_blocked
-                || result.compaction_budget_blocked
+                || result.fold_budget_blocked
                 || result.fold_disk_budget_blocked
                 || result.cleaner_disk_budget_blocked
                 || result.actions_performed == 0) {
@@ -891,8 +891,8 @@ private:
                     << ",\"materialization_disk_budget_blocked\":"
                     << (result.materialization_disk_budget_blocked
                             ? "true" : "false")
-                    << ",\"compaction_budget_blocked\":"
-                    << (result.compaction_budget_blocked
+                    << ",\"fold_budget_blocked\":"
+                    << (result.fold_budget_blocked
                             ? "true" : "false")
                     << ",\"fold_disk_budget_blocked\":"
                     << (result.fold_disk_budget_blocked
@@ -943,8 +943,8 @@ private:
                     << result.after.estimated_overlay_bytes
                     << ",\"frozen_wals\":"
                     << result.after.frozen_wal_count
-                    << ",\"delta_runs\":"
-                    << result.after.delta_run_count << "}\n"
+                    << ",\"index_runs\":"
+                    << result.after.index_run_count << "}\n"
                     << std::flush;
             } catch (const throwdb::server::InsufficientStorageError& error) {
                 std::cerr

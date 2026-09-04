@@ -29,11 +29,11 @@ from .workload import (
 )
 
 
-DEFAULT_SHARD_SIZE_GIB = 16
+DEFAULT_SEGMENT_SIZE_GIB = 16
 DEFAULT_BATCH_ROWS = 32_768
 MAX_PARTITIONED_FOLD_RUNS = 4096
-DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB = 8
-DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES = 1_000_000
+DEFAULT_FOLD_MAX_INPUT_GIB = 8
+DEFAULT_FOLD_MAX_INPUT_ENTRIES = 1_000_000
 DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS = 8
 DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES = 1 << 30
 DEFAULT_CLEAN_MAX_SOURCE_BYTES = 32 << 30
@@ -165,16 +165,7 @@ def _io_uring_workers(value: str) -> int:
     return parsed
 
 
-def _delta_compaction_runs(value: str) -> int:
-    parsed = int(value)
-    if parsed < 2 or parsed > MAX_PARTITIONED_FOLD_RUNS:
-        raise argparse.ArgumentTypeError(
-            f"value must be between 2 and {MAX_PARTITIONED_FOLD_RUNS}"
-        )
-    return parsed
-
-
-def _partitioned_compaction_min_runs(value: str) -> int:
+def _fold_runs(value: str) -> int:
     parsed = int(value)
     if parsed < 1 or parsed > MAX_PARTITIONED_FOLD_RUNS:
         raise argparse.ArgumentTypeError(
@@ -198,7 +189,7 @@ def _create(args: argparse.Namespace) -> None:
             f"--dimension is {args.dimension}, but embeddings have {dimension} columns"
         )
 
-    shard_size_bytes = args.shard_size_gib * (1 << 30)
+    segment_size_bytes = args.segment_size_gib * (1 << 30)
     schema = CollectionSchema(
         id_type="uint64",
         dimension=dimension,
@@ -207,7 +198,7 @@ def _create(args: argparse.Namespace) -> None:
     with Collection.create(
         args.storage,
         schema=schema,
-        shard_size_bytes=shard_size_bytes,
+        segment_size_bytes=segment_size_bytes,
         format_version=args.format_version,
     ) as collection:
         for begin in range(0, ids.shape[0], args.batch_rows):
@@ -294,11 +285,11 @@ def _materialize(args: argparse.Namespace) -> None:
         )
 
 
-def _compact_deltas(args: argparse.Namespace) -> None:
+def _fold_partitions(args: argparse.Namespace) -> None:
     with Collection.open(args.storage, mode="r+") as collection:
         print(
             json.dumps(
-                collection.compact_deltas(
+                collection.fold_partitions(
                     max_runs=args.max_runs,
                     max_input_bytes=args.max_input_gib * (1 << 30),
                     max_input_entries=args.max_input_entries,
@@ -362,10 +353,10 @@ def _maintain(args: argparse.Namespace) -> None:
                 args.materialize_max_input_entries
             ),
             materialize_max_memory_bytes=args.materialize_max_memory_bytes,
-            compact_min_runs=args.compact_min_runs,
-            compact_max_runs=args.compact_max_runs,
-            compact_max_input_bytes=args.compact_max_input_bytes,
-            compact_max_input_entries=args.compact_max_input_entries,
+            fold_min_runs=args.fold_min_runs,
+            fold_max_runs=args.fold_max_runs,
+            fold_max_input_bytes=args.fold_max_input_bytes,
+            fold_max_input_entries=args.fold_max_input_entries,
             clean_max_candidate_segments=args.clean_max_candidate_segments,
             clean_max_sidecar_scan_bytes=args.clean_max_sidecar_scan_bytes,
             clean_max_source_bytes=args.clean_max_source_bytes,
@@ -682,7 +673,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="on-disk collection format (only 7 is supported)",
     )
     create.add_argument(
-        "--shard-size-gib", type=_positive_int, default=DEFAULT_SHARD_SIZE_GIB
+        "--segment-size-gib", type=_positive_int, default=DEFAULT_SEGMENT_SIZE_GIB
     )
     create.add_argument(
         "--batch-rows", type=_positive_int, default=DEFAULT_BATCH_ROWS
@@ -951,30 +942,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     materialize.set_defaults(handler=_materialize)
 
-    compact_deltas = subparsers.add_parser(
-        "compact-deltas",
-        help="compact bounded immutable index state",
+    fold_partitions = subparsers.add_parser(
+        "fold-partitions",
+        help="fold bounded index runs into partition snapshots",
     )
-    compact_deltas.add_argument("--storage", type=Path, required=True)
-    compact_deltas.add_argument(
+    fold_partitions.add_argument("--storage", type=Path, required=True)
+    fold_partitions.add_argument(
         "--max-runs",
-        type=_delta_compaction_runs,
+        type=_fold_runs,
         default=None,
-        help="maximum input runs (default: 4096)",
+        help="maximum input runs per partition, excluding its snapshot (default: 4096)",
     )
-    compact_deltas.add_argument(
+    fold_partitions.add_argument(
         "--max-input-gib",
         type=_positive_int,
-        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB,
+        default=DEFAULT_FOLD_MAX_INPUT_GIB,
         help="maximum total input size in GiB (default: 8)",
     )
-    compact_deltas.add_argument(
+    fold_partitions.add_argument(
         "--max-input-entries",
         type=_positive_int,
-        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+        default=DEFAULT_FOLD_MAX_INPUT_ENTRIES,
         help="maximum total input version records (default: 1000000)",
     )
-    compact_deltas.set_defaults(handler=_compact_deltas)
+    fold_partitions.set_defaults(handler=_fold_partitions)
 
     clean_segments = subparsers.add_parser(
         "clean-segments",
@@ -1110,20 +1101,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     maintain.add_argument(
-        "--compact-min-runs", type=_partitioned_compaction_min_runs,
+        "--fold-min-runs", type=_fold_runs,
         default=None,
     )
     maintain.add_argument(
-        "--compact-max-runs", type=_delta_compaction_runs,
+        "--fold-max-runs", type=_fold_runs,
         default=None,
     )
     maintain.add_argument(
-        "--compact-max-input-bytes", type=_positive_int,
-        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_GIB * (1 << 30),
+        "--fold-max-input-bytes", type=_positive_int,
+        default=DEFAULT_FOLD_MAX_INPUT_GIB * (1 << 30),
     )
     maintain.add_argument(
-        "--compact-max-input-entries", type=_positive_int,
-        default=DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+        "--fold-max-input-entries", type=_positive_int,
+        default=DEFAULT_FOLD_MAX_INPUT_ENTRIES,
     )
     maintain.add_argument(
         "--clean-max-candidate-segments", type=_positive_int,

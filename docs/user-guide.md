@@ -165,7 +165,7 @@ throwdb create \
   --ids "$IDS" \
   --embeddings "$EMBEDDINGS" \
   --format-version 7 \
-  --shard-size-gib 16 \
+  --segment-size-gib 16 \
   --batch-rows 65536
 ```
 
@@ -194,7 +194,7 @@ with throwdb.Collection.create(
     Path("/nvme/throwdb/collection"),
     schema=schema,
     format_version=7,
-    shard_size_bytes=16 << 30,
+    segment_size_bytes=16 << 30,
 ) as collection:
     for begin in range(0, len(ids), 65_536):
         end = min(begin + 65_536, len(ids))

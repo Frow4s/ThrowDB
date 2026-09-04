@@ -101,9 +101,9 @@ The global order is `writer.lock -> lifecycle mutex -> mutation mutex ->
 commit.lock -> view.lock -> state mutex`. The collector follows the same order,
 so it cannot mistake an in-progress lifecycle output for an orphan.
 
-Segment IDs are durably reserved before a long delta build and are never reused,
-which protects against segment-ID ABA. Network filesystem and object-store
-semantics are not yet part of this contract.
+Segment IDs are durably reserved before a long materialization or cleaning
+build and are never reused, which protects against segment-ID ABA. Network
+filesystem and object-store semantics are not yet part of this contract.
 
 ## Current lifecycle safety slice
 
@@ -491,7 +491,7 @@ the latest WAL chain, then atomically advances `indexed_sequence` and removes
 only the selected WAL references. The retired WAL pathnames remain on disk as
 unreferenced files for a later orphan pass.
 
-`compact_deltas()` performs a selective fold in format 7. A candidate budget
+`fold_partitions()` performs a selective fold in format 7. A candidate budget
 charges the complete current partition snapshot plus every active run section
 for that partition; a partial fold is forbidden. The merge keeps the greatest
 sequence, validates equal-sequence cleaner relocations, and omits tombstones

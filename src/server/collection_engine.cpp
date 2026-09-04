@@ -268,7 +268,7 @@ void validate_maintenance_options(const EngineMaintenanceOptions& options) {
         || options.materialize_max_input_entries == 0
         || options.materialize_max_memory_bytes == 0
         || options.fold_min_runs == 0
-        || options.fold_max_runs < 2
+        || options.fold_max_runs == 0
         || options.fold_max_runs > 4096
         || options.fold_min_runs > options.fold_max_runs
         || options.fold_max_input_bytes == 0
@@ -990,7 +990,7 @@ public:
 
         const bool fold_due =
             collection_.format_version() == 7
-            && current.delta_run_count >= options.fold_min_runs;
+            && current.index_run_count >= options.fold_min_runs;
         if (!result.pending_mutation_deferred
             && !lifecycle_disk_budget_blocked && fold_due && may_attempt()) {
             try {
@@ -1000,13 +1000,13 @@ public:
                     estimated_lifecycle_write_bytes(
                         options.fold_max_input_bytes),
                     "automatic index folding");
-                current = collection_.compact_delta_runs(
+                current = collection_.fold_partitions(
                     options.fold_max_runs,
                     options.fold_max_input_bytes,
                     options.fold_max_input_entries);
-                result.folded = current.compacted;
-                result.compaction_budget_blocked =
-                    current.compaction_budget_blocked;
+                result.folded = current.folded;
+                result.fold_budget_blocked =
+                    current.fold_budget_blocked;
                 result.actions_performed += static_cast<std::uint64_t>(
                     result.folded);
             } catch (const PendingMutationFenceError&) {

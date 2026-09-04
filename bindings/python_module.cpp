@@ -23,7 +23,7 @@ namespace py = pybind11;
 
 namespace {
 
-constexpr std::uint64_t kDefaultShardSizeBytes = 16ULL << 30;
+constexpr std::uint64_t kDefaultSegmentSizeBytes = 16ULL << 30;
 constexpr std::int64_t kMaxIoWorkers = 1024;
 constexpr std::int64_t kMaxIoQueueCapacity = 1 << 20;
 constexpr std::int64_t kDefaultIoRangesPerTask = 8;
@@ -37,8 +37,8 @@ constexpr std::uint64_t kDefaultMaxGapBytes = 0;
 constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 22;
 constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 25;
 constexpr std::uint64_t kMaximumPartitionedFoldRuns = 4096;
-constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
-constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
+constexpr std::uint64_t kDefaultFoldMaxInputBytes = 8ULL << 30;
+constexpr std::uint64_t kDefaultFoldMaxInputEntries = 1'000'000;
 constexpr std::uint64_t kDefaultOrphanMaxFiles = 1024;
 constexpr std::uint64_t kDefaultOrphanMaxBytes = 8ULL << 30;
 constexpr std::uint64_t kDefaultMaxWalBacklogBytes = 16ULL << 30;
@@ -100,8 +100,6 @@ struct DTypeInfo {
 [[nodiscard]] py::dict mutation_log_stats_dict(
     const throwdb::NativeMutationLogStats& stats) {
     py::dict result;
-    result["catalog_managed"] = stats.catalog_managed;
-    result["delta_managed"] = stats.delta_managed;
     result["generation"] = stats.generation;
     result["committed_sequence"] = stats.committed_sequence;
     result["materialized_sequence"] = stats.materialized_sequence;
@@ -120,15 +118,13 @@ struct DTypeInfo {
     result["total_wal_operation_count"] =
         stats.total_wal_operation_count;
     result["frozen_wal_bytes"] = stats.frozen_wal_bytes;
-    result["delta_run_count"] = stats.delta_run_count;
-    result["delta_entry_count"] = stats.delta_entry_count;
-    result["delta_put_rows"] = stats.delta_put_rows;
-    result["total_delta_run_bytes"] = stats.total_delta_run_bytes;
-    result["total_delta_segment_bytes"] =
-        stats.total_delta_segment_bytes;
-    result["total_delta_bytes"] = stats.total_delta_bytes;
-    result["reclaimed_wal_count"] = stats.reclaimed_wal_count;
-    result["reclaimed_wal_bytes"] = stats.reclaimed_wal_bytes;
+    result["index_run_count"] = stats.index_run_count;
+    result["index_run_entry_count"] = stats.index_run_entry_count;
+    result["materialized_segment_rows"] = stats.materialized_segment_rows;
+    result["index_run_bytes"] = stats.index_run_bytes;
+    result["materialized_segment_bytes"] =
+        stats.materialized_segment_bytes;
+    result["mutation_resource_bytes"] = stats.mutation_resource_bytes;
     result["materialized_wal_count"] = stats.materialized_wal_count;
     result["materialized_wal_input_bytes"] =
         stats.materialized_wal_input_bytes;
@@ -136,27 +132,22 @@ struct DTypeInfo {
         stats.materialized_wal_input_entries;
     result["materialization_estimated_peak_memory_bytes"] =
         stats.materialization_estimated_peak_memory_bytes;
-    result["compacted_delta_run_count"] =
-        stats.compacted_delta_run_count;
-    result["compacted_delta_input_entries"] =
-        stats.compacted_delta_input_entries;
-    result["compacted_delta_input_bytes"] =
-        stats.compacted_delta_input_bytes;
-    result["reclaimed_delta_run_count"] =
-        stats.reclaimed_delta_run_count;
-    result["reclaimed_delta_bytes"] = stats.reclaimed_delta_bytes;
-    result["compacted_partition_count"] =
-        stats.compacted_partition_count;
-    result["compacted_run_section_count"] =
-        stats.compacted_run_section_count;
-    result["compacted_snapshot_input_entries"] =
-        stats.compacted_snapshot_input_entries;
-    result["compacted_snapshot_input_bytes"] =
-        stats.compacted_snapshot_input_bytes;
-    result["compacted_output_entries"] =
-        stats.compacted_output_entries;
-    result["compacted_output_bytes"] =
-        stats.compacted_output_bytes;
+    result["folded_run_input_entries"] =
+        stats.folded_run_input_entries;
+    result["folded_run_input_bytes"] =
+        stats.folded_run_input_bytes;
+    result["folded_partition_count"] =
+        stats.folded_partition_count;
+    result["folded_run_section_count"] =
+        stats.folded_run_section_count;
+    result["folded_snapshot_input_entries"] =
+        stats.folded_snapshot_input_entries;
+    result["folded_snapshot_input_bytes"] =
+        stats.folded_snapshot_input_bytes;
+    result["folded_output_entries"] =
+        stats.folded_output_entries;
+    result["folded_output_bytes"] =
+        stats.folded_output_bytes;
     result["rotated"] = stats.rotated;
     result["materialized"] = stats.materialized;
     result["materialization_budget_blocked"] =
@@ -165,9 +156,9 @@ struct DTypeInfo {
         stats.materialization_entry_budget_blocked;
     result["materialization_memory_budget_blocked"] =
         stats.materialization_memory_budget_blocked;
-    result["compacted"] = stats.compacted;
-    result["compaction_budget_blocked"] =
-        stats.compaction_budget_blocked;
+    result["folded"] = stats.folded;
+    result["fold_budget_blocked"] =
+        stats.fold_budget_blocked;
     result["reclamation_complete"] = stats.reclamation_complete;
     return result;
 }
@@ -337,7 +328,7 @@ struct DTypeInfo {
     result["maximum_range_bytes"] = stats.maximum_range_bytes;
     result["mean_range_bytes"] = stats.mean_range_bytes;
     result["backend_tasks"] = stats.backend_tasks;
-    result["zero_delta_fast_path"] = stats.zero_delta_fast_path;
+    result["snapshot_only_fast_path"] = stats.snapshot_only_fast_path;
     return result;
 }
 
@@ -740,14 +731,14 @@ public:
     static std::unique_ptr<PyNativeCollectionBuilder> create(
         const py::object& path,
         const std::uint32_t dimension,
-        const std::uint64_t shard_size_bytes,
+        const std::uint64_t segment_size_bytes,
         const std::string& dtype,
         const std::uint32_t format_version) {
         if (dimension == 0) {
             throw py::value_error("dimension must be greater than zero");
         }
-        if (shard_size_bytes == 0) {
-            throw py::value_error("shard_size_bytes must be greater than zero");
+        if (segment_size_bytes == 0) {
+            throw py::value_error("segment_size_bytes must be greater than zero");
         }
         if (format_version != 7) {
             throw py::value_error("only format_version=7 is supported");
@@ -756,7 +747,7 @@ public:
         throwdb::NativeBuilderOptions options;
         options.dimension = dimension;
         options.dtype = checked_dtype(dtype);
-        options.segment_size_bytes = shard_size_bytes;
+        options.segment_size_bytes = segment_size_bytes;
         options.format_version = format_version;
         const auto native_path = filesystem_path(path);
         std::unique_ptr<throwdb::NativeCollectionBuilder> builder;
@@ -1639,7 +1630,7 @@ public:
         return mutation_log_stats_dict(stats);
     }
 
-    [[nodiscard]] py::dict compact_delta_runs(
+    [[nodiscard]] py::dict fold_partitions(
         const py::object& max_runs,
         const py::object& max_input_bytes,
         const py::object& max_input_entries) {
@@ -1648,10 +1639,10 @@ public:
         const std::uint64_t checked_max_runs = max_runs.is_none()
             ? kMaximumPartitionedFoldRuns
             : checked_uint64_option(max_runs, "max_runs", false);
-        if (checked_max_runs < 2
+        if (checked_max_runs == 0
             || checked_max_runs > maximum_runs) {
             throw py::value_error(
-                "max_runs must be between 2 and "
+                "max_runs must be between 1 and "
                 + std::to_string(maximum_runs));
         }
         const std::uint64_t checked_max_input_bytes =
@@ -1664,7 +1655,7 @@ public:
         throwdb::NativeMutationLogStats stats;
         {
             py::gil_scoped_release release;
-            stats = collection->compact_delta_runs(
+            stats = collection->fold_partitions(
                 checked_max_runs,
                 checked_max_input_bytes,
                 checked_max_input_entries);
@@ -1915,7 +1906,7 @@ PYBIND11_MODULE(_throwdb, module) {
             &PyNativeCollectionBuilder::create,
             py::arg("path"),
             py::arg("dimension") = 1024,
-            py::arg("shard_size_bytes") = kDefaultShardSizeBytes,
+            py::arg("segment_size_bytes") = kDefaultSegmentSizeBytes,
             py::arg("dtype") = "float16",
             py::arg("format_version") = 7)
         .def(
@@ -2142,13 +2133,13 @@ PYBIND11_MODULE(_throwdb, module) {
             py::arg("max_memory_bytes") =
                 std::numeric_limits<std::uint64_t>::max())
         .def(
-            "compact_delta_runs",
-            &PyNativeCollection::compact_delta_runs,
+            "fold_partitions",
+            &PyNativeCollection::fold_partitions,
             py::arg("max_runs") = py::none(),
             py::arg("max_input_bytes") =
-                kDefaultDeltaCompactionMaxInputBytes,
+                kDefaultFoldMaxInputBytes,
             py::arg("max_input_entries") =
-                kDefaultDeltaCompactionMaxInputEntries)
+                kDefaultFoldMaxInputEntries)
         .def(
             "clean_segments",
             &PyNativeCollection::clean_segments,

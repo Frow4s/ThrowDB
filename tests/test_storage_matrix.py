@@ -124,7 +124,7 @@ def _report(kind: str, throughput: float = 1_000.0) -> dict[str, object]:
             },
             "mutation_snapshot": {
                 "committed_sequence": 0,
-                "delta_run_count": 0,
+                "index_run_count": 0,
             },
             "open_stats": {
                 "total_seconds": 2.0,

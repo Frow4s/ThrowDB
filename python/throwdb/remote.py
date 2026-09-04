@@ -347,9 +347,9 @@ class RemoteEngineStatistics:
     total_wal_operations: int
     overlay_entries: int
     estimated_overlay_bytes: int
-    delta_run_count: int
-    total_delta_run_bytes: int
-    total_delta_segment_bytes: int
+    index_run_count: int
+    index_run_bytes: int
+    materialized_segment_bytes: int
     idempotency_journal_bytes: int
     idempotency_completed_operations: int
     idempotency_aborted_operations: int

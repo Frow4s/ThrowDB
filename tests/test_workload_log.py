@@ -795,7 +795,7 @@ def test_storage_identity_matches_real_collection_and_rejects_another(
             dimension=1024,
             dtype="float16",
         ),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ):
         pass
@@ -823,7 +823,7 @@ def test_storage_identity_matches_real_collection_and_rejects_another(
             dimension=1024,
             dtype="float16",
         ),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ):
         pass

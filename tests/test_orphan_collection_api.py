@@ -20,7 +20,7 @@ def _build_store(path: Path, *, format_version: int = 7) -> None:
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=6, dtype="float16"),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=format_version,
     ) as builder:
         builder.add(np.array([10, 20], dtype=np.uint32), vectors)
@@ -94,8 +94,8 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
     _write_with_mtime(old_wal, b"old-wal", old_ns)
     _write_with_mtime(young_wal, b"young-wal", now_ns)
     _write_with_mtime(partial_segment, b"partial", old_ns)
-    _write_with_mtime(complete_data, b"delta-data", old_ns)
-    _write_with_mtime(complete_ids, b"delta-index", old_ns)
+    _write_with_mtime(complete_data, b"segment-data", old_ns)
+    _write_with_mtime(complete_ids, b"segment-ids", old_ns)
     _write_with_mtime(unknown, b"unknown", old_ns)
 
     expected_paths = {

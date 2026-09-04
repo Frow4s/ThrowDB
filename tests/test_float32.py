@@ -55,7 +55,7 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
+        segment_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
         format_version=7,
     ) as builder:
         assert builder.dtype == "float32"
@@ -170,7 +170,6 @@ def test_cli_preserves_float32_dtype_and_bits(
     metadata = json.loads(capsys.readouterr().out)
     assert metadata["dtype"] == "float32"
     assert metadata["format_version"] == 7
-    assert metadata["mutation_log"]["catalog_managed"] is True
     assert metadata["mutation_log"]["generation"] == 1
     assert metadata["open_stats"]["index_validation"] == "checksum"
     assert metadata["open_stats"]["index_body_checksum_verified"] is True
@@ -201,5 +200,5 @@ def test_cli_preserves_float32_dtype_and_bits(
     materialized = json.loads(capsys.readouterr().out)
     assert materialized["materialized"] is True
     assert materialized["materialized_sequence"] == 1
-    assert materialized["delta_run_count"] == 1
+    assert materialized["index_run_count"] == 1
     assert materialized["frozen_wal_count"] == 0

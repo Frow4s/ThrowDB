@@ -1293,12 +1293,12 @@ public:
                 operational.mutation.overlay_entry_count);
             engine_stats->set_estimated_overlay_bytes(
                 operational.mutation.estimated_overlay_bytes);
-            engine_stats->set_delta_run_count(
-                operational.mutation.delta_run_count);
-            engine_stats->set_total_delta_run_bytes(
-                operational.mutation.total_delta_run_bytes);
-            engine_stats->set_total_delta_segment_bytes(
-                operational.mutation.total_delta_segment_bytes);
+            engine_stats->set_index_run_count(
+                operational.mutation.index_run_count);
+            engine_stats->set_index_run_bytes(
+                operational.mutation.index_run_bytes);
+            engine_stats->set_materialized_segment_bytes(
+                operational.mutation.materialized_segment_bytes);
             engine_stats->set_idempotency_journal_bytes(
                 operational.idempotency.journal_bytes);
             engine_stats->set_idempotency_completed_operations(

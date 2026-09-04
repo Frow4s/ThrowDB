@@ -45,7 +45,7 @@ def _create_collection(
     ids: object,
     vectors: np.ndarray,
     *,
-    shard_size_bytes: int = 1 << 20,
+    segment_size_bytes: int = 1 << 20,
 ) -> None:
     schema = throwdb.CollectionSchema(
         id_type="uint64",
@@ -55,7 +55,7 @@ def _create_collection(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=shard_size_bytes,
+        segment_size_bytes=segment_size_bytes,
         format_version=7,
     ) as collection:
         collection.add(ids, vectors)
@@ -219,7 +219,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=3 * schema.dimension * np.dtype(np.float16).itemsize,
+        segment_size_bytes=3 * schema.dimension * np.dtype(np.float16).itemsize,
         format_version=7,
     ) as builder:
         assert builder.mode == "write"
@@ -366,6 +366,45 @@ def test_legacy_storage_and_writer_are_not_public_api() -> None:
     assert not hasattr(throwdb, "Writer")
     assert "Storage" not in throwdb.__all__
     assert "Writer" not in throwdb.__all__
+
+
+def test_collection_rejects_retired_names_without_changing_storage(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "store"
+    schema = throwdb.CollectionSchema(dimension=4, dtype="float16")
+    with pytest.raises(TypeError, match="shard_size_bytes"):
+        throwdb.Collection.create(path, schema=schema, shard_size_bytes=16)
+    assert not path.exists()
+
+    vectors = _vectors(2, schema.dimension)
+    with throwdb.Collection.create(
+        path, schema=schema, segment_size_bytes=vectors[0].nbytes,
+    ) as builder:
+        builder.add([1, 2], vectors)
+
+    with throwdb.Collection.open(path, mode="r+") as collection:
+        assert not hasattr(collection, "compact_deltas")
+        assert not hasattr(collection_module.NativeCollection, "compact_delta_runs")
+        before = collection.mutation_log_stats
+        for keyword in (
+            "compact_min_runs", "compact_max_runs",
+            "compact_max_input_bytes", "compact_max_input_entries",
+        ):
+            with pytest.raises(TypeError, match=keyword):
+                collection.maintain(**{keyword: 2})
+        assert collection.mutation_log_stats == before
+        _assert_same_bits(collection.get([2, 1]), vectors[::-1])
+
+        retired_stats = {
+            "catalog_managed", "delta_managed", "reclaimed_wal_count",
+            "reclaimed_wal_bytes", "compacted_delta_run_count",
+            "reclaimed_delta_run_count", "reclaimed_delta_bytes",
+            "delta_run_count", "delta_entry_count", "delta_put_rows",
+            "total_delta_segment_bytes", "total_delta_run_bytes",
+            "total_delta_bytes",
+        }
+        assert retired_stats.isdisjoint(before)
 
 
 def test_add_normalizes_layout_but_never_silently_casts_embedding_dtype(
@@ -641,7 +680,7 @@ def test_current_writer_reports_future_id_schema_features_explicitly(
 
 
 @pytest.mark.parametrize(
-    ("shard_size_bytes", "error", "message"),
+    ("segment_size_bytes", "error", "message"),
     [
         (True, TypeError, "not bool"),
         (np.bool_(False), TypeError, "not bool"),
@@ -651,17 +690,17 @@ def test_current_writer_reports_future_id_schema_features_explicitly(
         (1 << 64, ValueError, "between 1"),
     ],
 )
-def test_collection_create_validates_shard_size_before_native_open(
+def test_collection_create_validates_segment_size_before_native_open(
     tmp_path: Path,
-    shard_size_bytes: object,
+    segment_size_bytes: object,
     error: type[Exception],
     message: str,
 ) -> None:
     with pytest.raises(error, match=message):
         throwdb.Collection.create(
-            tmp_path / "invalid-shard-size",
+            tmp_path / "invalid-segment-size",
             schema=throwdb.CollectionSchema(dimension=4),
-            shard_size_bytes=shard_size_bytes,  # type: ignore[arg-type]
+            segment_size_bytes=segment_size_bytes,  # type: ignore[arg-type]
         )
 
 
@@ -779,7 +818,7 @@ def test_low_level_native_metadata_and_range_options(
         path,
         ids,
         vectors,
-        shard_size_bytes=segment_size_bytes,
+        segment_size_bytes=segment_size_bytes,
     )
 
     metadata = NativeCollection.inspect_metadata(path)

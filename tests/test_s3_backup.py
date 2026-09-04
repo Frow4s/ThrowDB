@@ -339,7 +339,7 @@ def _collection(path: Path, *, marker: int = 1) -> Path:
     with Collection.create(
         path,
         schema=CollectionSchema(dimension=2, dtype="float16"),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ) as collection:
         collection.add(

@@ -13,6 +13,7 @@ Start here according to the task:
 | Understand format-7 durability and maintenance | [Mutable storage](mutable-storage.md) |
 | Understand tuning profile matching | [Reader tuning profiles](tuning-profiles.md) |
 | Run benchmarks and acceptance tests | [Testing](testing.md) |
+| Validate actual Linux backends and mixed restart traffic | [Bounded Linux validation](linux-validation.md) |
 
 Format references:
 

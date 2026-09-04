@@ -203,9 +203,9 @@ message EngineStatistics {
   uint64 total_wal_operations = 10;
   uint64 overlay_entries = 11;
   uint64 estimated_overlay_bytes = 12;
-  uint64 delta_run_count = 13;
-  uint64 total_delta_run_bytes = 14;
-  uint64 total_delta_segment_bytes = 15;
+  uint64 index_run_count = 13;
+  uint64 index_run_bytes = 14;
+  uint64 materialized_segment_bytes = 15;
   uint64 idempotency_journal_bytes = 16;
   uint64 idempotency_completed_operations = 17;
   uint64 idempotency_aborted_operations = 18;

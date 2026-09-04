@@ -513,9 +513,9 @@ void test_sample_skips_catalog_inactive_run_sections() {
     static_cast<void>(writer->rotate_wal());
     static_cast<void>(writer->materialize_frozen_wals());
     const throwdb::NativeMutationLogStats folded =
-        writer->compact_delta_runs(2, 1ULL << 20, 2);
+        writer->fold_partitions(2, 1ULL << 20, 2);
     require(
-        folded.compacted && folded.compacted_partition_count == 1,
+        folded.folded && folded.folded_partition_count == 1,
         "sample fixture did not fold exactly one run section");
     const auto catalog = current_catalog(temporary.path());
     require(catalog.runs.size() == 1, "sample fixture removed the whole run");

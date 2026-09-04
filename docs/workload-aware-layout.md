@@ -5,7 +5,7 @@ future work.
 
 ThrowDB can reduce point-read I/O by placing IDs that are commonly requested
 together near one another on disk. This is an offline optimization pipeline,
-not a new read API and not an extension of ordinary mutation compaction:
+separate from point reads and routine partition folding:
 
 ```text
 bounded request log

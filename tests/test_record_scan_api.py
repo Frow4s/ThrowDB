@@ -53,7 +53,7 @@ def _build(
         path,
         schema=schema,
         format_version=format_version,
-        shard_size_bytes=max(1, vectors[0].nbytes * rows_per_segment),
+        segment_size_bytes=max(1, vectors[0].nbytes * rows_per_segment),
     ) as builder:
         builder.add(ids, vectors)
 

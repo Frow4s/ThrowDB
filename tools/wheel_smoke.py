@@ -141,7 +141,7 @@ def main() -> None:
                 dimension=8,
                 dtype="float16",
             ),
-            shard_size_bytes=1 << 20,
+            segment_size_bytes=1 << 20,
         ) as builder:
             if builder.format_version != 7:
                 raise AssertionError("installed package default is not format 7")
@@ -179,12 +179,12 @@ def main() -> None:
             )
             if not materialized["materialized"]:
                 raise AssertionError("format-7 WAL did not materialize")
-            folded = writer.compact_deltas(
-                max_runs=8,
+            folded = writer.fold_partitions(
+                max_runs=1,
                 max_input_bytes=8 << 20,
                 max_input_entries=64,
             )
-            if not folded["compacted"] or folded["delta_run_count"] != 0:
+            if not folded["folded"] or folded["index_run_count"] != 0:
                 raise AssertionError("format-7 partitions did not fold")
 
             cleaner_options = {
@@ -235,20 +235,20 @@ def main() -> None:
                 rotate_wal_bytes=1,
                 materialize_max_wals=8,
                 materialize_max_input_bytes=8 << 20,
-                compact_max_input_bytes=8 << 20,
-                compact_max_input_entries=64,
+                fold_max_input_bytes=8 << 20,
+                fold_max_input_entries=64,
                 orphan_min_age_seconds=0,
                 orphan_max_files=1024,
                 orphan_max_bytes=64 << 20,
             )
         if maintenance["format"] != "throwdb-maintenance-report":
             raise AssertionError("installed package returned invalid maintenance")
-        compact_action = next(
+        fold_action = next(
             action
             for action in maintenance["actions"]
-            if action["name"] == "compact_deltas"
+            if action["name"] == "fold_partitions"
         )
-        if not compact_action["attempted"] or not compact_action["performed"]:
+        if not fold_action["attempted"] or not fold_action["performed"]:
             raise AssertionError("maintenance did not fold the Cleaner run")
         orphan_action = next(
             action

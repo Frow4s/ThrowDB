@@ -1651,7 +1651,7 @@ def test_minimal_loopback_benchmark_smoke(tmp_path: Path) -> None:
     with throwdb.Collection.create(
         store,
         schema=throwdb.CollectionSchema(dimension=8, dtype="float16"),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ) as builder:
         builder.add(ids, embeddings)

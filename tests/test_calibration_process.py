@@ -15,7 +15,7 @@ def _create_store(path: Path) -> tuple[dict[str, object], int]:
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=4),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ) as collection:
         collection.add(
@@ -115,7 +115,7 @@ def test_worker_uses_anchored_directory_when_path_is_replaced(
     with throwdb.Collection.create(
         replacement,
         schema=throwdb.CollectionSchema(dimension=8),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ) as collection:
         collection.add(

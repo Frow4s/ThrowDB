@@ -24,7 +24,7 @@ class NativeCollectionBuilder:
     def create(
         path: str | bytes | PathLike[str] | PathLike[bytes],
         dimension: int = 1024,
-        shard_size_bytes: int = 17_179_869_184,
+        segment_size_bytes: int = 17_179_869_184,
         dtype: _DTypeName = "float16",
         format_version: int = 7,
     ) -> NativeCollectionBuilder: ...
@@ -307,7 +307,7 @@ class NativeCollection:
         max_input_entries: int = 18_446_744_073_709_551_615,
         max_memory_bytes: int = 18_446_744_073_709_551_615,
     ) -> dict[str, object]: ...
-    def compact_delta_runs(
+    def fold_partitions(
         self,
         max_runs: int | None = None,
         max_input_bytes: int = 8_589_934_592,

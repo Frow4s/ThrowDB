@@ -153,7 +153,7 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     deleted = collection.delete([200, 999])  # [True, False]
     lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
     materialized = collection.materialize_frozen_wals()
-    compacted = collection.compact_deltas()   # format 7: selective partition fold
+    folded = collection.fold_partitions()     # selective index partition fold
     cleaner_plan = collection.clean_segments(dry_run=True)
     cleaned = collection.clean_segments(dry_run=False)
     orphan_plan = collection.collect_orphans(
@@ -435,11 +435,17 @@ Per-phase durations and the validation path are available in
 
 `collection.mutation_log_stats` reports the selected catalog generation,
 committed/indexed sequence, frozen-WAL count, immutable-run count, and
-active/total WAL, run, and segment bytes. Calling `rotate_wal()` seals a
-non-empty active WAL and atomically publishes its successor. On format 7,
+active/total WAL, run, and segment bytes. `index_run_count`,
+`index_run_entry_count`, and `index_run_bytes` describe the retained index runs;
+`materialized_segment_rows` and `materialized_segment_bytes` describe immutable
+mutation segments, including cleaner output and ID sidecars in the byte count.
+`mutation_resource_bytes` is the sum of run and materialized-segment bytes;
+it excludes WALs, partition snapshots, and catalogs.
+Calling `rotate_wal()` seals a non-empty active WAL and atomically publishes
+its successor. On format 7,
 `materialize_frozen_wals()` collapses a bounded frozen-WAL prefix, streams its
 winning PUT rows into immutable segments, writes one partitioned mutation run,
-and atomically advances the indexed sequence. `compact_deltas()` then folds
+and atomically advances the indexed sequence. `fold_partitions()` then folds
 complete active run sections for selected partitions into new authoritative
 partition snapshots; it does not rewrite embedding payloads.
 
@@ -529,7 +535,7 @@ print(
     stats["physical_backend_seconds"],
     stats["planned_ranges"],
     stats["planned_read_bytes"],
-    stats["zero_delta_fast_path"],
+    stats["snapshot_only_fast_path"],
 )
 ```
 
@@ -579,7 +585,8 @@ throwdb create \
   --storage /data/example \
   --ids ids.npy \
   --embeddings embeddings.npy \
-  --format-version 7
+  --format-version 7 \
+  --segment-size-gib 16
 
 throwdb get \
   --storage /data/example \
@@ -601,7 +608,7 @@ throwdb rotate-wal --storage /data/example
 
 throwdb materialize --storage /data/example
 
-throwdb compact-deltas \
+throwdb fold-partitions \
   --storage /data/example \
   --max-runs 8 \
   --max-input-gib 8 \
@@ -628,7 +635,10 @@ throwdb collect-orphans \
   --max-bytes 8589934592
 
 throwdb maintain --storage /data/example --dry-run
-throwdb maintain --storage /data/example --execute
+throwdb maintain --storage /data/example --execute \
+  --fold-max-runs 8 \
+  --fold-max-input-bytes 8589934592 \
+  --fold-max-input-entries 1000000
 ```
 
 `collect-orphans` requires exactly one explicit mode. `--dry-run` is advisory;

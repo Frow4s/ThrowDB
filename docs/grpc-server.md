@@ -528,9 +528,9 @@ can replace the lease-owning instance.
 Maintenance does not hold the server mutation lane for a complete lifecycle
 build. Journal reconciliation/checkpoint and WAL rotation remain serialized
 with `PREPARE -> native commit -> COMPLETE`, because they can change the replay
-domain or freeze the WAL required for recovery. Expensive processing of an
-already selected frozen WAL, delta-run prefix, or segment runs outside that
-lane, so unrelated mutations can continue; native publication is still
+domain or freeze the WAL required for recovery. Expensive processing of a
+selected frozen-WAL prefix, set of index partitions, or segment happens outside
+that lane, so unrelated mutations can continue; native publication is still
 serialized internally. Format-7 orphan GC likewise performs its complete
 filesystem inventory, classification, and bounded selection without the
 mutation lane, then briefly reacquires the native mutation/commit/view locks to

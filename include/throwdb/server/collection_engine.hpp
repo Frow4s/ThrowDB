@@ -206,7 +206,7 @@ struct EngineMaintenanceResult {
     bool materialization_memory_budget_blocked = false;
     bool materialization_disk_budget_blocked = false;
     bool folded = false;
-    bool compaction_budget_blocked = false;
+    bool fold_budget_blocked = false;
     bool fold_disk_budget_blocked = false;
     bool idempotency_checkpointed = false;
     bool cleaner_attempted = false;

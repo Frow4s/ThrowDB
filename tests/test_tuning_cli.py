@@ -10,6 +10,32 @@ from throwdb.cli import _build_parser, _reader_tuning, main
 from throwdb.collection import Collection
 
 
+def test_cli_rejects_retired_storage_names() -> None:
+    parser = _build_parser()
+    create = [
+        "create", "--storage", "/tmp/store", "--ids", "/tmp/ids.npy",
+        "--embeddings", "/tmp/embeddings.npy",
+    ]
+    assert parser.parse_args(
+        [*create, "--segment-size-gib", "8"]
+    ).segment_size_gib == 8
+    invalid_commands = [
+        [*create, "--shard-size-gib", "8"],
+        ["compact-deltas", "--storage", "/tmp/store"],
+        *(
+            ["maintain", "--storage", "/tmp/store", "--dry-run", flag, "2"]
+            for flag in (
+                "--compact-min-runs", "--compact-max-runs",
+                "--compact-max-input-bytes", "--compact-max-input-entries",
+            )
+        ),
+    ]
+    for command in invalid_commands:
+        with pytest.raises(SystemExit) as error:
+            parser.parse_args(command)
+        assert error.value.code == 2
+
+
 def test_create_cli_only_accepts_format7() -> None:
     parser = _build_parser()
     required = [
@@ -173,36 +199,38 @@ def test_tune_command_has_bounded_defaults_and_writes_optional_report(
     assert json.loads(capsys.readouterr().out) == report
 
 
-def test_compact_deltas_command_has_bounded_defaults_and_forwards_limits(
+def test_fold_partitions_command_has_bounded_defaults_and_forwards_limits(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     defaults = _build_parser().parse_args(
-        ["compact-deltas", "--storage", "/tmp/store"]
+        ["fold-partitions", "--storage", "/tmp/store"]
     )
     assert defaults.max_runs is None
     assert defaults.max_input_gib == 8
     assert defaults.max_input_entries == 1_000_000
-    assert _build_parser().parse_args(
-        [
-            "compact-deltas", "--storage", "/tmp/store",
-            "--max-runs", "4096",
-        ]
-    ).max_runs == 4096
-    with pytest.raises(SystemExit):
-        _build_parser().parse_args(
+    for max_runs in (1, 4096):
+        assert _build_parser().parse_args(
             [
-                "compact-deltas", "--storage", "/tmp/store",
-                "--max-runs", "4097",
+                "fold-partitions", "--storage", "/tmp/store",
+                "--max-runs", str(max_runs),
             ]
-        )
+        ).max_runs == max_runs
+    for max_runs in (0, 4097):
+        with pytest.raises(SystemExit):
+            _build_parser().parse_args(
+                [
+                    "fold-partitions", "--storage", "/tmp/store",
+                    "--max-runs", str(max_runs),
+                ]
+            )
     capsys.readouterr()
 
     observed: dict[str, object] = {}
     report = {
-        "compacted": True,
-        "compacted_delta_run_count": 3,
-        "delta_run_count": 1,
+        "folded": True,
+        "folded_partition_count": 3,
+        "index_run_count": 1,
     }
 
     class FakeCollection:
@@ -212,7 +240,7 @@ def test_compact_deltas_command_has_bounded_defaults_and_forwards_limits(
         def __exit__(self, *args: object) -> None:
             del args
 
-        def compact_deltas(self, **kwargs: object) -> dict[str, object]:
+        def fold_partitions(self, **kwargs: object) -> dict[str, object]:
             observed.update(kwargs)
             return report
 
@@ -229,7 +257,7 @@ def test_compact_deltas_command_has_bounded_defaults_and_forwards_limits(
     monkeypatch.setattr(Collection, "open", classmethod(fake_open))
     main(
         [
-            "compact-deltas",
+            "fold-partitions",
             "--storage",
             "/tmp/store",
             "--max-runs",
@@ -377,23 +405,23 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
         ["maintain", "--storage", "/tmp/store", "--dry-run"]
     )
     assert defaults.max_actions == 5
-    assert defaults.compact_min_runs is None
-    assert defaults.compact_max_runs is None
+    assert defaults.fold_min_runs is None
+    assert defaults.fold_max_runs is None
     assert defaults.materialize_max_input_entries is None
     assert defaults.materialize_max_memory_bytes is None
     limits = parser.parse_args(
         [
             "maintain", "--storage", "/tmp/store", "--dry-run",
-            "--compact-min-runs", "1", "--compact-max-runs", "4096",
+            "--fold-min-runs", "1", "--fold-max-runs", "1",
         ]
     )
-    assert limits.compact_min_runs == 1
-    assert limits.compact_max_runs == 4096
+    assert limits.fold_min_runs == 1
+    assert limits.fold_max_runs == 1
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
                 "maintain", "--storage", "/tmp/store", "--dry-run",
-                "--compact-max-runs", "4097",
+                "--fold-max-runs", "4097",
             ]
         )
     capsys.readouterr()
@@ -429,9 +457,9 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
             "--materialize-max-input-bytes", "20",
             "--materialize-max-input-entries", "21",
             "--materialize-max-memory-bytes", "22",
-            "--compact-min-runs", "4", "--compact-max-runs", "5",
-            "--compact-max-input-bytes", "30",
-            "--compact-max-input-entries", "40",
+            "--fold-min-runs", "4", "--fold-max-runs", "5",
+            "--fold-max-input-bytes", "30",
+            "--fold-max-input-entries", "40",
             "--clean-max-candidate-segments", "9",
             "--clean-max-sidecar-scan-bytes", "60",
             "--clean-max-source-bytes", "70",
@@ -456,10 +484,10 @@ def test_maintain_cli_requires_mode_and_forwards_bounded_policy(
         "materialize_max_input_bytes": 20,
         "materialize_max_input_entries": 21,
         "materialize_max_memory_bytes": 22,
-        "compact_min_runs": 4,
-        "compact_max_runs": 5,
-        "compact_max_input_bytes": 30,
-        "compact_max_input_entries": 40,
+        "fold_min_runs": 4,
+        "fold_max_runs": 5,
+        "fold_max_input_bytes": 30,
+        "fold_max_input_entries": 40,
         "clean_max_candidate_segments": 9,
         "clean_max_sidecar_scan_bytes": 60,
         "clean_max_source_bytes": 70,

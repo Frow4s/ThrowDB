@@ -234,7 +234,7 @@ class AdmissionStatistics(_message.Message):
     def __init__(self, active_unary_calls: _Optional[int] = ..., active_scans: _Optional[int] = ..., unary_estimated_bytes: _Optional[int] = ..., scan_estimated_bytes: _Optional[int] = ..., admitted_unary_calls: _Optional[int] = ..., rejected_unary_calls: _Optional[int] = ..., admitted_scans: _Optional[int] = ..., rejected_scans: _Optional[int] = ..., admission_closed: _Optional[bool] = ..., draining: _Optional[bool] = ..., terminal_faulted: _Optional[bool] = ...) -> None: ...
 
 class EngineStatistics(_message.Message):
-    __slots__ = ("catalog_generation", "committed_sequence", "materialized_sequence", "active_wal_bytes", "active_wal_transactions", "active_wal_operations", "frozen_wal_count", "frozen_wal_bytes", "total_wal_bytes", "total_wal_operations", "overlay_entries", "estimated_overlay_bytes", "delta_run_count", "total_delta_run_bytes", "total_delta_segment_bytes", "idempotency_journal_bytes", "idempotency_completed_operations", "idempotency_aborted_operations", "idempotency_max_bytes", "idempotency_max_operations", "idempotency_generation", "filesystem_available_bytes", "mutation_disk_reserve_bytes", "maintenance_active")
+    __slots__ = ("catalog_generation", "committed_sequence", "materialized_sequence", "active_wal_bytes", "active_wal_transactions", "active_wal_operations", "frozen_wal_count", "frozen_wal_bytes", "total_wal_bytes", "total_wal_operations", "overlay_entries", "estimated_overlay_bytes", "index_run_count", "index_run_bytes", "materialized_segment_bytes", "idempotency_journal_bytes", "idempotency_completed_operations", "idempotency_aborted_operations", "idempotency_max_bytes", "idempotency_max_operations", "idempotency_generation", "filesystem_available_bytes", "mutation_disk_reserve_bytes", "maintenance_active")
     CATALOG_GENERATION_FIELD_NUMBER: _ClassVar[int]
     COMMITTED_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
     MATERIALIZED_SEQUENCE_FIELD_NUMBER: _ClassVar[int]
@@ -247,9 +247,9 @@ class EngineStatistics(_message.Message):
     TOTAL_WAL_OPERATIONS_FIELD_NUMBER: _ClassVar[int]
     OVERLAY_ENTRIES_FIELD_NUMBER: _ClassVar[int]
     ESTIMATED_OVERLAY_BYTES_FIELD_NUMBER: _ClassVar[int]
-    DELTA_RUN_COUNT_FIELD_NUMBER: _ClassVar[int]
-    TOTAL_DELTA_RUN_BYTES_FIELD_NUMBER: _ClassVar[int]
-    TOTAL_DELTA_SEGMENT_BYTES_FIELD_NUMBER: _ClassVar[int]
+    INDEX_RUN_COUNT_FIELD_NUMBER: _ClassVar[int]
+    INDEX_RUN_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MATERIALIZED_SEGMENT_BYTES_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_JOURNAL_BYTES_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_COMPLETED_OPERATIONS_FIELD_NUMBER: _ClassVar[int]
     IDEMPOTENCY_ABORTED_OPERATIONS_FIELD_NUMBER: _ClassVar[int]
@@ -271,9 +271,9 @@ class EngineStatistics(_message.Message):
     total_wal_operations: int
     overlay_entries: int
     estimated_overlay_bytes: int
-    delta_run_count: int
-    total_delta_run_bytes: int
-    total_delta_segment_bytes: int
+    index_run_count: int
+    index_run_bytes: int
+    materialized_segment_bytes: int
     idempotency_journal_bytes: int
     idempotency_completed_operations: int
     idempotency_aborted_operations: int
@@ -283,7 +283,7 @@ class EngineStatistics(_message.Message):
     filesystem_available_bytes: int
     mutation_disk_reserve_bytes: int
     maintenance_active: bool
-    def __init__(self, catalog_generation: _Optional[int] = ..., committed_sequence: _Optional[int] = ..., materialized_sequence: _Optional[int] = ..., active_wal_bytes: _Optional[int] = ..., active_wal_transactions: _Optional[int] = ..., active_wal_operations: _Optional[int] = ..., frozen_wal_count: _Optional[int] = ..., frozen_wal_bytes: _Optional[int] = ..., total_wal_bytes: _Optional[int] = ..., total_wal_operations: _Optional[int] = ..., overlay_entries: _Optional[int] = ..., estimated_overlay_bytes: _Optional[int] = ..., delta_run_count: _Optional[int] = ..., total_delta_run_bytes: _Optional[int] = ..., total_delta_segment_bytes: _Optional[int] = ..., idempotency_journal_bytes: _Optional[int] = ..., idempotency_completed_operations: _Optional[int] = ..., idempotency_aborted_operations: _Optional[int] = ..., idempotency_max_bytes: _Optional[int] = ..., idempotency_max_operations: _Optional[int] = ..., idempotency_generation: _Optional[int] = ..., filesystem_available_bytes: _Optional[int] = ..., mutation_disk_reserve_bytes: _Optional[int] = ..., maintenance_active: _Optional[bool] = ...) -> None: ...
+    def __init__(self, catalog_generation: _Optional[int] = ..., committed_sequence: _Optional[int] = ..., materialized_sequence: _Optional[int] = ..., active_wal_bytes: _Optional[int] = ..., active_wal_transactions: _Optional[int] = ..., active_wal_operations: _Optional[int] = ..., frozen_wal_count: _Optional[int] = ..., frozen_wal_bytes: _Optional[int] = ..., total_wal_bytes: _Optional[int] = ..., total_wal_operations: _Optional[int] = ..., overlay_entries: _Optional[int] = ..., estimated_overlay_bytes: _Optional[int] = ..., index_run_count: _Optional[int] = ..., index_run_bytes: _Optional[int] = ..., materialized_segment_bytes: _Optional[int] = ..., idempotency_journal_bytes: _Optional[int] = ..., idempotency_completed_operations: _Optional[int] = ..., idempotency_aborted_operations: _Optional[int] = ..., idempotency_max_bytes: _Optional[int] = ..., idempotency_max_operations: _Optional[int] = ..., idempotency_generation: _Optional[int] = ..., filesystem_available_bytes: _Optional[int] = ..., mutation_disk_reserve_bytes: _Optional[int] = ..., maintenance_active: _Optional[bool] = ...) -> None: ...
 
 class ReadLoggingConfiguration(_message.Message):
     __slots__ = ("enabled", "sample_ppm", "max_ids_per_event", "buffer_bytes", "segment_bytes", "rotate_seconds", "retention_bytes", "retention_seconds", "minimum_free_bytes", "max_write_bytes_per_second", "max_retained_files", "id_chunk_rows", "format_version")

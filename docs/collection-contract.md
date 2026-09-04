@@ -30,9 +30,9 @@ create -> append batches -> finish -> read-only snapshot
 ```
 
 `finish()` is the initial publication point. A failed build must not replace a
-readable snapshot. Record mutations are represented by committed delta records
-over the base, not by overwriting active segment bytes. Routine cleaning rewrites
-only selected immutable segments and atomically switches the resource catalog;
+readable snapshot. Record mutations are committed to the WAL and later indexed
+in immutable runs, without overwriting active segment bytes. Routine cleaning
+rewrites only selected immutable segments and atomically switches the resource catalog;
 it does not copy the complete base. Existing readers retain their previous
 view.
 
@@ -220,7 +220,7 @@ collection.upsert(ids, embeddings)   # explicit insert-or-replace
 deleted = collection.delete(ids)     # boolean result per requested ID
 collection.rotate_wal()              # freeze a non-empty active WAL
 collection.materialize_frozen_wals() # replace a bounded frozen-WAL prefix
-collection.compact_deltas()           # format 7: fold selected partitions
+collection.fold_partitions()         # fold selected index partitions
 cleaner_plan = collection.clean_segments(dry_run=True)
 cleaned = collection.clean_segments(dry_run=False)
 plan = collection.collect_orphans(    # advisory report
@@ -265,6 +265,22 @@ read-write handle also sees its own later commits. Reopen a different process's
 already-open handle to observe later commits. Within a handle, each read
 resolves all IDs against one state, so it cannot mix rows across a commit.
 
+`mutation_log_stats` separates WAL backlog from immutable mutation resources:
+
+- `index_run_count`, `index_run_entry_count`, and `index_run_bytes` count the
+  retained run files, their stored entries, and their full file sizes. A
+  partially folded run still contributes its full retained size.
+- `materialized_segment_rows` and `materialized_segment_bytes` count retained
+  segments published by materialization or cleaning. Bytes include both data
+  and ID sidecars; initial bulk-build segments are excluded.
+- `mutation_resource_bytes` is exactly `index_run_bytes` plus
+  `materialized_segment_bytes`. It excludes WALs, partition snapshots, and
+  catalogs, so it is not total collection disk usage.
+- `folded`, `folded_partition_count`, `folded_run_section_count`, and the
+  `folded_*_entries`/`folded_*_bytes` fields describe the current folding call.
+  `fold_budget_blocked` reports whether a remaining partition exceeds that
+  call's complete-input budget.
+
 ## Mutation and segment-cleaning model
 
 ```text
@@ -290,8 +306,8 @@ selected WAL references, and preserves every newer WAL. Commits and rotations
 may proceed during the long build; only durable reservation and final rebase
 are short serialized metadata transactions.
 
-For format 7, `compact_deltas()` means selective index folding rather than
-embedding compaction. Its default admits up to all 4096 active
+`fold_partitions()` selectively merges index partitions into authoritative
+snapshots. Its default admits up to all 4096 active
 runs so a partition cannot become permanently ineligible merely because more
 than eight runs accumulated; callers may set a smaller explicit bound. A
 partition is eligible only when its complete current
@@ -364,6 +380,14 @@ lifecycle. Retired pathnames are reclaimed by the later orphan action rather
 than by materialization, folding, or cleaning itself. A complete collection
 rewrite is reserved for explicit schema/layout migration rather than normal
 CRUD maintenance. The detailed contract is in `mutable-storage.md`.
+
+### Partition folding run budget
+
+`fold_partitions(max_runs=1)` permits folding a partition with one active run.
+The valid range is 1..4096; the existing snapshot does not count as a run.
+A partition with more active runs than the budget is left unchanged, never
+partially folded. `maintain(fold_max_runs=...)` and the corresponding CLI/server
+options apply the same bound.
 
 ## Storage version policy
 

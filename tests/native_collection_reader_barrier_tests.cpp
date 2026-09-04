@@ -359,7 +359,7 @@ public:
                     const auto reclaimed = writer->reclaim_orphans();
                     if (!reclaimed.durability_complete
                         || !materialized.materialized
-                        || materialized.delta_run_count != 1
+                        || materialized.index_run_count != 1
                         || materialized.frozen_wal_count != 0) {
                         result = 26;
                     } else if (!write_byte(status_fd, 'D')) {
@@ -476,8 +476,8 @@ void test_reader_open_gate_pins_old_catalog_before_publication_and_reclaim() {
                   "blocked reader did not capture the old catalog");
     require_equal(old_stats.frozen_wal_count, std::uint64_t{1},
                   "blocked reader lost its frozen WAL view");
-    require_equal(old_stats.delta_run_count, std::uint64_t{0},
-                  "blocked reader captured the publisher's delta");
+    require_equal(old_stats.index_run_count, std::uint64_t{0},
+                  "blocked reader captured the publisher's materialized run");
     require_bytes_equal(
         old_reader->get_bytes(ids), updated,
         "old reader cannot read its unlinked frozen WAL resource");
@@ -486,7 +486,7 @@ void test_reader_open_gate_pins_old_catalog_before_publication_and_reclaim() {
     require_equal(after.generation, before.generation + 2,
                   "publisher produced the wrong catalog generation");
     require_equal(after.runs.size(), std::size_t{1},
-                  "publisher did not create one delta run");
+                  "publisher did not create one index run");
     require_equal(after.wal_entries.size(), std::size_t{1},
                   "publisher retained its selected frozen WAL");
     require(!std::filesystem::exists(frozen_path),
@@ -496,8 +496,8 @@ void test_reader_open_gate_pins_old_catalog_before_publication_and_reclaim() {
     const auto later_stats = later_reader->mutation_log_stats();
     require_equal(later_stats.generation, after.generation,
                   "later reader did not select the published catalog");
-    require_equal(later_stats.delta_run_count, std::uint64_t{1},
-                  "later reader did not open the materialized delta");
+    require_equal(later_stats.index_run_count, std::uint64_t{1},
+                  "later reader did not open the materialized run");
     require_equal(later_stats.frozen_wal_count, std::uint64_t{0},
                   "later reader reopened the retired WAL view");
     require_bytes_equal(

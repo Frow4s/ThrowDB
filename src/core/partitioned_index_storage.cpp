@@ -1391,7 +1391,7 @@ public:
         }
         if (ids.empty()) {
             if constexpr (Profiled) {
-                stats->zero_delta_fast_path =
+                stats->snapshot_only_fast_path =
                     !mutation_read_path_active_.load(
                         std::memory_order_acquire);
                 stats->total_seconds = elapsed_seconds(total_started);
@@ -1408,16 +1408,16 @@ public:
         {
             std::shared_lock state(state_mutex_);
             resource_pin = resources_;
-            const bool zero_delta_fast_path =
+            const bool snapshot_only_fast_path =
                 resource_pin->runs.empty()
                 && !mutation_read_path_active_.load(
                     std::memory_order_relaxed);
             if constexpr (Profiled) {
-                stats->zero_delta_fast_path = zero_delta_fast_path;
+                stats->snapshot_only_fast_path = snapshot_only_fast_path;
             }
             for (std::size_t output_index = 0;
                  output_index != ids.size(); ++output_index) {
-                const std::optional<RowRef> row = zero_delta_fast_path
+                const std::optional<RowRef> row = snapshot_only_fast_path
                     ? [&]() -> std::optional<RowRef> {
                           const std::optional<IndexedVersion> indexed =
                               snapshot_version(
@@ -1505,8 +1505,8 @@ public:
         std::uint64_t residual_limit = inspection_limit;
         // A very small calibration sample must still see the mutable layers
         // before falling back to the immutable snapshot.  For larger samples
-        // this one-slot reservation is negligible, while it prevents a small
-        // delta from disappearing behind sparse snapshot capacity.
+        // this one-slot reservation is negligible, while it prevents recent
+        // mutations from disappearing behind sparse snapshot capacity.
         for (const std::size_t index : std::array<std::size_t, 3>{0, 1, 2}) {
             if (residual_limit == 0 || residual_source_slots[index] == 0) {
                 continue;
@@ -1710,12 +1710,12 @@ public:
         std::vector<std::uint8_t> result(ids.size(), 0);
         std::shared_lock state(state_mutex_);
         const std::shared_ptr<ResourceSet> resource_pin = resources_;
-        const bool zero_delta_fast_path =
+        const bool snapshot_only_fast_path =
             resource_pin->runs.empty()
             && !mutation_read_path_active_.load(std::memory_order_relaxed);
         for (std::size_t index = 0; index != ids.size(); ++index) {
             result[index] = static_cast<std::uint8_t>(
-                zero_delta_fast_path
+                snapshot_only_fast_path
                     ? snapshot_version(ids[index], *resource_pin).has_value()
                     : logical_lookup_unlocked(
                           ids[index], *resource_pin).has_value());
@@ -2460,9 +2460,9 @@ public:
         const std::uint64_t max_input_entries) {
         ensure_mutable();
         ensure_lifecycle_allowed(NativeCollectionTestOperation::FoldPartitions);
-        if (max_runs < 2 || max_runs > kPartitionedMaximumRuns) {
+        if (max_runs == 0 || max_runs > kPartitionedMaximumRuns) {
             throw InvalidArgumentError(
-                "partition fold max_runs must be between 2 and 4096");
+                "partition fold max_runs must be between 1 and 4096");
         }
         if (max_input_bytes == 0 || max_input_entries == 0) {
             throw InvalidArgumentError(
@@ -2547,23 +2547,23 @@ public:
                 remaining_runs, manifest_.partition_bits,
                 candidate->partition_id);
         }
-        const bool compaction_budget_blocked = !remaining_runs.empty();
+        const bool fold_budget_blocked = !remaining_runs.empty();
         if (selected.empty()) {
             std::lock_guard mutation(mutation_mutex_);
             ensure_healthy();
             return mutation_log_stats_locked(
                 false, false, 0, 0, false, false,
-                compaction_budget_blocked);
+                fold_budget_blocked);
         }
 
-        std::uint64_t compacted_run_sections = 0;
+        std::uint64_t folded_run_sections = 0;
         std::uint64_t run_input_entries = 0;
         std::uint64_t run_input_bytes = 0;
         std::uint64_t snapshot_input_entries = 0;
         std::uint64_t snapshot_input_bytes = 0;
         for (const PartitionFoldCandidate& candidate : selected) {
-            compacted_run_sections = checked_sum(
-                compacted_run_sections, candidate.active_run_count,
+            folded_run_sections = checked_sum(
+                folded_run_sections, candidate.active_run_count,
                 "partition fold run sections");
             run_input_entries = checked_sum(
                 run_input_entries, candidate.run_entries,
@@ -2778,9 +2778,9 @@ public:
         }
         return mutation_log_stats_locked(
             false, false, 0, 0, false, true,
-            compaction_budget_blocked,
+            fold_budget_blocked,
             static_cast<std::uint64_t>(selected.size()),
-            compacted_run_sections, snapshot_input_entries,
+            folded_run_sections, snapshot_input_entries,
             snapshot_input_bytes, output_entries, output_bytes,
             run_input_entries, run_input_bytes);
     }
@@ -3651,7 +3651,7 @@ private:
             }
             if (ids.empty()) {
                 if constexpr (Profiled) {
-                    stats->zero_delta_fast_path =
+                    stats->snapshot_only_fast_path =
                         resources_->runs.empty() && overlay_.empty();
                     stats->total_seconds = elapsed_seconds(total_started);
                 }
@@ -3675,7 +3675,7 @@ private:
                 }
             }
             if constexpr (Profiled) {
-                stats->zero_delta_fast_path =
+                stats->snapshot_only_fast_path =
                     resources_->runs.empty() && overlay_.empty();
                 stats->lookup_seconds = elapsed_seconds(lookup_started);
                 const PhysicalReadStats physical =
@@ -5692,19 +5692,17 @@ private:
         const std::uint64_t materialized_wal_count = 0,
         const std::uint64_t materialized_wal_input_bytes = 0,
         const bool materialization_budget_blocked = false,
-        const bool compacted = false,
-        const bool compaction_budget_blocked = false,
-        const std::uint64_t compacted_partition_count = 0,
-        const std::uint64_t compacted_run_section_count = 0,
-        const std::uint64_t compacted_snapshot_input_entries = 0,
-        const std::uint64_t compacted_snapshot_input_bytes = 0,
-        const std::uint64_t compacted_output_entries = 0,
-        const std::uint64_t compacted_output_bytes = 0,
-        const std::uint64_t compacted_delta_input_entries = 0,
-        const std::uint64_t compacted_delta_input_bytes = 0) const {
+        const bool folded = false,
+        const bool fold_budget_blocked = false,
+        const std::uint64_t folded_partition_count = 0,
+        const std::uint64_t folded_run_section_count = 0,
+        const std::uint64_t folded_snapshot_input_entries = 0,
+        const std::uint64_t folded_snapshot_input_bytes = 0,
+        const std::uint64_t folded_output_entries = 0,
+        const std::uint64_t folded_output_bytes = 0,
+        const std::uint64_t folded_run_input_entries = 0,
+        const std::uint64_t folded_run_input_bytes = 0) const {
         NativeMutationLogStats stats;
-        stats.catalog_managed = true;
-        stats.delta_managed = true;
         stats.generation = catalog_.generation;
         stats.committed_sequence = next_sequence_ - 1;
         stats.materialized_sequence = catalog_.indexed_sequence;
@@ -5723,23 +5721,23 @@ private:
             materialized_wal_input_bytes;
         stats.materialization_budget_blocked =
             materialization_budget_blocked;
-        stats.compacted = compacted;
-        stats.compaction_budget_blocked = compaction_budget_blocked;
-        stats.compacted_partition_count = compacted_partition_count;
-        stats.compacted_run_section_count = compacted_run_section_count;
-        stats.compacted_snapshot_input_entries =
-            compacted_snapshot_input_entries;
-        stats.compacted_snapshot_input_bytes =
-            compacted_snapshot_input_bytes;
-        stats.compacted_output_entries = compacted_output_entries;
-        stats.compacted_output_bytes = compacted_output_bytes;
-        stats.compacted_delta_input_entries =
-            compacted_delta_input_entries;
-        stats.compacted_delta_input_bytes = compacted_delta_input_bytes;
+        stats.folded = folded;
+        stats.fold_budget_blocked = fold_budget_blocked;
+        stats.folded_partition_count = folded_partition_count;
+        stats.folded_run_section_count = folded_run_section_count;
+        stats.folded_snapshot_input_entries =
+            folded_snapshot_input_entries;
+        stats.folded_snapshot_input_bytes =
+            folded_snapshot_input_bytes;
+        stats.folded_output_entries = folded_output_entries;
+        stats.folded_output_bytes = folded_output_bytes;
+        stats.folded_run_input_entries =
+            folded_run_input_entries;
+        stats.folded_run_input_bytes = folded_run_input_bytes;
         // Materialization intentionally leaves selected WAL pathnames for the
         // orphan collector. Readers already hold exact inode pins, so unlink
         // and namespace reclamation are a separate lifecycle transaction.
-        stats.reclamation_complete = !materialized && !compacted;
+        stats.reclamation_complete = !materialized && !folded;
         for (const auto& source : resources_->sources) {
             if (source->entry.state == MutationWalState::Frozen) {
                 ++stats.frozen_wal_count;
@@ -5760,30 +5758,30 @@ private:
                 "partitioned WAL total operations");
         }
         for (const RunView& run : resources_->runs) {
-            ++stats.delta_run_count;
-            stats.delta_entry_count = checked_sum(
-                stats.delta_entry_count, run.catalog.entry_count,
+            ++stats.index_run_count;
+            stats.index_run_entry_count = checked_sum(
+                stats.index_run_entry_count, run.catalog.entry_count,
                 "partitioned run entries");
-            stats.total_delta_run_bytes = checked_sum(
-                stats.total_delta_run_bytes, run.catalog.file_size,
+            stats.index_run_bytes = checked_sum(
+                stats.index_run_bytes, run.catalog.file_size,
                 "partitioned run bytes");
         }
         for (const auto& segment : resources_->materialized_segments) {
             const PartitionedSegmentDescriptor& descriptor =
                 segment->descriptor();
-            stats.delta_put_rows = checked_sum(
-                stats.delta_put_rows, descriptor.row_count,
+            stats.materialized_segment_rows = checked_sum(
+                stats.materialized_segment_rows, descriptor.row_count,
                 "partitioned materialized rows");
             const std::uint64_t bytes = checked_sum(
                 descriptor.data_file_size, descriptor.ids_file_size,
                 "partitioned materialized segment bytes");
-            stats.total_delta_segment_bytes = checked_sum(
-                stats.total_delta_segment_bytes, bytes,
+            stats.materialized_segment_bytes = checked_sum(
+                stats.materialized_segment_bytes, bytes,
                 "partitioned materialized segment bytes");
         }
-        stats.total_delta_bytes = checked_sum(
-            stats.total_delta_run_bytes,
-            stats.total_delta_segment_bytes,
+        stats.mutation_resource_bytes = checked_sum(
+            stats.index_run_bytes,
+            stats.materialized_segment_bytes,
             "partitioned mutation resource bytes");
         return stats;
     }

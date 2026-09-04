@@ -3806,8 +3806,9 @@ def run_bounded_calibration(
     sample = np.require(sample_value, dtype=np.uint64, requirements=["C", "A"])
     if sample.size == 0:
         raise CalibrationError(
-            "the bounded base-index sample contains no live IDs; "
-            "rebuild or compact a mutation-only collection before tuning"
+            "the bounded partition-snapshot sample contains no live IDs; "
+            "rotate and materialize pending WALs, then fold partitions "
+            "before tuning a mutation-only collection"
         )
     sample_report = _sample_report(
         sampled,
