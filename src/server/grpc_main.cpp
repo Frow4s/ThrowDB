@@ -1044,9 +1044,8 @@ private:
 int main(const int argc, char** argv) {
     try {
         Options options = parse_options(argc, argv);
-        // The daemon is format-7-only. Reject legacy stores through the
-        // lightweight manifest/index-header path before loading a flat index
-        // or replaying a potentially large format-6 mutation backlog.
+        // Reject unsupported stores through lightweight metadata inspection
+        // before loading the partitioned index or replaying the WAL backlog.
         const throwdb::NativeCollectionMetadata metadata =
             throwdb::NativeCollection::inspect_metadata(options.storage);
         if (metadata.format_version != 7) {

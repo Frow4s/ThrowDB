@@ -102,29 +102,6 @@ def test_python_clean_segments_is_safe_by_default_and_advances_execute_cursor(
         )
 
 
-def test_clean_segments_rejects_format6(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    path = tmp_path / "legacy"
-    _build_garbage(path, format_version=6)
-    with throwdb.Collection.open(path, mode="r+") as writer:
-        with pytest.raises(NotImplementedError, match="format-7"):
-            writer.clean_segments(**_PERMISSIVE)
-
-    with pytest.raises(SystemExit) as raised:
-        cli_main(
-            [
-                "clean-segments",
-                "--storage",
-                str(path),
-                "--dry-run",
-            ]
-        )
-    assert raised.value.code == 2
-    assert "Traceback" not in capsys.readouterr().err
-
-
 def test_clean_segments_cli_dry_run_exposes_every_bound(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

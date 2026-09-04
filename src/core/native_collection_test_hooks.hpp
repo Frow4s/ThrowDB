@@ -13,9 +13,7 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
     MutationCatalogDurableBeforeCurrent = 2,
     MutationCurrentDurable = 3,
     MutationReservationDurable = 4,
-    MutationDeltaOutputDurable = 5,
-    BeforeSourceUnlink = 6,
-    AfterSourceUnlink = 7,
+    LifecycleOutputDurable = 5,
     BeforeOrphanRevalidation = 8,
     AfterOrphanUnlink = 9,
     BeforeOrphanDirectorySync = 10,
@@ -29,7 +27,6 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
 enum class NativeCollectionTestOperation : std::uint8_t {
     None = 0,
     MaterializeFrozenWals = 1,
-    CompactDeltaRuns = 2,
     CollectOrphans = 3,
     FoldPartitions = 4,
     CleanSegment = 5,
@@ -37,10 +34,6 @@ enum class NativeCollectionTestOperation : std::uint8_t {
 
 enum class NativeCollectionTestResourceKind : std::uint8_t {
     None = 0,
-    MutationWal = 1,
-    MutationDeltaPair = 2,
-    MutationDeltaData = 3,
-    MutationDeltaIndex = 4,
     OrphanFile = 5,
     OrphanDirectory = 6,
     PartitionSnapshot = 7,

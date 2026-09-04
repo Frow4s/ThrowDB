@@ -6,14 +6,14 @@
 #include <span>
 #include <vector>
 
-#include "mutation_catalog.hpp"
+#include "internal.hpp"
 #include "mutation_types.hpp"
+#include "native_collection_test_hooks.hpp"
 
 namespace throwdb::detail {
 
-// Format-7 wire primitives are intentionally isolated from the format-6
-// reader/writer path.  Slice A only defines and validates the durable contract;
-// no existing collection selects these resources yet.
+// Durable format-7 wire primitives. Individual resource wire versions are
+// independent of the public collection format number.
 inline constexpr std::uint32_t kPartitionedPublicFormatVersion = 7;
 inline constexpr std::uint32_t kPartitionedManifestWireVersion = 2;
 inline constexpr std::uint32_t kPartitionedCatalogWireVersion = 3;
@@ -21,14 +21,15 @@ inline constexpr std::uint32_t kPartitionedResourceWireVersion = 1;
 inline constexpr std::uint64_t kPartitionedHeaderSize = 4096;
 inline constexpr std::uint32_t kPartitionedChecksumAlgorithmCrc32c = 1;
 
+inline constexpr std::uint64_t kRequiredFeatureCatalogV1 = 1ULL << 0;
 inline constexpr std::uint64_t kRequiredFeatureSegmentCatalogV1 = 1ULL << 2;
 inline constexpr std::uint64_t kRequiredFeaturePartitionedRowRefV1 = 1ULL << 3;
 inline constexpr std::uint64_t kPartitionedRequiredFeatureBits =
-    kNativeRequiredFeatureCatalogV1
+    kRequiredFeatureCatalogV1
     | kRequiredFeatureSegmentCatalogV1
     | kRequiredFeaturePartitionedRowRefV1;
 inline constexpr std::uint64_t kPartitionedSupportedRequiredFeatureBits =
-    kPartitionedRequiredFeatureBits | kNativeRequiredFeatureDeltaV1;
+    kPartitionedRequiredFeatureBits;
 
 inline constexpr std::uint32_t kPartitionedMaximumPartitionBits = 16;
 inline constexpr std::uint64_t kPartitionedMaximumResourceEntries = 1'000'000;
@@ -48,13 +49,11 @@ enum class PartitionedSegmentKind : std::uint32_t {
     Initial = 1,
     Materialized = 2,
     Cleaner = 3,
-    LegacyDeltaV1 = 4,
 };
 
 enum class PartitionedRunKind : std::uint32_t {
     Mutation = 1,
     Cleaner = 2,
-    LegacyDeltaV1 = 3,
 };
 
 struct PartitionedManifestV2 {

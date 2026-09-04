@@ -16,7 +16,7 @@ def _create_store(path: Path) -> tuple[dict[str, object], int]:
         path,
         schema=throwdb.CollectionSchema(dimension=4),
         shard_size_bytes=1 << 20,
-        format_version=6,
+        format_version=7,
     ) as collection:
         collection.add(
             np.arange(64, dtype=np.uint64),
@@ -116,7 +116,7 @@ def test_worker_uses_anchored_directory_when_path_is_replaced(
         replacement,
         schema=throwdb.CollectionSchema(dimension=8),
         shard_size_bytes=1 << 20,
-        format_version=6,
+        format_version=7,
     ) as collection:
         collection.add(
             np.arange(64, dtype=np.uint64),
@@ -178,7 +178,7 @@ def test_isolated_calibration_refuses_to_start_after_deadline(
         deadline=1.0,
         expected_dimension=4,
         expected_dtype="float16",
-        expected_format_version=6,
+        expected_format_version=7,
         expected_root_identity=(1, 1),
         clock=lambda: 2.0,
     )
@@ -220,7 +220,7 @@ def test_deadline_crossed_while_anchoring_does_not_spawn_worker(
         deadline=1.0,
         expected_dimension=4,
         expected_dtype="float16",
-        expected_format_version=6,
+        expected_format_version=7,
         expected_root_identity=(root_status.st_dev, root_status.st_ino),
         clock=lambda: now[0],
     )
@@ -261,7 +261,7 @@ def test_root_descriptor_is_closed_when_identity_probe_fails(
             deadline=time.perf_counter() + 10.0,
             expected_dimension=4,
             expected_dtype="float16",
-            expected_format_version=6,
+            expected_format_version=7,
             expected_root_identity=(1, 1),
         )
 
@@ -287,6 +287,6 @@ def test_isolated_calibration_propagates_worker_open_failure(
             deadline=time.perf_counter() + 10.0,
             expected_dimension=4,
             expected_dtype="float16",
-            expected_format_version=6,
+            expected_format_version=7,
             expected_root_identity=(tmp_path.stat().st_dev, -1),
         )

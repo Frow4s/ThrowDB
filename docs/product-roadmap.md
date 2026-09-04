@@ -69,8 +69,7 @@ Stage 1 slices are called out inline:
   the thread-pool or io_uring parallel coordinator is enabled; per-request
   backend/policy selection remains a later optimization;
 - explicit source-array rebuild into the fresh format during the experimental
-  MVP; high-level read compatibility remains available for formats 3 through
-  6, while new collections default to format 7.
+  MVP; format 7 is the only supported storage format.
 
 The scheduler and backend interfaces keep the public API independent of
 `pread`, thread pools, and io_uring.

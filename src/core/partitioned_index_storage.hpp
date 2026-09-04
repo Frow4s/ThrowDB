@@ -140,8 +140,8 @@ private:
 };
 
 // Reads only the manifest discriminator, without following a substituted
-// symlink or blocking on a non-regular file. A false result means that the
-// existing format-6 path should perform its normal validation.
+// symlink or blocking on a non-regular file. A false result rejects unsupported
+// storage before any collection locks or resources are opened.
 [[nodiscard]] bool is_partitioned_index_store(
     const std::filesystem::path& store_path);
 

@@ -35,8 +35,8 @@ def _normalize_numeric_ids(
 
     A native aligned C-contiguous uint64 ndarray is returned by identity. All
     other accepted inputs receive a safe, exact conversion. This function is
-    intentionally kept separate from the native binding: callers that require
-    control over every allocation can continue to use ``Writer``/``Storage``.
+    shared by the embedded API and remote transport so both enforce the same
+    exact conversion and buffer contract.
     """
 
     if isinstance(ids, np.ma.MaskedArray):

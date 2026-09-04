@@ -295,7 +295,7 @@ void test_invalid_inputs_poison_and_rowref_capacity() {
     }
     for (const PartitionedSegmentKind kind : {
              PartitionedSegmentKind::Initial,
-             PartitionedSegmentKind::LegacyDeltaV1}) {
+             static_cast<PartitionedSegmentKind>(99)}) {
         TempDirectory temporary;
         require_throws<throwdb::InvalidArgumentError>(
             [&] {

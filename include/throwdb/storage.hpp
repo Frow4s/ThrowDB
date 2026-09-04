@@ -19,20 +19,13 @@ enum class IoBackend : std::uint32_t {
     IoUring = 1,
 };
 
-struct WriterOptions {
-    std::uint32_t dimension = 1024;
-    DType dtype = DType::Float16;
-    // The payload capacity of one shard. The 4 KiB shard header is additional.
-    std::uint64_t shard_size_bytes = 16ULL << 30;
-};
-
 struct ReaderOptions {
     // Adjacent requested records are read as one range up to this size.
     std::uint64_t max_read_range_bytes = 1ULL << 20;
     // A range may include this many unrequested bytes between records.
     std::uint64_t max_gap_bytes = 0;
     // Zero keeps the deterministic sequential pread baseline. A positive
-    // value creates one executor shared by every get() call on this Storage.
+    // value creates one executor shared by every get() call on this collection.
     std::uint32_t io_workers = 0;
     // Maximum number of tasks waiting for a worker. With workers enabled,
     // zero selects 2 * io_workers. submit() applies backpressure at the bound.
@@ -51,102 +44,9 @@ struct ReaderOptions {
     // Number of independent io_uring lanes. One preserves the caller-driven
     // baseline; two or more create dedicated ring-owner worker threads.
     std::uint32_t io_uring_workers = 1;
-    // Native mutable collections normally verify the persisted index-body
-    // checksum and fall back to a full structural scan for legacy indexes.
-    // Set this to also run the complete structural verification on every
-    // open. Immutable Storage readers ignore this native-only option.
+    // Collection opens always verify persisted index checksums. Set this to
+    // additionally verify complete index structure and segment payloads.
     bool verify_native_index = false;
 };
-
-class Writer {
-public:
-    static std::unique_ptr<Writer> create(
-        const std::filesystem::path& path,
-        WriterOptions options = {});
-
-    ~Writer();
-
-    Writer(const Writer&) = delete;
-    Writer& operator=(const Writer&) = delete;
-    Writer(Writer&&) = delete;
-    Writer& operator=(Writer&&) = delete;
-
-    // append() is synchronous. The input buffers may be reused when it returns.
-    void append(
-        std::span<const std::uint64_t> ids,
-        std::span<const std::byte> embeddings);
-
-    void append(
-        const std::uint64_t* ids,
-        std::size_t count,
-        const void* embeddings,
-        std::size_t embedding_bytes);
-
-    // Makes all shard and index files durable, then atomically publishes the
-    // manifest. Readers cannot open a build until finish() succeeds.
-    void finish();
-
-    [[nodiscard]] std::uint64_t count() const noexcept;
-    [[nodiscard]] std::uint32_t dimension() const noexcept;
-    [[nodiscard]] DType dtype() const noexcept;
-    [[nodiscard]] std::uint32_t format_version() const noexcept;
-    [[nodiscard]] std::uint64_t record_size() const noexcept;
-    [[nodiscard]] bool finished() const noexcept;
-
-private:
-    class Impl;
-    explicit Writer(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
-};
-
-class Storage {
-public:
-    static std::unique_ptr<Storage> open(
-        const std::filesystem::path& path,
-        ReaderOptions options = {});
-
-    ~Storage();
-
-    Storage(const Storage&) = delete;
-    Storage& operator=(const Storage&) = delete;
-    Storage(Storage&&) = delete;
-    Storage& operator=(Storage&&) = delete;
-
-    // Missing IDs are a strict error. Lookup of every ID completes before any
-    // output bytes are modified.
-    void get_into(
-        std::span<const std::uint64_t> ids,
-        std::span<std::byte> output) const;
-
-    void get_into(
-        const std::uint64_t* ids,
-        std::size_t count,
-        void* output,
-        std::size_t output_bytes) const;
-
-    // Returns the raw row-major payload for any supported dtype.
-    [[nodiscard]] std::vector<std::byte> get_bytes(
-        std::span<const std::uint64_t> ids) const;
-
-    // Compatibility convenience for float16 collections. Values are returned
-    // as their raw IEEE-754 binary16 bit patterns. Float32 collections must use
-    // get_bytes() or get_into().
-    [[nodiscard]] std::vector<std::uint16_t> get(
-        std::span<const std::uint64_t> ids) const;
-
-    [[nodiscard]] std::uint64_t count() const noexcept;
-    [[nodiscard]] std::uint32_t dimension() const noexcept;
-    [[nodiscard]] DType dtype() const noexcept;
-    [[nodiscard]] std::uint32_t format_version() const noexcept;
-    [[nodiscard]] std::uint64_t record_size() const noexcept;
-
-private:
-    class Impl;
-    explicit Storage(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
-};
-
-using StorageWriter = Writer;
-using StorageReader = Storage;
 
 }  // namespace throwdb

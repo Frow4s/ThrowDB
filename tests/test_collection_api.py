@@ -56,7 +56,7 @@ def _create_collection(
         path,
         schema=schema,
         shard_size_bytes=shard_size_bytes,
-        format_version=6,
+        format_version=7,
     ) as collection:
         collection.add(ids, vectors)
 
@@ -220,13 +220,13 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
         path,
         schema=schema,
         shard_size_bytes=3 * schema.dimension * np.dtype(np.float16).itemsize,
-        format_version=6,
+        format_version=7,
     ) as builder:
         assert builder.mode == "write"
         assert builder.schema is schema
         assert builder.id_type == "uint64"
         assert builder.dtype == "float16"
-        assert builder.format_version == 6
+        assert builder.format_version == 7
         assert builder.dimension == schema.dimension
         assert builder.count == 0
         assert builder.tuning is None
@@ -241,7 +241,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert collection.schema == schema
     assert collection.id_type == "uint64"
     assert collection.dtype == "float16"
-    assert collection.format_version == 6
+    assert collection.format_version == 7
     assert collection.dimension == schema.dimension
     assert collection.count == ids.size
     open_stats = collection.open_stats
@@ -251,7 +251,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     assert open_stats["index_body_checksum_verified"] is True
     assert open_stats["index_structural_validation_performed"] is False
     assert open_stats["total_seconds"] > 0
-    assert open_stats["index_allocation_seconds"] >= 0
+    assert open_stats["base_segments_seconds"] >= 0
     open_stats["index_validation"] = "caller mutation"
     assert collection.open_stats["index_validation"] == "checksum"  # type: ignore[index]
 
@@ -282,7 +282,7 @@ def test_collection_create_open_add_get_and_get_into_are_bit_exact(
     _assert_same_bits(output, vectors[order])
 
 
-def test_collection_create_forwards_default_and_explicit_legacy_format_versions(
+def test_collection_create_forwards_default_and_explicit_current_format(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,16 +312,16 @@ def test_collection_create_forwards_default_and_explicit_legacy_format_versions(
     )
 
     default = throwdb.Collection.create(tmp_path / "default")
-    legacy = throwdb.Collection.create(
-        tmp_path / "legacy",
-        format_version=6,
+    explicit = throwdb.Collection.create(
+        tmp_path / "explicit",
+        format_version=7,
     )
 
-    assert calls == [7, 6]
+    assert calls == [7, 7]
     assert default.format_version == 7
-    assert legacy.format_version == 6
+    assert explicit.format_version == 7
     default.abort()
-    legacy.abort()
+    explicit.abort()
 
 
 @pytest.mark.parametrize(
@@ -331,8 +331,8 @@ def test_collection_create_forwards_default_and_explicit_legacy_format_versions(
         (np.bool_(False), TypeError, "not bool"),
         (6.0, TypeError, "must be an integer"),
         ("7", TypeError, "must be an integer"),
-        (5, ValueError, "must be 6 or 7"),
-        (8, ValueError, "must be 6 or 7"),
+        *((version, ValueError, "must be 7") for version in range(7)),
+        (8, ValueError, "must be 7"),
     ],
 )
 def test_collection_create_rejects_invalid_format_versions_before_native_open(
@@ -358,6 +358,14 @@ def test_collection_create_rejects_invalid_format_versions_before_native_open(
             tmp_path / "invalid-format",
             format_version=format_version,  # type: ignore[arg-type]
         )
+    assert not (tmp_path / "invalid-format").exists()
+
+
+def test_legacy_storage_and_writer_are_not_public_api() -> None:
+    assert not hasattr(throwdb, "Storage")
+    assert not hasattr(throwdb, "Writer")
+    assert "Storage" not in throwdb.__all__
+    assert "Writer" not in throwdb.__all__
 
 
 def test_add_normalizes_layout_but_never_silently_casts_embedding_dtype(
@@ -379,7 +387,7 @@ def test_add_normalizes_layout_but_never_silently_casts_embedding_dtype(
     builder = throwdb.Collection.create(
         tmp_path / "wrong-dtype",
         schema=throwdb.CollectionSchema(dimension=dimension),
-        format_version=6,
+        format_version=7,
     )
     with pytest.raises(TypeError, match="float16.*float32"):
         builder.add(ids, expected.astype(np.float32))
@@ -514,7 +522,7 @@ def test_builder_context_aborts_on_exception(tmp_path: Path) -> None:
         with throwdb.Collection.create(
             path,
             schema=throwdb.CollectionSchema(dimension=3),
-            format_version=6,
+            format_version=7,
         ) as builder:
             builder.add(ids, _vectors(ids.size, 3))
             raise RuntimeError("stop build")
@@ -531,7 +539,7 @@ def test_explicit_finish_and_abort_are_idempotent_and_close_the_builder(
     finished = throwdb.Collection.create(
         finished_path,
         schema=throwdb.CollectionSchema(dimension=3),
-        format_version=6,
+        format_version=7,
     )
     finished.add(ids, vectors)
     finished.finish()
@@ -547,7 +555,7 @@ def test_explicit_finish_and_abort_are_idempotent_and_close_the_builder(
     aborted = throwdb.Collection.create(
         aborted_path,
         schema=throwdb.CollectionSchema(dimension=3),
-        format_version=6,
+        format_version=7,
     )
     aborted.add(ids, vectors)
     aborted.abort()
@@ -566,7 +574,7 @@ def test_collection_operations_reject_the_wrong_mode(tmp_path: Path) -> None:
     builder = throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=2),
-        format_version=6,
+        format_version=7,
     )
 
     with pytest.raises(RuntimeError, match="opened collection reader"):
@@ -737,38 +745,6 @@ def test_invalid_tuning_is_rejected(
         throwdb.Collection.open(path, tuning=tuning)  # type: ignore[arg-type]
 
 
-def test_native_api_remains_strict_while_collection_normalizes_ids(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "store"
-    ids = np.array([13, 29], dtype=np.uint32)
-    vectors = _vectors(ids.size, 3)
-    _create_collection(path, ids, vectors)
-
-    collection = throwdb.Collection.open(path)
-    _assert_same_bits(collection.get(ids), vectors)
-
-    native_path = tmp_path / "native-storage"
-    with throwdb.Writer.create(
-        native_path,
-        dimension=3,
-        shard_size_bytes=1 << 20,
-    ) as native_builder:
-        native_builder.add(ids.astype(np.uint64), vectors)
-    native_storage = throwdb.Storage.open(native_path)
-    with pytest.raises(ValueError, match="uint64"):
-        native_storage.get(ids)
-
-    native_writer = throwdb.Writer.create(
-        tmp_path / "native",
-        dimension=3,
-        shard_size_bytes=1 << 20,
-    )
-    with pytest.raises(ValueError, match="uint64"):
-        native_writer.add(ids, vectors)
-    native_writer.abort()
-
-
 def test_low_level_native_verify_flag_requires_a_python_bool(
     tmp_path: Path,
 ) -> None:
@@ -811,18 +787,14 @@ def test_low_level_native_metadata_and_range_options(
     collection_id_high = metadata.pop("collection_id_high")
     assert collection_id_low != 0 or collection_id_high != 0
     assert metadata == {
-        "format_version": 6,
+        "format_version": 7,
         "dimension": dimension,
         "dtype": "float16",
         "record_size": dimension * np.dtype(np.float16).itemsize,
-        "segment_size_bytes": (
-            segment_size_bytes
-            // (dimension * np.dtype(np.float16).itemsize)
-            * (dimension * np.dtype(np.float16).itemsize)
-        ),
-        "layout": "uint64_dense_row_major_flat_v1",
-        "feature_discriminator": "catalog_v1+delta_v1",
-        "required_feature_bits": 3,
+        "segment_size_bytes": segment_size_bytes,
+        "layout": "uint64_dense_row_major_partitioned_rowref_v1",
+        "feature_discriminator": "segment_catalog_v1+partitioned_rowref_v1",
+        "required_feature_bits": 13,
         "optional_feature_bits": 0,
     }
 
@@ -898,11 +870,11 @@ def test_low_level_calibration_snapshot_reuses_index_for_reader_trials(
     sampled = calibration.sample_ids(
         requested_count=ids.size,
         seed=123,
-        max_inspected_slots=128,
+        max_inspected_slots=1 << 20,
     )
     assert sampled["complete"] is True
     assert sampled["requested_count"] == ids.size
-    assert sampled["inspected_slots"] <= 128
+    assert sampled["inspected_slots"] <= 1 << 20
     sampled_ids = sampled["ids"]
     assert isinstance(sampled_ids, np.ndarray)
     assert sampled_ids.dtype == np.dtype(np.uint64)

@@ -1,6 +1,6 @@
 """Python bindings for the ThrowDB storage engine."""
 
-from ._throwdb import ReaderBackendError, Storage, Writer, __version__
+from ._throwdb import ReaderBackendError, __version__
 from ._calibration import CalibrationError
 from ._tuning import TuningRegistryError
 from .collection import (
@@ -117,10 +117,8 @@ __all__ = [
     "RemoteTuningSelection",
     "RemoteUnavailableError",
     "RemoteUnimplementedError",
-    "Storage",
     "TuningRegistryError",
     "WorkloadLogError",
-    "Writer",
     "RecordBatch",
     "backup_to_s3",
     "inspect_workload_logs",

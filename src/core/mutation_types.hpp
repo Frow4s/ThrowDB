@@ -22,7 +22,29 @@ struct Uuid128 {
     auto operator<=>(const Uuid128&) const = default;
 };
 
-// Declared in internal.hpp and implemented by the existing immutable index.
+enum class MutationWalState : std::uint32_t {
+    Frozen = 1,
+    Active = 2,
+};
+
+struct MutationWalEntry {
+    Uuid128 wal_id;
+    Uuid128 predecessor_wal_id;
+    std::uint32_t segment_id{0};
+    MutationWalState state{MutationWalState::Active};
+    std::uint64_t previous_sequence{0};
+    std::uint64_t first_sequence{1};
+    // Frozen WALs store their inclusive final sequence. Active WALs use zero.
+    std::uint64_t last_sequence{0};
+    // Frozen WALs store their immutable PUT-row count. Active WALs use zero.
+    std::uint64_t put_count{0};
+    // Frozen WALs store their exact immutable size. Active WALs use zero.
+    std::uint64_t sealed_file_size{0};
+
+    bool operator==(const MutationWalEntry&) const = default;
+};
+
+// Declared in internal.hpp and implemented by the core binary utilities.
 // Keeping the declaration here lets this private foundation header remain
 // independent of the complete snapshot-format implementation.
 [[nodiscard]] std::uint64_t hash_id(

@@ -1664,40 +1664,7 @@ void test_non_loopback_transport_is_fail_closed() {
     health_server.shutdown();
 }
 
-void test_grpc_rejects_legacy_storage_format() {
-    TemporaryDirectory temporary;
-    const auto store = temporary.path() / "legacy-store";
-    constexpr std::uint32_t dimension = 4;
-    constexpr std::uint64_t record_size = 8;
-    const std::array<std::uint64_t, 1> ids{10};
-    const std::vector<std::byte> embeddings = rows(1, record_size, 9);
 
-    throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
-    builder_options.dimension = dimension;
-    builder_options.dtype = throwdb::DType::Float16;
-    auto builder = throwdb::NativeCollectionBuilder::create(
-        store, builder_options);
-    builder->append(ids, embeddings);
-    builder->finish();
-
-    auto collection = throwdb::NativeCollection::open(store, {}, true);
-    throwdb::server::EngineOptions engine_options;
-    engine_options.durable_idempotency = false;
-    throwdb::server::SingleCollectionEngine engine(
-        *collection, store, engine_options);
-
-    bool rejected = false;
-    try {
-        throwdb::server::GrpcServer server(engine);
-    } catch (const throwdb::InvalidArgumentError& error) {
-        rejected = std::string(error.what()).find("format 7")
-                   != std::string::npos;
-    }
-    require(
-        rejected,
-        "gRPC server did not reject a legacy storage format clearly");
-}
 
 void test_get_is_rejected_before_native_read_or_allocation() {
     TemporaryDirectory temporary;
@@ -1953,7 +1920,6 @@ int main() {
         // Fork/exec lifecycle coverage must run before this process initializes
         // any gRPC worker threads.
         test_daemon_terminal_exit_and_hard_shutdown_watchdog();
-        test_grpc_rejects_legacy_storage_format();
         test_non_loopback_transport_is_fail_closed();
         test_grpc_read_workload_logging_is_opt_in_and_bounded();
         test_get_is_rejected_before_native_read_or_allocation();

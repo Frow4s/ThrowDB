@@ -15,7 +15,7 @@ from throwdb.collection import _orphan_report
 from throwdb.cli import main as cli_main
 
 
-def _build_store(path: Path, *, format_version: int = 6) -> None:
+def _build_store(path: Path, *, format_version: int = 7) -> None:
     vectors = np.arange(12, dtype=np.uint16).reshape(2, 6).view(np.float16)
     with throwdb.Collection.create(
         path,
@@ -46,8 +46,8 @@ def test_orphan_policy_defers_pre_epoch_and_future_timestamps(
             "current_catalog_id": "1" * 32,
             "entries": [
                 {
-                    "path": "deltas/delta-" + "2" * 32 + ".dat",
-                    "classification": "partial_unreferenced_delta_pair",
+                    "path": "segments/segment-" + "2" * 32 + ".dat",
+                    "classification": "partial_unreferenced_segment_pair",
                     "candidate": True,
                     "bytes": 11,
                     "modified_unix_ns": -1,
@@ -85,17 +85,17 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
     current_temp = store / f"CURRENT.{'1' * 32}.tmp"
     old_wal = store / "wal" / f"wal-{'2' * 32}.wal"
     young_wal = store / "wal" / f"wal-{'3' * 32}.wal"
-    partial_delta = store / "deltas" / f"delta-{'4' * 32}.dat"
-    complete_data = store / "deltas" / f"delta-{'5' * 32}.dat"
-    complete_index = store / "deltas" / f"delta-{'5' * 32}.idx"
+    partial_segment = store / "segments" / f"segment-{'4' * 32}.dat"
+    complete_data = store / "segments" / f"segment-{'5' * 32}.dat"
+    complete_ids = store / "segments" / f"segment-{'5' * 32}.ids"
     unknown = store / "wal" / "user-notes.txt"
 
     _write_with_mtime(current_temp, b"tmp", old_ns)
     _write_with_mtime(old_wal, b"old-wal", old_ns)
     _write_with_mtime(young_wal, b"young-wal", now_ns)
-    _write_with_mtime(partial_delta, b"partial", old_ns)
+    _write_with_mtime(partial_segment, b"partial", old_ns)
     _write_with_mtime(complete_data, b"delta-data", old_ns)
-    _write_with_mtime(complete_index, b"delta-index", old_ns)
+    _write_with_mtime(complete_ids, b"delta-index", old_ns)
     _write_with_mtime(unknown, b"unknown", old_ns)
 
     expected_paths = {
@@ -104,9 +104,9 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
             current_temp,
             old_wal,
             young_wal,
-            partial_delta,
+            partial_segment,
             complete_data,
-            complete_index,
+            complete_ids,
             unknown,
         )
     }
@@ -128,9 +128,9 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
             current_temp,
             old_wal,
             young_wal,
-            partial_delta,
+            partial_segment,
             complete_data,
-            complete_index,
+            complete_ids,
         )
     )
     assert report["reclaimable_bytes"] == sum(
@@ -138,9 +138,9 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
         for path in (
             current_temp,
             old_wal,
-            partial_delta,
+            partial_segment,
             complete_data,
-            complete_index,
+            complete_ids,
         )
     )
     assert report["unknown_file_count"] == 1
@@ -148,13 +148,13 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
     assert report["classification_counts"]["unreferenced_wal"] == 2
     assert (
         report["classification_counts"][
-            "complete_unreferenced_delta_pair"
+            "complete_unreferenced_segment_pair"
         ]
         == 2
     )
     assert (
         report["classification_counts"][
-            "partial_unreferenced_delta_pair"
+            "partial_unreferenced_segment_pair"
         ]
         == 1
     )
@@ -203,7 +203,7 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
         assert executed["durability_complete"] is True
         assert executed["policy_complete"] is True
         assert executed["reclamation_complete"] is True
-        assert executed["synced_directories"] == [".", "wal", "deltas"]
+        assert executed["synced_directories"] == [".", "segments", "wal"]
         assert all(
             entry["durable"]
             for entry in executed["entries"]
@@ -217,9 +217,9 @@ def test_orphan_dry_run_classifies_age_and_never_removes_files(
     assert not current_temp.exists()
     assert not old_wal.exists()
     assert young_wal.exists()
-    assert not partial_delta.exists()
+    assert not partial_segment.exists()
     assert not complete_data.exists()
-    assert not complete_index.exists()
+    assert not complete_ids.exists()
     assert unknown.exists()
 
 

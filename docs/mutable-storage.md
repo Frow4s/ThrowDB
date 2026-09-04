@@ -18,7 +18,6 @@ The fresh native numeric MVP now implements:
   active/frozen WAL recovery;
 - checksummed `CURRENT`, immutable catalog generations, UUID-named WAL chains,
   and manual plus hard-limit WAL rotation;
-- format-6 DeltaV1 materialization and prefix compaction for compatibility;
 - format-7 frozen-WAL materialization into immutable segments and one
   partitioned mutation run;
 - an authoritative format-7 index made of one immutable snapshot per partition
@@ -27,8 +26,8 @@ The fresh native numeric MVP now implements:
   embedding payloads;
 - bounded segment cleaning with same-sequence RowRef relocation and a cleaner
   run that fences every row of the retired source;
-- format-aware orphan planning and fail-closed deletion for WALs, delta pairs,
-  segment pairs, snapshots, runs, and temporary publications;
+- orphan planning and fail-closed deletion for WALs, segment pairs, snapshots,
+  runs, and temporary publications;
 - generic physical reads spanning immutable segments and multiple WAL payloads,
   with one shared resource-set pin retained through physical I/O.
 
@@ -38,9 +37,8 @@ runs. Materialization, folding, and cleaning publish a new catalog but do not
 unlink retired resources. They become unreachable only after the catalog
 switch and are reclaimed by a later fresh, locked orphan pass. This separates
 logical publication from namespace reclamation and preserves readers that
-pinned the previous view. Format 6 keeps its flat-index/DeltaV1 lifecycle, and
-format 5 remains catalog/WAL-only. The historical formats 3 through 6 are
-specified in `native-format-v3.md`.
+pinned the previous view. Format 7 is the only supported storage format;
+earlier experimental implementations have been removed.
 
 One writable handle serializes materialization, folding, cleaning, and orphan
 passes through its lifecycle mutex. Ordinary commits and compatible WAL
@@ -187,8 +185,7 @@ Embedded `maintain(dry_run=...)` is an explicit deterministic pass, not a
 library-created background thread. Format 7 considers, in order, rotation of a non-empty active WAL,
 bounded materialization of the oldest frozen prefix, selective partition
 folding, cleaning of at most one segment, and bounded orphan collection. Each
-action is attempted at most once. Format 6 uses the older four-action sequence
-without cleaning. `max_actions` is hard; `max_seconds` is cooperative and is
+action is attempted at most once. `max_actions` is hard; `max_seconds` is cooperative and is
 checked only between durable primitives. Publication failures remain fail-fast,
 while individual orphan unlink/fsync failures are represented in the report.
 
@@ -234,12 +231,7 @@ row_index  = n % R
 Older immutable collections are rebuilt from their source NumPy arrays rather
 than adapted with a global-ordinal compatibility layer.
 
-## Index modes and format-7 steady state
-
-Format 6 is the compatibility mode: a versioned RAM overlay rebuilt from
-DeltaV1 runs and retained WALs shadows one flat base index. It supports CRUD,
-rotation, frozen-prefix materialization, and bounded oldest-prefix DeltaV1
-compaction, but it cannot safely retire base segments.
+## Authoritative partitioned index
 
 Format 7 makes the durable partitioned index authoritative. It maps every live
 logical ID to `{sequence, RowRef}`; a tombstone may appear in a run, while
@@ -473,113 +465,16 @@ can never live only in an unreferenced WAL:
 3. Publish a catalog/CURRENT generation containing both the frozen WAL and the
    new active WAL. Only then may the writer append or acknowledge new commits.
 
-Format 5 stops there and deliberately retains every frozen WAL. Format 6 adds
-`materialize_frozen_wals()` (CLI: `throwdb materialize --storage PATH`) with two
-short catalog publications around an unlocked data build:
-
-1. Under the mutation/commit locks, publish a metadata-only generation that
-   advances `next_segment_id`. This durably reserves the output segment ID even
-   if the process crashes or the later build becomes an orphan.
-2. Release the mutation lock. Strictly rescan the captured complete frozen WAL
-   prefix and collapse each ID to its newest `{sequence, PUT/DELETE}` in that
-   interval. Concurrent commits and rotations continue during this phase.
-3. Stream bit-exact live PUT rows into a synced immutable
-   `deltas/delta-<uuid>.dat`. Write and sync its matching `.idx`, whose 32-byte
-   version records are sorted by ID and whose 16-byte reverse `{id, sequence}`
-   records correspond one-for-one with dense payload rows. CRC32C binds both
-   bodies through the catalog descriptor.
-4. Reacquire the mutation lock, verify the selected prefix and lineage still
-   match, and rebase on the latest catalog. Retain the active WAL and every WAL
-   frozen after the build started, so their newer sequences continue to shadow
-   the delta.
-5. Publish a second catalog and atomically replace `CURRENT`, removing only the
-   selected WAL prefix and adding the delta descriptor. Switch the in-memory
-   view after the durable pointer change.
-6. Best-effort unlink the replaced WAL pathnames. Failure leaves harmless
-   unreferenced files for the explicit orphan collector; it does not roll back
-   the selected catalog. Already-open POSIX descriptors remain valid for older
-   reads.
-
-Thus materialization is not a base compaction: it bounds the selected mutation
-history without copying any base embedding or flat-index entry.
-
-`materialize_frozen_wals(max_wals=..., max_input_bytes=...)` may select only
-the oldest contiguous frozen prefix fitting both format-6 limits. The legacy
-no-argument call remains unlimited. If the oldest frozen WAL does not fit, the
-operation is a no-op with `materialization_budget_blocked=true`; it never
-silently exceeds a maintenance budget. Entry-count and estimated-memory limits
-are format-7-only because format 6 retains its compatibility implementation.
-
-Format 6 also exposes `compact_deltas()` (CLI: `throwdb compact-deltas`). It
-selects the oldest contiguous prefix of at least two DeltaV1 runs subject to
-explicit run-count, input-byte, and input-entry budgets. Before reserving an
-output segment, it verifies every selected source payload CRC. It then performs
-a bounded k-way merge of the ID-sorted indexes, retaining the greatest original
-commit sequence for each ID and retaining tombstones. PUT payload rows are
-copied bit-exactly into one new immutable DeltaV1 pair. A metadata-only catalog
-generation reserves the output segment ID; a second generation atomically
-replaces exactly the selected prefix after revalidation and a complete output
-payload checksum pass. Newer unselected
-deltas and every retained WAL remain in place and continue to shadow the merged
-run. Only after the durable `CURRENT` switch are the selected source pairs
-unlinked best-effort. A process that crashes before the switch leaves an orphan
-or an unused segment-ID gap; after the switch, recovery selects the compacted
-view.
-
-The byte budget is the catalog footprint of selected source files, not a bound
-on total physical I/O. Source payloads are scanned for integrity, winning PUT
-rows are read again for the copy, and the output payload is read back before
-publication. The entry budget bounds retained version metadata; the current
-writer still holds bounded input/output vectors rather than implementing a
-fully streaming external merge.
-
-Format-6 compaction reduces run/file count, duplicated delta payload, and reopen
-work without reading or copying the immutable base. It deliberately cannot
-discard tombstones while the flat base index remains a fallback and therefore
-cannot reclaim garbage inside base segments. Format 7, described below,
-provides the authoritative partitioned RowRef index and selective cleaner.
-Explicit embedded `maintain()` supplies deterministic triggers. The optional
-writable-server worker uses the same bounded lifecycle primitives and also
-attempts format-7 selective cleaning conservatively: at most one candidate is
-rewritten per pass, after threshold and minimum-interval checks.
-
-### Format-6 DeltaV1 limits
-
-- Finite `NativeOpenOptions` are enforced before mapping each retained WAL and
-  before allocating each decoded DeltaV1 record vector. WAL committed-operation
-  limits are passed into the validating scanner; the retained overlay is then
-  bounded by exact unique ID count and a conservative 64-byte-per-entry
-  estimate across all deltas and WALs.
-- The same handle limits remain active after recovery. A mutation checks exact
-  projected total retained WAL bytes/operations and exact unique overlay growth
-  before its durable append. Rotation charges its additional 4096-byte active
-  WAL header while retaining the frozen predecessor. A limit error neither
-  appends a transaction nor publishes a rotation.
-- `mutation_log_stats()` reports exact active/frozen/total WAL operation counts,
-  exact active/frozen/total logical WAL bytes, and exact overlay cardinality;
-  `estimated_overlay_bytes` uses the same conservative estimator as admission.
-- Delta version records still populate the full mutation overlay in RAM when a
-  collection opens; `.idx` is durable metadata, not yet an on-demand or
-  partitioned lookup structure.
-- Writes and WAL rotation continue while the delta files are built, but the
-  initial segment-ID reservation and final rebase/catalog switch briefly pause
-  mutations.
-- Normal open checks each delta data header, exact size, index geometry, reverse
-  rows, and the complete `.idx` body CRC. It intentionally does not stream the
-  complete `.dat` embedding payload to verify its stored CRC; no public payload
-  scrub operation exists yet.
-- Delta compaction is prefix-only. Explicit `maintain()` applies its bounded
-  trigger policy, but no background worker invokes it. Format-6 base segments
-  are not compacted.
-- Publication, old-view safety, and post-switch WAL unlink currently rely on
-  local POSIX `rename`, `fsync`, open-descriptor, and unlink semantics. CephFS,
-  other network filesystems, and object storage require a separately validated
-  backend protocol.
+All retained WALs count toward the configured byte and operation limits.
+Mutations charge their exact encoded transaction; rotation also charges the new
+4096-byte WAL header. Admission happens before durable writes and overlay
+publication. Maintenance releases retained WAL quota after materialization.
+Publication and pinned-reader safety depend on local POSIX rename, fsync,
+open-descriptor, and unlink semantics.
 
 ## Format-7 materialization and selective folding
 
-Format 7 uses the same active/frozen WAL protocol but a different immutable
-destination. `materialize_frozen_wals()` selects the oldest contiguous frozen
+`materialize_frozen_wals()` selects the oldest contiguous frozen
 prefix fitting its WAL-count, input-byte, committed-operation, and estimated
 peak-memory budgets. It collapses each ID to the greatest sequence in that
 prefix, orders winning PUT payload reads by their source `RowRef`, and streams
@@ -642,10 +537,7 @@ A complete collection rewrite remains an explicit administrative operation for
 schema/layout migration or major workload reorganization, not routine garbage
 collection.
 
-Tombstone reclamation follows the lookup mode. In format-6 overlay mode a
-DELETE must remain until every older source that could contain the ID is
-removed or durably shadowed; dropping it early would resurrect a base row. In
-authoritative partitioned mode, partition absence is itself the final
+In the authoritative partitioned index, partition absence is itself the final
 "missing" answer and never falls back to an older base mapping. A DELETE run
 can be folded into that absence only when the new authoritative partition is
 published atomically and no catalog reachable by the new view can reintroduce

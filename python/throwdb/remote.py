@@ -1975,6 +1975,11 @@ class RemoteCollection:
             self._stub.Describe, throwdb_pb2.DescribeRequest()
         )
         assert isinstance(response, throwdb_pb2.DescribeResponse)
+        if response.format_version != 7:
+            raise RemoteProtocolError(
+                f"server collection format {response.format_version} is unsupported; "
+                "only format 7 is supported"
+            )
         if response.schema.id_type != throwdb_pb2.ID_TYPE_UINT64:
             raise RemoteProtocolError("server collection is not a uint64 collection")
         dtype = _PROTO_TO_DTYPE.get(response.schema.embedding_dtype)

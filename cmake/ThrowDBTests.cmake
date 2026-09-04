@@ -11,7 +11,6 @@ endfunction()
 
 foreach(name IN ITEMS
     core
-    format_v2
     mutation_types
     partitioned_index_format
     partitioned_index_run_storage
@@ -22,23 +21,15 @@ foreach(name IN ITEMS
     partitioned_segment_storage
     partitioned_resource_inventory
     mutation_wal
-    mutation_catalog
-    mutation_delta
-    mutation_inventory
     physical_reader
     read_scheduler
     io_uring_coordinator
-    native_format
     native_collection
-    native_collection_lifecycle
-    native_collection_materialization
-    native_collection_compaction
-    native_collection_compaction_crash
     native_collection_reader_barrier
 )
     throwdb_add_test(${name} throwdb::core)
 endforeach()
-set_tests_properties(throwdb_native_collection_compaction_crash_tests
+set_tests_properties(throwdb_native_collection_reader_barrier_tests
     PROPERTIES TIMEOUT 30)
 
 if(THROWDB_BUILD_SERVER)

@@ -181,7 +181,7 @@ void validate_reader_set(
             require<CorruptionError>(
                 descriptor.kind == PartitionedRunKind::Mutation
                     || descriptor.kind == PartitionedRunKind::Cleaner,
-                "partition fold cannot consume a legacy run kind");
+                "partition fold cannot consume an unknown run kind");
         }
         previous_epoch = descriptor.epoch;
     }

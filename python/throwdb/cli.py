@@ -677,9 +677,9 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--format-version",
         type=int,
-        choices=(6, 7),
+        choices=(7,),
         default=7,
-        help="on-disk collection format (default: 7; 6 remains supported)",
+        help="on-disk collection format (only 7 is supported)",
     )
     create.add_argument(
         "--shard-size-gib", type=_positive_int, default=DEFAULT_SHARD_SIZE_GIB
@@ -960,7 +960,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-runs",
         type=_delta_compaction_runs,
         default=None,
-        help="maximum input runs (default: 8 for format 6, 4096 for format 7)",
+        help="maximum input runs (default: 4096)",
     )
     compact_deltas.add_argument(
         "--max-input-gib",

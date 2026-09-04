@@ -47,7 +47,7 @@ def _build(
         path,
         schema=schema,
         shard_size_bytes=shard_size_bytes,
-        format_version=6,
+        format_version=7,
     ) as builder:
         builder.add(ids, embeddings)
 
@@ -69,7 +69,7 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
 
     with throwdb.Collection.open(path, mode="r+") as collection:
         assert collection.mode == "read_write"
-        assert collection.format_version == 6
+        assert collection.format_version == 7
         assert collection.count == 3
 
         collection.insert(np.array([40, 50], dtype=np.int16), inserted)
@@ -493,7 +493,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert second_rotation["frozen_wal_count"] == 2
 
     with throwdb.Collection.open(path) as reopened:
-        assert reopened.format_version == 6
+        assert reopened.format_version == 7
         stats = reopened.mutation_log_stats
         assert stats is not None
         assert stats["catalog_managed"] is True
@@ -508,7 +508,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
             reopened.rotate_wal()
 
 
-def test_frozen_wals_materialize_into_reopenable_delta_runs(
+def test_frozen_wals_materialize_into_reopenable_partition_runs(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "materialized"
@@ -541,11 +541,13 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
         assert materialized["delta_run_count"] == 1
         assert materialized["delta_entry_count"] == 3
         assert materialized["delta_put_rows"] == 2
-        assert materialized["reclaimed_wal_count"] == 2
-        assert materialized["reclamation_complete"] is True
+        assert materialized["reclamation_complete"] is False
+        assert len(list((path / "wal").glob("*.wal"))) == 3
+        assert len(list((path / "segments").glob("*.dat"))) == 2
+        assert len(list((path / "index" / "runs").glob("*.idx"))) == 1
+        reclaimed = collection.collect_orphans(dry_run=False, min_age_seconds=0)
+        assert reclaimed["reclamation_complete"] is True
         assert len(list((path / "wal").glob("*.wal"))) == 1
-        assert len(list((path / "deltas").glob("*.dat"))) == 1
-        assert len(list((path / "deltas").glob("*.idx"))) == 1
         _assert_same_bits(
             collection.get([maximum_id, boundary_id, 0]),
             np.stack([second[1], second[0], first[0]]),
@@ -654,14 +656,16 @@ def test_delta_compaction_public_api_is_bounded_and_reopenable(
             max_input_entries=np.int64(16),
         )
         assert compacted["compacted"] is True
-        assert compacted["compacted_delta_run_count"] == 2
+        assert compacted["compacted_partition_count"] == 1
+        assert compacted["compacted_run_section_count"] == 2
         assert compacted["compacted_delta_input_entries"] == 2
         assert compacted["compacted_delta_input_bytes"] > 0
-        assert compacted["delta_run_count"] == 1
-        assert compacted["delta_entry_count"] == 1
-        assert compacted["reclaimed_delta_run_count"] == 2
-        assert compacted["reclaimed_delta_bytes"] > 0
-        assert compacted["reclamation_complete"] is True
+        assert compacted["delta_run_count"] == 0
+        assert compacted["delta_entry_count"] == 0
+        assert compacted["reclamation_complete"] is False
+        reclaimed = collection.collect_orphans(dry_run=False, min_age_seconds=0)
+        assert reclaimed["reclamation_complete"] is True
+        assert len(list((path / "index" / "runs").glob("*.idx"))) == 0
         _assert_same_bits(
             collection.get([1, 2]),
             np.stack([second[0], base[1]]),
@@ -669,7 +673,7 @@ def test_delta_compaction_public_api_is_bounded_and_reopenable(
 
         with pytest.raises(TypeError, match="max_runs.*bool"):
             collection.compact_deltas(max_runs=True)
-        with pytest.raises(ValueError, match="max_runs.*between 2 and 64"):
+        with pytest.raises(ValueError, match="max_runs.*between 2 and 4096"):
             collection.compact_deltas(max_runs=1)
         with pytest.raises(ValueError, match="max_input_bytes.*between"):
             collection.compact_deltas(max_input_bytes=0)
@@ -677,7 +681,7 @@ def test_delta_compaction_public_api_is_bounded_and_reopenable(
             collection.compact_deltas(max_input_entries=1.5)
 
     with throwdb.Collection.open(path) as reopened:
-        assert reopened.mutation_log_stats["delta_run_count"] == 1
+        assert reopened.mutation_log_stats["delta_run_count"] == 0
         _assert_same_bits(
             reopened.get([1, 2]),
             np.stack([second[0], base[1]]),
@@ -811,7 +815,7 @@ def test_read_only_and_builder_reject_crud_and_context_closes_handles(
     builder = throwdb.Collection.create(
         tmp_path / "builder",
         schema=throwdb.CollectionSchema(dimension=3),
-        format_version=6,
+        format_version=7,
     )
     for operation in (builder.insert, builder.update, builder.upsert):
         with pytest.raises(RuntimeError, match="opened collection"):

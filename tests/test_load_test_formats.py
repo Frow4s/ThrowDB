@@ -22,69 +22,21 @@ def _load_benchmark_module() -> ModuleType:
 BENCHMARK = _load_benchmark_module()
 
 
-@pytest.mark.parametrize(
-    ("magic", "expected"),
-    [
-        (b"THROWDBM", "legacy_immutable"),
-        (b"TDBNMNF1", "native_mutable"),
-        (b"TDBNMNF2", "native_mutable"),
-    ],
-)
-def test_store_format_is_detected_from_manifest_magic(
-    tmp_path: Path,
-    magic: bytes,
-    expected: str,
-) -> None:
-    (tmp_path / "manifest.bin").write_bytes(magic + bytes(64))
-    assert BENCHMARK.detect_store_format(tmp_path) == expected
-
-
-def test_unknown_and_truncated_manifest_magic_are_rejected(tmp_path: Path) -> None:
-    manifest = tmp_path / "manifest.bin"
-    manifest.write_bytes(b"short")
-    with pytest.raises(ValueError, match="truncated"):
-        BENCHMARK.detect_store_format(tmp_path)
-
-    manifest.write_bytes(b"UNKNOWN!")
-    with pytest.raises(ValueError, match="unsupported storage manifest magic"):
-        BENCHMARK.detect_store_format(tmp_path)
-
-
-@pytest.mark.parametrize(
-    ("magic", "expected_api"),
-    [
-        (b"TDBNMNF1", "collection"),
-        (b"TDBNMNF2", "collection"),
-        (b"THROWDBM", "storage"),
-    ],
-)
-def test_storage_open_is_routed_with_identical_reader_tuning(
+def test_storage_open_uses_collection_with_explicit_reader_tuning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    magic: bytes,
-    expected_api: str,
 ) -> None:
-    (tmp_path / "manifest.bin").write_bytes(magic)
-    calls: list[tuple[str, Path, dict[str, object]]] = []
+    calls: list[tuple[Path, dict[str, object]]] = []
     native_handle = object()
-    legacy_handle = object()
 
     class FakeCollection:
         @staticmethod
         def open(path: Path, **kwargs: object) -> object:
-            calls.append(("collection", path, kwargs))
+            calls.append((path, kwargs))
             return native_handle
 
-    class FakeStorage:
-        @staticmethod
-        def open(path: Path, **kwargs: object) -> object:
-            calls.append(("storage", path, kwargs))
-            return legacy_handle
-
     monkeypatch.setattr(
-        BENCHMARK,
-        "throwdb",
-        SimpleNamespace(Collection=FakeCollection, Storage=FakeStorage),
+        BENCHMARK, "throwdb", SimpleNamespace(Collection=FakeCollection)
     )
     tuning = {
         "io_workers": 4,
@@ -94,17 +46,10 @@ def test_storage_open_is_routed_with_identical_reader_tuning(
         "io_uring_workers": 2,
         "io_uring_queue_depth": 64,
     }
-
-    handle, _ = BENCHMARK.open_benchmark_storage(tmp_path, **tuning)
-
-    assert calls[0][0] == expected_api
-    assert calls[0][1] == tmp_path
-    if expected_api == "collection":
-        assert handle is native_handle
-        assert calls[0][2] == {"mode": "r", "tuning": tuning}
-    else:
-        assert handle is legacy_handle
-        assert calls[0][2] == tuning
+    handle, store_format = BENCHMARK.open_benchmark_storage(tmp_path, **tuning)
+    assert handle is native_handle
+    assert store_format == "native_mutable"
+    assert calls == [(tmp_path, {"mode": "r", "tuning": tuning})]
 
 
 def test_optional_storage_open_stats_are_normalized_to_a_dict() -> None:
@@ -118,7 +63,6 @@ def test_native_benchmark_can_require_persisted_reader_tuning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / "manifest.bin").write_bytes(b"TDBNMNF2")
     calls: list[tuple[Path, dict[str, object]]] = []
     handle = object()
 
@@ -148,22 +92,6 @@ def test_native_benchmark_can_require_persisted_reader_tuning(
     assert actual is handle
     assert store_format == "native_mutable"
     assert calls == [(tmp_path, {"mode": "r", "tuning": "persisted"})]
-
-
-def test_legacy_benchmark_rejects_saved_reader_tuning(tmp_path: Path) -> None:
-    (tmp_path / "manifest.bin").write_bytes(b"THROWDBM")
-
-    with pytest.raises(ValueError, match="only by native collections"):
-        BENCHMARK.open_benchmark_storage(
-            tmp_path,
-            io_workers=0,
-            io_queue_capacity=0,
-            io_ranges_per_task=8,
-            io_backend="thread_pool",
-            io_uring_workers=1,
-            io_uring_queue_depth=32,
-            tuning_mode="persisted",
-        )
 
 
 def test_actual_storage_tuning_is_normalized_to_a_copy() -> None:
@@ -275,11 +203,11 @@ def test_cache_eviction_includes_base_segments_and_active_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = tmp_path / "data"
+    data = tmp_path / "segments"
     data.mkdir()
     wal = tmp_path / "wal"
     wal.mkdir()
-    (data / "shard-000001.dat").write_bytes(bytes(11))
+    (data / "segment-00000000.dat").write_bytes(bytes(11))
     (data / "segment-00000001.dat").write_bytes(bytes(13))
     (data / "unrelated.dat").write_bytes(bytes(17))
     (wal / "active.wal").write_bytes(bytes(19))
@@ -297,7 +225,6 @@ def test_cache_eviction_includes_base_segments_and_active_wal(
 
     result = BENCHMARK.evict_data_cache(tmp_path)
 
-    assert result["shard_count"] == 2
     assert result["data_file_count"] == 2
     assert result["wal_file_count"] == 1
     assert result["advised_file_count"] == 3

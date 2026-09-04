@@ -19,7 +19,7 @@ def _build(path: Path) -> None:
         path,
         schema=throwdb.CollectionSchema(dimension=4, dtype="float16"),
         shard_size_bytes=1 << 20,
-        format_version=6,
+        format_version=7,
     ) as builder:
         builder.add([1, 2], _vectors(1))
 
@@ -57,7 +57,7 @@ def test_maintain_dry_run_is_non_mutating_and_explains_policy(
         after = dict(collection.mutation_log_stats or {})
 
     assert report["format"] == "throwdb-maintenance-report"
-    assert report["version"] == 1
+    assert report["version"] == 2
     assert report["dry_run"] is True
     assert report["before"] == report["after"] == before == after
     assert report["work_performed"] is False
@@ -66,6 +66,7 @@ def test_maintain_dry_run_is_non_mutating_and_explains_policy(
         "rotate_wal",
         "materialize_frozen_wals",
         "compact_deltas",
+        "clean_segments",
         "collect_orphans",
     ]
     assert report["actions"][0]["planned"] is True
@@ -93,26 +94,18 @@ def test_maintain_executes_rotate_then_bounded_materialization(
         )
 
     assert report["dry_run"] is False
-    assert report["actions_performed"] == 2
+    assert report["actions_performed"] == 3
     assert report["work_performed"] is True
-    rotate, materialize, compact, collect = report["actions"]
+    rotate, materialize, compact, clean, collect = report["actions"]
     assert rotate["performed"] is True
     assert materialize["performed"] is True
     assert materialize["result"]["materialized_wal_count"] == 1
     assert compact["attempted"] is False
+    assert clean["performed"] is False
     assert collect["attempted"] is True
+    assert collect["performed"] is True
     assert report["after"]["frozen_wal_count"] == 0
     assert report["after"]["delta_run_count"] == 1
-
-
-def test_format6_maintain_rejects_format7_only_materialization_bounds(
-    tmp_path: Path,
-) -> None:
-    store = tmp_path / "format6-materialization-bounds"
-    _build(store)
-    with throwdb.Collection.open(store, mode="r+") as collection:
-        with pytest.raises(ValueError, match="require a format-7 collection"):
-            collection.maintain(materialize_max_input_entries=10)
 
 
 def test_maintain_hard_action_and_cooperative_time_budgets(

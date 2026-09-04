@@ -63,8 +63,6 @@ _DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
 _DEFAULT_ID_SCAN_BATCH_ROWS: Final = 65_536
 _DEFAULT_STREAM_BATCH_BYTES: Final = 64 << 20
 _DEFAULT_STREAM_SNAPSHOT_BYTES: Final = 256 << 20
-_DEFAULT_DELTA_COMPACTION_MAX_RUNS: Final = 8
-_MAX_DELTA_COMPACTION_RUNS: Final = 64
 _MAX_PARTITIONED_FOLD_RUNS: Final = 4096
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES: Final = 1_000_000
@@ -86,7 +84,6 @@ _DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS: Final = 8
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES: Final = 2_000_000
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES: Final = 1 << 30
-_DEFAULT_MAINTAIN_COMPACT_MIN_RUNS: Final = 8
 _DEFAULT_MAX_WAL_BACKLOG_BYTES: Final = 16 << 30
 _DEFAULT_MAX_WAL_BACKLOG_OPERATIONS: Final = 4_000_000
 _DEFAULT_MAX_OVERLAY_ENTRIES: Final = 4_000_000
@@ -97,8 +94,6 @@ _ORPHAN_INVENTORY_CLASS_NAMES: Final = (
     "superseded_catalog",
     "temp_publication",
     "unreferenced_wal",
-    "complete_unreferenced_delta_pair",
-    "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
     "complete_unreferenced_segment_pair",
     "partial_unreferenced_segment_pair",
@@ -117,8 +112,6 @@ OrphanClassification: TypeAlias = Literal[
     "superseded_catalog",
     "temp_publication",
     "unreferenced_wal",
-    "complete_unreferenced_delta_pair",
-    "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
     "complete_unreferenced_segment_pair",
     "partial_unreferenced_segment_pair",
@@ -382,8 +375,8 @@ def _validate_format_version(value: object) -> int:
         version = operator.index(value)
     except TypeError as error:
         raise TypeError("format_version must be an integer") from error
-    if version not in {6, 7}:
-        raise ValueError("format_version must be 6 or 7")
+    if version != 7:
+        raise ValueError("format_version must be 7")
     return version
 
 
@@ -603,8 +596,8 @@ def _orphan_report(
 
         # Candidate policy is format-specific. In particular, format 7 can
         # safely retire superseded catalogs and unreferenced segment
-        # singletons under view.lock, while the format-6 catalog policy stays
-        # conservative. Never infer this destructive policy from a class name.
+        # singletons under view.lock. Never infer this destructive policy
+        # from a class name.
         candidate = native_candidate
         valid_modification_time = 0 <= modified_unix_ns <= snapshot_unix_ns
         eligible = (
@@ -3282,28 +3275,18 @@ class Collection:
     ) -> dict[str, object]:
         """Compact bounded immutable index state.
 
-        Format 6 merges a complete oldest delta-run prefix. Format 7 folds
-        complete per-partition run sections into authoritative snapshots.
+        Fold complete per-partition run sections into authoritative snapshots.
         The operation never rewrites embedding segments.
         """
 
         native = self._ensure_mutable("compact immutable mutation deltas")
-        maximum_runs = (
-            _MAX_PARTITIONED_FOLD_RUNS
-            if self._format_version == 7
-            else _MAX_DELTA_COMPACTION_RUNS
-        )
         validated_max_runs = _validate_delta_compaction_limit(
-            (
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
-            )
+            _MAX_PARTITIONED_FOLD_RUNS
             if max_runs is None
             else max_runs,
             name="max_runs",
             minimum=2,
-            maximum=maximum_runs,
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
         validated_max_input_bytes = _validate_delta_compaction_limit(
             max_input_bytes,
@@ -3437,19 +3420,8 @@ class Collection:
             materialize_max_input_bytes,
             name="materialize_max_input_bytes",
         )
-        if self._format_version != 7 and (
-            materialize_max_input_entries is not None
-            or materialize_max_memory_bytes is not None
-        ):
-            raise ValueError(
-                "materialize entry and memory budgets require a format-7 "
-                "collection"
-            )
         validated_materialize_entries = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES
-            if self._format_version == 7
-            and materialize_max_input_entries is None
-            else _UINT64_MAX
             if materialize_max_input_entries is None
             else _validate_delta_compaction_limit(
                 materialize_max_input_entries,
@@ -3458,9 +3430,6 @@ class Collection:
         )
         validated_materialize_memory = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES
-            if self._format_version == 7
-            and materialize_max_memory_bytes is None
-            else _UINT64_MAX
             if materialize_max_memory_bytes is None
             else _validate_delta_compaction_limit(
                 materialize_max_memory_bytes,
@@ -3468,36 +3437,20 @@ class Collection:
             )
         )
         validated_compact_min_runs = _validate_delta_compaction_limit(
-            (
-                1
-                if self._format_version == 7
-                else _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS
-            )
+            1
             if compact_min_runs is None
             else compact_min_runs,
             name="compact_min_runs",
-            minimum=1 if self._format_version == 7 else 2,
-            maximum=(
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _MAX_DELTA_COMPACTION_RUNS
-            ),
+            minimum=1,
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
         validated_compact_max_runs = _validate_delta_compaction_limit(
-            (
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
-            )
+            _MAX_PARTITIONED_FOLD_RUNS
             if compact_max_runs is None
             else compact_max_runs,
             name="compact_max_runs",
             minimum=2,
-            maximum=(
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _MAX_DELTA_COMPACTION_RUNS
-            ),
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
         if validated_compact_max_runs < validated_compact_min_runs:
             raise ValueError("compact_max_runs must be >= compact_min_runs")
@@ -3712,96 +3665,95 @@ class Collection:
                             ), "before": action_before,
                             "after": dict(current), "result": result})
 
-        if self._format_version == 7:
-            clean_kwargs = {
-                "max_candidate_segments": validated_clean[
-                    "clean_max_candidate_segments"
-                ],
-                "max_sidecar_scan_bytes": validated_clean[
-                    "clean_max_sidecar_scan_bytes"
-                ],
-                "max_source_bytes": validated_clean[
-                    "clean_max_source_bytes"
-                ],
-                "max_output_bytes": validated_clean[
-                    "clean_max_output_bytes"
-                ],
-                "max_memory_bytes": validated_clean[
-                    "clean_max_memory_bytes"
-                ],
-                "min_garbage_rows": validated_clean[
-                    "clean_min_garbage_rows"
-                ],
-                "min_reclaimable_bytes": validated_clean_reclaimable,
-                "min_garbage_ratio_ppm": validated_clean_ratio,
-                "start_after_segment_id": validated_clean_cursor,
-            }
-            if dry_run:
-                clean_plan = self.clean_segments(dry_run=True, **clean_kwargs)
-                clean_planned = clean_plan["candidate_found"]
-                actions.append(
-                    {
-                        "name": "clean_segments",
-                        "planned": clean_planned,
-                        "attempted": False,
-                        "performed": False,
-                        "reason": (
-                            "candidate_found"
-                            if clean_planned
-                            else (
-                                "budget_blocked"
-                                if clean_plan["budget_blocked"]
-                                else "no_candidate"
-                            )
-                        ),
-                        "before": dict(current),
-                        "after": dict(current),
-                        "result": clean_plan,
-                    }
-                )
-            elif actions_attempted >= validated_max_actions:
-                action_budget_reached = True
-                record_skipped(
-                    "clean_segments", True, "maintenance_budget_reached"
-                )
-            elif time.monotonic() - started >= seconds:
-                deadline_reached = True
-                record_skipped(
-                    "clean_segments", True, "maintenance_budget_reached"
-                )
-            else:
-                # Execute performs its own bounded selection while holding the
-                # native lifecycle locks. A separate dry-run here would scan
-                # every candidate sidecar twice and could consume twice the
-                # advertised scan budget in one maintenance pass.
-                actions_attempted += 1
-                action_before = dict(current)
-                clean_result = self.clean_segments(
-                    dry_run=False, **clean_kwargs
-                )
-                performed = clean_result["cleaned"]
-                actions_performed += int(performed)
-                current = stats_snapshot()
-                actions.append(
-                    {
-                        "name": "clean_segments",
-                        "planned": clean_result["candidate_found"],
-                        "attempted": True,
-                        "performed": performed,
-                        "reason": (
-                            "completed"
-                            if performed
-                            else (
-                                "budget_blocked"
-                                if clean_result["budget_blocked"]
-                                else "no_candidate"
-                            )
-                        ),
-                        "before": action_before,
-                        "after": dict(current),
-                        "result": clean_result,
-                    }
-                )
+        clean_kwargs = {
+            "max_candidate_segments": validated_clean[
+                "clean_max_candidate_segments"
+            ],
+            "max_sidecar_scan_bytes": validated_clean[
+                "clean_max_sidecar_scan_bytes"
+            ],
+            "max_source_bytes": validated_clean[
+                "clean_max_source_bytes"
+            ],
+            "max_output_bytes": validated_clean[
+                "clean_max_output_bytes"
+            ],
+            "max_memory_bytes": validated_clean[
+                "clean_max_memory_bytes"
+            ],
+            "min_garbage_rows": validated_clean[
+                "clean_min_garbage_rows"
+            ],
+            "min_reclaimable_bytes": validated_clean_reclaimable,
+            "min_garbage_ratio_ppm": validated_clean_ratio,
+            "start_after_segment_id": validated_clean_cursor,
+        }
+        if dry_run:
+            clean_plan = self.clean_segments(dry_run=True, **clean_kwargs)
+            clean_planned = clean_plan["candidate_found"]
+            actions.append(
+                {
+                    "name": "clean_segments",
+                    "planned": clean_planned,
+                    "attempted": False,
+                    "performed": False,
+                    "reason": (
+                        "candidate_found"
+                        if clean_planned
+                        else (
+                            "budget_blocked"
+                            if clean_plan["budget_blocked"]
+                            else "no_candidate"
+                        )
+                    ),
+                    "before": dict(current),
+                    "after": dict(current),
+                    "result": clean_plan,
+                }
+            )
+        elif actions_attempted >= validated_max_actions:
+            action_budget_reached = True
+            record_skipped(
+                "clean_segments", True, "maintenance_budget_reached"
+            )
+        elif time.monotonic() - started >= seconds:
+            deadline_reached = True
+            record_skipped(
+                "clean_segments", True, "maintenance_budget_reached"
+            )
+        else:
+            # Execute performs its own bounded selection while holding the
+            # native lifecycle locks. A separate dry-run here would scan
+            # every candidate sidecar twice and could consume twice the
+            # advertised scan budget in one maintenance pass.
+            actions_attempted += 1
+            action_before = dict(current)
+            clean_result = self.clean_segments(
+                dry_run=False, **clean_kwargs
+            )
+            performed = clean_result["cleaned"]
+            actions_performed += int(performed)
+            current = stats_snapshot()
+            actions.append(
+                {
+                    "name": "clean_segments",
+                    "planned": clean_result["candidate_found"],
+                    "attempted": True,
+                    "performed": performed,
+                    "reason": (
+                        "completed"
+                        if performed
+                        else (
+                            "budget_blocked"
+                            if clean_result["budget_blocked"]
+                            else "no_candidate"
+                        )
+                    ),
+                    "before": action_before,
+                    "after": dict(current),
+                    "result": clean_result,
+                }
+            )
 
         if dry_run:
             orphan_result = self.collect_orphans(
@@ -3838,7 +3790,7 @@ class Collection:
         finished_unix_ns = time.time_ns()
         return {
             "format": "throwdb-maintenance-report",
-            "version": 2 if self._format_version == 7 else 1,
+            "version": 2,
             "dry_run": dry_run,
             "started_unix_ns": started_unix_ns,
             "finished_unix_ns": finished_unix_ns,
@@ -3869,17 +3821,9 @@ class Collection:
         normalized lazily, so callers must not mutate its structure or values
         until the returned stream is closed. Previously yielded batches remain
         valid if a later batch contains a missing/invalid ID and fails.
-
-        The operation is available only for format 7 because older formats do
-        not expose a pinned mutable-view read primitive.
         """
 
         storage = self._ensure_reader()
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "snapshot-consistent stream_get requires a format-7 "
-                "collection; rebuild the collection in format 7"
-            )
         rows = _validate_id_scan_batch_rows(batch_rows)
         batch_bytes = _validate_stream_byte_limit(
             max_batch_bytes,
@@ -3995,11 +3939,6 @@ class Collection:
         """
 
         storage = self._ensure_reader()
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "snapshot-consistent record scanning requires a format-7 "
-                "collection; rebuild the collection in format 7"
-            )
         rows = _validate_id_scan_batch_rows(batch_rows)
         if not isinstance(with_locations, bool):
             raise TypeError("with_locations must be a bool")
@@ -4069,11 +4008,6 @@ class Collection:
         rows = _validate_id_scan_batch_rows(batch_rows)
         if not isinstance(with_locations, bool):
             raise TypeError("with_locations must be a bool")
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "physical ID scanning requires a format-7 collection; "
-                "rebuild the collection in format 7"
-            )
         snapshot_limit = (
             None
             if max_snapshot_bytes is None
@@ -4188,10 +4122,6 @@ class Collection:
 
         if not isinstance(dry_run, bool):
             raise TypeError("dry_run must be a bool")
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "selective segment cleaning requires a format-7 collection"
-            )
         limits = {
             "max_candidate_segments": max_candidate_segments,
             "max_sidecar_scan_bytes": max_sidecar_scan_bytes,

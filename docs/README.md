@@ -18,9 +18,6 @@ Format references:
 
 - [Collection contract](collection-contract.md)
 - [Format 7 mutable lifecycle](mutable-storage.md)
-- [Formats 3–6 native layout](native-format-v3.md)
-- [Older immutable format](storage-format.md)
-- [Numeric format-v2 representation](storage-format-v2.md)
 - [Product roadmap](product-roadmap.md)
 
 The operational guides describe the current single-collection product. They

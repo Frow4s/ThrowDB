@@ -21,11 +21,9 @@ struct NativeBuilderOptions {
     // Target payload bytes per immutable base segment. Headers/ID sidecars are
     // additional. The builder also caps every segment at 2^32 rows.
     std::uint64_t segment_size_bytes = 16ULL << 30;
-    // Format 7 is the stable local-storage format. Format 6 remains readable
-    // and writable for existing collections.
+    // Format 7 is the only supported storage format.
     std::uint32_t format_version = 7;
-    // Format-7 builders use 4096 authoritative partitions by default. Kept at
-    // the end to preserve aggregate initialization of the stable v6 fields.
+    // Builders use 4096 authoritative partitions by default.
     std::uint32_t partition_bits = 12;
 };
 
@@ -34,9 +32,6 @@ struct NativeOpenStats {
     double manifest_seconds = 0.0;
     double index_seconds = 0.0;
     double index_header_seconds = 0.0;
-    double index_allocation_seconds = 0.0;
-    double index_controls_seconds = 0.0;
-    double index_slots_seconds = 0.0;
     double index_checksum_seconds = 0.0;
     double index_structural_validation_seconds = 0.0;
     double base_segments_seconds = 0.0;
@@ -49,7 +44,7 @@ struct NativeOpenStats {
 
 // Native-only safety bounds applied while opening/replaying mutable state and
 // before live overlay growth, committed WAL operations/bytes, or the extra WAL
-// header retained by rotation, for both formats 6 and 7. Finite limits reject
+// header retained by rotation, for format 7. Finite limits reject
 // writes before publication so the collection can reopen under the same bounds.
 // Defaults preserve the historical unbounded embedded-open behaviour. Servers
 // should provide finite values to bound retained mutation state.
@@ -69,8 +64,8 @@ struct NativeOpenOptions {
 };
 
 // Lightweight immutable layout metadata used to select reader policies before
-// loading the potentially multi-gigabyte flat index. inspect_metadata() reads
-// only the checksummed manifest and index header.
+// loading partition snapshots and replaying WALs. inspect_metadata() reads only
+// the checksummed collection manifest.
 struct NativeCollectionMetadata {
     std::uint32_t format_version = 0;
     std::uint32_t dimension = 0;
@@ -81,8 +76,6 @@ struct NativeCollectionMetadata {
     std::string feature_discriminator;
     std::uint64_t required_feature_bits = 0;
     std::uint64_t optional_feature_bits = 0;
-    // Appended to preserve positional aggregate initialization of the
-    // pre-existing metadata fields.
     std::uint64_t collection_id_low = 0;
     std::uint64_t collection_id_high = 0;
 };
@@ -241,8 +234,6 @@ struct NativeMutationLogStats {
     bool materialization_budget_blocked = false;
     bool compacted = false;
     bool reclamation_complete = true;
-    // New diagnostics are appended to preserve the layout of the original
-    // format-6 stats prefix for native callers.
     std::uint64_t total_delta_run_bytes = 0;
     std::uint64_t total_delta_segment_bytes = 0;
     std::uint64_t compacted_partition_count = 0;
@@ -321,11 +312,7 @@ enum class NativeOrphanClass : std::uint8_t {
     SupersededCatalog,
     TempPublication,
     UnreferencedWal,
-    CompleteUnreferencedDeltaPair,
-    PartialUnreferencedDeltaPair,
     UnknownDoNotTouch,
-    // Format-7 values are append-only so existing numeric values remain
-    // stable for native callers that persist diagnostics.
     CompleteUnreferencedSegmentPair,
     PartialUnreferencedSegmentPair,
     UnreferencedSnapshot,
@@ -346,7 +333,6 @@ struct NativeOrphanEntry {
     // True when this storage format's destructive collector may consider the
     // class after its own fresh locked scan, age/budget checks, and no-follow
     // identity revalidation. This remains diagnostic, not unlink authority.
-    // Kept append-only so the layout of the pre-existing fields stays stable.
     bool candidate = false;
 };
 
@@ -678,11 +664,9 @@ public:
             std::numeric_limits<std::uint64_t>::max(),
         std::uint64_t max_memory_bytes =
             std::numeric_limits<std::uint64_t>::max());
-    // Format 6 merges the oldest contiguous DeltaV1 prefix. Format 7 folds
-    // complete active run sections into selected authoritative partitions.
+    // Fold complete active run sections into selected authoritative partitions.
     // Embedding segments and newer WAL resources are never rewritten here.
-    // The no-argument overload uses the format-aware complete bound: 8 runs
-    // for format 6 and all 4096 possible active runs for format 7.
+    // The no-argument overload admits up to all 4096 possible active runs.
     [[nodiscard]] NativeMutationLogStats compact_delta_runs();
     [[nodiscard]] NativeMutationLogStats compact_delta_runs(
         std::uint64_t max_runs,

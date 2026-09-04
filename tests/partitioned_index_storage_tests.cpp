@@ -283,7 +283,7 @@ void blocking_materialization_hook(
     if (context.operation
             != NativeCollectionTestOperation::MaterializeFrozenWals
         || context.point
-               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+               != NativeCollectionTestHookPoint::LifecycleOutputDurable) {
         return;
     }
     materialization_output_entered.store(true, std::memory_order_release);
@@ -300,7 +300,7 @@ void blocking_fold_hook(
     using namespace throwdb::detail;
     if (context.operation != NativeCollectionTestOperation::FoldPartitions
         || context.point
-               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+               != NativeCollectionTestHookPoint::LifecycleOutputDurable) {
         return;
     }
     fold_output_entered.store(true, std::memory_order_release);
@@ -1766,7 +1766,7 @@ void test_materialization_crash_checkpoints_reopen() {
     };
     const std::array<CrashCase, 4> cases{{
         {HookPoint::MutationReservationDurable, 3, false},
-        {HookPoint::MutationDeltaOutputDurable, 3, false},
+        {HookPoint::LifecycleOutputDurable, 3, false},
         {HookPoint::MutationCatalogDurableBeforeCurrent, 4, false},
         {HookPoint::MutationCurrentDurable, 4, true},
     }};
@@ -2147,7 +2147,7 @@ void test_selective_fold_crash_checkpoints_reopen() {
     };
     const std::array<CrashCase, 4> cases{{
         {HookPoint::MutationReservationDurable, 5, false},
-        {HookPoint::MutationDeltaOutputDurable, 5, false},
+        {HookPoint::LifecycleOutputDurable, 5, false},
         {HookPoint::MutationCatalogDurableBeforeCurrent, 6, false},
         {HookPoint::MutationCurrentDurable, 6, true},
     }};

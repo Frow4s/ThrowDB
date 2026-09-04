@@ -49,7 +49,7 @@ def test_mutable_smoke_test_restores_the_collection_and_writes_report(
         store,
         schema=throwdb.CollectionSchema(dimension=7, dtype="float16"),
         shard_size_bytes=3 * 7 * np.dtype(np.float16).itemsize,
-        format_version=6,
+        format_version=7,
     ) as builder:
         builder.add(ids[:2], embeddings[:2])
         builder.add(ids[2:], embeddings[2:])

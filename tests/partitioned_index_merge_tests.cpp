@@ -498,7 +498,7 @@ void test_merge_lookup_tombstones_extremes_and_cleaner_chain() {
     return fixture;
 }
 
-void test_equal_sequence_conflicts_and_legacy_rejected() {
+void test_equal_sequence_conflicts_rejected() {
     {
         MergeFixture fixture = single_tie_fixture(
             PartitionedRunKind::Mutation,
@@ -537,17 +537,7 @@ void test_equal_sequence_conflicts_and_legacy_rejected() {
             },
             "cleaner replaced a live value with a tombstone at equal sequence");
     }
-    {
-        MergeFixture fixture = single_tie_fixture(
-            PartitionedRunKind::LegacyDeltaV1,
-            RowRef::create(11, 0).raw(), 0, 730);
-        require_throws<throwdb::CorruptionError>(
-            [&] {
-                static_cast<void>(merge_partition_for_fold(
-                    0, 0, *fixture.snapshot, fixture.run_views));
-            },
-            "legacy run kind was silently folded");
-    }
+
 }
 
 void test_catalog_view_mask_is_independent_of_reused_reader() {
@@ -698,8 +688,8 @@ int main() {
          test_selector_deterministic_ties_and_zero_bit_layout},
         {"merge_lookup_tombstones_extremes_and_cleaner_chain",
          test_merge_lookup_tombstones_extremes_and_cleaner_chain},
-        {"equal_sequence_conflicts_and_legacy_rejected",
-         test_equal_sequence_conflicts_and_legacy_rejected},
+        {"equal_sequence_conflicts_rejected",
+         test_equal_sequence_conflicts_rejected},
         {"catalog_view_mask_is_independent_of_reused_reader",
          test_catalog_view_mask_is_independent_of_reused_reader},
         {"transactional_bitmap_cleanup_and_extreme_layouts",

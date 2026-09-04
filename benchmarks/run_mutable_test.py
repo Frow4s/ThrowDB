@@ -354,12 +354,6 @@ def run_mutable_test(
                     "sample_rows": int(sampled_ids.size),
                 }
             )
-            if reader.format_version not in {3, 4, 5, 6, 7}:
-                raise ValueError(
-                    "the mutable smoke test requires native mutable format "
-                    "version 3, 4, 5, 6, or 7, got "
-                    f"{reader.format_version}"
-                )
 
             actual = _timed(
                 timings,

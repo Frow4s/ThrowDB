@@ -788,6 +788,11 @@ NativeCollectionMetadata inspect_partitioned_index_metadata(
 }
 
 class PartitionedIndexBuilder::Impl {
+    struct BuildIndexEntry {
+        std::uint64_t id;
+        std::uint64_t row_ref;
+    };
+
 public:
     Impl(std::filesystem::path root, NativeBuilderOptions options)
         : root_(std::move(root)),
@@ -867,7 +872,7 @@ public:
             for (std::uint32_t partition = 0;
                  partition != partition_count_; ++partition) {
                 snapshots.push_back(write_snapshot(partition));
-                std::vector<IndexSlot>().swap(buckets_[partition]);
+                std::vector<BuildIndexEntry>().swap(buckets_[partition]);
             }
             sync_directory(root_ / "index" / "partitions");
 
@@ -1101,7 +1106,7 @@ private:
             const std::uint64_t hash = hash_id(id, kHashSeed);
             const std::uint64_t partition = partition_for_hash(
                 hash, options_.partition_bits);
-            buckets_[static_cast<std::size_t>(partition)].push_back(IndexSlot{
+            buckets_[static_cast<std::size_t>(partition)].push_back(BuildIndexEntry{
                 id, RowRef::create(active_segment_id_, active_rows_ + row).raw()});
         }
         write_all(
@@ -1174,7 +1179,7 @@ private:
 
     [[nodiscard]] PartitionSnapshotDescriptor write_snapshot(
         const std::uint32_t partition) {
-        const std::vector<IndexSlot>& input = buckets_[partition];
+        const std::vector<BuildIndexEntry>& input = buckets_[partition];
         const std::uint64_t capacity = choose_capacity(input.size());
         const std::uint64_t lookup_offset = snapshot_lookup_offset(capacity);
         const std::uint64_t sequence_offset = snapshot_sequence_offset(capacity);
@@ -1186,7 +1191,7 @@ private:
         const std::size_t controls_offset =
             static_cast<std::size_t>(kPartitionedHeaderSize);
         const std::uint64_t mask = capacity - 1;
-        for (const IndexSlot& entry : input) {
+        for (const BuildIndexEntry& entry : input) {
             std::uint64_t slot = hash_id(entry.id, kHashSeed) & mask;
             while (bytes[controls_offset + static_cast<std::size_t>(slot)]
                    != std::byte{0}) {
@@ -1202,7 +1207,7 @@ private:
             const std::size_t offset = static_cast<std::size_t>(
                 lookup_offset + slot * kPartitionSnapshotLookupSlotSize);
             put_u64(bytes, offset, entry.id);
-            put_u64(bytes, offset + 8, entry.ordinal);
+            put_u64(bytes, offset + 8, entry.row_ref);
         }
 
         PartitionSnapshotDescriptor descriptor;
@@ -1242,7 +1247,7 @@ private:
     Uuid128 schema_id_;
     Uuid128 wal_id_;
     std::uint64_t partition_count_{0};
-    std::vector<std::vector<IndexSlot>> buckets_;
+    std::vector<std::vector<BuildIndexEntry>> buckets_;
     std::vector<PartitionedSegmentDescriptor> segments_;
     AdvisoryLockFile writer_lock_;
 
@@ -1314,6 +1319,10 @@ public:
         commit_lock_.lock(
             writable_ ? FileLockMode::Exclusive : FileLockMode::Shared);
         try {
+            if (!writable_) {
+                invoke_native_collection_test_hook(
+                    {NativeCollectionTestHookPoint::ReaderOpenCommitLockAcquired});
+            }
             view_lock_.lock(FileLockMode::Shared);
             open_catalog();
             resources_ = std::make_shared<ResourceSet>();
@@ -1908,6 +1917,7 @@ public:
     [[nodiscard]] PartitionedOrphanCollectionResult reclaim_orphans(
         const PartitionedOrphanCollectionOptions options) {
         ensure_mutable();
+        ensure_lifecycle_allowed(NativeCollectionTestOperation::CollectOrphans);
         std::unique_lock lifecycle(lifecycle_mutex_);
         // Directory inventory and candidate selection can scale with retained
         // and stray files. Build that advisory plan without the mutation or
@@ -1948,6 +1958,8 @@ public:
         const std::uint64_t max_input_entries,
         const std::uint64_t max_memory_bytes) {
         ensure_mutable();
+        ensure_lifecycle_allowed(
+            NativeCollectionTestOperation::MaterializeFrozenWals);
         if (max_wals == 0 || max_input_bytes == 0
             || max_input_entries == 0 || max_memory_bytes == 0) {
             throw InvalidArgumentError(
@@ -2298,9 +2310,9 @@ public:
             write_partitioned_index_run(root_, run_spec, run_records);
         sync_directory(partitioned_index_runs_directory(root_));
         invoke_native_collection_test_hook({
-            NativeCollectionTestHookPoint::MutationDeltaOutputDurable,
+            NativeCollectionTestHookPoint::LifecycleOutputDurable,
             NativeCollectionTestOperation::MaterializeFrozenWals,
-            NativeCollectionTestResourceKind::MutationDeltaPair,
+            NativeCollectionTestResourceKind::PartitionIndexRun,
             reservation_generation,
             0});
 
@@ -2447,6 +2459,7 @@ public:
         const std::uint64_t max_input_bytes,
         const std::uint64_t max_input_entries) {
         ensure_mutable();
+        ensure_lifecycle_allowed(NativeCollectionTestOperation::FoldPartitions);
         if (max_runs < 2 || max_runs > kPartitionedMaximumRuns) {
             throw InvalidArgumentError(
                 "partition fold max_runs must be between 2 and 4096");
@@ -2659,7 +2672,7 @@ public:
         }
         sync_directory(partitioned_partition_snapshots_directory(root_));
         invoke_native_collection_test_hook({
-            NativeCollectionTestHookPoint::MutationDeltaOutputDurable,
+            NativeCollectionTestHookPoint::LifecycleOutputDurable,
             NativeCollectionTestOperation::FoldPartitions,
             NativeCollectionTestResourceKind::PartitionSnapshot,
             reservation_generation,
@@ -2776,6 +2789,9 @@ public:
         const PhysicalReader& physical_reader,
         const NativeSegmentCleaningOptions options) {
         ensure_mutable();
+        if (!options.dry_run) {
+            ensure_lifecycle_allowed(NativeCollectionTestOperation::CleanSegment);
+        }
         if (options.max_candidate_segments == 0
             || options.max_sidecar_scan_bytes == 0
             || options.max_source_bytes == 0
@@ -3788,8 +3804,7 @@ private:
                         run.catalog.active_partitions, partition)) {
                     continue;
                 }
-                if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
-                    || run.catalog.epoch
+                if (run.catalog.epoch
                            <= resources_->snapshots[partition]
                                   ->header.descriptor.epoch) {
                     throw CorruptionError(
@@ -4225,8 +4240,7 @@ private:
                         run.catalog.active_partitions, partition)) {
                     continue;
                 }
-                if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
-                    || run.catalog.epoch
+                if (run.catalog.epoch
                            <= resources_->snapshots[partition]
                                   ->header.descriptor.epoch) {
                     throw CorruptionError(
@@ -4668,6 +4682,14 @@ private:
         ensure_healthy();
     }
 
+    void ensure_lifecycle_allowed(
+        const NativeCollectionTestOperation operation) const {
+        invoke_native_collection_test_hook({
+            NativeCollectionTestHookPoint::BeforeLifecycleFenceCheck, operation});
+        ensure_pending_mutation_fence_absent(
+            root_, "destructive collection maintenance");
+    }
+
     void open_catalog() {
         const std::vector<std::byte> current_bytes =
             read_exact_file(
@@ -4982,10 +5004,6 @@ private:
     void pin_runs() {
         resources_->runs.reserve(catalog_.runs.size());
         for (const PartitionIndexRunDescriptor& descriptor : catalog_.runs) {
-            if (descriptor.kind == PartitionedRunKind::LegacyDeltaV1) {
-                throw CorruptionError(
-                    "format-7 reader does not support legacy delta runs");
-            }
             auto run = std::make_shared<PartitionIndexRunReader>(
                 root_, manifest_.collection_id, manifest_.schema_id,
                 manifest_.partition_bits, manifest_.hash_seed, descriptor);
@@ -5312,8 +5330,7 @@ private:
                     run.catalog.active_partitions, partition)) {
                 continue;
             }
-            if (run.catalog.kind == PartitionedRunKind::LegacyDeltaV1
-                || run.catalog.epoch
+            if (run.catalog.epoch
                        <= resources.snapshots[partition]
                               ->header.descriptor.epoch) {
                 throw CorruptionError(

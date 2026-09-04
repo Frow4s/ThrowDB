@@ -802,8 +802,8 @@ little-endian `uint32 row_index`. They are valid only for the accompanying
 snapshot metadata; clients should expose the two fields separately instead
 of treating them as a stable global row number.
 
-The server MVP accepts storage format 7 only. `throwdbd` fails before binding
-a port with a clear rebuild message for legacy collections, so `Describe`
+The server accepts storage format 7 only. `throwdbd` fails before binding
+a port with an unsupported-format error for older collections, so `Describe`
 never advertises physical scan locations that the opened format cannot
 provide.
 

@@ -36,7 +36,6 @@ constexpr std::uint64_t kDefaultMaxReadRangeBytes = 1ULL << 20;
 constexpr std::uint64_t kDefaultMaxGapBytes = 0;
 constexpr std::uint64_t kMaxIdSampleRows = 1ULL << 22;
 constexpr std::uint64_t kMaxIdSampleInspectedSlots = 1ULL << 25;
-constexpr std::uint64_t kMaximumDeltaCompactionMaxRuns = 64;
 constexpr std::uint64_t kMaximumPartitionedFoldRuns = 4096;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputBytes = 8ULL << 30;
 constexpr std::uint64_t kDefaultDeltaCompactionMaxInputEntries = 1'000'000;
@@ -213,10 +212,6 @@ struct DTypeInfo {
         return "temp_publication";
     case throwdb::NativeOrphanClass::UnreferencedWal:
         return "unreferenced_wal";
-    case throwdb::NativeOrphanClass::CompleteUnreferencedDeltaPair:
-        return "complete_unreferenced_delta_pair";
-    case throwdb::NativeOrphanClass::PartialUnreferencedDeltaPair:
-        return "partial_unreferenced_delta_pair";
     case throwdb::NativeOrphanClass::UnknownDoNotTouch:
         return "unknown_do_not_touch";
     case throwdb::NativeOrphanClass::CompleteUnreferencedSegmentPair:
@@ -740,215 +735,6 @@ void require_disjoint_record_scan_outputs(
     }
 }
 
-class PyWriter {
-public:
-    static std::unique_ptr<PyWriter> create(
-        const py::object& path,
-        const std::uint32_t dimension,
-        const std::uint64_t shard_size_bytes,
-        const std::string& dtype) {
-        if (dimension == 0) {
-            throw py::value_error("dimension must be greater than zero");
-        }
-        if (shard_size_bytes == 0) {
-            throw py::value_error("shard_size_bytes must be greater than zero");
-        }
-        throwdb::WriterOptions options;
-        options.dimension = dimension;
-        options.dtype = checked_dtype(dtype);
-        options.shard_size_bytes = shard_size_bytes;
-        const auto native_path = filesystem_path(path);
-        std::unique_ptr<throwdb::Writer> writer;
-        {
-            py::gil_scoped_release release;
-            writer = throwdb::Writer::create(native_path, options);
-        }
-        return std::unique_ptr<PyWriter>(new PyWriter(std::move(writer)));
-    }
-
-    void add(const py::array& ids, const py::array& embeddings) {
-        ensure_open();
-        const auto id_span = validate_ids(ids);
-        const auto embedding_span = validate_embeddings(
-            embeddings, ids.shape(0), dimension(), writer_->dtype(),
-            writer_->record_size());
-        try {
-            py::gil_scoped_release release;
-            writer_->append(id_span, embedding_span);
-        } catch (const throwdb::DuplicateIdError& error) {
-            throw py::value_error(error.what());
-        }
-    }
-
-    void finish() {
-        if (finished_) {
-            return;
-        }
-        try {
-            py::gil_scoped_release release;
-            writer_->finish();
-        } catch (const throwdb::DuplicateIdError& error) {
-            throw py::value_error(error.what());
-        }
-        finished_ = true;
-    }
-
-    void abort() noexcept {
-        if (writer_ != nullptr && !finished_) {
-            // Destroying an unfinished core writer closes the staging files but
-            // never publishes the incomplete store.
-            writer_.reset();
-            finished_ = true;
-        }
-    }
-
-    [[nodiscard]] std::uint32_t dimension() const {
-        ensure_alive();
-        return writer_->dimension();
-    }
-
-    [[nodiscard]] std::uint64_t count() const {
-        ensure_alive();
-        return writer_->count();
-    }
-
-    [[nodiscard]] std::string dtype() const {
-        ensure_alive();
-        return dtype_info(writer_->dtype()).name;
-    }
-
-    [[nodiscard]] std::uint32_t format_version() const {
-        ensure_alive();
-        return static_cast<std::uint32_t>(writer_->format_version());
-    }
-
-    PyWriter& enter() {
-        ensure_open();
-        return *this;
-    }
-
-    bool exit(const py::object& exception_type,
-              const py::object&,
-              const py::object&) {
-        if (exception_type.is_none()) {
-            finish();
-        } else {
-            py::gil_scoped_release release;
-            abort();
-        }
-        return false;
-    }
-
-private:
-    explicit PyWriter(std::unique_ptr<throwdb::Writer> writer)
-        : writer_(std::move(writer)) {}
-
-    void ensure_open() const {
-        ensure_alive();
-        if (finished_ || writer_->finished()) {
-            throw std::runtime_error("writer is already finished");
-        }
-    }
-
-    void ensure_alive() const {
-        if (writer_ == nullptr) {
-            throw std::runtime_error("writer is closed");
-        }
-    }
-
-    std::unique_ptr<throwdb::Writer> writer_;
-    bool finished_{false};
-};
-
-class PyStorage {
-public:
-    static std::unique_ptr<PyStorage> open(
-        const py::object& path,
-        const std::int64_t io_workers,
-        const std::int64_t io_queue_capacity,
-        const std::int64_t io_ranges_per_task,
-        const std::string& io_backend,
-        const std::int64_t io_uring_queue_depth,
-        const std::int64_t io_uring_workers,
-        const py::object& max_read_range_bytes,
-        const py::object& max_gap_bytes) {
-        const std::uint64_t checked_max_read_range_bytes =
-            checked_uint64_option(
-                max_read_range_bytes, "max_read_range_bytes", false);
-        const std::uint64_t checked_max_gap_bytes = checked_uint64_option(
-            max_gap_bytes, "max_gap_bytes", true);
-        const throwdb::ReaderOptions options = checked_reader_options(
-            io_workers,
-            io_queue_capacity,
-            io_ranges_per_task,
-            io_backend,
-            io_uring_queue_depth,
-            io_uring_workers,
-            false,
-            checked_max_read_range_bytes,
-            checked_max_gap_bytes);
-        const auto native_path = filesystem_path(path);
-        std::unique_ptr<throwdb::Storage> reader;
-        {
-            py::gil_scoped_release release;
-            reader = throwdb::Storage::open(native_path, options);
-        }
-        return std::unique_ptr<PyStorage>(new PyStorage(std::move(reader)));
-    }
-
-    [[nodiscard]] std::uint32_t dimension() const {
-        return reader_->dimension();
-    }
-
-    [[nodiscard]] std::uint64_t count() const {
-        return reader_->count();
-    }
-
-    [[nodiscard]] std::string dtype() const {
-        return dtype_info(reader_->dtype()).name;
-    }
-
-    [[nodiscard]] std::uint32_t format_version() const {
-        return static_cast<std::uint32_t>(reader_->format_version());
-    }
-
-    py::array get(const py::array& ids) const {
-        const auto id_span = validate_ids(ids);
-        py::array output(
-            numpy_dtype(reader_->dtype()),
-            {ids.shape(0), static_cast<py::ssize_t>(dimension())});
-        auto output_span = validate_output(
-            output, ids.shape(0), dimension(), reader_->dtype(),
-            reader_->record_size());
-        try {
-            py::gil_scoped_release release;
-            reader_->get_into(id_span, output_span);
-        } catch (const throwdb::MissingIdError& error) {
-            throw py::key_error(error.what());
-        }
-        return output;
-    }
-
-    void get_into(const py::array& ids, py::array output) const {
-        const auto id_span = validate_ids(ids);
-        auto output_span = validate_output(
-            output, ids.shape(0), dimension(), reader_->dtype(),
-            reader_->record_size());
-        try {
-            py::gil_scoped_release release;
-            reader_->get_into(id_span, output_span);
-        } catch (const throwdb::MissingIdError& error) {
-            throw py::key_error(error.what());
-        }
-    }
-
-private:
-    explicit PyStorage(std::unique_ptr<throwdb::Storage> reader)
-        : reader_(std::move(reader)) {}
-
-    std::unique_ptr<throwdb::Storage> reader_;
-};
-
 class PyNativeCollectionBuilder {
 public:
     static std::unique_ptr<PyNativeCollectionBuilder> create(
@@ -963,8 +749,8 @@ public:
         if (shard_size_bytes == 0) {
             throw py::value_error("shard_size_bytes must be greater than zero");
         }
-        if (format_version != 6 && format_version != 7) {
-            throw py::value_error("format_version must be 6 or 7");
+        if (format_version != 7) {
+            throw py::value_error("only format_version=7 is supported");
         }
 
         throwdb::NativeBuilderOptions options;
@@ -1617,9 +1403,6 @@ public:
         result["manifest_seconds"] = stats.manifest_seconds;
         result["index_seconds"] = stats.index_seconds;
         result["index_header_seconds"] = stats.index_header_seconds;
-        result["index_allocation_seconds"] = stats.index_allocation_seconds;
-        result["index_controls_seconds"] = stats.index_controls_seconds;
-        result["index_slots_seconds"] = stats.index_slots_seconds;
         result["index_checksum_seconds"] = stats.index_checksum_seconds;
         result["index_structural_validation_seconds"] =
             stats.index_structural_validation_seconds;
@@ -1634,9 +1417,7 @@ public:
             stats.index_structural_validation_performed;
         const char* validation = "checksum";
         if (stats.index_structural_validation_performed) {
-            validation = stats.index_body_checksum_present
-                ? "checksum_and_full"
-                : "full_legacy_fallback";
+            validation = "checksum_and_full";
         }
         result["index_validation"] = validation;
         return result;
@@ -1863,14 +1644,9 @@ public:
         const py::object& max_input_bytes,
         const py::object& max_input_entries) {
         const auto collection = acquire_collection();
-        const std::uint64_t maximum_runs =
-            collection->format_version() == 7
-                ? kMaximumPartitionedFoldRuns
-                : kMaximumDeltaCompactionMaxRuns;
+        const std::uint64_t maximum_runs = kMaximumPartitionedFoldRuns;
         const std::uint64_t checked_max_runs = max_runs.is_none()
-            ? (collection->format_version() == 7
-                   ? kMaximumPartitionedFoldRuns
-                   : std::uint64_t{8})
+            ? kMaximumPartitionedFoldRuns
             : checked_uint64_option(max_runs, "max_runs", false);
         if (checked_max_runs < 2
             || checked_max_runs > maximum_runs) {
@@ -2132,44 +1908,6 @@ PYBIND11_MODULE(_throwdb, module) {
         throwdb::NativeIdLocation, segment_id, row_index);
     py::register_exception<throwdb::ReaderBackendError>(
         module, "ReaderBackendError", PyExc_RuntimeError);
-
-    py::class_<PyWriter>(module, "Writer")
-        .def_static(
-            "create",
-            &PyWriter::create,
-            py::arg("path"),
-            py::arg("dimension") = 1024,
-            py::arg("shard_size_bytes") = kDefaultShardSizeBytes,
-            py::arg("dtype") = "float16")
-        .def("add", &PyWriter::add, py::arg("ids"), py::arg("embeddings"))
-        .def("finish", &PyWriter::finish)
-        .def("abort", &PyWriter::abort)
-        .def_property_readonly("dimension", &PyWriter::dimension)
-        .def_property_readonly("count", &PyWriter::count)
-        .def_property_readonly("dtype", &PyWriter::dtype)
-        .def_property_readonly("format_version", &PyWriter::format_version)
-        .def("__enter__", &PyWriter::enter, py::return_value_policy::reference_internal)
-        .def("__exit__", &PyWriter::exit);
-
-    py::class_<PyStorage>(module, "Storage")
-        .def_static(
-            "open",
-            &PyStorage::open,
-            py::arg("path"),
-            py::arg("io_workers") = 0,
-            py::arg("io_queue_capacity") = 0,
-            py::arg("io_ranges_per_task") = kDefaultIoRangesPerTask,
-            py::arg("io_backend") = "thread_pool",
-            py::arg("io_uring_queue_depth") = kDefaultIoUringQueueDepth,
-            py::arg("io_uring_workers") = kDefaultIoUringWorkers,
-            py::arg("max_read_range_bytes") = kDefaultMaxReadRangeBytes,
-            py::arg("max_gap_bytes") = kDefaultMaxGapBytes)
-        .def_property_readonly("dimension", &PyStorage::dimension)
-        .def_property_readonly("count", &PyStorage::count)
-        .def_property_readonly("dtype", &PyStorage::dtype)
-        .def_property_readonly("format_version", &PyStorage::format_version)
-        .def("get", &PyStorage::get, py::arg("ids"))
-        .def("get_into", &PyStorage::get_into, py::arg("ids"), py::arg("output"));
 
     py::class_<PyNativeCollectionBuilder>(module, "NativeCollectionBuilder")
         .def_static(

@@ -65,8 +65,7 @@ flowchart LR
 
 ### Collection construction and schema
 
-- Default creation format is format 7; format 6 remains a compatibility
-  option.
+- Format 7 is the only supported storage format.
 - Embeddings are fixed-width row-major `float16` or `float32`.
 - One dimension and dtype are fixed for the lifetime of a collection.
 - Python accepts every standard NumPy signed/unsigned integer width when every

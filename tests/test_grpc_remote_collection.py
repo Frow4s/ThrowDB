@@ -1957,3 +1957,16 @@ def test_mutation_token_validates_persisted_uuid_fields() -> None:
         RemoteMutationToken(uuid.uuid4(), "invalid")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="idempotency_domain must be nonzero"):
         RemoteMutationToken(uuid.uuid4(), uuid.UUID(int=0))
+
+
+@pytest.mark.parametrize("format_version", [0, 1, 2, 3, 4, 5, 6, 8])
+def test_remote_rejects_unsupported_collection_formats(format_version: int) -> None:
+    class UnsupportedFormatService(_FakeGrpcService):
+        def Describe(self, request, context):
+            response = super().Describe(request, context)
+            response.format_version = format_version
+            return response
+
+    with _RunningGrpcServer(UnsupportedFormatService()) as server:
+        with pytest.raises(RemoteProtocolError, match="only format 7 is supported"):
+            RemoteCollection.connect(server.endpoint, timeout=2)

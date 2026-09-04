@@ -23,7 +23,8 @@
 
 #include "throwdb/errors.hpp"
 #include "throwdb/native_collection.hpp"
-#include "../src/core/native_format.hpp"
+#include "../src/core/partitioned_index_format.hpp"
+#include "../src/core/file_lock.hpp"
 
 namespace {
 
@@ -105,32 +106,7 @@ void require_equal(
         message);
 }
 
-void remove_index_body_checksum(const std::filesystem::path& store) {
-    using namespace throwdb::detail;
-    const auto path = native_index_path(store);
-    std::array<std::byte, kNativeHeaderSize> encoded{};
-    {
-        std::ifstream stream(path, std::ios::binary);
-        require(stream.good(), "cannot open index header for reading");
-        stream.read(
-            reinterpret_cast<char*>(encoded.data()),
-            static_cast<std::streamsize>(encoded.size()));
-        require(
-            stream.gcount() == static_cast<std::streamsize>(encoded.size()),
-            "cannot read complete index header");
-    }
-    NativeIndexHeader header = decode_native_index_header(encoded);
-    header.body_checksum_algorithm = 0;
-    header.body_checksum = 0;
-    encoded = encode_native_index_header(header);
-    std::fstream stream(path, std::ios::binary | std::ios::in | std::ios::out);
-    require(stream.good(), "cannot open index header for legacy rewrite");
-    stream.write(
-        reinterpret_cast<const char*>(encoded.data()),
-        static_cast<std::streamsize>(encoded.size()));
-    stream.close();
-    require(stream.good(), "cannot rewrite legacy index header");
-}
+
 
 void test_multisegment_crud_snapshot_and_reopen() {
     TempDirectory temporary;
@@ -141,7 +117,8 @@ void test_multisegment_crud_snapshot_and_reopen() {
     const std::vector<std::byte> base = rows(base_ids.size(), record_size, 3);
 
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 2 * record_size;
@@ -153,7 +130,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
         std::span(base_ids).subspan(3),
         std::span(base).subspan(3 * record_size));
     require(builder->count() == base_ids.size(), "builder count is wrong");
-    require(builder->format_version() == 6, "native public version is wrong");
+    require(builder->format_version() == 7, "native public version is wrong");
     builder->finish();
 
     auto old_snapshot = throwdb::NativeCollection::open(store);
@@ -256,58 +233,7 @@ void test_multisegment_crud_snapshot_and_reopen() {
     require_equal(actual, expected, "reopened CRUD state is wrong");
 }
 
-void test_open_stats_fast_forced_and_legacy_validation() {
-    TempDirectory temporary;
-    const auto store = temporary.path() / "store";
-    throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
-    options.dimension = 2;
-    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
-    const std::array<std::uint64_t, 2> ids{7, 11};
-    const std::vector<std::byte> embeddings = rows(2, 4, 29);
-    builder->append(ids, embeddings);
-    builder->finish();
 
-    {
-        auto reader = throwdb::NativeCollection::open(store);
-        require(reader->format_version() == 6,
-                "delta collection did not report version 6");
-        const throwdb::NativeOpenStats stats = reader->open_stats();
-        require(stats.total_seconds > 0.0,
-                "open diagnostics have no total duration");
-        require(stats.index_file_bytes == std::filesystem::file_size(
-                    throwdb::detail::native_index_path(store)),
-                "open diagnostics report the wrong index size");
-        require(stats.index_body_checksum_present,
-                "normal open did not report the index checksum");
-        require(stats.index_body_checksum_verified,
-                "normal open did not verify the index checksum");
-        require(!stats.index_structural_validation_performed,
-                "normal open unexpectedly ran the full structural scan");
-    }
-
-    {
-        throwdb::ReaderOptions reader_options;
-        reader_options.verify_native_index = true;
-        auto reader = throwdb::NativeCollection::open(
-            store, reader_options);
-        const throwdb::NativeOpenStats stats = reader->open_stats();
-        require(stats.index_body_checksum_verified,
-                "forced open did not verify the checksum");
-        require(stats.index_structural_validation_performed,
-                "forced open did not perform structural verification");
-    }
-
-    remove_index_body_checksum(store);
-    auto legacy = throwdb::NativeCollection::open(store);
-    require(legacy->format_version() == 6,
-            "catalog collection changed version with index validation mode");
-    const throwdb::NativeOpenStats legacy_stats = legacy->open_stats();
-    require(!legacy_stats.index_body_checksum_present,
-            "legacy open invented an index checksum");
-    require(legacy_stats.index_structural_validation_performed,
-            "legacy open skipped its full-validation fallback");
-}
 
 void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
     TempDirectory temporary;
@@ -316,7 +242,8 @@ void test_active_wal_tail_is_ignored_and_writer_repairs_it() {
     constexpr std::uint64_t record_size = dimension * 4;
 
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float32;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
@@ -385,7 +312,8 @@ void test_zero_delta_read_path_transitions_on_first_commit() {
     const std::vector<std::byte> updated = rows(row_count, record_size, 149);
 
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = dimension;
     options.segment_size_bytes = 64 * record_size;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
@@ -458,7 +386,8 @@ void test_empty_collection_and_empty_batches() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     builder->append({}, {});
@@ -477,7 +406,8 @@ void test_read_only_open_does_not_require_writable_lock_metadata() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     builder->finish();
@@ -496,24 +426,24 @@ void test_read_only_open_does_not_require_writable_lock_metadata() {
     require(::chmod(writer_lock.c_str(), 0644) == 0, "cannot restore writer lock");
     require(::chmod(commit_lock.c_str(), 0644) == 0, "cannot restore commit lock");
 
-    require(std::filesystem::remove(writer_lock), "cannot remove writer lock");
+    require(std::filesystem::remove(commit_lock), "cannot remove commit lock");
     require_throws<throwdb::StorageError>(
         [&] { static_cast<void>(throwdb::NativeCollection::open(store)); },
         "open recreated a missing lock file");
     require(
-        !std::filesystem::exists(writer_lock),
+        !std::filesystem::exists(commit_lock),
         "read-only open recreated missing metadata");
 
     const auto second_store = temporary.path() / "non-regular";
     auto second_builder =
         throwdb::NativeCollectionBuilder::create(second_store, options);
     second_builder->finish();
-    const auto second_writer_lock = second_store / "locks" / "writer.lock";
+    const auto second_commit_lock = second_store / "locks" / "commit.lock";
     require(
-        std::filesystem::remove(second_writer_lock),
-        "cannot remove second writer lock");
+        std::filesystem::remove(second_commit_lock),
+        "cannot remove second commit lock");
     require(
-        std::filesystem::create_directory(second_writer_lock),
+        std::filesystem::create_directory(second_commit_lock),
         "cannot replace lock with a directory");
     require_throws<throwdb::StorageError>(
         [&] { static_cast<void>(throwdb::NativeCollection::open(second_store)); },
@@ -527,7 +457,8 @@ void test_forked_builder_and_writer_handles_are_rejected() {
 
     const auto builder_store = temporary.path() / "builder";
     throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
+    builder_options.format_version = 7;
+    builder_options.partition_bits = 2;
     builder_options.dimension = dimension;
     auto builder = throwdb::NativeCollectionBuilder::create(
         builder_store, builder_options);
@@ -559,13 +490,13 @@ void test_forked_builder_and_writer_handles_are_rejected() {
         waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "forked builder was not rejected or did not tear down safely");
     bool parent_builder_lease_preserved = false;
+    auto builder_lease_probe = throwdb::detail::AdvisoryLockFile::open_existing(
+        builder_store / "locks" / "writer.lock", true);
     try {
-        static_cast<void>(
-            throwdb::NativeCollection::inspect_orphans(builder_store));
-    } catch (const throwdb::StorageError& error) {
-        parent_builder_lease_preserved =
-            std::string(error.what()).find("another writer")
-            != std::string::npos;
+        builder_lease_probe.lock(throwdb::detail::FileLockMode::Exclusive, true);
+        builder_lease_probe.unlock();
+    } catch (const throwdb::StorageError&) {
+        parent_builder_lease_preserved = true;
     }
     require(
         parent_builder_lease_preserved,
@@ -694,20 +625,92 @@ void test_native_open_rejects_big_endian_hosts() {
     }
 }
 
-void test_builder_options_default_and_explicit_legacy_format_versions() {
-    throwdb::NativeBuilderOptions options;
+void test_builder_options_default_to_current_format() {
+    const throwdb::NativeBuilderOptions options;
     require(options.format_version == 7,
             "native builder options do not default to format 7");
-    options.format_version = 6;
-    require(options.format_version == 6,
-            "native builder options do not retain explicit format 6");
+}
+
+void test_current_format_boundary_rejects_before_mutating_storage() {
+    TempDirectory temporary;
+    for (const std::uint32_t version : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 8U}) {
+        const auto path = temporary.path() / ("unsupported-" + std::to_string(version));
+        throwdb::NativeBuilderOptions options;
+        options.dimension = 2;
+        options.format_version = version;
+        require_throws<throwdb::InvalidArgumentError>(
+            [&] { static_cast<void>(throwdb::NativeCollectionBuilder::create(path, options)); },
+            "builder accepted an unsupported format version");
+        require(!std::filesystem::exists(path),
+                "unsupported builder version created storage artifacts");
+    }
+
+    const auto unsupported = temporary.path() / "unsupported-manifest";
+    std::filesystem::create_directory(unsupported);
+    const std::array<char, 8> magic{'N', 'O', 'T', '_', 'A', '_', 'D', 'B'};
+    const auto manifest = unsupported / "manifest.bin";
+    {
+        std::ofstream file(manifest, std::ios::binary);
+        file.write(magic.data(), magic.size());
+        require(file.good(), "cannot create unsupported-manifest fixture");
+    }
+    const auto rejected_without_writes = [&](auto&& action) {
+        bool rejected = false;
+        try {
+            action();
+        } catch (const throwdb::InvalidArgumentError& error) {
+            rejected = std::string(error.what()).find("only format 7")
+                       != std::string::npos;
+        }
+        require(rejected, "unsupported store did not fail with its format boundary");
+        std::size_t entries = 0;
+        for ([[maybe_unused]] const auto& entry :
+             std::filesystem::directory_iterator(unsupported)) {
+            ++entries;
+        }
+        require(entries == 1 && std::filesystem::file_size(manifest) == magic.size(),
+                "rejected store access created or changed files");
+        std::array<char, 8> after{};
+        std::ifstream file(manifest, std::ios::binary);
+        file.read(after.data(), after.size());
+        require(file.good() && after == magic,
+                "rejected store access modified its manifest");
+    };
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::open(unsupported)); });
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::open(unsupported, {}, true)); });
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::open(unsupported, {}, false, true)); });
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::inspect_metadata(unsupported)); });
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::inspect_orphans(unsupported)); });
+    rejected_without_writes([&] { static_cast<void>(throwdb::NativeCollection::reclaim_orphans(unsupported)); });
+
+    const auto current = temporary.path() / "corrupt-current";
+    throwdb::NativeBuilderOptions options;
+    options.dimension = 2;
+    options.partition_bits = 1;
+    auto builder = throwdb::NativeCollectionBuilder::create(current, options);
+    builder->finish();
+    {
+        std::fstream file(current / "manifest.bin",
+                          std::ios::binary | std::ios::in | std::ios::out);
+        file.seekg(20);  // Alter only the current-format CRC, retaining its magic.
+        char checksum_byte = 0;
+        file.read(&checksum_byte, 1);
+        checksum_byte ^= 1;
+        file.seekp(20);
+        file.write(&checksum_byte, 1);
+        require(file.good(), "cannot corrupt current manifest checksum");
+    }
+    require_throws<throwdb::CorruptionError>(
+        [&] { static_cast<void>(throwdb::NativeCollection::inspect_metadata(current)); },
+        "corrupt current-format manifest escaped structural validation");
 }
 
 void test_lightweight_metadata_inspection() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = 7;
     options.dtype = throwdb::DType::Float32;
     options.segment_size_bytes = 32 * 1024;
@@ -720,21 +723,19 @@ void test_lightweight_metadata_inspection() {
         metadata.collection_id_low != 0
             || metadata.collection_id_high != 0,
         "metadata collection identity is empty");
-    require(metadata.format_version == 6, "metadata format version is wrong");
+    require(metadata.format_version == 7, "metadata format version is wrong");
     require(metadata.dimension == options.dimension,
             "metadata dimension is wrong");
     require(metadata.dtype == options.dtype, "metadata dtype is wrong");
     require(metadata.record_size == 7 * sizeof(float),
             "metadata record size is wrong");
-    require(metadata.segment_size_bytes
-                == (options.segment_size_bytes / metadata.record_size)
-                       * metadata.record_size,
-            "metadata segment size is wrong");
-    require(metadata.layout == "uint64_dense_row_major_flat_v1",
+    require(metadata.segment_size_bytes == options.segment_size_bytes,
+            "metadata target segment size is wrong");
+    require(metadata.layout == "uint64_dense_row_major_partitioned_rowref_v1",
             "metadata layout discriminator is wrong");
-    require(metadata.feature_discriminator == "catalog_v1+delta_v1",
+    require(metadata.feature_discriminator == "segment_catalog_v1+partitioned_rowref_v1",
             "metadata feature discriminator is wrong");
-    require(metadata.required_feature_bits == 3,
+    require(metadata.required_feature_bits == throwdb::detail::kPartitionedRequiredFeatureBits,
             "metadata required features are wrong");
     require(metadata.optional_feature_bits == 0,
             "metadata optional features are wrong");
@@ -754,7 +755,8 @@ void test_reader_trials_and_bounded_id_sampling() {
         rows(ids.size(), record_size, 23);
 
     throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
+    builder_options.format_version = 7;
+    builder_options.partition_bits = 2;
     builder_options.dimension = dimension;
     builder_options.segment_size_bytes = 7 * record_size;
     auto builder = throwdb::NativeCollectionBuilder::create(
@@ -835,7 +837,8 @@ void test_calibration_handle_owns_exclusive_read_only_lease() {
     const auto store = temporary.path() / "store";
     constexpr std::uint64_t record_size = 4;
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = 2;
     auto builder = throwdb::NativeCollectionBuilder::create(store, options);
     const std::array<std::uint64_t, 1> ids{7};
@@ -886,259 +889,48 @@ void test_calibration_handle_owns_exclusive_read_only_lease() {
             "calibration did not release its writer lease");
 }
 
-void test_format6_startup_replay_bounds_and_exact_stats() {
-    TempDirectory temporary;
-    const auto store = temporary.path() / "store";
-    constexpr std::uint64_t record_size = 4;
-    throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
-    builder_options.dimension = 2;
-    auto builder = throwdb::NativeCollectionBuilder::create(
-        store, builder_options);
-    builder->finish();
 
-    const std::array<std::uint64_t, 2> ids{10, 20};
-    const auto embeddings = rows(ids.size(), record_size, 17);
-    auto writer = throwdb::NativeCollection::open(store, {}, true);
-    writer->insert(ids, embeddings);
-    const throwdb::NativeMutationLogStats expected =
-        writer->mutation_log_stats();
-    require(expected.overlay_entry_count == 2,
-            "format-6 stats did not count retained overlay IDs");
-    require(expected.estimated_overlay_bytes == 128,
-            "format-6 overlay memory estimate is not conservative/exact");
-    require(expected.active_wal_operation_count == 2
-                && expected.frozen_wal_operation_count == 0
-                && expected.total_wal_operation_count == 2,
-            "format-6 stats did not count committed WAL operations");
-    require(expected.total_wal_bytes == expected.active_wal_bytes,
-            "single format-6 WAL byte totals disagree");
-    writer.reset();
 
-    throwdb::NativeOpenOptions limits;
-    limits.max_wal_bytes = expected.total_wal_bytes;
-    limits.max_wal_operations = expected.total_wal_operation_count;
-    limits.max_overlay_entries = expected.overlay_entry_count;
-    limits.max_overlay_bytes = expected.estimated_overlay_bytes;
-    auto exact = throwdb::NativeCollection::open(
-        store, {}, false, false, limits);
-    require_equal(
-        exact->get_bytes(ids), embeddings,
-        "format-6 exact-bound replay changed committed rows");
-    const throwdb::NativeMutationLogStats exact_stats =
-        exact->mutation_log_stats();
-    require(exact_stats.total_wal_bytes == expected.total_wal_bytes
-                && exact_stats.total_wal_operation_count
-                       == expected.total_wal_operation_count
-                && exact_stats.overlay_entry_count
-                       == expected.overlay_entry_count,
-            "format-6 exact-bound replay stats changed after reopen");
-    exact.reset();
 
-    throwdb::NativeOpenOptions operation_limited = limits;
-    operation_limited.max_wal_operations = 1;
-    require_throws<throwdb::StorageError>(
-        [&] {
-            static_cast<void>(throwdb::NativeCollection::open(
-                store, {}, false, false, operation_limited));
-        },
-        "format-6 replay exceeded its committed-operation limit");
 
-    throwdb::NativeOpenOptions byte_limited = limits;
-    byte_limited.max_wal_bytes = expected.total_wal_bytes - 1;
-    require_throws<throwdb::StorageError>(
-        [&] {
-            static_cast<void>(throwdb::NativeCollection::open(
-                store, {}, false, false, byte_limited));
-        },
-        "format-6 replay exceeded its raw WAL-byte limit");
 
-    throwdb::NativeOpenOptions entry_limited = limits;
-    entry_limited.max_overlay_entries = 1;
-    require_throws<throwdb::StorageError>(
-        [&] {
-            static_cast<void>(throwdb::NativeCollection::open(
-                store, {}, false, false, entry_limited));
-        },
-        "format-6 replay exceeded its unique-overlay-entry limit");
-
-    throwdb::NativeOpenOptions memory_limited = limits;
-    memory_limited.max_overlay_bytes = 127;
-    require_throws<throwdb::StorageError>(
-        [&] {
-            static_cast<void>(throwdb::NativeCollection::open(
-                store, {}, false, false, memory_limited));
-        },
-        "format-6 replay exceeded its estimated-overlay-memory limit");
-}
-
-void test_format6_live_bounds_fail_before_durable_growth() {
-    TempDirectory temporary;
-    const auto store = temporary.path() / "store";
-    constexpr std::uint64_t record_size = 4;
-    throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
-    builder_options.dimension = 2;
-    auto builder = throwdb::NativeCollectionBuilder::create(
-        store, builder_options);
-    builder->finish();
-
-    const std::array<std::uint64_t, 1> id{10};
-    const auto first = rows(1, record_size, 11);
-    auto seed_writer = throwdb::NativeCollection::open(store, {}, true);
-    seed_writer->insert(id, first);
-    const throwdb::NativeMutationLogStats baseline =
-        seed_writer->mutation_log_stats();
-    require(baseline.overlay_entry_count == 1
-                && baseline.active_wal_operation_count == 1
-                && baseline.total_wal_operation_count == 1,
-            "format-6 live-bound fixture stats are not exact");
-    seed_writer.reset();
-
-    throwdb::NativeOpenOptions limits;
-    limits.max_wal_bytes = baseline.total_wal_bytes;
-    limits.max_wal_operations = baseline.total_wal_operation_count;
-    limits.max_overlay_entries = baseline.overlay_entry_count;
-    limits.max_overlay_bytes = baseline.estimated_overlay_bytes;
-    const auto replacement = rows(1, record_size, 31);
-
-    auto operation_limited = throwdb::NativeCollection::open(
-        store, {}, true, false, limits);
-    require_throws<throwdb::StorageError>(
-        [&] { operation_limited->update(id, replacement); },
-        "format-6 live update exceeded the total WAL-operation limit");
-    require(operation_limited->mutation_log_stats().total_wal_bytes
-                == baseline.total_wal_bytes,
-            "operation-bound rejection appended durable WAL bytes");
-    operation_limited.reset();
-
-    throwdb::NativeOpenOptions byte_limits = limits;
-    byte_limits.max_wal_operations = 2;
-    auto byte_limited = throwdb::NativeCollection::open(
-        store, {}, true, false, byte_limits);
-    require_throws<throwdb::StorageError>(
-        [&] { byte_limited->update(id, replacement); },
-        "format-6 live update exceeded the total WAL-byte limit");
-    const throwdb::NativeMutationLogStats after_byte_rejection =
-        byte_limited->mutation_log_stats();
-    require(after_byte_rejection.total_wal_bytes == baseline.total_wal_bytes
-                && after_byte_rejection.total_wal_operation_count
-                       == baseline.total_wal_operation_count
-                && after_byte_rejection.overlay_entry_count
-                       == baseline.overlay_entry_count,
-            "byte-bound rejection changed format-6 durable/logical stats");
-    byte_limited.reset();
-
-    throwdb::NativeOpenOptions overlay_limits = limits;
-    overlay_limits.max_wal_bytes =
-        std::numeric_limits<std::uint64_t>::max();
-    overlay_limits.max_wal_operations = 2;
-    auto overlay_limited = throwdb::NativeCollection::open(
-        store, {}, true, false, overlay_limits);
-    const std::array<std::uint64_t, 1> new_id{20};
-    require_throws<throwdb::StorageError>(
-        [&] { overlay_limited->insert(new_id, replacement); },
-        "format-6 live insert exceeded the unique overlay limit");
-    require(overlay_limited->mutation_log_stats().total_wal_bytes
-                == baseline.total_wal_bytes,
-            "overlay-bound rejection appended durable WAL bytes");
-    overlay_limited.reset();
-
-    throwdb::NativeOpenOptions rotation_limits = limits;
-    rotation_limits.max_wal_operations = 2;
-    auto rotation_limited = throwdb::NativeCollection::open(
-        store, {}, true, false, rotation_limits);
-    require_throws<throwdb::StorageError>(
-        [&] { static_cast<void>(rotation_limited->rotate_wal()); },
-        "format-6 rotation exceeded the total WAL-byte limit");
-    const throwdb::NativeMutationLogStats after_rotation_rejection =
-        rotation_limited->mutation_log_stats();
-    require(after_rotation_rejection.generation == baseline.generation
-                && after_rotation_rejection.frozen_wal_count == 0
-                && after_rotation_rejection.total_wal_bytes
-                       == baseline.total_wal_bytes,
-            "rotation-header rejection published a catalog/WAL change");
-}
-
-void test_format6_delta_replay_is_preflight_bounded() {
-    TempDirectory temporary;
-    const auto store = temporary.path() / "store";
-    constexpr std::uint64_t record_size = 4;
-    throwdb::NativeBuilderOptions builder_options;
-    builder_options.format_version = 6;
-    builder_options.dimension = 2;
-    auto builder = throwdb::NativeCollectionBuilder::create(
-        store, builder_options);
-    builder->finish();
-
-    const std::array<std::uint64_t, 2> ids{10, 20};
-    const auto embeddings = rows(ids.size(), record_size, 47);
-    auto writer = throwdb::NativeCollection::open(store, {}, true);
-    writer->insert(ids, embeddings);
-    const throwdb::NativeMutationLogStats rotated = writer->rotate_wal();
-    require(rotated.rotated && rotated.frozen_wal_count == 1
-                && rotated.active_wal_operation_count == 0
-                && rotated.frozen_wal_operation_count == 2
-                && rotated.total_wal_operation_count == 2
-                && rotated.frozen_wal_bytes + rotated.active_wal_bytes
-                       == rotated.total_wal_bytes,
-            "format-6 frozen/active WAL stats are not exact after rotation");
-    const throwdb::NativeMutationLogStats materialized =
-        writer->materialize_frozen_wals();
-    require(materialized.materialized && materialized.delta_entry_count == 2
-                && materialized.materialized_wal_input_entries == 2,
-            "format-6 delta-bound fixture was not materialized exactly");
-    writer.reset();
-
-    throwdb::NativeOpenOptions limits;
-    limits.max_overlay_entries = 1;
-    limits.max_overlay_bytes = 64;
-    require_throws<throwdb::StorageError>(
-        [&] {
-            static_cast<void>(throwdb::NativeCollection::open(
-                store, {}, false, false, limits));
-        },
-        "format-6 delta decoded an over-limit replay vector");
-}
 
 void test_contains_is_snapshot_consistent_without_reading_payloads() {
-    for (const std::uint32_t format_version : {6U, 7U}) {
-        TempDirectory temporary;
-        const auto store = temporary.path()
-                           / ("store-" + std::to_string(format_version));
-        constexpr std::uint32_t dimension = 2;
-        constexpr std::uint64_t record_size = dimension * 2;
-        throwdb::NativeBuilderOptions options;
-        options.format_version = format_version;
-        options.dimension = dimension;
-        options.segment_size_bytes = 2 * record_size;
-        const std::array<std::uint64_t, 3> base_ids{10, 20, 30};
-        const auto base = rows(base_ids.size(), record_size, 9);
-        auto builder = throwdb::NativeCollectionBuilder::create(store, options);
-        builder->append(base_ids, base);
-        builder->finish();
+    TempDirectory temporary;
+    const auto store = temporary.path() / "store";
+    constexpr std::uint32_t dimension = 2;
+    constexpr std::uint64_t record_size = dimension * 2;
+    throwdb::NativeBuilderOptions options;
+    options.format_version = 7;
+    options.partition_bits = 2;
+    options.dimension = dimension;
+    options.segment_size_bytes = 2 * record_size;
+    const std::array<std::uint64_t, 3> base_ids{10, 20, 30};
+    const auto base = rows(base_ids.size(), record_size, 9);
+    auto builder = throwdb::NativeCollectionBuilder::create(store, options);
+    builder->append(base_ids, base);
+    builder->finish();
 
-        auto collection = throwdb::NativeCollection::open(store, {}, true);
-        const std::array<std::uint64_t, 5> query{20, 999, 10, 20, 0};
-        require(
-            collection->contains(query)
-                == std::vector<std::uint8_t>({1, 0, 1, 1, 0}),
-            "base contains mask is wrong");
-        require(collection->contains(std::span<const std::uint64_t>{}).empty(),
-                "empty contains query is not empty");
+    auto collection = throwdb::NativeCollection::open(store, {}, true);
+    const std::array<std::uint64_t, 5> query{20, 999, 10, 20, 0};
+    require(
+        collection->contains(query)
+            == std::vector<std::uint8_t>({1, 0, 1, 1, 0}),
+        "base contains mask is wrong");
+    require(collection->contains(std::span<const std::uint64_t>{}).empty(),
+            "empty contains query is not empty");
 
-        const std::array<std::uint64_t, 1> inserted_id{40};
-        const auto inserted = rows(1, record_size, 31);
-        collection->insert(inserted_id, inserted);
-        const std::array<std::uint64_t, 1> deleted_id{20};
-        require(collection->erase(deleted_id) == std::vector<std::uint8_t>{1},
-                "contains fixture delete failed");
-        const std::array<std::uint64_t, 4> mutated_query{40, 20, 30, 40};
-        require(
-            collection->contains(mutated_query)
-                == std::vector<std::uint8_t>({1, 0, 1, 1}),
-            "mutation contains mask is wrong");
-    }
+    const std::array<std::uint64_t, 1> inserted_id{40};
+    const auto inserted = rows(1, record_size, 31);
+    collection->insert(inserted_id, inserted);
+    const std::array<std::uint64_t, 1> deleted_id{20};
+    require(collection->erase(deleted_id) == std::vector<std::uint8_t>{1},
+            "contains fixture delete failed");
+    const std::array<std::uint64_t, 4> mutated_query{40, 20, 30, 40};
+    require(
+        collection->contains(mutated_query)
+            == std::vector<std::uint8_t>({1, 0, 1, 1}),
+        "mutation contains mask is wrong");
 }
 
 }  // namespace
@@ -1152,9 +944,6 @@ int main() {
         TestCase{
             "multisegment_crud_snapshot_and_reopen",
             test_multisegment_crud_snapshot_and_reopen},
-        TestCase{
-            "open_stats_fast_forced_and_legacy_validation",
-            test_open_stats_fast_forced_and_legacy_validation},
         TestCase{
             "active_wal_tail_is_ignored_and_writer_repairs_it",
             test_active_wal_tail_is_ignored_and_writer_repairs_it},
@@ -1174,8 +963,11 @@ int main() {
             "native_open_rejects_big_endian_hosts",
             test_native_open_rejects_big_endian_hosts},
         TestCase{
-            "builder_options_default_and_explicit_legacy_format_versions",
-            test_builder_options_default_and_explicit_legacy_format_versions},
+            "builder_options_default_to_current_format",
+            test_builder_options_default_to_current_format},
+        TestCase{
+            "current_format_boundary_rejects_before_mutating_storage",
+            test_current_format_boundary_rejects_before_mutating_storage},
         TestCase{
             "lightweight_metadata_inspection",
             test_lightweight_metadata_inspection},
@@ -1185,15 +977,6 @@ int main() {
         TestCase{
             "calibration_handle_owns_exclusive_read_only_lease",
             test_calibration_handle_owns_exclusive_read_only_lease},
-        TestCase{
-            "format6_startup_replay_bounds_and_exact_stats",
-            test_format6_startup_replay_bounds_and_exact_stats},
-        TestCase{
-            "format6_live_bounds_fail_before_durable_growth",
-            test_format6_live_bounds_fail_before_durable_growth},
-        TestCase{
-            "format6_delta_replay_is_preflight_bounded",
-            test_format6_delta_replay_is_preflight_bounded},
         TestCase{
             "contains_is_snapshot_consistent_without_reading_payloads",
             test_contains_is_snapshot_consistent_without_reading_payloads},

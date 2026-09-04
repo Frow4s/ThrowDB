@@ -10,7 +10,7 @@ from throwdb.cli import _build_parser, _reader_tuning, main
 from throwdb.collection import Collection
 
 
-def test_create_cli_defaults_to_format7_and_accepts_explicit_format6() -> None:
+def test_create_cli_only_accepts_format7() -> None:
     parser = _build_parser()
     required = [
         "--storage", "/tmp/store", "--ids", "/tmp/ids.npy",
@@ -18,11 +18,11 @@ def test_create_cli_defaults_to_format7_and_accepts_explicit_format6() -> None:
     ]
     assert parser.parse_args(["create", *required]).format_version == 7
     assert parser.parse_args(
-        ["create", *required, "--format-version", "6"]
-    ).format_version == 6
+        ["create", *required, "--format-version", "7"]
+    ).format_version == 7
     with pytest.raises(SystemExit):
         parser.parse_args(
-            ["create", *required, "--format-version", "5"]
+            ["create", *required, "--format-version", "6"]
         )
 
 

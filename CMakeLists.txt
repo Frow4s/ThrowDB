@@ -40,16 +40,11 @@ add_library(throwdb_core STATIC
     src/core/crc32c.cpp
     src/core/file_lock.cpp
     src/core/format.cpp
-    src/core/index.cpp
     src/core/io_uring_coordinator.cpp
     src/core/io_uring_engine.cpp
     src/core/io_uring_pool.cpp
-    src/core/mutation_catalog.cpp
-    src/core/mutation_delta.cpp
-    src/core/mutation_inventory.cpp
     src/core/mutation_wal.cpp
     src/core/native_collection.cpp
-    src/core/native_format.cpp
     src/core/partition_snapshot_storage.cpp
     src/core/partitioned_index_format.cpp
     src/core/partitioned_index_merge.cpp
@@ -60,8 +55,6 @@ add_library(throwdb_core STATIC
     src/core/physical_reader.cpp
     src/core/read_scheduler.cpp
     src/core/sha256.cpp
-    src/core/storage_reader.cpp
-    src/core/storage_writer.cpp
     src/core/wal_file.cpp
 )
 add_library(throwdb::core ALIAS throwdb_core)
@@ -118,8 +111,6 @@ if(THROWDB_BUILD_SERVER)
     set_target_properties(
         throwdb_server PROPERTIES POSITION_INDEPENDENT_CODE ON)
     throwdb_enable_warnings(throwdb_server)
-
-
 endif()
 
 if(THROWDB_BUILD_GRPC_SERVER)
@@ -263,10 +254,6 @@ if(THROWDB_BUILD_TESTS)
 endif()
 
 if(THROWDB_BUILD_BENCHMARKS)
-    add_executable(throwdb_bench benchmarks/throwdb_bench.cpp)
-    target_link_libraries(throwdb_bench PRIVATE throwdb::core)
-    target_compile_features(throwdb_bench PRIVATE cxx_std_20)
-
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(throwdb_io_uring_probe benchmarks/io_uring_probe.cpp)
         target_compile_features(throwdb_io_uring_probe PRIVATE cxx_std_20)
