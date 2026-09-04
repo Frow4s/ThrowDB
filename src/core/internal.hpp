@@ -73,6 +73,14 @@ inline constexpr std::array<char, 8> kIndexMagic{
 inline constexpr std::array<char, 8> kStagingMagic{
     'T', 'H', 'R', 'O', 'W', 'D', 'B', 'L'};
 
+#ifdef THROWDB_NATIVE_TEST_HOOKS
+// Private syscall seam for deterministic descriptor-lifecycle tests. Absent
+// from production builds and the installed public headers.
+using FileDescriptorCloseTestHook = int (*)(int fd) noexcept;
+void set_file_descriptor_close_test_hook(
+    FileDescriptorCloseTestHook hook) noexcept;
+#endif
+
 struct FileDescriptor {
     int value{-1};
 

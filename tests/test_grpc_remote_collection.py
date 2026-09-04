@@ -21,6 +21,8 @@ from throwdb.remote import (
     RemoteCollection,
     RemoteDescription,
     RemoteProtocolError,
+    RemoteFailedPreconditionError,
+    RemoteMutationToken,
     RemoteUnavailableError,
     _IndexedIds,
 )
@@ -1836,3 +1838,122 @@ def test_protocol_major_mismatch_fails_during_connect() -> None:
     with _RunningGrpcServer(_IncompatibleProtocolService()) as server:
         with pytest.raises(RemoteProtocolError, match="protocol major"):
             RemoteCollection.connect(server.endpoint, timeout=2)
+
+
+class _DomainRolloverService(_FakeGrpcService):
+    """Retain replies within a replay domain; checkpoint discards that history."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.domain = uuid.uuid4()
+        self.fail_next = True
+        self.replies: dict[uuid.UUID, object] = {}
+        self.received_domains: list[uuid.UUID] = []
+
+    def Describe(self, request, context):  # type: ignore[no-untyped-def]
+        response = super().Describe(request, context)
+        response.capabilities.durable_idempotency = True
+        response.idempotency_domain.high = self.domain.int >> 64
+        response.idempotency_domain.low = self.domain.int & ((1 << 64) - 1)
+        return response
+
+    def checkpoint(self) -> None:
+        self.domain = uuid.uuid4()
+        self.replies.clear()
+
+    def _mutate_in_domain(self, request, context, invoke):  # type: ignore[no-untyped-def]
+        domain = uuid.UUID(int=(request.idempotency_domain.high << 64)
+                           | request.idempotency_domain.low)
+        self.received_domains.append(domain)
+        if domain != self.domain:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "stale replay domain")
+        identifier = uuid.UUID(int=(request.operation_id.high << 64)
+                               | request.operation_id.low)
+        if identifier in self.replies:
+            return self.replies[identifier]
+        response = invoke()
+        self.replies[identifier] = response
+        if self.fail_next:
+            self.fail_next = False
+            context.abort(grpc.StatusCode.UNAVAILABLE, "response lost after commit")
+        return response
+
+    def _put(self, request, context, operation):  # type: ignore[no-untyped-def]
+        return self._mutate_in_domain(
+            request, context,
+            lambda: super(_DomainRolloverService, self)._put(request, context, operation),
+        )
+
+    def Delete(self, request, context):  # type: ignore[no-untyped-def]
+        return self._mutate_in_domain(
+            request, context,
+            lambda: super(_DomainRolloverService, self).Delete(request, context),
+        )
+
+
+def _domain_mutation(collection, operation, token):  # type: ignore[no-untyped-def]
+    if operation == "delete":
+        return collection.delete([10], operation_id=token)
+    ids = [40] if operation == "insert" else [10]
+    return getattr(collection, operation)(ids, _vectors(1, 5, salt=443), operation_id=token)
+
+
+@pytest.mark.parametrize("operation", ["insert", "update", "upsert", "delete"])
+def test_describe_refresh_does_not_rebind_ambiguous_mutation(operation: str) -> None:
+    service = _DomainRolloverService()
+    with _RunningGrpcServer(service) as server, RemoteCollection.connect(
+        server.endpoint, timeout=2,
+    ) as collection:
+        identifier = uuid.uuid4()
+        original_domain = collection.idempotency_domain
+        with pytest.raises(AmbiguousCommitError) as raised:
+            _domain_mutation(collection, operation, identifier)
+        error = raised.value
+        assert error.idempotency_domain == original_domain
+        assert error.retry_token == RemoteMutationToken(identifier, original_domain)
+        assert service.commit_sequence == 1
+        # A same-domain retry must return the durable reply without a new commit.
+        _domain_mutation(collection, operation, error.retry_token)
+        assert service.commit_sequence == 1
+        service.checkpoint()
+        assert collection.count == len(service.rows)  # count refreshes Describe
+        assert collection.idempotency_domain == service.domain
+        with pytest.raises(RemoteFailedPreconditionError, match="stale replay domain"):
+            _domain_mutation(collection, operation, identifier)
+        assert service.received_domains[-1] == original_domain
+        assert service.commit_sequence == 1
+        # A token remains bound across reconnect, where plain UUIDs cannot
+        # convey their original domain by themselves.
+        with RemoteCollection.connect(server.endpoint, timeout=2) as reconnected:
+            with pytest.raises(RemoteFailedPreconditionError, match="stale replay domain"):
+                _domain_mutation(reconnected, operation, error.retry_token)
+        assert service.commit_sequence == 1
+
+
+def test_new_mutation_token_uses_explicitly_refreshed_domain() -> None:
+    service = _DomainRolloverService()
+    service.fail_next = False
+    with _RunningGrpcServer(service) as server, RemoteCollection.connect(
+        server.endpoint, timeout=2,
+    ) as collection:
+        old_token = collection.mutation_token()
+        service.checkpoint()
+        collection.describe()
+        token = collection.mutation_token()
+        assert token.idempotency_domain == service.domain
+        assert token.idempotency_domain != old_token.idempotency_domain
+        _domain_mutation(collection, "upsert", token)
+        assert service.commit_sequence == 1
+        collection.upsert([20], _vectors(1, 5))  # generated UUID denotes new work
+        assert service.commit_sequence == 2
+
+
+def test_mutation_token_validates_persisted_uuid_fields() -> None:
+    with pytest.raises(TypeError, match="operation_id must be a UUID"):
+        RemoteMutationToken("invalid", uuid.uuid4())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="operation_id must be nonzero"):
+        RemoteMutationToken(uuid.UUID(int=0), uuid.uuid4())
+    with pytest.raises(TypeError, match="idempotency_domain must be a UUID"):
+        RemoteMutationToken(uuid.uuid4(), "invalid")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="idempotency_domain must be nonzero"):
+        RemoteMutationToken(uuid.uuid4(), uuid.UUID(int=0))

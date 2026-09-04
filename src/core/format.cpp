@@ -31,6 +31,20 @@ namespace {
 
 constexpr std::size_t kIoChunk = 1U << 30;
 
+#ifdef THROWDB_NATIVE_TEST_HOOKS
+std::atomic<FileDescriptorCloseTestHook> descriptor_close_hook{nullptr};
+#endif
+
+int close_descriptor(const int fd) noexcept {
+#ifdef THROWDB_NATIVE_TEST_HOOKS
+    const auto hook = descriptor_close_hook.load(std::memory_order_acquire);
+    if (hook != nullptr) {
+        return hook(fd);
+    }
+#endif
+    return ::close(fd);
+}
+
 void require_magic(std::span<const std::byte> bytes,
                    const std::array<char, 8>& expected,
                    std::string_view description) {
@@ -244,6 +258,13 @@ void require_reserved_zero(
 
 }  // namespace
 
+#ifdef THROWDB_NATIVE_TEST_HOOKS
+void set_file_descriptor_close_test_hook(
+    const FileDescriptorCloseTestHook hook) noexcept {
+    descriptor_close_hook.store(hook, std::memory_order_release);
+}
+#endif
+
 FileDescriptor::~FileDescriptor() {
     reset();
 }
@@ -256,11 +277,19 @@ FileDescriptor& FileDescriptor::operator=(FileDescriptor&& other) noexcept {
 }
 
 void FileDescriptor::reset(const int fd) noexcept {
-    if (value >= 0) {
-        while (::close(value) < 0 && errno == EINTR) {
+    const int previous = std::exchange(value, fd);
+    if (previous >= 0) {
+#if defined(__linux__)
+        // Linux releases the descriptor even when close reports EINTR. A
+        // retry could close an unrelated file that another thread just opened
+        // with the reused number. Durability is established by explicit fsync.
+        // https://man7.org/linux/man-pages/man2/close.2.html
+        static_cast<void>(close_descriptor(previous));
+#else
+        while (close_descriptor(previous) < 0 && errno == EINTR) {
         }
+#endif
     }
-    value = fd;
 }
 
 std::string system_error_message(const std::string_view operation,

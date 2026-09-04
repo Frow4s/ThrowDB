@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 2,
   "cmakeMinimumRequired": {
     "major": 3,
     "minor": 20,
@@ -8,7 +8,7 @@
   "configurePresets": [
     {
       "name": "server-release",
-      "displayName": "ThrowDB single-collection server (gRPC + TCP)",
+      "displayName": "ThrowDB single-collection server (gRPC)",
       "description": "Release server build; gRPC dependencies are mandatory and never silently disabled.",
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/server-release",

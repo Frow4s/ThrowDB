@@ -6,8 +6,8 @@
 namespace throwdb::detail {
 
 // Private deterministic synchronization points for native lifecycle tests.
-// Production code pays only one null atomic load at an instrumented point;
-// this header is not installed as part of the public ThrowDB API.
+// Compiled out when native tests are disabled; this header is not installed
+// as part of the public ThrowDB API.
 enum class NativeCollectionTestHookPoint : std::uint8_t {
     ReaderOpenCommitLockAcquired = 1,
     MutationCatalogDurableBeforeCurrent = 2,
@@ -66,9 +66,15 @@ static_assert(std::is_trivially_copyable_v<NativeCollectionTestHookContext>);
 using NativeCollectionTestHook = void (*)(
     NativeCollectionTestHookContext context) noexcept;
 
+#ifdef THROWDB_NATIVE_TEST_HOOKS
 void set_native_collection_test_hook(
     NativeCollectionTestHook hook) noexcept;
 void invoke_native_collection_test_hook(
     NativeCollectionTestHookContext context) noexcept;
+
+#else
+inline void invoke_native_collection_test_hook(
+    NativeCollectionTestHookContext) noexcept {}
+#endif
 
 }  // namespace throwdb::detail

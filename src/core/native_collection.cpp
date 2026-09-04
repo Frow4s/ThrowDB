@@ -7,6 +7,7 @@
 #include "mutation_catalog.hpp"
 #include "mutation_delta.hpp"
 #include "mutation_inventory.hpp"
+#include "mutation_limits.hpp"
 #include "mutation_types.hpp"
 #include "mutation_wal.hpp"
 #include "native_format.hpp"
@@ -3064,54 +3065,12 @@ private:
         }
     }
 
-    [[nodiscard]] std::uint64_t total_wal_bytes_locked() const {
-        std::uint64_t total = 0;
-        for (const auto& source : wal_resources_->sources) {
-            if (source->valid_end
-                > std::numeric_limits<std::uint64_t>::max() - total) {
-                throw StorageError(
-                    "format-6 retained WAL byte count overflows uint64");
-            }
-            total += source->valid_end;
-        }
-        return total;
-    }
-
-    [[nodiscard]] std::uint64_t total_wal_operations_locked() const {
-        std::uint64_t total = 0;
-        for (const auto& source : wal_resources_->sources) {
-            if (source->operation_count
-                > std::numeric_limits<std::uint64_t>::max() - total) {
-                throw StorageError(
-                    "format-6 retained WAL operation count overflows uint64");
-            }
-            total += source->operation_count;
-        }
-        return total;
-    }
-
     void ensure_wal_growth_locked(
         const std::uint64_t additional_bytes,
         const std::uint64_t additional_operations) const {
-        const std::uint64_t current_bytes = total_wal_bytes_locked();
-        if (current_bytes > open_options_.max_wal_bytes
-            || additional_bytes
-                   > open_options_.max_wal_bytes - current_bytes) {
-            throw StorageError(
-                "format-6 mutation would exceed the configured total WAL "
-                "byte limit before durable append; run bounded maintenance "
-                "or raise the explicit limit");
-        }
-        const std::uint64_t current_operations =
-            total_wal_operations_locked();
-        if (current_operations > open_options_.max_wal_operations
-            || additional_operations
-                   > open_options_.max_wal_operations - current_operations) {
-            throw StorageError(
-                "format-6 mutation would exceed the configured total WAL "
-                "operation limit before durable append; run bounded "
-                "maintenance or raise the explicit limit");
-        }
+        detail::ensure_wal_growth(
+            wal_resources_->sources, open_options_, additional_bytes,
+            additional_operations);
     }
 
     void apply_recovered_delta(

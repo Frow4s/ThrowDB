@@ -232,7 +232,7 @@ with `throwdb backup s3 --dry-run` against a non-production prefix.
 ## Recommended release procedure
 
 1. Select the project license and assemble third-party notices.
-2. Make version information single-source and bump it.
+2. Bump the canonical version in `pyproject.toml`; CMake and the extension derive it.
 3. Require all Python, native, gRPC, sanitizer, and protobuf checks.
 4. Build at least one manylinux wheel as a PR packaging canary.
 5. Tag the exact reviewed commit.
@@ -249,8 +249,8 @@ artifacts. It does not create a GitHub Release or publish to PyPI.
 
 ## Known packaging gaps
 
-- `0.1.0` is duplicated in three source locations and not validated against a
-  tag.
+- The package version is canonical in `pyproject.toml` and shared by CMake
+  and the extension, but is not yet validated against a release tag.
 - No LICENSE or NOTICE exists, which blocks responsible external distribution.
 - Build backend dependencies are lower-bounded rather than fully locked.
 - A published sdist would require users to bootstrap native gRPC first.

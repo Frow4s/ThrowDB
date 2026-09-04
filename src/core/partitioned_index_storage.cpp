@@ -2,6 +2,7 @@
 
 #include "crc32c.hpp"
 #include "file_lock.hpp"
+#include "mutation_limits.hpp"
 #include "mutation_wal.hpp"
 #include "native_collection_test_hooks.hpp"
 #include "partition_snapshot_storage.hpp"
@@ -1780,6 +1781,7 @@ public:
             live_count_.load(std::memory_order_acquire);
         {
             std::unique_lock state(state_mutex_);
+            std::size_t new_overlay_entries = 0;
             for (const std::uint64_t id : ids) {
                 const bool exists =
                     logical_lookup_unlocked(id, *resources_).has_value();
@@ -1797,29 +1799,10 @@ public:
                     }
                     ++resulting_count;
                 }
-            }
-        }
-        if (ids.size() > RowRef::kMaximumRowsPerSegment
-                             - active_wal().payload_offsets.size()) {
-            if (!rotate_wal_locked()) {
-                throw InvalidArgumentError(
-                    "active WAL exceeds the 2^32 PUT-row limit");
-            }
-        }
-        const std::uint64_t original_rows =
-            active_wal().payload_offsets.size();
-        {
-            std::unique_lock state(state_mutex_);
-            std::size_t new_overlay_entries = 0;
-            for (const std::uint64_t id : ids) {
                 new_overlay_entries += static_cast<std::size_t>(
                     !overlay_.contains(id));
             }
             ensure_overlay_growth_unlocked(new_overlay_entries);
-            prepare_publication_capacity(new_overlay_entries, ids.size());
-            for (const std::uint64_t id : ids) {
-                prime_overlay_node_unlocked(id);
-            }
         }
 
         std::vector<WalMutation> operations;
@@ -1831,6 +1814,31 @@ public:
                     index * static_cast<std::size_t>(manifest_.record_size),
                     static_cast<std::size_t>(manifest_.record_size))});
         }
+        if (ids.size() > RowRef::kMaximumRowsPerSegment
+                             - active_wal().payload_offsets.size()) {
+            // Automatic rotation must not publish a successor if its first
+            // transaction cannot fit the retained WAL budget.
+            ensure_wal_growth_locked(kWalFileHeaderSize, operations.size());
+            MutationWalEntry successor;
+            successor.wal_id = make_uuid();
+            successor.predecessor_wal_id = active_wal().entry.wal_id;
+            successor.previous_sequence = next_sequence_ - 1;
+            successor.first_sequence = next_sequence_;
+            const EncodedWalTransaction probe = encode_wal_transaction(
+                partitioned_wal_header_for(manifest_, successor),
+                next_sequence_, kWalFileHeaderSize, operations);
+            ensure_wal_growth_locked(
+                checked_sum(
+                    kWalFileHeaderSize, probe.bytes.size(),
+                    "rotated WAL transaction size"),
+                operations.size());
+            if (!rotate_wal_locked()) {
+                throw InvalidArgumentError(
+                    "active WAL exceeds the 2^32 PUT-row limit");
+            }
+        }
+        const std::uint64_t original_rows =
+            active_wal().payload_offsets.size();
         commit_operations(operations, original_rows, resulting_count);
     }
 
@@ -1860,18 +1868,6 @@ public:
                 --resulting_count;
                 operations.push_back(WalMutation{
                     ids[index], WalOperationKind::Delete, {}});
-            }
-            if (!operations.empty()) {
-                std::size_t new_overlay_entries = 0;
-                for (const WalMutation& operation : operations) {
-                    new_overlay_entries += static_cast<std::size_t>(
-                        !overlay_.contains(operation.id));
-                }
-                ensure_overlay_growth_unlocked(new_overlay_entries);
-                prepare_publication_capacity(new_overlay_entries, 0);
-                for (const WalMutation& operation : operations) {
-                    prime_overlay_node_unlocked(operation.id);
-                }
             }
         }
         if (!operations.empty()) {
@@ -5541,6 +5537,14 @@ private:
         }
     }
 
+    void ensure_wal_growth_locked(
+        const std::uint64_t additional_bytes,
+        const std::uint64_t additional_operations) const {
+        ensure_wal_growth(
+            resources_->sources, open_options_, additional_bytes,
+            additional_operations);
+    }
+
     void commit_operations(
         const std::span<const WalMutation> operations,
         const std::uint64_t original_wal_rows,
@@ -5556,6 +5560,7 @@ private:
             "active WAL operation count");
         const EncodedWalTransaction transaction = encode_wal_transaction(
             active.header, next_sequence_, append_offset_, operations);
+        ensure_wal_growth_locked(transaction.bytes.size(), operations.size());
         const std::uint64_t relative_payload_offset = get_u64(
             std::span<const std::byte>(transaction.bytes), 64);
         std::uint64_t payload_cursor = append_offset_ + relative_payload_offset;
@@ -5567,6 +5572,24 @@ private:
                 payload_cursor = checked_sum(
                     payload_cursor, manifest_.record_size,
                     "partitioned WAL payload offset");
+            }
+        }
+
+        // Reject invalid/over-budget transactions before reserving retained
+        // overlay nodes. Prepare all publication allocations before fsync so
+        // the durable transaction can then be installed without allocation.
+        {
+            std::unique_lock state(state_mutex_);
+            std::size_t new_overlay_entries = 0;
+            for (const WalMutation& operation : operations) {
+                new_overlay_entries += static_cast<std::size_t>(
+                    !overlay_.contains(operation.id));
+            }
+            ensure_overlay_growth_unlocked(new_overlay_entries);
+            prepare_publication_capacity(
+                new_overlay_entries, put_offsets.size());
+            for (const WalMutation& operation : operations) {
+                prime_overlay_node_unlocked(operation.id);
             }
         }
 
@@ -5753,6 +5776,7 @@ private:
         if (next_sequence_ == old_active.header.first_sequence) {
             return false;
         }
+        ensure_wal_growth_locked(kWalFileHeaderSize, 0);
         if (catalog_.generation == std::numeric_limits<std::uint64_t>::max()) {
             throw StorageError("partitioned catalog generation is exhausted");
         }

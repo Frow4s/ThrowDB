@@ -24,7 +24,8 @@ For a complete product handoff, start with the
 [end-user guide](docs/user-guide.md),
 [Kubernetes runbook](docs/kubernetes-deployment.md),
 [wheel/release guide](docs/release-packaging.md), or the
-[documentation index](docs/README.md).
+[documentation index](docs/README.md). The latest code audit and refactoring
+decisions are in [the refactoring review](docs/refactoring-review.md).
 
 ## Install
 
@@ -286,12 +287,16 @@ iterator yields embedding arrays in query order, while `scan_records()` yields
 writes. See [`docs/streaming-reads.md`](docs/streaming-reads.md) for snapshot,
 memory, cancellation, and partial-progress semantics.
 
-Public mutations always carry a nonzero UUID operation ID. Supplying one
-explicitly lets a caller repeat an ambiguous request after reconnect/restart;
-the durable server journal replays the original result only when the complete
-request digest matches. `RemoteCollection` creates an ID automatically when
-none is supplied and exposes it on `AmbiguousCommitError` if the outcome is
-unknown. Ambient HTTP proxies are disabled by default for internal embedding
+Public mutations carry a nonzero UUID operation ID and the server's replay
+domain. Capture both with `remote.mutation_token()` and pass the token as
+`operation_id=` when a retry must survive reconnect/restart. The durable server
+journal replays the original result only within that domain and when the
+complete request digest matches. `RemoteCollection` also creates IDs
+automatically; if the outcome is unknown and durable idempotency was enabled,
+retry the identical request with `operation_id=error.retry_token` from
+`AmbiguousCommitError`. A refreshed
+`Describe` never silently changes the domain of caller-supplied UUIDs within
+an existing connection. See [safe mutation retry](docs/user-guide.md#safe-mutation-retry). Ambient HTTP proxies are disabled by default for internal embedding
 traffic; opt in explicitly with `use_http_proxy=True`. The MVP transport is
 plaintext only on a numeric loopback endpoint. A non-loopback bind requires
 server certificate, private key, and client CA (mTLS), unless the operator uses

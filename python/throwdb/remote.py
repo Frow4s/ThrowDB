@@ -6,7 +6,6 @@ import contextlib
 import operator
 import threading
 import uuid
-from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Final, Iterator, Literal, overload
@@ -14,13 +13,17 @@ from typing import Final, Iterator, Literal, overload
 import grpc
 import numpy as np
 
+from ._array_validation import (
+    _StreamingNumericIdSource,
+    _normalize_numeric_ids,
+    _require_disjoint_numpy_arrays as _reject_array_overlap,
+    _validate_id_scan_output,
+    _validate_output,
+)
 from ._tuning import normalize_reader_options
 from .collection import (
     CollectionSchema,
     _normalize_embeddings,
-    _normalize_numeric_ids,
-    _validate_id_scan_output,
-    _validate_output,
     _validate_prefix_dimensions,
 )
 from .id_scan import (
@@ -150,6 +153,32 @@ _DEFINITE_MUTATION_REJECTIONS: Final = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteMutationToken:
+    """An operation ID bound to its original server replay domain.
+
+    Persist both UUIDs before submitting a mutation when recovery must survive
+    client restarts. Pass the complete token as ``operation_id`` on every retry.
+    A stale domain is rejected by the server instead of replaying the operation
+    as new work after an idempotency-journal checkpoint.
+    """
+
+    operation_id: uuid.UUID
+    idempotency_domain: uuid.UUID | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, uuid.UUID):
+            raise TypeError("operation_id must be a UUID")
+        if self.operation_id.int == 0:
+            raise ValueError("operation_id must be nonzero")
+        domain = self.idempotency_domain
+        if domain is not None:
+            if not isinstance(domain, uuid.UUID):
+                raise TypeError("idempotency_domain must be a UUID or None")
+            if domain.int == 0:
+                raise ValueError("idempotency_domain must be nonzero")
+
+
 class AmbiguousCommitError(RemoteError, ConnectionError):
     """A mutation may have committed although its response was not received."""
 
@@ -160,14 +189,18 @@ class AmbiguousCommitError(RemoteError, ConnectionError):
         *,
         code: str,
         details: str,
+        idempotency_domain: uuid.UUID | None = None,
     ) -> None:
         self.operation_id = operation_id
         self.operation = operation
+        self.idempotency_domain = idempotency_domain
+        self.retry_token = RemoteMutationToken(operation_id, idempotency_domain)
         super().__init__(
             code,
             f"remote {operation} outcome is unknown; "
             f"operation_id={operation_id}; {details or code}. Do not retry "
-            "automatically unless the server advertises durable idempotency.",
+            "automatically unless the server advertises durable idempotency. "
+            "Retain retry_token and pass it as operation_id on every retry.",
         )
 
 
@@ -194,16 +227,20 @@ class RemoteAbortedError(AmbiguousCommitError):
         operation: str,
         *,
         details: str,
+        idempotency_domain: uuid.UUID | None = None,
     ) -> None:
         self.operation_id = operation_id
         self.operation = operation
+        self.idempotency_domain = idempotency_domain
+        self.retry_token = RemoteMutationToken(operation_id, idempotency_domain)
         RemoteError.__init__(
             self,
             "ABORTED",
             f"remote {operation} was rejected before durable PREPARE; "
             f"operation_id={operation_id}; {details or 'ABORTED'}. Retry only "
             f"the identical {operation} request with the same operation_id; "
-            "never allocate a new operation_id for this logical mutation.",
+            "never allocate a new operation_id for this logical mutation. "
+            "Pass retry_token as operation_id to preserve its replay domain.",
         )
 
 
@@ -540,23 +577,6 @@ def _bounded_stream_parameters(
             f"streaming limits cannot fit one {operation} row"
         )
     return int(rows), int(payload_bytes)
-
-
-def _reject_array_overlap(
-    arrays: Sequence[tuple[str, np.ndarray]],
-    *,
-    operation: str,
-) -> None:
-    for left_index, (left_name, left) in enumerate(arrays):
-        for right_name, right in arrays[left_index + 1 :]:
-            # may_share_memory is deliberately conservative and bounded. An
-            # occasional false positive is preferable to successful-looking
-            # corruption while sequential copies advance a remote cursor.
-            if np.may_share_memory(left, right):
-                raise ValueError(
-                    f"{operation} buffers {left_name} and {right_name} "
-                    "must not overlap"
-                )
 
 
 @contextlib.contextmanager
@@ -994,128 +1014,19 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
             self.close()
 
 
-class _BoundedSequenceWindow(Sequence[object]):
-    """Non-owning ID window so one remote batch has one dense allocation."""
-
-    def __init__(
-        self,
-        source: Sequence[object],
-        begin: int,
-        end: int,
-    ) -> None:
-        self._source = source
-        self._begin = begin
-        self._length = end - begin
-
-    def __len__(self) -> int:
-        return self._length
-
-    def __getitem__(self, index: int | slice) -> object:
-        if isinstance(index, slice):
-            start, stop, step = index.indices(self._length)
-            return [
-                self._source[self._begin + position]
-                for position in range(start, stop, step)
-            ]
-        normalized = operator.index(index)
-        if normalized < 0:
-            normalized += self._length
-        if not 0 <= normalized < self._length:
-            raise IndexError(index)
-        return self._source[self._begin + normalized]
-
-
-class _IndexedIds:
-    """Lazily normalize an ndarray/memmap or ordered Python sequence."""
-
-    def __init__(self, ids: object) -> None:
-        if isinstance(ids, np.ma.MaskedArray):
-            raise TypeError("ids must not be a masked array")
-        self._array: np.ndarray | None = None
-        self._sequence: Sequence[object] | None = None
-        self._shape: tuple[int, ...] | None = None
-        self._dtype: np.dtype[object] | None = None
-        self._strides: tuple[int, ...] | None = None
-        self._data_pointer: int | None = None
-        if isinstance(ids, np.ndarray):
-            if ids.ndim != 1:
-                raise ValueError(f"ids must have shape (N,), got {ids.shape}")
-            if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
-                1,
-                2,
-                4,
-                8,
-            }:
-                raise TypeError(
-                    "ids ndarray must have an 8-, 16-, 32-, or 64-bit "
-                    f"integer dtype, got {ids.dtype}"
-                )
-            self._array = ids
-            self._count = int(ids.shape[0])
-            self._shape = tuple(ids.shape)
-            self._dtype = ids.dtype
-            self._strides = tuple(ids.strides)
-            self._data_pointer = int(ids.ctypes.data)
-        else:
-            if isinstance(ids, (str, bytes, bytearray, memoryview)):
-                raise TypeError(
-                    "numeric ids must be a one-dimensional integer array "
-                    "or ordered sequence"
-                )
-            if not isinstance(ids, Sequence):
-                raise TypeError(
-                    "stream_get ids must be a one-dimensional integer array "
-                    "or ordered sequence"
-                )
-            self._sequence = ids
-            self._count = len(ids)
+class _IndexedIds(_StreamingNumericIdSource):
+    """Remote naming adapter around the shared bounded ID source."""
 
     @property
     def count(self) -> int:
-        return self._count
-
-    def _require_unchanged(self) -> None:
-        if self._array is not None:
-            array = self._array
-            if (
-                array.ndim != 1
-                or tuple(array.shape) != self._shape
-                or array.dtype != self._dtype
-                or tuple(array.strides) != self._strides
-                or int(array.ctypes.data) != self._data_pointer
-            ):
-                raise RuntimeError(
-                    "ids source structure changed while stream_get was active"
-                )
-            return
-        assert self._sequence is not None
-        if len(self._sequence) != self._count:
-            raise RuntimeError(
-                "ids source length changed while stream_get was active"
-            )
+        return len(self)
 
     def normalized_slice(self, begin: int, end: int) -> np.ndarray:
-        self._require_unchanged()
-        if not 0 <= begin <= end <= self._count:
-            raise RuntimeError("stream_get requested an invalid ID slice")
-        values: object
-        if self._array is not None:
-            values = self._array[begin:end]
-        else:
-            assert self._sequence is not None
-            values = _BoundedSequenceWindow(self._sequence, begin, end)
-        normalized = _normalize_numeric_ids(values, position_offset=begin)
-        if normalized.size != end - begin:
-            raise ValueError("ids sequence changed length during streaming")
-        self._require_unchanged()
-        return normalized
+        return self.batch(begin, end)
 
     def reject_output_overlap(self, output: np.ndarray) -> None:
-        if self._array is not None:
-            _reject_array_overlap(
-                (("ids source", self._array), ("output", output)),
-                operation="StreamGet",
-            )
+        if self.output_overlaps_unread(output, begin=0):
+            raise ValueError("StreamGet buffers ids source and output must not overlap")
 
 
 class _StreamGetRequestIterator(Iterator[throwdb_pb2.StreamGetRequest]):
@@ -1978,6 +1889,9 @@ class RemoteCollection:
                     "UNAVAILABLE", "ThrowDB server is not ready to serve"
                 )
             self._description = self._describe()
+            # Describe refreshes live diagnostics and may observe a journal
+            # rollover. Legacy UUID retries must keep their original domain.
+            self._mutation_domain = self._description.idempotency_domain
         except BaseException:
             self.close()
             raise
@@ -2029,7 +1943,7 @@ class RemoteCollection:
         request: object,
         *,
         operation: str,
-        operation_id: uuid.UUID,
+        token: RemoteMutationToken,
     ) -> object:
         try:
             return call(  # type: ignore[operator]
@@ -2041,16 +1955,18 @@ class RemoteCollection:
             code = _rpc_code_name(error)
             if code == "ABORTED":
                 raise RemoteAbortedError(
-                    operation_id,
+                    token.operation_id,
                     operation,
                     details=_rpc_details(error),
+                    idempotency_domain=token.idempotency_domain,
                 ) from error
             if code not in _DEFINITE_MUTATION_REJECTIONS:
                 raise AmbiguousCommitError(
-                    operation_id,
+                    token.operation_id,
                     operation,
                     code=code,
                     details=_rpc_details(error),
+                    idempotency_domain=token.idempotency_domain,
                 ) from error
             raise _typed_rpc_error(error) from error
 
@@ -2627,6 +2543,36 @@ class RemoteCollection:
     def idempotency_domain(self) -> uuid.UUID | None:
         return self._description.idempotency_domain
 
+    def mutation_token(
+        self,
+        operation_id: uuid.UUID | str | bytes | None = None,
+    ) -> RemoteMutationToken:
+        """Bind a new logical mutation to the currently described domain.
+
+        Call ``describe()`` first when intentionally starting new work after a
+        server journal checkpoint. Existing ambiguous operations must retain
+        their original token; never create a replacement token for a retry.
+        """
+        self._ensure_open()
+        return RemoteMutationToken(
+            _operation_id(operation_id), self._description.idempotency_domain
+        )
+
+    def _mutation_token(
+        self,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None,
+    ) -> RemoteMutationToken:
+        if isinstance(operation_id, RemoteMutationToken):
+            return operation_id
+        # A generated UUID always denotes new work; caller-supplied UUIDs
+        # may be retries and therefore retain the connection's original domain.
+        domain = (
+            self._description.idempotency_domain
+            if operation_id is None
+            else self._mutation_domain
+        )
+        return RemoteMutationToken(_operation_id(operation_id), domain)
+
     @property
     def reader(self) -> RemoteReaderConfiguration | None:
         return self._description.reader
@@ -2775,7 +2721,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None,
     ) -> None:
         self._ensure_open()
         if not self._description.writable:
@@ -2788,7 +2734,8 @@ class RemoteCollection:
         )
         if normalized_ids.size == 0:
             return
-        identifier = _operation_id(operation_id)
+        token = self._mutation_token(operation_id)
+        identifier = token.operation_id
         wire_embeddings = _native_little_endian(
             normalized_embeddings, self.dtype
         )
@@ -2802,21 +2749,22 @@ class RemoteCollection:
                 values_le=wire_embeddings.tobytes(order="C"),
             ),
         )
-        if self._description.idempotency_domain is not None:
+        if token.idempotency_domain is not None:
             request.idempotency_domain.CopyFrom(
-                _proto_operation_id(self._description.idempotency_domain)
+                _proto_operation_id(token.idempotency_domain)
             )
         response = self._invoke_mutation(
             method,
             request,
             operation=operation_name,
-            operation_id=identifier,
+            token=token,
         )
         assert isinstance(response, throwdb_pb2.MutationResponse)
         if response.affected_count != normalized_ids.size:
             raise AmbiguousCommitError(
                 identifier,
                 operation_name,
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="mutation response count does not match request",
             )
@@ -2826,7 +2774,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Insert,
@@ -2841,7 +2789,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Update,
@@ -2856,7 +2804,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Upsert,
@@ -2870,7 +2818,7 @@ class RemoteCollection:
         self,
         ids: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> np.ndarray:
         self._ensure_open()
         if not self._description.writable:
@@ -2878,20 +2826,21 @@ class RemoteCollection:
         normalized_ids = _normalize_numeric_ids(ids)
         if normalized_ids.size == 0:
             return np.empty(0, dtype=np.bool_)
-        identifier = _operation_id(operation_id)
+        token = self._mutation_token(operation_id)
+        identifier = token.operation_id
         request = throwdb_pb2.DeleteRequest(
             operation_id=_proto_operation_id(identifier),
             ids=_proto_ids(normalized_ids),
         )
-        if self._description.idempotency_domain is not None:
+        if token.idempotency_domain is not None:
             request.idempotency_domain.CopyFrom(
-                _proto_operation_id(self._description.idempotency_domain)
+                _proto_operation_id(token.idempotency_domain)
             )
         response = self._invoke_mutation(
             self._stub.Delete,
             request,
             operation="delete",
-            operation_id=identifier,
+            token=token,
         )
         assert isinstance(response, throwdb_pb2.DeleteResponse)
         if (
@@ -2901,6 +2850,7 @@ class RemoteCollection:
             raise AmbiguousCommitError(
                 identifier,
                 "delete",
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="delete response size does not match request",
             )
@@ -2909,6 +2859,7 @@ class RemoteCollection:
             raise AmbiguousCommitError(
                 identifier,
                 "delete",
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="delete response contains an invalid bitmap value",
             )
@@ -3131,6 +3082,7 @@ __all__ = [
     "RemoteIdScan",
     "RemoteInternalError",
     "RemoteInvalidArgumentError",
+    "RemoteMutationToken",
     "RemoteNotFoundError",
     "RemoteProtocolError",
     "RemoteReadLoggingConfiguration",

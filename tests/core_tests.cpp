@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #include "throwdb/errors.hpp"
 #include "throwdb/storage.hpp"
@@ -1208,6 +1210,54 @@ void test_io_uring_pool_planning_is_depth_aware() {
         "io_uring lane planner ignored unequal queue depths");
 }
 
+int interrupted_close_calls = 0;
+int interrupted_close_replacement = -1;
+
+int interrupted_descriptor_close(const int fd) noexcept {
+    ++interrupted_close_calls;
+    if (interrupted_close_calls == 1) {
+#if defined(__linux__)
+        // Model Linux releasing the fd before reporting an interrupted close,
+        // followed by another thread opening a file under the reused number.
+        static_cast<void>(::close(fd));
+        interrupted_close_replacement = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+#endif
+        errno = EINTR;
+        return -1;
+    }
+    return ::close(fd);
+}
+
+void test_file_descriptor_interrupted_close_ownership() {
+    const int original = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    require(original >= 0, "cannot open descriptor-lifecycle fixture");
+    throwdb::detail::FileDescriptor descriptor(original);
+    interrupted_close_calls = 0;
+    interrupted_close_replacement = -1;
+    throwdb::detail::set_file_descriptor_close_test_hook(
+        interrupted_descriptor_close);
+    descriptor.reset();
+    throwdb::detail::set_file_descriptor_close_test_hook(nullptr);
+    require_equal(descriptor.get(), -1, "reset retained ownership of closed fd");
+#if defined(__linux__)
+    const int replacement = interrupted_close_replacement;
+    const bool replacement_open =
+        replacement >= 0 && ::fcntl(replacement, F_GETFD) >= 0;
+    if (replacement_open) {
+        static_cast<void>(::close(replacement));
+    }
+    require_equal(replacement, original, "fixture did not reuse the closed fd");
+    require_equal(interrupted_close_calls, 1,
+                  "Linux close(EINTR) retried a released descriptor");
+    require(replacement_open, "close retry closed an unrelated reused fd");
+#else
+    require_equal(interrupted_close_calls, 2,
+                  "non-Linux interrupted-close retry behavior changed");
+    require(::fcntl(original, F_GETFD) < 0 && errno == EBADF,
+            "non-Linux interrupted close leaked its descriptor");
+#endif
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -1216,7 +1266,9 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 19> tests{{
+    const std::array<TestCase, 20> tests{{
+        {"file_descriptor_interrupted_close_ownership",
+         test_file_descriptor_interrupted_close_ownership},
         {"round_trip_arbitrary_ids_and_order", test_round_trip_arbitrary_ids_and_order},
         {"multiple_append_batches_and_shards", test_multiple_append_batches_and_shards},
         {"duplicate_id_rejects_publication", test_duplicate_id_rejects_publication},

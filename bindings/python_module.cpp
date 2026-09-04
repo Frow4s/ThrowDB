@@ -2066,7 +2066,7 @@ private:
 
 PYBIND11_MODULE(_throwdb, module) {
     module.doc() = "Native bindings for the ThrowDB storage engine";
-    module.attr("__version__") = "0.1.0";
+    module.attr("__version__") = THROWDB_VERSION;
     module.def(
         "_crc32c",
         [](const py::buffer& input,

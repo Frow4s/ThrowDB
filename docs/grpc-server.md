@@ -3,8 +3,8 @@
 The public gRPC contract is
 [`proto/throwdb/v1/throwdb.proto`](../proto/throwdb/v1/throwdb.proto). It is a
 first-class transport over the same transport-neutral collection engine as the
-embedded Python API. The earlier TDBP/TCP transport remains a build-tree-only
-comparison tool; it is not the public server contract and is not installed.
+embedded Python API. The earlier internal TDBP/TCP comparison transport has
+been removed; gRPC is the supported network API.
 
 ## Build contract
 
@@ -94,7 +94,7 @@ refuses a source checkout whose commit is not the pinned one.
 
 `THROWDB_BUILD_GRPC_SERVER=ON` uses `find_package(... REQUIRED)`. A missing
 compiler, plugin, header, or C++ library is therefore a configuration error;
-the build never substitutes the custom TCP server silently.
+the build fails if its required transport dependencies are missing.
 
 The release preset also enables `THROWDB_GRPC_ENABLE_REFLECTION`. This
 requires `gRPC::grpc++_reflection` and exposes the service to `grpcurl` and
@@ -106,7 +106,7 @@ Python gRPC client and the public `throwdbd` launcher. The launcher resolves a
 reader profile once and then replaces itself with the wheel's private C++
 `throwdb/libexec/_throwdbd_native` daemon. Python is never in the RPC data
 path. A missing C++ gRPC toolchain therefore fails the wheel build rather than
-silently publishing a client-only or TCP-only artifact. Core-only developers
+silently publishing an incomplete server artifact. Core-only developers
 may explicitly configure both
 `THROWDB_BUILD_SERVER=OFF` and `THROWDB_BUILD_GRPC_SERVER=OFF`; the Python CI
 matrix uses that mode once per Python version, while a dedicated job builds and
@@ -463,8 +463,6 @@ before framing overhead, including the reserved active segment.
 - `build/server-release/throwdbd`: raw daemon produced by a standalone source
   build; it bypasses the tuning registry unless selected through the launcher
   with `--native-binary`.
-- `throwdbd-tcp`: provisional build-tree target retained only for internal
-  comparison.
 
 The public daemon opens one format-7 collection and enforces its single-writer
 lease. gRPC v1 provides `Health`, `Describe`, `Get`, bidirectional `StreamGet`,
@@ -562,15 +560,24 @@ not an acceptable deployment policy.
 Writable format-7 servers normally report `durable_idempotency = true` and a
 nonzero `idempotency_domain`: within that domain, a repeated ID with the same
 request digest replays the original result, while a different request is
-rejected. `RemoteCollection` copies the domain advertised by `Describe` into
-every mutation. If the capability is explicitly disabled, clients must not
+rejected. `RemoteCollection` pins the domain for caller-supplied UUID/string/bytes IDs when the connection
+opens; a subsequent `describe()` or `count` refresh does not silently change
+that domain. Automatically generated IDs denote new work and use the current
+advertised domain. Refresh metadata with `describe()`, then use
+`remote.mutation_token()` to capture a fresh operation ID and
+the currently advertised domain for a new logical mutation. Pass that token as
+`operation_id=` and retain it with the original request. After an ambiguous
+result, `error.retry_token` retains the exact domain and ID sent on the wire,
+including across reconnects. A retired domain fails closed; never move an
+uncertain operation into a new domain just to make the retry succeed.
+If the capability is explicitly disabled, clients must not
 automatically retry an ambiguous mutation because its WAL commit may already be
 durable.
 
 The server reserves mutation `ABORTED` for an admission failure before the
 current request enters durable `PREPARE`; the current request therefore
 definitely did not commit. The Python client maps it to `RemoteAbortedError`, a
-typed retry signal carrying `operation` and `operation_id`, with
+typed retry signal carrying `operation`, `operation_id`, and `retry_token`, with
 `definitely_not_committed = true`. This remains distinct from an unknown
 transport outcome and is safe to retry even without durable idempotency. A
 caller may apply bounded backoff, but must replay the identical request with

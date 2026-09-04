@@ -30,6 +30,7 @@
 #include "throwdb/native_collection.hpp"
 #include "../src/core/crc32c.hpp"
 #include "../src/core/internal.hpp"
+#include "../src/core/mutation_wal.hpp"
 #include "../src/core/native_collection_test_hooks.hpp"
 #include "../src/core/partition_snapshot_storage.hpp"
 #include "../src/core/partitioned_index_format.hpp"
@@ -2801,6 +2802,153 @@ void test_mutable_open_limits_and_pending_fence_fail_closed() {
         temporary.path(), {}, true, false, recovery));
 }
 
+void test_live_wal_limits_preserve_state_and_recover_after_materialization() {
+    // Exercise byte and operation bounds independently, including the frozen
+    // prefix: an empty active WAL must not bypass retained-backlog limits.
+    for (const bool bound_bytes : {false, true}) {
+        TemporaryDirectory temporary(
+            bound_bytes ? "live-wal-bytes" : "live-wal-operations");
+        const std::array<std::uint64_t, 2> ids{3, 5};
+        auto embeddings = rows(ids.size(), 4);
+        build_collection(
+            temporary.path(), ids, embeddings, throwdb::DType::Float16,
+            2, 8, 1);
+        const std::array<std::uint64_t, 1> changed{ids[0]};
+        const std::array<std::uint64_t, 1> untouched{ids[1]};
+        const std::array<std::uint64_t, 1> inserted{7};
+        const std::vector<std::byte> replacement(4, std::byte{0x7f});
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(changed, replacement);
+        std::copy(replacement.begin(), replacement.end(), embeddings.begin());
+        const auto baseline = writer->rotate_wal();
+        require(baseline.frozen_wal_count == 1
+                    && baseline.active_wal_operation_count == 0,
+                "live-bound fixture does not retain a frozen WAL");
+        writer.reset();
+
+        throwdb::NativeOpenOptions limits;
+        if (bound_bytes) {
+            limits.max_wal_bytes = baseline.total_wal_bytes;
+        } else {
+            limits.max_wal_operations = baseline.total_wal_operation_count;
+        }
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        const auto require_unchanged = [&] {
+            const auto after = writer->mutation_log_stats();
+            require(after.generation == baseline.generation
+                        && after.committed_sequence == baseline.committed_sequence
+                        && after.total_wal_bytes == baseline.total_wal_bytes
+                        && after.total_wal_operation_count
+                               == baseline.total_wal_operation_count
+                        && after.overlay_entry_count == baseline.overlay_entry_count
+                        && writer->count() == ids.size(),
+                    "rejected mutation changed WAL or overlay state");
+            require(writer->get_bytes(ids) == embeddings,
+                    "rejected mutation changed visible rows");
+        };
+        require_throws<throwdb::StorageError>(
+            [&] { writer->insert(inserted, replacement); },
+            "live insert exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { writer->upsert(inserted, replacement); },
+            "live upsert exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { writer->update(changed, replacement); },
+            "live update exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { static_cast<void>(writer->erase(untouched)); },
+            "live erase exceeded the retained WAL limit");
+        require_unchanged();
+
+        // A no-op consumes no durable budget, even exactly at the limit.
+        require(writer->erase(inserted) == std::vector<std::uint8_t>{0},
+                "missing-ID erase changed state at the WAL limit");
+        require(!writer->rotate_wal().rotated,
+                "empty active WAL rotated at the WAL limit");
+        require_unchanged();
+        writer.reset();
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        require_unchanged();
+
+        const auto maintained = writer->materialize_frozen_wals();
+        require(maintained.materialized
+                    && maintained.total_wal_operation_count == 0,
+                "materialization did not release retained WAL budget");
+        writer->insert(inserted, replacement);
+        require(writer->get_bytes(inserted) == replacement,
+                "released WAL budget did not admit a new mutation");
+        writer.reset();
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        require(writer->count() == ids.size() + 1
+                    && writer->get_bytes(inserted) == replacement,
+                "bounded writer could not reopen its accepted mutation");
+    }
+}
+
+void test_live_wal_rotation_and_append_accept_exact_byte_limits() {
+    TemporaryDirectory temporary("rotation-byte-budget");
+    const std::array<std::uint64_t, 1> ids{9};
+    const auto embeddings = rows(ids.size(), 4);
+    build_collection(
+        temporary.path(), ids, embeddings, throwdb::DType::Float16,
+        2, 8, 1);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    writer->update(ids, embeddings);
+    const auto baseline = writer->mutation_log_stats();
+    writer.reset();
+
+    throwdb::NativeOpenOptions limits;
+    limits.max_wal_bytes =
+        baseline.total_wal_bytes + throwdb::detail::kWalFileHeaderSize - 1;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    require_throws<throwdb::StorageError>(
+        [&] { static_cast<void>(writer->rotate_wal()); },
+        "rotation failed to charge its complete retained WAL header");
+    const auto rejected = writer->mutation_log_stats();
+    require(rejected.generation == baseline.generation
+                && rejected.total_wal_bytes == baseline.total_wal_bytes
+                && rejected.frozen_wal_count == 0,
+            "rejected rotation published a catalog or successor WAL");
+    writer.reset();
+
+    ++limits.max_wal_bytes;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    const auto rotated = writer->rotate_wal();
+    require(rotated.rotated
+                && rotated.total_wal_bytes == limits.max_wal_bytes,
+            "rotation rejected an exact header-byte budget");
+    writer.reset();
+
+    limits.max_wal_bytes +=
+        baseline.total_wal_bytes - throwdb::detail::kWalFileHeaderSize;
+    limits.max_wal_operations = 2;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    writer->update(ids, embeddings);
+    const auto appended = writer->mutation_log_stats();
+    require(appended.total_wal_bytes == limits.max_wal_bytes
+                && appended.total_wal_operation_count == limits.max_wal_operations,
+            "append rejected an exact byte/operation budget");
+    require_throws<throwdb::StorageError>(
+        [&] { writer->update(ids, embeddings); },
+        "append exceeded its exact retained WAL budget");
+    writer.reset();
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    require(writer->get_bytes(ids) == embeddings,
+            "exact-budget mutations could not reopen under the same limits");
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -2809,7 +2957,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 28> tests{{
+    const std::array<TestCase, 30> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
@@ -2864,6 +3012,10 @@ int main() {
          test_checksummed_post_initial_catalog_fails_closed},
         {"mutable_open_limits_and_pending_fence_fail_closed",
          test_mutable_open_limits_and_pending_fence_fail_closed},
+        {"live_wal_limits_preserve_state_and_recover_after_materialization",
+         test_live_wal_limits_preserve_state_and_recover_after_materialization},
+        {"live_wal_rotation_and_append_accept_exact_byte_limits",
+         test_live_wal_rotation_and_append_accept_exact_byte_limits},
     }};
 
     std::size_t failures = 0;

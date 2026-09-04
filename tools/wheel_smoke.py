@@ -126,6 +126,9 @@ def _assert_grpc_server(
 
 
 def main() -> None:
+    assert throwdb.__version__ == importlib.metadata.version("throwdb"), (
+        "native extension and installed package versions differ"
+    )
     with tempfile.TemporaryDirectory(prefix="throwdb-wheel-smoke-") as raw:
         store = Path(raw) / "store"
         ids = np.array([1, 2, 3], dtype=np.uint32)

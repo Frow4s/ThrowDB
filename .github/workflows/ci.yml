@@ -55,6 +55,24 @@ jobs:
         run: cmake --build --preset server-release
       - name: Test
         run: ctest --preset server-release
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install Python client and local extension for server integration
+        env:
+          CMAKE_ARGS: >-
+            -DTHROWDB_BUILD_SERVER=OFF
+            -DTHROWDB_BUILD_GRPC_SERVER=OFF
+        run: python -m pip install '.[test]'
+      - name: Test native server through Python client and benchmark runners
+        env:
+          THROWDB_SERVER_BINARY: ${{ github.workspace }}/build/server-release/throwdbd
+        run: >-
+          python -m pytest -q
+          tests/server
+          tests/test_grpc_server_benchmark.py::test_minimal_loopback_benchmark_smoke
+          tests/test_grpc_server_soak.py::test_minimal_native_mixed_streaming_soak
 
   native:
     name: Native C++20 / Werror

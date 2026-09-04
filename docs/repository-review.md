@@ -221,8 +221,8 @@ collection understands the new barrier; mixed old/new operation is unsupported.
 
 - No project license has been selected and no LICENSE/third-party NOTICE is
   bundled, despite static native dependencies.
-- Version `0.1.0` is duplicated in `pyproject.toml`, `CMakeLists.txt`, and the
-  binding, with no tag/version consistency gate.
+- Version now comes from `pyproject.toml` for both CMake and the extension;
+  a tag/version consistency gate is still missing.
 - The workflow uploads ephemeral Actions artifacts only; it does not publish a
   GitHub Release, package-index artifact, checksum manifest, SBOM, signature,
   provenance, or OCI image.

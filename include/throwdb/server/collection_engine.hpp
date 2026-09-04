@@ -224,9 +224,9 @@ struct EngineMaintenanceResult {
     bool action_budget_reached = false;
 };
 
-// The sole transport-neutral owner of remote operation semantics. TDBP and
-// gRPC adapters must share one instance so mutation ordering, preconditions,
-// durable idempotency, and returned commit sequences cannot diverge.
+// The sole transport-neutral owner of remote operation semantics. Server
+// adapters share one instance so mutation ordering, preconditions, durable
+// idempotency, and returned commit sequences cannot diverge.
 class SingleCollectionEngine {
 public:
     SingleCollectionEngine(

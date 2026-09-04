@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 
-#include "throwdb/server/single_collection_service.hpp"
+#include "throwdb/server/service_limits.hpp"
 
 namespace throwdb::server {
 

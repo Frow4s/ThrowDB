@@ -296,6 +296,7 @@ source_entries = (
     "README.md",
     "benchmarks",
     "bindings",
+    "cmake",
     "deploy",
     "docs",
     "include",

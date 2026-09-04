@@ -47,12 +47,12 @@ struct NativeOpenStats {
     bool index_structural_validation_performed = false;
 };
 
-// Native-only safety bounds applied while opening and replaying mutable state.
-// Format 6 also applies finite values to live overlay growth, committed WAL
-// operations/bytes, and the extra header retained by rotation. Defaults
-// preserve the historical unbounded embedded-open behaviour. Servers should
-// provide finite values so a valid but unexpectedly large WAL backlog fails
-// closed before rebuilding an unbounded in-memory overlay.
+// Native-only safety bounds applied while opening/replaying mutable state and
+// before live overlay growth, committed WAL operations/bytes, or the extra WAL
+// header retained by rotation, for both formats 6 and 7. Finite limits reject
+// writes before publication so the collection can reopen under the same bounds.
+// Defaults preserve the historical unbounded embedded-open behaviour. Servers
+// should provide finite values to bound retained mutation state.
 struct NativeOpenOptions {
     std::uint64_t max_wal_bytes =
         std::numeric_limits<std::uint64_t>::max();

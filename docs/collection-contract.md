@@ -262,8 +262,8 @@ overlay. Override `max_wal_backlog_bytes`, `max_wal_backlog_operations`,
 corresponding disk/RAM. Format-7 materialization is independently bounded by
 selected WAL count, bytes, committed operations, and estimated peak memory.
 Format 6 applies the same open bounds to both retained WALs and the unique
-overlay rebuilt from WAL/DeltaV1 records. A writable format-6 handle also
-checks projected total WAL bytes and committed-operation count before each
+overlay rebuilt from WAL/DeltaV1 records. Writable format-6 and format-7 handles
+also check projected total WAL bytes and committed-operation count before each
 append, unique overlay growth before publication, and the additional 4096-byte
 WAL header before rotation. These bounds reject work before the corresponding
 durable write; they never silently truncate durable history.
