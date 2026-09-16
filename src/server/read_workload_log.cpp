@@ -1,4 +1,5 @@
 #include "read_workload_log.hpp"
+#include "read_workload_write_budget.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2614,18 +2615,10 @@ private:
         const auto elapsed = std::chrono::duration_cast<
             std::chrono::nanoseconds>(now - write_budget_updated_);
         if (elapsed.count() > 0) {
-            const auto numerator =
-                static_cast<unsigned __int128>(
-                    options_.max_write_bytes_per_second)
-                    * static_cast<std::uint64_t>(elapsed.count())
-                + write_budget_remainder_;
-            const auto added = static_cast<std::uint64_t>(
-                numerator / 1'000'000'000ULL);
-            write_budget_remainder_ = static_cast<std::uint64_t>(
-                numerator % 1'000'000'000ULL);
-            write_budget_tokens_ = std::min(
+            refill_read_workload_write_budget(
                 options_.max_write_bytes_per_second,
-                saturating_add_value(write_budget_tokens_, added));
+                static_cast<std::uint64_t>(elapsed.count()),
+                write_budget_tokens_, write_budget_remainder_);
             write_budget_updated_ = now;
         }
         if (bytes > write_budget_tokens_) {

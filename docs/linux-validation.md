@@ -5,6 +5,8 @@ It creates a disposable data set and keeps reports separate from the source
 checkout. It does not restart a service or open a production collection.
 Run commands from an isolated checkout of the revision being evaluated.
 
+Recorded results: [Linux validation on 2026-09-16](linux-validation-results-20260916.md).
+
 ## Build and record the environment
 
 Use the pinned gRPC toolchain described in [the server guide](grpc-server.md)
@@ -152,7 +154,7 @@ timeout --signal=TERM --kill-after=30s 5m \
     --source-embeddings "$THROWDB_VALIDATION_DIR/embeddings.npy" \
     --results "$THROWDB_VALIDATION_DIR/mixed" \
     --native-binary "$THROWDB_SERVER_BINARY" --tuning conservative \
-    --max-seconds 180 --max-transfer-gib 8 --max-client-memory-mib 512 \
+    --max-seconds 180 --max-transfer-gib 8 --max-client-memory-mib 1024 \
     --max-get-calls 0 --max-mutations 400 \
     --get-workers 4 --max-inflight-gets 8 --get-batch-sizes 1,128,1024 \
     --prefix-dimensions full,128 \
@@ -169,6 +171,11 @@ WAL/overlay resource telemetry. A bounds-limited run may not complete the
 requested restart cycles or trigger maintenance. Such a run does not validate
 those paths. For a longer run, explicitly increase time/transfer limits and
 require maintenance progress when the mutation volume reaches its thresholds.
+
+The client memory budget includes resident pages of the source oracle. For the
+512 MiB fixture above, 512 MiB of working-memory budget can stop streaming before
+the first restart; 1024 MiB leaves room for the oracle and in-flight batches.
+This budget is checked by the harness, not enforced as an OS RSS limit.
 
 Filesystem exhaustion needs a separate disposable filesystem with a strict
 quota or size bound; do not fill the host filesystem to simulate ENOSPC.

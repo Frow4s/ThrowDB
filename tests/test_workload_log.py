@@ -288,14 +288,23 @@ def _write_log(
 
 
 def test_inspector_reports_quality_without_exposing_ids(tmp_path: Path) -> None:
+    # Full uint64 sentinels cannot be confused with ordinary dates or counters
+    # in permitted metadata, such as a caller-provided directory containing 2026.
+    identifiers = [
+        0x9E37_79B9_7F4A_7C15,
+        0xD1B5_4A32_D192_ED03,
+        0x94D0_49BB_1331_11EB,
+        0xBF58_476D_1CE4_E5B9,
+        0xA076_1D64_78BD_642F,
+    ]
     logs = tmp_path / "logs"
     logs.mkdir()
     _write_log(
         logs / "sample.tdbrl",
         frames=(
-            _event([101, 202, 303], sequence=1),
+            _event(identifiers[:3], sequence=1),
             _event(
-                [404, 505],
+                identifiers[3:],
                 original=10,
                 method=2,
                 prefix=128,
@@ -324,8 +333,8 @@ def test_inspector_reports_quality_without_exposing_ids(tmp_path: Path) -> None:
     assert report["configuration"]["max_write_bytes_per_second"] == 16 << 20
     assert report["configuration"]["max_retained_files"] == 4096
     serialized = json.dumps(report, sort_keys=True)
-    for identifier in ("101", "202", "303", "404", "505"):
-        assert identifier not in serialized
+    for identifier in identifiers:
+        assert str(identifier) not in serialized
 
 
 def test_open_torn_tail_is_recoverable_but_finalized_tail_is_corrupt(

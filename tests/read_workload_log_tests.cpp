@@ -21,6 +21,7 @@
 
 #include "../src/core/crc32c.hpp"
 #include "../src/server/read_workload_log.hpp"
+#include "../src/server/read_workload_write_budget.hpp"
 
 namespace {
 
@@ -1425,6 +1426,75 @@ void test_invalid_bounds_are_rejected_before_worker_start() {
     require(rejected, "one-slot queue bypassed minimum capacity");
 }
 
+void test_write_budget_refill_is_exact_and_bounded() {
+    // Expected values use exact integer arithmetic for
+    // min(rate, tokens + (rate * elapsed_ns + remainder) / 1e9).
+    struct Case {
+        std::uint64_t rate;
+        std::uint64_t elapsed_ns;
+        std::uint64_t tokens;
+        std::uint64_t remainder;
+        std::uint64_t expected_tokens;
+        std::uint64_t expected_remainder;
+        const char* label;
+    };
+    const Case cases[]{
+        {18446744073709551615ULL, 0ULL, 18446744073709551598ULL, 999999999ULL,
+         18446744073709551598ULL, 999999999ULL,
+         "zero elapsed preserves the existing fractional credit"},
+        {18446744073709551615ULL, 1ULL, 0ULL, 0ULL,
+         18446744073ULL, 709551615ULL,
+         "one nanosecond at uint64 maximum rate"},
+        {18446744073709551615ULL, 999999999ULL, 0ULL, 999999999ULL,
+         18446744055262807542ULL, 290448384ULL,
+         "sub-second credit and carry do not overflow"},
+        {18446744073709551615ULL, 999999999ULL, 18446744073709551614ULL, 999999999ULL,
+         18446744073709551615ULL, 290448384ULL,
+         "a nearly full bucket saturates without adding past uint64"},
+        {18446744073709551615ULL, 1000000000ULL, 0ULL, 17ULL,
+         18446744073709551615ULL, 17ULL,
+         "exactly one second fills the bucket"},
+        {18446744073709551615ULL, 2000000000ULL, 0ULL, 0ULL,
+         18446744073709551615ULL, 0ULL,
+         "multi-second credit does not narrow and wrap"},
+        {18446744073709551615ULL, 18446744073709551615ULL, 0ULL, 999999999ULL,
+         18446744073709551615ULL, 349108224ULL,
+         "maximum idle duration preserves the fractional remainder"},
+        {3ULL, 333333333ULL, 0ULL, 0ULL,
+         0ULL, 999999999ULL,
+         "fractional byte remains below the admission threshold"},
+        {3ULL, 1ULL, 0ULL, 999999999ULL,
+         1ULL, 2ULL,
+         "fractional carry permits the next byte"},
+        {16777216ULL, 123456789ULL, 4096ULL, 99ULL,
+         2075357ULL, 215719523ULL,
+         "ordinary rate and partial refill"},
+        {3ULL, 333333333ULL, 3ULL, 0ULL,
+         3ULL, 999999999ULL,
+         "saturation still retains fractional byte credit"}
+    };
+    for (const auto& item : cases) {
+        auto tokens = item.tokens;
+        auto remainder = item.remainder;
+        throwdb::server::detail::refill_read_workload_write_budget(
+            item.rate, item.elapsed_ns, tokens, remainder);
+        require_equal(tokens, item.expected_tokens, item.label);
+        require_equal(remainder, item.expected_remainder, item.label);
+    }
+
+    // Repeated sub-byte refills must eventually make a whole byte available,
+    // including credit accumulated while the bucket was already full.
+    std::uint64_t tokens = 3;
+    std::uint64_t remainder = 0;
+    throwdb::server::detail::refill_read_workload_write_budget(
+        3, 333'333'333, tokens, remainder);
+    tokens -= 3;
+    throwdb::server::detail::refill_read_workload_write_budget(
+        3, 1, tokens, remainder);
+    require_equal(tokens, 1ULL, "full bucket lost fractional byte credit");
+    require_equal(remainder, 2ULL, "fractional byte carry was rounded");
+}
+
 void test_default_sequential_reader_context_is_accepted() {
     TempDirectory temporary("sequential-reader");
     auto logger = ReadWorkloadLogger::open(
@@ -1476,6 +1546,7 @@ void test_impossible_native_reader_context_is_rejected() {
 
 int main() {
     try {
+        test_write_budget_refill_is_exact_and_bounded();
         test_v2_format_lifecycle_crc_digest_and_split();
         test_cancelled_and_abandoned_requests_are_not_training_data();
         test_concurrent_fifo_lifecycle_and_physical_sequence();

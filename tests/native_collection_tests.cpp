@@ -579,9 +579,14 @@ void test_forked_builder_and_writer_handles_are_rejected() {
         parent_error = std::current_exception();
     }
 
+    bool child_released = false;
     if (child_closed_handle) {
         const char release = 'X';
-        static_cast<void>(::write(child_release[1], &release, 1));
+        ssize_t written = -1;
+        do {
+            written = ::write(child_release[1], &release, 1);
+        } while (written < 0 && errno == EINTR);
+        child_released = written == 1;
     }
     static_cast<void>(::close(child_ready[0]));
     static_cast<void>(::close(child_release[1]));
@@ -594,6 +599,7 @@ void test_forked_builder_and_writer_handles_are_rejected() {
         std::rethrow_exception(parent_error);
     }
     require(child_closed_handle, "forked child did not close its handle");
+    require(child_released, "cannot release the forked child");
     require(
         waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "forked writer was not rejected or did not tear down safely");
