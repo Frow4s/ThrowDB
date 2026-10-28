@@ -14,6 +14,7 @@ Start here according to the task:
 | Understand tuning profile matching | [Reader tuning profiles](tuning-profiles.md) |
 | Run benchmarks and acceptance tests | [Testing](testing.md) |
 | Validate actual Linux backends and mixed restart traffic | [Bounded Linux validation](linux-validation.md) |
+| Review the 400-million-vector integrity and read benchmark results | [Scale validation, 2026-09-17](scale-validation-results-20260917.md) |
 
 Format references:
 
