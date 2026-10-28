@@ -69,8 +69,7 @@ Stage 1 slices are called out inline:
   the thread-pool or io_uring parallel coordinator is enabled; per-request
   backend/policy selection remains a later optimization;
 - explicit source-array rebuild into the fresh format during the experimental
-  MVP; high-level read compatibility remains available for formats 3 through
-  6, while new collections default to format 7.
+  MVP; format 7 is the only supported storage format.
 
 The scheduler and backend interfaces keep the public API independent of
 `pread`, thread pools, and io_uring.
@@ -136,6 +135,11 @@ Use these signals to propose or build a new immutable version with improved
 sharding, hot tiers, prefix layout, index representation, cache allocation, and
 tuning profiles. Validate the new version and atomically publish it; do not
 rewrite the active collection in place.
+
+The accepted first implementation is specified in
+[workload-aware-layout.md](workload-aware-layout.md). It starts with bounded
+point-read logs and exact metadata-only replay, then uses a bounded hot-set and
+sparse co-access layout before constructing an offline sibling collection.
 
 ## Adaptive execution strategy
 

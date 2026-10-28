@@ -4,6 +4,7 @@ Start here according to the task:
 
 | Goal | Document |
 |---|---|
+| Review the latest code changes, tradeoffs, and validation | [Refactoring review](refactoring-review.md) |
 | Understand what is implemented and what is not | [Repository and production-readiness review](repository-review.md) |
 | Create, read, mutate, tune, serve, back up, and restore | [End-user guide](user-guide.md) |
 | Deploy one collection on Kubernetes/local NVMe | [Kubernetes deployment and operations](kubernetes-deployment.md) |
@@ -12,14 +13,13 @@ Start here according to the task:
 | Understand format-7 durability and maintenance | [Mutable storage](mutable-storage.md) |
 | Understand tuning profile matching | [Reader tuning profiles](tuning-profiles.md) |
 | Run benchmarks and acceptance tests | [Testing](testing.md) |
+| Validate actual Linux backends and mixed restart traffic | [Bounded Linux validation](linux-validation.md) |
+| Review the 400-million-vector integrity and read benchmark results | [Scale validation, 2026-09-17](scale-validation-results-20260917.md) |
 
 Format references:
 
 - [Collection contract](collection-contract.md)
 - [Format 7 mutable lifecycle](mutable-storage.md)
-- [Formats 3–6 native layout](native-format-v3.md)
-- [Older immutable format](storage-format.md)
-- [Numeric format-v2 representation](storage-format-v2.md)
 - [Product roadmap](product-roadmap.md)
 
 The operational guides describe the current single-collection product. They

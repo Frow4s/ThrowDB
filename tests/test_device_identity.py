@@ -168,14 +168,14 @@ def local_partition_source(
     wwid: str = "nvme-secret-wwid",
 ) -> FakeProbeSource:
     source = FakeProbeSource()
-    data_path = f"{root}/data/segment-1.dat"
-    pattern = f"{root}/data/segment-*.dat"
+    data_path = f"{root}/segments/segment-1.dat"
+    pattern = f"{root}/segments/segment-*.dat"
     source.glob_values[pattern] = (data_path,)
     source.stats[root] = stat_device(259, 1)
     source.stats[data_path] = stat_device(259, 1)
     source.statvfs_values[root] = statvfs_with_fsid(0x12345678)
     source.statvfs_values[data_path] = statvfs_with_fsid(0x12345678)
-    for directory_name in ("data", "deltas", "wal"):
+    for directory_name in ("segments", "wal"):
         directory = f"{root}/{directory_name}"
         source.directories.add(directory)
         source.stats[directory] = stat_device(259, 1)
@@ -220,7 +220,7 @@ def local_partition_source(
     return source
 
 
-def test_probe_uses_data_shard_mount_and_returns_only_redacted_identity() -> None:
+def test_probe_uses_segment_mount_and_returns_only_redacted_identity() -> None:
     source = local_partition_source()
     result = probe_collection_storage(
         "/collection",
@@ -228,7 +228,7 @@ def test_probe_uses_data_shard_mount_and_returns_only_redacted_identity() -> Non
         source=source,
     )
 
-    assert result.probed_path_count == 5
+    assert result.probed_path_count == 4
     assert result.used_root_fallback is False
     assert result.media.kind == "local_block"
     assert result.media.confidence == "high"
@@ -242,13 +242,11 @@ def test_probe_uses_data_shard_mount_and_returns_only_redacted_identity() -> Non
     assert "nvme-secret-wwid" not in serialized
 
 
-def test_default_discovery_probes_base_delta_and_wal_payloads() -> None:
+def test_default_discovery_probes_segment_and_wal_payloads() -> None:
     source = local_partition_source()
-    delta_path = "/collection/deltas/delta-a.dat"
     wal_path = "/collection/wal/wal-a.wal"
-    source.glob_values["/collection/deltas/delta-*.dat"] = (delta_path,)
     source.glob_values["/collection/wal/*.wal"] = (wal_path,)
-    for path in (delta_path, wal_path):
+    for path in (wal_path,):
         source.stats[path] = stat_device(259, 1)
         source.statvfs_values[path] = statvfs_with_fsid(0x12345678)
 
@@ -257,15 +255,13 @@ def test_default_discovery_probes_base_delta_and_wal_payloads() -> None:
         collection_salt=SALT,
         source=source,
     )
-    assert result.probed_path_count == 7
+    assert result.probed_path_count == 5
     assert result.media.component_count == 1
     assert result.media.reuse_scope == "durable"
     for path in (
         "/collection",
-        "/collection/data",
-        "/collection/data/segment-1.dat",
-        "/collection/deltas",
-        delta_path,
+        "/collection/segments",
+        "/collection/segments/segment-1.dat",
         "/collection/wal",
         wal_path,
     ):
@@ -362,7 +358,7 @@ def test_inaccessible_format7_segment_discovery_fails_closed() -> None:
 def test_incomplete_payload_discovery_fails_closed() -> None:
     complete_source = local_partition_source()
     incomplete_source = local_partition_source()
-    incomplete_source.glob_errors["/collection/deltas/delta-*.dat"] = PermissionError(
+    incomplete_source.glob_errors["/collection/wal/*.wal"] = PermissionError(
         "not allowed"
     )
 
@@ -385,12 +381,12 @@ def test_incomplete_payload_discovery_fails_closed() -> None:
 
 def test_payload_discovery_stops_at_limit_and_fails_closed() -> None:
     source = local_partition_source()
-    delta_paths = (
-        "/collection/deltas/delta-a.dat",
-        "/collection/deltas/delta-b.dat",
+    wal_paths = (
+        "/collection/wal/wal-a.wal",
+        "/collection/wal/wal-b.wal",
     )
-    source.glob_values["/collection/deltas/delta-*.dat"] = delta_paths
-    for path in delta_paths:
+    source.glob_values["/collection/wal/*.wal"] = wal_paths
+    for path in wal_paths:
         source.stats[path] = stat_device(259, 1)
         source.statvfs_values[path] = statvfs_with_fsid(0x12345678)
 
@@ -405,12 +401,12 @@ def test_payload_discovery_stops_at_limit_and_fails_closed() -> None:
     assert result.media.reuse_scope == "none"
     assert "discovery_incomplete" in result.media.evidence
     assert source.glob_limits == [
-        ("/collection/data/segment-*.dat", 2),
-        ("/collection/deltas/delta-*.dat", 1),
+        ("/collection/segments/segment-*.dat", 2),
+        ("/collection/wal/*.wal", 1),
     ]
-    assert source.stat_calls[delta_paths[0]] == 1
-    assert source.stat_calls[delta_paths[1]] == 0
-    assert source.is_dir_calls["/collection/wal"] == 0
+    assert source.stat_calls[wal_paths[0]] == 1
+    assert source.stat_calls[wal_paths[1]] == 0
+    assert len(source.glob_limits) == 2
 
     for invalid in (0, 65_537, True):
         with pytest.raises(ValueError, match="discovery_entry_limit"):
@@ -526,7 +522,7 @@ def test_machine_id_falls_back_to_dbus_location() -> None:
 
 def test_block_probe_recursively_includes_device_mapper_slaves() -> None:
     source = FakeProbeSource()
-    data_path = "/db/data/segment-1.dat"
+    data_path = "/db/segments/segment-1.dat"
     source.stats[data_path] = stat_device(253, 0)
     source.statvfs_values[data_path] = statvfs_with_fsid(42)
     source.texts["/proc/self/mountinfo"] = "\n".join(
@@ -577,7 +573,7 @@ def ceph_source(
     fsid: int | None = 4242,
 ) -> tuple[FakeProbeSource, str]:
     source = FakeProbeSource()
-    data_path = f"{mount_point}/store/data/segment-1.dat"
+    data_path = f"{mount_point}/store/segments/segment-1.dat"
     source.stats[data_path] = stat_device(0, 42)
     source.statvfs_values[data_path] = statvfs_with_fsid(fsid)
     escaped_mount = mount_point.replace(" ", "\\040")
@@ -664,8 +660,8 @@ def test_network_mount_without_fsid_is_not_durably_reused() -> None:
 
 def test_multiple_data_mounts_form_an_order_independent_composite() -> None:
     source = FakeProbeSource()
-    first_path = "/ceph-a/store/data/segment-1.dat"
-    second_path = "/ceph-b/store/data/segment-2.dat"
+    first_path = "/ceph-a/store/segments/segment-1.dat"
+    second_path = "/ceph-b/store/segments/segment-2.dat"
     source.stats[first_path] = stat_device(0, 42)
     source.stats[second_path] = stat_device(0, 43)
     source.statvfs_values[first_path] = statvfs_with_fsid(42)
@@ -708,7 +704,7 @@ def overlay_source(
     seccomp_filters: int,
 ) -> tuple[FakeProbeSource, str]:
     source = FakeProbeSource()
-    path = f"{mount_point}/store/data/segment-1.dat"
+    path = f"{mount_point}/store/segments/segment-1.dat"
     source.stats[path] = stat_device(0, minor)
     source.statvfs_values[path] = statvfs_with_fsid(fsid)
     source.texts["/proc/self/mountinfo"] = "\n".join(
@@ -1066,7 +1062,7 @@ def test_bytes_and_pathlike_bytes_are_decoded_for_probe_source() -> None:
     from_bytes = probe_collection_storage(
         BytesPath(b"/collection"),
         collection_salt=SALT,
-        data_paths=(BytesPath(b"/collection/data/segment-1.dat"),),
+        data_paths=(BytesPath(b"/collection/segments/segment-1.dat"),),
         source=source,
     )
     assert from_bytes.media.fingerprint == expected.media.fingerprint

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import throwdb
+from throwdb.server import ServerLaunchError, find_native_server
 
 from ._harness import ServerProcess
 
@@ -22,33 +23,35 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture(scope="session")
 def throwdb_server_binary(pytestconfig: pytest.Config) -> Path:
-    configured = pytestconfig.getoption("--throwdb-server-binary")
-    candidates: list[Path] = []
+    configured = (
+        pytestconfig.getoption("--throwdb-server-binary")
+        or os.environ.get("THROWDB_SERVER_BINARY")
+    )
     if configured:
-        candidates.append(Path(configured))
-    environment = os.environ.get("THROWDB_SERVER_BINARY")
-    if environment:
-        candidates.append(Path(environment))
+        try:
+            return find_native_server(Path(configured))
+        except ServerLaunchError as error:
+            pytest.fail(f"configured native server is invalid: {error}", pytrace=False)
     repository = Path(__file__).resolve().parents[2]
     installed_binary = (
         Path(throwdb.__file__).resolve().parent
         / "libexec"
         / "_throwdbd_native"
     )
-    candidates.extend(
-        [
-            installed_binary,
-            repository / "build-grpc" / "throwdbd",
-            repository / "build-grpc-dev" / "throwdbd",
-        ]
-    )
+    candidates = [
+        installed_binary,
+        repository / "build" / "server-release" / "throwdbd",
+        repository / "build-grpc" / "throwdbd",
+        repository / "build-grpc-dev" / "throwdbd",
+    ]
     discovered = shutil.which("throwdbd")
     if discovered:
         candidates.append(Path(discovered))
     for candidate in candidates:
-        resolved = candidate.expanduser().resolve()
-        if resolved.is_file() and os.access(resolved, os.X_OK):
-            return resolved
+        try:
+            return find_native_server(candidate)
+        except ServerLaunchError:
+            continue
     pytest.skip(
         "throwdbd is not built; pass --throwdb-server-binary or set "
         "THROWDB_SERVER_BINARY"

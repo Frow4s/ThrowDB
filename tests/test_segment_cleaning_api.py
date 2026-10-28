@@ -31,7 +31,7 @@ def _build_garbage(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=4 * dimension * 2,
+        segment_size_bytes=4 * dimension * 2,
         format_version=format_version,
     ) as builder:
         builder.add(ids, vectors)
@@ -102,29 +102,6 @@ def test_python_clean_segments_is_safe_by_default_and_advances_execute_cursor(
         )
 
 
-def test_clean_segments_rejects_format6(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    path = tmp_path / "legacy"
-    _build_garbage(path, format_version=6)
-    with throwdb.Collection.open(path, mode="r+") as writer:
-        with pytest.raises(NotImplementedError, match="format-7"):
-            writer.clean_segments(**_PERMISSIVE)
-
-    with pytest.raises(SystemExit) as raised:
-        cli_main(
-            [
-                "clean-segments",
-                "--storage",
-                str(path),
-                "--dry-run",
-            ]
-        )
-    assert raised.value.code == 2
-    assert "Traceback" not in capsys.readouterr().err
-
-
 def test_clean_segments_cli_dry_run_exposes_every_bound(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -171,11 +148,11 @@ def test_executing_maintain_advances_past_a_clean_segment_prefix(
     path = tmp_path / "cursor-maintain"
     _build_garbage(path, deleted_ids=(5, 6, 7))
     with throwdb.Collection.open(path, mode="r+") as writer:
-        folded = writer.compact_deltas(
+        folded = writer.fold_partitions(
             max_input_bytes=1 << 20,
             max_input_entries=16,
         )
-        assert folded["compacted"] is True
+        assert folded["folded"] is True
         policy = {
             "clean_max_candidate_segments": 1,
             "clean_max_sidecar_scan_bytes": 1 << 20,

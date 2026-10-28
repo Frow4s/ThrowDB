@@ -37,8 +37,8 @@ THROWDB_BUILD_BENCHMARKS = "OFF"
 THROWDB_INSTALL_CPP_SDK = "OFF"
 # The installed product exposes gRPC as its public server contract. Official
 # wheel builders must provide the pinned C++ gRPC/Protobuf CMake packages;
-# configuration fails explicitly instead of silently shipping a TCP-only
-# daemon when those build dependencies are absent.
+# configuration fails explicitly when the required transport dependencies
+# are absent.
 THROWDB_BUILD_SERVER = "ON"
 THROWDB_BUILD_GRPC_SERVER = "ON"
 THROWDB_GRPC_ENABLE_REFLECTION = "OFF"

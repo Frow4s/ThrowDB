@@ -53,7 +53,7 @@ def _build(
         path,
         schema=schema,
         format_version=format_version,
-        shard_size_bytes=max(1, vectors[0].nbytes * rows_per_segment),
+        segment_size_bytes=max(1, vectors[0].nbytes * rows_per_segment),
     ) as builder:
         builder.add(ids, vectors)
 
@@ -360,7 +360,7 @@ def test_stream_get_preserves_snapshot_order_duplicates_and_partial_failure(
             failing.read_into(np.empty((1, 4), dtype=np.float16))
 
 
-def test_streaming_validation_snapshot_limits_and_format_gate(
+def test_streaming_validation_and_snapshot_limits(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "limits"
@@ -392,15 +392,6 @@ def test_streaming_validation_snapshot_limits_and_format_gate(
         with collection.scan_ids(max_snapshot_bytes=1 << 20) as scan:
             assert 0 < scan.snapshot_bytes <= 1 << 20
 
-    legacy = tmp_path / "legacy"
-    _build(legacy, [1, 2], vectors, format_version=6)
-    with throwdb.Collection.open(legacy) as collection:
-        with pytest.raises(NotImplementedError, match="format-7"):
-            collection.stream_get([1])
-        with pytest.raises(NotImplementedError, match="format-7"):
-            collection.scan_records()
-        with pytest.raises(NotImplementedError, match="format-7"):
-            collection.scan_ids()
 
 
 def test_stream_get_detects_source_length_change_between_batches(

@@ -13,9 +13,6 @@ from typing import Final
 
 
 _PAYLOAD_PATTERNS: Final = (
-    ("data", "shard-*.dat", "data"),
-    ("data", "segment-*.dat", "data"),
-    ("deltas", "delta-*.dat", "data"),
     ("segments", "segment-*.dat", "data"),
     ("wal", "*.wal", "wal"),
 )

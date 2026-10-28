@@ -38,7 +38,7 @@ def _build_store(path: Path) -> np.ndarray:
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=dimension, dtype="float16"),
-        shard_size_bytes=base[:2].nbytes,
+        segment_size_bytes=base[:2].nbytes,
         format_version=7,
     ) as builder:
         builder.add(np.array([10, 20, 30], dtype=np.uint32), base)
@@ -508,7 +508,7 @@ def test_grpc_requests_and_responses_larger_than_four_mib(
             dimension=dimension,
             dtype="float16",
         ),
-        shard_size_bytes=2 << 20,
+        segment_size_bytes=2 << 20,
         format_version=7,
     ) as builder:
         builder.add(ids, original)

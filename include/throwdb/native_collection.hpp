@@ -21,11 +21,9 @@ struct NativeBuilderOptions {
     // Target payload bytes per immutable base segment. Headers/ID sidecars are
     // additional. The builder also caps every segment at 2^32 rows.
     std::uint64_t segment_size_bytes = 16ULL << 30;
-    // Format 7 is the stable local-storage format. Format 6 remains readable
-    // and writable for existing collections.
+    // Format 7 is the only supported storage format.
     std::uint32_t format_version = 7;
-    // Format-7 builders use 4096 authoritative partitions by default. Kept at
-    // the end to preserve aggregate initialization of the stable v6 fields.
+    // Builders use 4096 authoritative partitions by default.
     std::uint32_t partition_bits = 12;
 };
 
@@ -34,9 +32,6 @@ struct NativeOpenStats {
     double manifest_seconds = 0.0;
     double index_seconds = 0.0;
     double index_header_seconds = 0.0;
-    double index_allocation_seconds = 0.0;
-    double index_controls_seconds = 0.0;
-    double index_slots_seconds = 0.0;
     double index_checksum_seconds = 0.0;
     double index_structural_validation_seconds = 0.0;
     double base_segments_seconds = 0.0;
@@ -47,12 +42,12 @@ struct NativeOpenStats {
     bool index_structural_validation_performed = false;
 };
 
-// Native-only safety bounds applied while opening and replaying mutable state.
-// Format 6 also applies finite values to live overlay growth, committed WAL
-// operations/bytes, and the extra header retained by rotation. Defaults
-// preserve the historical unbounded embedded-open behaviour. Servers should
-// provide finite values so a valid but unexpectedly large WAL backlog fails
-// closed before rebuilding an unbounded in-memory overlay.
+// Native-only safety bounds applied while opening/replaying mutable state and
+// before live overlay growth, committed WAL operations/bytes, or the extra WAL
+// header retained by rotation, for format 7. Finite limits reject
+// writes before publication so the collection can reopen under the same bounds.
+// Defaults preserve the historical unbounded embedded-open behaviour. Servers
+// should provide finite values to bound retained mutation state.
 struct NativeOpenOptions {
     std::uint64_t max_wal_bytes =
         std::numeric_limits<std::uint64_t>::max();
@@ -69,8 +64,8 @@ struct NativeOpenOptions {
 };
 
 // Lightweight immutable layout metadata used to select reader policies before
-// loading the potentially multi-gigabyte flat index. inspect_metadata() reads
-// only the checksummed manifest and index header.
+// loading partition snapshots and replaying WALs. inspect_metadata() reads only
+// the checksummed collection manifest.
 struct NativeCollectionMetadata {
     std::uint32_t format_version = 0;
     std::uint32_t dimension = 0;
@@ -81,6 +76,8 @@ struct NativeCollectionMetadata {
     std::string feature_discriminator;
     std::uint64_t required_feature_bits = 0;
     std::uint64_t optional_feature_bits = 0;
+    std::uint64_t collection_id_low = 0;
+    std::uint64_t collection_id_high = 0;
 };
 
 // Process/container capability probe used before selecting a persisted reader
@@ -99,6 +96,7 @@ struct NativeReaderCapabilities {
 struct NativeReadStats {
     double total_seconds = 0.0;
     double lookup_seconds = 0.0;
+    double physical_sort_seconds = 0.0;
     double physical_plan_seconds = 0.0;
     // Queue/admission wait, physical I/O, and scatter copies currently share
     // one wall-clock phase because those operations overlap in parallel
@@ -107,10 +105,24 @@ struct NativeReadStats {
     std::uint64_t requested_rows = 0;
     std::uint64_t base_rows = 0;
     std::uint64_t mutation_rows = 0;
+    std::uint64_t unique_files = 0;
     std::uint64_t planned_ranges = 0;
+    std::uint64_t requested_bytes = 0;
     std::uint64_t planned_read_bytes = 0;
+    std::uint64_t completed_read_bytes = 0;
+    std::uint64_t useful_read_bytes = 0;
+    std::uint64_t gap_bytes = 0;
+    std::uint64_t overread_bytes = 0;
+    std::uint64_t pages_touched = 0;
+    std::uint64_t page_runs = 0;
+    std::uint64_t chunks_touched = 0;
+    std::uint64_t chunk_runs = 0;
+    std::uint64_t input_discontinuities = 0;
+    std::uint64_t input_inversions = 0;
+    std::uint64_t maximum_range_bytes = 0;
+    std::uint64_t mean_range_bytes = 0;
     std::uint64_t backend_tasks = 0;
-    bool zero_delta_fast_path = false;
+    bool snapshot_only_fast_path = false;
 };
 
 // A deterministic, bounded sample within one open collection snapshot and
@@ -195,8 +207,6 @@ enum class NativeMutationVerification : std::uint8_t {
 // rotate_wal() returns the same snapshot with rotated=true when it published a
 // successor WAL. An empty active WAL is a successful no-op.
 struct NativeMutationLogStats {
-    bool catalog_managed = false;
-    bool delta_managed = false;
     std::uint64_t generation = 0;
     std::uint64_t committed_sequence = 0;
     std::uint64_t materialized_sequence = 0;
@@ -204,40 +214,45 @@ struct NativeMutationLogStats {
     std::uint64_t active_wal_bytes = 0;
     std::uint64_t active_wal_put_rows = 0;
     std::uint64_t total_wal_bytes = 0;
-    std::uint64_t delta_run_count = 0;
-    std::uint64_t delta_entry_count = 0;
-    std::uint64_t delta_put_rows = 0;
-    std::uint64_t total_delta_bytes = 0;
-    std::uint64_t reclaimed_wal_count = 0;
-    std::uint64_t reclaimed_wal_bytes = 0;
+    // CURRENT-referenced run files and all their entries, including inactive
+    // sections of files retained for other partitions.
+    std::uint64_t index_run_count = 0;
+    std::uint64_t index_run_entry_count = 0;
+    // Rows retained in segments produced by WAL materialization or cleaning;
+    // these may include obsolete rows, so this is not a live-record count.
+    std::uint64_t materialized_segment_rows = 0;
+    // index_run_bytes + materialized_segment_bytes. Excludes WALs, partition
+    // snapshots and unreferenced files awaiting orphan reclamation.
+    std::uint64_t mutation_resource_bytes = 0;
     std::uint64_t materialized_wal_count = 0;
     std::uint64_t materialized_wal_input_bytes = 0;
-    std::uint64_t compacted_delta_run_count = 0;
-    std::uint64_t compacted_delta_input_entries = 0;
-    std::uint64_t compacted_delta_input_bytes = 0;
-    std::uint64_t reclaimed_delta_run_count = 0;
-    std::uint64_t reclaimed_delta_bytes = 0;
+    // Active run-section records consumed by this fold. Bytes exclude run
+    // headers and tables of contents; entries may repeat an ID across runs.
+    std::uint64_t folded_run_input_entries = 0;
+    std::uint64_t folded_run_input_bytes = 0;
     bool rotated = false;
     bool materialized = false;
     bool materialization_budget_blocked = false;
-    bool compacted = false;
+    bool folded = false;
     bool reclamation_complete = true;
-    // New diagnostics are appended to preserve the layout of the original
-    // format-6 stats prefix for native callers.
-    std::uint64_t total_delta_run_bytes = 0;
-    std::uint64_t total_delta_segment_bytes = 0;
-    std::uint64_t compacted_partition_count = 0;
-    std::uint64_t compacted_run_section_count = 0;
-    std::uint64_t compacted_snapshot_input_entries = 0;
-    std::uint64_t compacted_snapshot_input_bytes = 0;
-    std::uint64_t compacted_output_entries = 0;
-    std::uint64_t compacted_output_bytes = 0;
+    // Complete retained run-file sizes, including inactive sections, headers
+    // and tables of contents.
+    std::uint64_t index_run_bytes = 0;
+    // Complete retained materialized/cleaned data and ID-sidecar file sizes.
+    std::uint64_t materialized_segment_bytes = 0;
+    std::uint64_t folded_partition_count = 0;
+    std::uint64_t folded_run_section_count = 0;
+    std::uint64_t folded_snapshot_input_entries = 0;
+    std::uint64_t folded_snapshot_input_bytes = 0;
+    std::uint64_t folded_output_entries = 0;
+    std::uint64_t folded_output_bytes = 0;
     // Committed transaction records in the active WAL. Unlike put_rows, this
     // is non-zero for a delete-only transaction stream.
     std::uint64_t active_wal_transaction_count = 0;
-    bool compaction_budget_blocked = false;
-    // Format-6/7 retained-memory/backlog diagnostics. Appended for native ABI
-    // compatibility with callers compiled against the original stats prefix.
+    // At least one active run section remains after this bounded pass. This
+    // can be true even when folded is also true.
+    bool fold_budget_blocked = false;
+    // Retained-memory and WAL-backlog diagnostics.
     std::uint64_t overlay_entry_count = 0;
     std::uint64_t estimated_overlay_bytes = 0;
     std::uint64_t active_wal_operation_count = 0;
@@ -302,11 +317,7 @@ enum class NativeOrphanClass : std::uint8_t {
     SupersededCatalog,
     TempPublication,
     UnreferencedWal,
-    CompleteUnreferencedDeltaPair,
-    PartialUnreferencedDeltaPair,
     UnknownDoNotTouch,
-    // Format-7 values are append-only so existing numeric values remain
-    // stable for native callers that persist diagnostics.
     CompleteUnreferencedSegmentPair,
     PartialUnreferencedSegmentPair,
     UnreferencedSnapshot,
@@ -327,7 +338,6 @@ struct NativeOrphanEntry {
     // True when this storage format's destructive collector may consider the
     // class after its own fresh locked scan, age/budget checks, and no-follow
     // identity revalidation. This remains diagnostic, not unlink authority.
-    // Kept append-only so the layout of the pre-existing fields stays stable.
     bool candidate = false;
 };
 
@@ -431,6 +441,9 @@ public:
     [[nodiscard]] std::uint32_t output_dimension() const noexcept;
     [[nodiscard]] DType dtype() const noexcept;
     void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+    [[nodiscard]] NativeReadStats get_into_profiled(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const;
 
@@ -656,13 +669,13 @@ public:
             std::numeric_limits<std::uint64_t>::max(),
         std::uint64_t max_memory_bytes =
             std::numeric_limits<std::uint64_t>::max());
-    // Format 6 merges the oldest contiguous DeltaV1 prefix. Format 7 folds
-    // complete active run sections into selected authoritative partitions.
+    // Fold complete active run sections into selected authoritative partitions.
     // Embedding segments and newer WAL resources are never rewritten here.
-    // The no-argument overload uses the format-aware complete bound: 8 runs
-    // for format 6 and all 4096 possible active runs for format 7.
-    [[nodiscard]] NativeMutationLogStats compact_delta_runs();
-    [[nodiscard]] NativeMutationLogStats compact_delta_runs(
+    // max_runs (1..4096) limits active runs per selected partition. A
+    // partition over the limit is left unchanged; its runs are never folded
+    // partially. The no-argument overload admits all 4096 possible runs.
+    [[nodiscard]] NativeMutationLogStats fold_partitions();
+    [[nodiscard]] NativeMutationLogStats fold_partitions(
         std::uint64_t max_runs,
         std::uint64_t max_input_bytes = 8ULL << 30,
         std::uint64_t max_input_entries = 1'000'000);
@@ -673,7 +686,7 @@ public:
         NativeSegmentCleaningOptions options = {});
     // Build the same read-only inventory through an already-open writable
     // handle. A writable handle is required because its lifetime writer lease
-    // excludes unpublished materialization/compaction output.
+    // excludes unpublished materialization/folding output.
     [[nodiscard]] NativeOrphanInventory collect_orphans();
     [[nodiscard]] NativeOrphanCollectionResult reclaim_orphans(
         NativeOrphanCollectionOptions options = {});

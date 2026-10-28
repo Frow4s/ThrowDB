@@ -65,8 +65,7 @@ flowchart LR
 
 ### Collection construction and schema
 
-- Default creation format is format 7; format 6 remains a compatibility
-  option.
+- Format 7 is the only supported storage format.
 - Embeddings are fixed-width row-major `float16` or `float32`.
 - One dimension and dtype are fixed for the lifetime of a collection.
 - Python accepts every standard NumPy signed/unsigned integer width when every
@@ -221,8 +220,8 @@ collection understands the new barrier; mixed old/new operation is unsupported.
 
 - No project license has been selected and no LICENSE/third-party NOTICE is
   bundled, despite static native dependencies.
-- Version `0.1.0` is duplicated in `pyproject.toml`, `CMakeLists.txt`, and the
-  binding, with no tag/version consistency gate.
+- Version now comes from `pyproject.toml` for both CMake and the extension;
+  a tag/version consistency gate is still missing.
 - The workflow uploads ephemeral Actions artifacts only; it does not publish a
   GitHub Release, package-index artifact, checksum manifest, SBOM, signature,
   provenance, or OCI image.

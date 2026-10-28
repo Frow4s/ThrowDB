@@ -85,11 +85,7 @@ READER_OPTION_NAMES = (
     "max_read_range_bytes",
 )
 
-LEGACY_MANIFEST_MAGIC = b"THROWDBM"
-NATIVE_MANIFEST_MAGICS = frozenset({b"TDBNMNF1", b"TDBNMNF2"})
-LEGACY_STORE_FORMAT = "legacy_immutable"
 NATIVE_STORE_FORMAT = "native_mutable"
-
 
 @dataclass(frozen=True)
 class SequentialScenario:
@@ -320,31 +316,6 @@ def directory_size(path: Path) -> int:
     return total
 
 
-def detect_store_format(store_path: Path) -> str:
-    """Identify the on-disk format without asking either reader to parse it."""
-
-    manifest_path = store_path / "manifest.bin"
-    try:
-        with manifest_path.open("rb") as manifest:
-            magic = manifest.read(8)
-    except FileNotFoundError as error:
-        raise FileNotFoundError(
-            f"storage manifest does not exist: {manifest_path}"
-        ) from error
-    if magic == LEGACY_MANIFEST_MAGIC:
-        return LEGACY_STORE_FORMAT
-    if magic in NATIVE_MANIFEST_MAGICS:
-        return NATIVE_STORE_FORMAT
-    if len(magic) != 8:
-        raise ValueError(
-            f"storage manifest is truncated: {manifest_path} "
-            f"contains only {len(magic)} magic bytes"
-        )
-    raise ValueError(
-        f"unsupported storage manifest magic {magic!r}: {manifest_path}"
-    )
-
-
 def open_benchmark_storage(
     store_path: Path,
     *,
@@ -356,13 +327,12 @@ def open_benchmark_storage(
     io_uring_queue_depth: int,
     tuning_mode: str = TUNING_MODE,
 ) -> tuple[Any, str]:
-    """Open either format through its supported public Python interface."""
+    """Open the format-7 collection through its public Python interface."""
 
     if tuning_mode not in {"explicit", "auto", "persisted", "conservative"}:
         raise ValueError(
             "tuning_mode must be explicit, auto, persisted, or conservative"
         )
-    store_format = detect_store_format(store_path)
     tuning = {
         "io_workers": io_workers,
         "io_queue_capacity": io_queue_capacity,
@@ -371,20 +341,14 @@ def open_benchmark_storage(
         "io_uring_workers": io_uring_workers,
         "io_uring_queue_depth": io_uring_queue_depth,
     }
-    if store_format == NATIVE_STORE_FORMAT:
-        return (
-            throwdb.Collection.open(
-                store_path,
-                mode="r",
-                tuning=tuning if tuning_mode == "explicit" else tuning_mode,
-            ),
-            store_format,
-        )
-    if tuning_mode != "explicit":
-        raise ValueError(
-            "saved reader tuning is supported only by native collections"
-        )
-    return throwdb.Storage.open(store_path, **tuning), store_format
+    return (
+        throwdb.Collection.open(
+            store_path,
+            mode="r",
+            tuning=tuning if tuning_mode == "explicit" else tuning_mode,
+        ),
+        NATIVE_STORE_FORMAT,
+    )
 
 
 def close_benchmark_storage(storage: Any) -> None:
@@ -842,13 +806,7 @@ def evict_data_cache(store_path: Path) -> dict[str, int | float]:
         raise RuntimeError(
             "cold cache mode requires os.posix_fadvise and POSIX_FADV_DONTNEED"
         )
-    data_directory = store_path / "data"
-    partitioned_segments_directory = store_path / "segments"
-    data_paths = sorted(
-        set(data_directory.glob("shard-*.dat"))
-        | set(data_directory.glob("segment-*.dat"))
-        | set(partitioned_segments_directory.glob("segment-*.dat"))
-    )
+    data_paths = sorted((store_path / "segments").glob("segment-*.dat"))
     wal_paths = sorted((store_path / "wal").glob("*.wal"))
     if not data_paths:
         raise RuntimeError(f"no embedding data files found under {store_path}")
@@ -867,8 +825,6 @@ def evict_data_cache(store_path: Path) -> dict[str, int | float]:
         finally:
             os.close(fd)
     return {
-        # Keep the historical key so existing report consumers do not break.
-        "shard_count": len(data_paths),
         "data_file_count": len(data_paths),
         "wal_file_count": len(wal_paths),
         "advised_file_count": len(payload_paths),

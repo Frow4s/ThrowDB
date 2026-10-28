@@ -216,6 +216,26 @@ def _no_io_uring(
     }
 
 
+class _FakeResourceProbe(calibration.ResourceProbe):
+    """Synthetic reads and clocks must not include host procfs/cgroup activity."""
+
+    def __init__(self) -> None:
+        # Avoid discovering real host resources for this deterministic fixture.
+        pass
+
+    def snapshot(self) -> calibration.ResourceSnapshot:
+        return calibration.ResourceSnapshot(
+            monotonic_ns=0,
+            process_usage=None,
+            process_io=None,
+            cgroup_path=None,
+            cgroup_cpu_stat=None,
+            cgroup_cpu_max=None,
+            cgroup_cpu_weight=None,
+            cgroup_pressure=None,
+        )
+
+
 def _run_fake(
     native: _FakeNative,
     monkeypatch: pytest.MonkeyPatch,
@@ -251,6 +271,7 @@ def _run_fake(
         clock=_StepClock() if clock is None else clock,  # type: ignore[arg-type]
         progress=progress,
         capability_probe=_no_io_uring,
+        resource_probe=_FakeResourceProbe(),
     )
 
 

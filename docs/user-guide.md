@@ -165,7 +165,7 @@ throwdb create \
   --ids "$IDS" \
   --embeddings "$EMBEDDINGS" \
   --format-version 7 \
-  --shard-size-gib 16 \
+  --segment-size-gib 16 \
   --batch-rows 65536
 ```
 
@@ -194,7 +194,7 @@ with throwdb.Collection.create(
     Path("/nvme/throwdb/collection"),
     schema=schema,
     format_version=7,
-    shard_size_bytes=16 << 30,
+    segment_size_bytes=16 << 30,
 ) as collection:
     for begin in range(0, len(ids), 65_536):
         end = min(begin + 65_536, len(ids))
@@ -458,35 +458,44 @@ queries below both that byte limit and `max_ids_per_request`.
 
 `RemoteCollection` generates a UUID operation ID when none is supplied. If the
 transport fails after the server may have committed, it raises
-`AmbiguousCommitError` and exposes that ID. Retry the identical operation with
-the same ID:
+`AmbiguousCommitError` and exposes `retry_token`, which retains both the ID
+and the original replay domain. With durable idempotency enabled, retry the
+identical operation with that token:
 
 ```python
-import uuid
 import throwdb
 
-operation_id = uuid.uuid4()
+durable_replay = remote.durable_idempotency
+operation = remote.mutation_token()
 try:
-    remote.upsert(ids, vectors, operation_id=operation_id)
+    remote.upsert(ids, vectors, operation_id=operation)
 except throwdb.AmbiguousCommitError as error:
-    assert error.operation_id == operation_id
-    # Reconnect/Describe, then replay the exact same method, IDs and bytes.
-    remote.upsert(ids, vectors, operation_id=operation_id)
+    if not durable_replay:
+        raise  # Reconcile the outcome; this server cannot guarantee replay.
+    # Reconnect if needed, then replay the exact method, IDs and bytes.
+    remote.upsert(ids, vectors, operation_id=error.retry_token)
 ```
+
+A connection pins the default domain used by plain UUID operation IDs.
+`describe()` and `count` can refresh server metadata without changing it. After
+journal rollover, refresh `describe()` and capture `mutation_token()` for new
+operations, or reconnect. Retrying an old token against a retired domain returns a
+precondition error; reconcile an uncertain result before issuing a new logical
+operation. An operation ID alone is insufficient for retries across reconnects.
 
 An explicit gRPC mutation `ABORTED` response is exposed as
 `RemoteAbortedError`. ThrowDB reserves this status for an admission rejection
 before the current request entered durable `PREPARE`, so that request
 definitely did not commit. It is safe to retry even when the server does not
 advertise durable idempotency, but replay only the identical method, IDs, and
-embedding bytes with the error's operation ID and bounded backoff:
+embedding bytes with the error's retry token and bounded backoff:
 
 ```python
 try:
-    remote.upsert(ids, vectors, operation_id=operation_id)
+    remote.upsert(ids, vectors, operation_id=operation)
 except throwdb.RemoteAbortedError as error:
     # Apply bounded backoff, then replay the exact logical operation.
-    remote.upsert(ids, vectors, operation_id=error.operation_id)
+    remote.upsert(ids, vectors, operation_id=error.retry_token)
 ```
 
 `RemoteAbortedError` remains a subclass of `AmbiguousCommitError` for backward

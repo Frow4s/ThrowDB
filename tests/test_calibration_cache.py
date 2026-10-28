@@ -43,17 +43,13 @@ def test_prepare_cold_payload_cache_advises_unique_payload_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = tmp_path / "data"
-    deltas = tmp_path / "deltas"
     segments = tmp_path / "segments"
     wal = tmp_path / "wal"
-    data.mkdir()
-    deltas.mkdir()
     segments.mkdir()
     wal.mkdir()
-    (data / "shard-000001.dat").write_bytes(bytes(11))
-    (data / "segment-00000001.dat").write_bytes(bytes(13))
-    (deltas / "delta-00000001.dat").write_bytes(bytes(7))
+    (segments / "segment-00000000000000000000000000000002.dat").write_bytes(bytes(11))
+    (segments / "segment-00000000000000000000000000000003.dat").write_bytes(bytes(13))
+    (segments / "segment-00000000000000000000000000000004.dat").write_bytes(bytes(7))
     (segments / "segment-00000000000000000000000000000001.dat").write_bytes(
         bytes(17)
     )
@@ -62,11 +58,11 @@ def test_prepare_cold_payload_cache_advises_unique_payload_files(
     (wal / "ignored.bin").write_bytes(bytes(29))
 
     # Exercise the set-based path de-duplication explicitly: the extra
-    # pattern overlaps both existing data patterns.
+    # pattern overlaps the segment payload pattern.
     monkeypatch.setattr(
         calibration_cache,
         "_PAYLOAD_PATTERNS",
-        (*calibration_cache._PAYLOAD_PATTERNS, ("data", "*.dat", "data")),
+        (*calibration_cache._PAYLOAD_PATTERNS, ("segments", "*.dat", "data")),
     )
     advised: list[tuple[int, int, int]] = []
 
@@ -125,9 +121,9 @@ def test_prepare_cold_payload_cache_reports_fadvise_failure_and_closes_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = tmp_path / "data"
+    data = tmp_path / "segments"
     data.mkdir()
-    (data / "shard-000001.dat").write_bytes(bytes(31))
+    (data / "segment-000001.dat").write_bytes(bytes(31))
     observed_fds: list[int] = []
 
     def fail(fd: int, offset: int, length: int, advice: int) -> None:
@@ -161,9 +157,9 @@ def test_prepare_cold_payload_cache_never_follows_payload_symlink(
         pytest.skip("platform does not expose O_NOFOLLOW")
     outside = tmp_path / "outside-payload.dat"
     outside.write_bytes(b"do not advise through this symlink")
-    data = tmp_path / "store" / "data"
+    data = tmp_path / "store" / "segments"
     data.mkdir(parents=True)
-    (data / "shard-000001.dat").symlink_to(outside)
+    (data / "segment-000001.dat").symlink_to(outside)
     advised: list[int] = []
 
     def advise(fd: int, offset: int, length: int, advice: int) -> None:
@@ -187,8 +183,8 @@ def test_prepare_cold_payload_cache_reports_no_payload_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / "data").mkdir()
-    (tmp_path / "data" / "unrelated.bin").write_bytes(bytes(7))
+    (tmp_path / "segments").mkdir()
+    (tmp_path / "segments" / "unrelated.bin").write_bytes(bytes(7))
     advised: list[int] = []
     _install_supported_fadvise(
         monkeypatch,
@@ -213,10 +209,10 @@ def test_prepare_cold_payload_cache_honors_discovery_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = tmp_path / "data"
+    data = tmp_path / "segments"
     data.mkdir()
-    (data / "shard-000001.dat").write_bytes(bytes(7))
-    (data / "shard-000002.dat").write_bytes(bytes(11))
+    (data / "segment-000001.dat").write_bytes(bytes(7))
+    (data / "segment-000002.dat").write_bytes(bytes(11))
     advised: list[int] = []
     _install_supported_fadvise(
         monkeypatch,
@@ -245,10 +241,10 @@ def test_prepare_cold_payload_cache_bounds_inventory_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data = tmp_path / "data"
+    data = tmp_path / "segments"
     data.mkdir()
-    (data / "shard-000001.dat").write_bytes(bytes(7))
-    (data / "shard-000002.dat").write_bytes(bytes(11))
+    (data / "segment-000001.dat").write_bytes(bytes(7))
+    (data / "segment-000002.dat").write_bytes(bytes(11))
     advised: list[int] = []
     _install_supported_fadvise(
         monkeypatch,

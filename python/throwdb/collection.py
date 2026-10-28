@@ -10,7 +10,7 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from os import PathLike
 from types import TracebackType
@@ -18,6 +18,14 @@ from typing import Any, Final, Literal, TypeAlias, TypedDict, cast, overload
 
 import numpy as np
 
+from ._array_validation import (
+    _StreamingNumericIdSource,
+    _normalize_numeric_ids,
+    _require_disjoint_numpy_arrays,
+    _validate_id_scan_output,
+    _validate_output,
+    _validate_stream_output,
+)
 from ._throwdb import (
     NativeCollection,
     NativeCollectionBuilder,
@@ -51,16 +59,13 @@ from .record_scan import RecordBatch
 _UINT32_MAX: Final = (1 << 32) - 1
 _ROW_REF_SEGMENT_ID_MAX: Final = _UINT32_MAX - 1
 _UINT64_MAX: Final = (1 << 64) - 1
-_DEFAULT_SHARD_SIZE_BYTES: Final = 16 << 30
-_ID_SCAN_CHUNK_ROWS: Final = 1 << 20
+_DEFAULT_SEGMENT_SIZE_BYTES: Final = 16 << 30
 _DEFAULT_ID_SCAN_BATCH_ROWS: Final = 65_536
 _DEFAULT_STREAM_BATCH_BYTES: Final = 64 << 20
 _DEFAULT_STREAM_SNAPSHOT_BYTES: Final = 256 << 20
-_DEFAULT_DELTA_COMPACTION_MAX_RUNS: Final = 8
-_MAX_DELTA_COMPACTION_RUNS: Final = 64
 _MAX_PARTITIONED_FOLD_RUNS: Final = 4096
-_DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES: Final = 8 << 30
-_DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES: Final = 1_000_000
+_DEFAULT_FOLD_MAX_INPUT_BYTES: Final = 8 << 30
+_DEFAULT_FOLD_MAX_INPUT_ENTRIES: Final = 1_000_000
 _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS: Final = 8
 _DEFAULT_CLEAN_MAX_SIDECAR_SCAN_BYTES: Final = 1 << 30
 _DEFAULT_CLEAN_MAX_SOURCE_BYTES: Final = 32 << 30
@@ -79,7 +84,6 @@ _DEFAULT_MAINTAIN_MATERIALIZE_MAX_WALS: Final = 8
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_BYTES: Final = 8 << 30
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES: Final = 2_000_000
 _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES: Final = 1 << 30
-_DEFAULT_MAINTAIN_COMPACT_MIN_RUNS: Final = 8
 _DEFAULT_MAX_WAL_BACKLOG_BYTES: Final = 16 << 30
 _DEFAULT_MAX_WAL_BACKLOG_OPERATIONS: Final = 4_000_000
 _DEFAULT_MAX_OVERLAY_ENTRIES: Final = 4_000_000
@@ -90,8 +94,6 @@ _ORPHAN_INVENTORY_CLASS_NAMES: Final = (
     "superseded_catalog",
     "temp_publication",
     "unreferenced_wal",
-    "complete_unreferenced_delta_pair",
-    "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
     "complete_unreferenced_segment_pair",
     "partial_unreferenced_segment_pair",
@@ -110,8 +112,6 @@ OrphanClassification: TypeAlias = Literal[
     "superseded_catalog",
     "temp_publication",
     "unreferenced_wal",
-    "complete_unreferenced_delta_pair",
-    "partial_unreferenced_delta_pair",
     "unknown_do_not_touch",
     "complete_unreferenced_segment_pair",
     "partial_unreferenced_segment_pair",
@@ -300,107 +300,6 @@ class CollectionSchema:
         object.__setattr__(self, "dtype", dtype)
 
 
-def _first_negative_position(ids: np.ndarray) -> int | None:
-    """Return the first negative element without allocating an N-row mask."""
-
-    for begin in range(0, ids.size, _ID_SCAN_CHUNK_ROWS):
-        chunk = ids[begin : begin + _ID_SCAN_CHUNK_ROWS]
-        negative = chunk < 0
-        if bool(negative.any()):
-            return begin + int(np.flatnonzero(negative)[0])
-    return None
-
-
-def _normalize_numeric_ids(
-    ids: object,
-    *,
-    position_offset: int = 0,
-) -> np.ndarray:
-    """Validate numeric IDs and return native, aligned, contiguous uint64.
-
-    A native aligned C-contiguous uint64 ndarray is returned by identity. All
-    other accepted inputs receive a safe, exact conversion. This function is
-    intentionally kept separate from the native binding: callers that require
-    control over every allocation can continue to use ``Writer``/``Storage``.
-    """
-
-    if isinstance(ids, np.ma.MaskedArray):
-        raise TypeError("ids must not be a masked array")
-
-    if isinstance(ids, np.ndarray):
-        if ids.ndim != 1:
-            raise ValueError(f"ids must have shape (N,), got {ids.shape}")
-        if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
-            1,
-            2,
-            4,
-            8,
-        }:
-            raise TypeError(
-                "ids ndarray must have an 8-, 16-, 32-, or 64-bit integer "
-                f"dtype, got {ids.dtype}"
-            )
-
-        if ids.dtype.kind == "i":
-            position = _first_negative_position(ids)
-            if position is not None:
-                absolute_position = position_offset + position
-                raise ValueError(
-                    f"ids[{absolute_position}]={int(ids[position])} is negative; "
-                    "numeric IDs must be between 0 and 2**64-1"
-                )
-
-        native_uint64 = np.dtype(np.uint64)
-        if (
-            ids.dtype == native_uint64
-            and ids.dtype.isnative
-            and ids.flags.c_contiguous
-            and ids.flags.aligned
-        ):
-            return ids
-
-        # ascontiguousarray() alone is allowed to retain an unaligned buffer.
-        # np.require(..., "A") makes the low-level binding contract explicit.
-        return np.require(ids, dtype=native_uint64, requirements=["C", "A"])
-
-    if isinstance(ids, (str, bytes, bytearray, memoryview)):
-        raise TypeError(
-            "numeric ids must be a one-dimensional integer array or sequence"
-        )
-    if not isinstance(ids, Sequence):
-        raise TypeError(
-            "numeric ids must be a one-dimensional integer array or ordered sequence"
-        )
-
-    expected_length = len(ids)
-    normalized = np.empty(expected_length, dtype=np.uint64)
-    actual_length = 0
-    for position, value in enumerate(ids):
-        absolute_position = position_offset + position
-        if position >= expected_length:
-            raise ValueError("ids sequence changed length during normalization")
-        if isinstance(value, (bool, np.bool_)):
-            raise TypeError(
-                f"ids[{absolute_position}]={value!r} is boolean, not an integer ID"
-            )
-        try:
-            integer = operator.index(value)
-        except TypeError as error:
-            raise TypeError(
-                f"ids[{absolute_position}]={value!r} is not an integer ID"
-            ) from error
-        if not 0 <= integer <= _UINT64_MAX:
-            raise ValueError(
-                f"ids[{absolute_position}]={integer} is outside the uint64 range "
-                "0..2**64-1"
-            )
-        normalized[position] = integer
-        actual_length = position + 1
-    if actual_length != expected_length:
-        raise ValueError("ids sequence changed length during normalization")
-    return normalized
-
-
 def _normalize_embeddings(
     embeddings: object,
     *,
@@ -455,16 +354,16 @@ def _validate_prefix_dimensions(value: object, dimension: int) -> int:
     return prefix
 
 
-def _validate_shard_size_bytes(value: object) -> int:
+def _validate_segment_size_bytes(value: object) -> int:
     if isinstance(value, (bool, np.bool_)):
-        raise TypeError("shard_size_bytes must be an integer, not bool")
+        raise TypeError("segment_size_bytes must be an integer, not bool")
     try:
         size = operator.index(value)
     except TypeError as error:
-        raise TypeError("shard_size_bytes must be an integer") from error
+        raise TypeError("segment_size_bytes must be an integer") from error
     if not 1 <= size <= _UINT64_MAX:
         raise ValueError(
-            "shard_size_bytes must be between 1 and 2**64-1"
+            "segment_size_bytes must be between 1 and 2**64-1"
         )
     return size
 
@@ -476,12 +375,12 @@ def _validate_format_version(value: object) -> int:
         version = operator.index(value)
     except TypeError as error:
         raise TypeError("format_version must be an integer") from error
-    if version not in {6, 7}:
-        raise ValueError("format_version must be 6 or 7")
+    if version != 7:
+        raise ValueError("format_version must be 7")
     return version
 
 
-def _validate_delta_compaction_limit(
+def _validate_resource_limit(
     value: object,
     *,
     name: str,
@@ -525,10 +424,10 @@ def _validate_orphan_options(
         raise ValueError(
             "min_age_seconds must be finite and zero or greater"
         )
-    validated_max_files = _validate_delta_compaction_limit(
+    validated_max_files = _validate_resource_limit(
         max_files, name="max_files"
     )
-    validated_max_bytes = _validate_delta_compaction_limit(
+    validated_max_bytes = _validate_resource_limit(
         max_bytes, name="max_bytes"
     )
     return seconds, validated_max_files, validated_max_bytes
@@ -697,8 +596,8 @@ def _orphan_report(
 
         # Candidate policy is format-specific. In particular, format 7 can
         # safely retire superseded catalogs and unreferenced segment
-        # singletons under view.lock, while the format-6 catalog policy stays
-        # conservative. Never infer this destructive policy from a class name.
+        # singletons under view.lock. Never infer this destructive policy
+        # from a class name.
         candidate = native_candidate
         valid_modification_time = 0 <= modified_unix_ns <= snapshot_unix_ns
         eligible = (
@@ -921,7 +820,6 @@ def _orphan_execution_report(
                 ".",
                 "catalogs",
                 "wal",
-                "deltas",
                 "segments",
                 "index/partitions",
                 "index/runs",
@@ -960,32 +858,6 @@ def _orphan_execution_report(
         "reclamation_complete": reclamation_complete,
         "entries": execution_entries,
     }
-
-
-def _validate_output(
-    output: object,
-    *,
-    expected_rows: int,
-    expected_columns: int,
-    dtype: str,
-) -> np.ndarray:
-    if isinstance(output, np.ma.MaskedArray) or not isinstance(output, np.ndarray):
-        raise TypeError("output must be a NumPy ndarray")
-    expected_dtype = np.dtype(dtype)
-    if output.dtype != expected_dtype or not output.dtype.isnative:
-        raise TypeError(
-            f"output must have native-endian dtype {dtype}, got {output.dtype}"
-        )
-    expected_shape = (expected_rows, expected_columns)
-    if output.shape != expected_shape:
-        raise ValueError(f"output must have shape {expected_shape}, got {output.shape}")
-    if not output.flags.c_contiguous:
-        raise ValueError("output must be C-contiguous")
-    if not output.flags.aligned:
-        raise ValueError("output must be memory-aligned")
-    if not output.flags.writeable:
-        raise ValueError("output must be writable")
-    return output
 
 
 def _layout_identity(
@@ -1359,7 +1231,7 @@ def _validate_id_scan_batch_rows(value: object) -> int:
 
 
 def _validate_stream_byte_limit(value: object, *, name: str) -> int:
-    return _validate_delta_compaction_limit(value, name=name)
+    return _validate_resource_limit(value, name=name)
 
 
 def _effective_stream_batch_rows(
@@ -1391,38 +1263,6 @@ def _scan_snapshot_bytes(metadata: object) -> int:
     return value
 
 
-def _numpy_arrays_overlap(left: np.ndarray, right: np.ndarray) -> bool:
-    """Return an exact overlap answer, with a conservative bounded fallback."""
-
-    # Drop ndarray subclasses before invoking NumPy dispatch. This keeps the
-    # check tied to the actual exported address/stride metadata and remains a
-    # zero-copy view for ndarray and memmap inputs.
-    left_view = np.asarray(left)
-    right_view = np.asarray(right)
-    if not bool(np.may_share_memory(left_view, right_view)):
-        return False
-    try:
-        return bool(
-            np.shares_memory(left_view, right_view, max_work=1024)
-        )
-    except (RuntimeError, ValueError):
-        # Fail closed when NumPy declines bounded exact analysis for an
-        # unusually complex retained stream_get source layout.
-        return True
-
-
-def _require_disjoint_numpy_arrays(
-    arrays: Sequence[tuple[str, np.ndarray]],
-) -> None:
-    for left_index, (left_name, left) in enumerate(arrays):
-        for right_name, right in arrays[left_index + 1 :]:
-            if _numpy_arrays_overlap(left, right):
-                raise ValueError(
-                    "record scan output buffers must not overlap: "
-                    f"{left_name} and {right_name}"
-                )
-
-
 class _SingleConsumerOperation:
     """A fork-aware, fail-fast guard for one stateful local cursor."""
 
@@ -1443,169 +1283,6 @@ class _SingleConsumerOperation:
                 f"{self._label} is already in use by another thread"
             )
         return self._lock
-
-
-class _BoundedSequenceWindow(Sequence[object]):
-    """Non-owning fixed window used to avoid a second per-batch ID list."""
-
-    def __init__(
-        self,
-        source: Sequence[object],
-        begin: int,
-        end: int,
-    ) -> None:
-        self._source = source
-        self._begin = begin
-        self._length = end - begin
-
-    def __len__(self) -> int:
-        return self._length
-
-    def __getitem__(self, index: int | slice) -> object:
-        if isinstance(index, slice):
-            start, stop, step = index.indices(self._length)
-            return [
-                self._source[self._begin + position]
-                for position in range(start, stop, step)
-            ]
-        normalized = operator.index(index)
-        if normalized < 0:
-            normalized += self._length
-        if not 0 <= normalized < self._length:
-            raise IndexError(index)
-        return self._source[self._begin + normalized]
-
-
-class _StreamingNumericIdSource:
-    """Lazily normalize a stable ndarray/Sequence in bounded slices."""
-
-    def __init__(self, ids: object) -> None:
-        if isinstance(ids, np.ma.MaskedArray):
-            raise TypeError("ids must not be a masked array")
-        self._array: np.ndarray | None = None
-        self._sequence: Sequence[object] | None = None
-        self._shape: tuple[int, ...] | None = None
-        self._dtype: np.dtype[object] | None = None
-        self._strides: tuple[int, ...] | None = None
-        self._data_pointer: int | None = None
-
-        if isinstance(ids, np.ndarray):
-            if ids.ndim != 1:
-                raise ValueError(f"ids must have shape (N,), got {ids.shape}")
-            if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
-                1,
-                2,
-                4,
-                8,
-            }:
-                raise TypeError(
-                    "ids ndarray must have an 8-, 16-, 32-, or 64-bit "
-                    f"integer dtype, got {ids.dtype}"
-                )
-            self._array = ids
-            self._length = int(ids.shape[0])
-            self._shape = tuple(ids.shape)
-            self._dtype = ids.dtype
-            self._strides = tuple(ids.strides)
-            self._data_pointer = int(ids.ctypes.data)
-            return
-
-        if isinstance(ids, (str, bytes, bytearray, memoryview)):
-            raise TypeError(
-                "numeric ids must be a one-dimensional integer array or sequence"
-            )
-        if not isinstance(ids, Sequence):
-            raise TypeError(
-                "numeric ids must be a one-dimensional integer array or "
-                "ordered sequence; streaming iterables are not supported"
-            )
-        self._sequence = cast(Sequence[object], ids)
-        self._length = len(ids)
-
-    def __len__(self) -> int:
-        return self._length
-
-    def _require_unchanged(self) -> None:
-        if self._array is not None:
-            array = self._array
-            if (
-                array.ndim != 1
-                or tuple(array.shape) != self._shape
-                or array.dtype != self._dtype
-                or tuple(array.strides) != self._strides
-                or int(array.ctypes.data) != self._data_pointer
-            ):
-                raise RuntimeError(
-                    "ids source structure changed while stream_get was active"
-                )
-            return
-        assert self._sequence is not None
-        if len(self._sequence) != self._length:
-            raise RuntimeError(
-                "ids source length changed while stream_get was active"
-            )
-
-    def batch(self, begin: int, end: int) -> np.ndarray:
-        self._require_unchanged()
-        if not 0 <= begin <= end <= self._length:
-            raise RuntimeError("stream_get requested an invalid ID source slice")
-        if self._array is not None:
-            return _normalize_numeric_ids(
-                self._array[begin:end],
-                position_offset=begin,
-            )
-        assert self._sequence is not None
-        # Sequence slicing is not part of the minimal Sequence protocol and
-        # may itself allocate an implementation-defined object. A non-owning
-        # window lets normalization allocate only the bounded uint64 array.
-        return _normalize_numeric_ids(
-            _BoundedSequenceWindow(self._sequence, begin, end),
-            position_offset=begin,
-        )
-
-    def output_overlaps_unread(
-        self,
-        output: np.ndarray,
-        *,
-        begin: int,
-    ) -> bool:
-        """Detect address overlap with the current or a future array ID."""
-
-        if self._array is None:
-            return False
-        self._require_unchanged()
-        if not 0 <= begin <= self._length:
-            raise RuntimeError("stream_get requested an invalid ID source offset")
-        return _numpy_arrays_overlap(self._array[begin:], output)
-
-
-def _validate_stream_output(
-    output: object,
-    *,
-    expected_columns: int,
-    dtype: str,
-) -> np.ndarray:
-    if isinstance(output, np.ma.MaskedArray) or not isinstance(output, np.ndarray):
-        raise TypeError("output must be a NumPy ndarray")
-    expected_dtype = np.dtype(dtype)
-    if output.dtype != expected_dtype or not output.dtype.isnative:
-        raise TypeError(
-            f"output must have native-endian dtype {dtype}, got {output.dtype}"
-        )
-    if output.ndim != 2 or output.shape[1] != expected_columns:
-        raise ValueError(
-            "output must have shape (N, "
-            f"{expected_columns}), got {output.shape}"
-        )
-    if output.shape[0] == 0:
-        raise ValueError("output must contain at least one row")
-    if not output.flags.c_contiguous:
-        raise ValueError("output must be C-contiguous")
-    if not output.flags.aligned:
-        raise ValueError("output must be memory-aligned")
-    if not output.flags.writeable:
-        raise ValueError("output must be writable")
-    return output
 
 
 def _id_scan_snapshot(metadata: object) -> IdScanSnapshot:
@@ -1646,57 +1323,6 @@ def _id_scan_snapshot(metadata: object) -> IdScanSnapshot:
         count=count,
         token=token,
     )
-
-
-def _validate_id_scan_output(
-    ids: object,
-    locations: object | None,
-    *,
-    with_locations: bool,
-    operation: str = "scan_ids",
-) -> tuple[np.ndarray, np.ndarray | None]:
-    if not isinstance(ids, np.ndarray):
-        raise TypeError("ids output must be a NumPy ndarray")
-    if ids.dtype != np.dtype(np.uint64) or not ids.dtype.isnative:
-        raise TypeError("ids output must have native-endian dtype uint64")
-    if ids.ndim != 1:
-        raise ValueError("ids output must have shape (N,)")
-    if not ids.flags.c_contiguous:
-        raise ValueError("ids output must be C-contiguous")
-    if not ids.flags.aligned:
-        raise ValueError("ids output must be memory-aligned")
-    if not ids.flags.writeable:
-        raise ValueError("ids output must be writable")
-    if ids.size == 0:
-        raise ValueError("ids output must contain at least one row")
-
-    if not with_locations:
-        if locations is not None:
-            raise ValueError(
-                "locations output requires "
-                f"{operation}(with_locations=True)"
-            )
-        return ids, None
-    if not isinstance(locations, np.ndarray):
-        raise TypeError("locations output must be a NumPy ndarray")
-    if locations.dtype != ID_LOCATION_DTYPE:
-        raise TypeError(
-            "locations output must have dtype "
-            "[('segment_id', '<u4'), ('row_index', '<u4')]"
-        )
-    if locations.ndim != 1 or locations.shape != ids.shape:
-        raise ValueError("locations output must have shape (len(ids),)")
-    if not locations.flags.c_contiguous:
-        raise ValueError("locations output must be C-contiguous")
-    if not locations.flags.aligned:
-        raise ValueError("locations output must be memory-aligned")
-    if not locations.flags.writeable:
-        raise ValueError("locations output must be writable")
-    if _numpy_arrays_overlap(ids, locations):
-        raise ValueError(
-            f"{operation} output buffers must not overlap: ids and locations"
-        )
-    return ids, locations
 
 
 class EmbeddedIdScan(Iterator[np.ndarray | LocatedIdBatch]):
@@ -2262,7 +1888,7 @@ class Collection:
         path: str | bytes | PathLike[str] | PathLike[bytes],
         *,
         schema: CollectionSchema | None = None,
-        shard_size_bytes: int = _DEFAULT_SHARD_SIZE_BYTES,
+        segment_size_bytes: int = _DEFAULT_SEGMENT_SIZE_BYTES,
         format_version: int = 7,
     ) -> Collection:
         if schema is None:
@@ -2273,12 +1899,12 @@ class Collection:
             raise NotImplementedError(
                 "utf8 IDs are not implemented by the numeric collection format"
             )
-        validated_shard_size = _validate_shard_size_bytes(shard_size_bytes)
+        validated_segment_size = _validate_segment_size_bytes(segment_size_bytes)
         validated_format_version = _validate_format_version(format_version)
         builder = NativeCollectionBuilder.create(
             path,
             dimension=schema.dimension,
-            shard_size_bytes=validated_shard_size,
+            segment_size_bytes=validated_segment_size,
             dtype=schema.dtype,
             format_version=validated_format_version,
         )
@@ -2304,17 +1930,17 @@ class Collection:
         if not isinstance(verify_index, bool):
             raise TypeError("verify_index must be a bool")
         open_bounds = {
-            "max_wal_bytes": _validate_delta_compaction_limit(
+            "max_wal_bytes": _validate_resource_limit(
                 max_wal_backlog_bytes, name="max_wal_backlog_bytes"
             ),
-            "max_wal_operations": _validate_delta_compaction_limit(
+            "max_wal_operations": _validate_resource_limit(
                 max_wal_backlog_operations,
                 name="max_wal_backlog_operations",
             ),
-            "max_overlay_entries": _validate_delta_compaction_limit(
+            "max_overlay_entries": _validate_resource_limit(
                 max_overlay_entries, name="max_overlay_entries"
             ),
-            "max_overlay_bytes": _validate_delta_compaction_limit(
+            "max_overlay_bytes": _validate_resource_limit(
                 max_overlay_memory_bytes, name="max_overlay_memory_bytes"
             ),
         }
@@ -3592,7 +3218,7 @@ class Collection:
         max_input_entries: int | None = None,
         max_memory_bytes: int | None = None,
     ) -> dict[str, object]:
-        """Replace the frozen WAL prefix with an immutable delta run.
+        """Replace the frozen WAL prefix with segments and an immutable index run.
 
         The durable catalog is switched atomically. Referenced WAL files are
         reclaimed only after the new view is published.
@@ -3602,28 +3228,28 @@ class Collection:
         validated_max_wals = (
             _UINT64_MAX
             if max_wals is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_wals, name="max_wals"
             )
         )
         validated_max_input_bytes = (
             _UINT64_MAX
             if max_input_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_input_bytes, name="max_input_bytes"
             )
         )
         validated_max_input_entries = (
             _UINT64_MAX
             if max_input_entries is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_input_entries, name="max_input_entries"
             )
         )
         validated_max_memory_bytes = (
             _UINT64_MAX
             if max_memory_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 max_memory_bytes, name="max_memory_bytes"
             )
         )
@@ -3639,54 +3265,46 @@ class Collection:
             )
         return dict(stats)
 
-    def compact_deltas(
+    def fold_partitions(
         self,
         *,
         max_runs: int | None = None,
-        max_input_bytes: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES,
-        max_input_entries: int = _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES,
+        max_input_bytes: int = _DEFAULT_FOLD_MAX_INPUT_BYTES,
+        max_input_entries: int = _DEFAULT_FOLD_MAX_INPUT_ENTRIES,
     ) -> dict[str, object]:
-        """Compact bounded immutable index state.
+        """Fold bounded immutable index state into partition snapshots.
 
-        Format 6 merges a complete oldest delta-run prefix. Format 7 folds
-        complete per-partition run sections into authoritative snapshots.
-        The operation never rewrites embedding segments.
+        Fold complete per-partition run sections into authoritative snapshots.
+        ``max_runs`` bounds the active run files contributing to each partition;
+        its existing snapshot is not counted. The operation never rewrites
+        embedding segments.
         """
 
-        native = self._ensure_mutable("compact immutable mutation deltas")
-        maximum_runs = (
+        native = self._ensure_mutable("fold index partitions")
+        validated_max_runs = _validate_resource_limit(
             _MAX_PARTITIONED_FOLD_RUNS
-            if self._format_version == 7
-            else _MAX_DELTA_COMPACTION_RUNS
-        )
-        validated_max_runs = _validate_delta_compaction_limit(
-            (
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
-            )
             if max_runs is None
             else max_runs,
             name="max_runs",
-            minimum=2,
-            maximum=maximum_runs,
+            minimum=1,
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        validated_max_input_bytes = _validate_delta_compaction_limit(
+        validated_max_input_bytes = _validate_resource_limit(
             max_input_bytes,
             name="max_input_bytes",
         )
-        validated_max_input_entries = _validate_delta_compaction_limit(
+        validated_max_input_entries = _validate_resource_limit(
             max_input_entries,
             name="max_input_entries",
         )
-        stats = native.compact_delta_runs(
+        stats = native.fold_partitions(
             validated_max_runs,
             validated_max_input_bytes,
             validated_max_input_entries,
         )
         if not isinstance(stats, dict):
             raise RuntimeError(
-                "native delta compaction returned invalid diagnostics"
+                "native partition folding returned invalid diagnostics"
             )
         return dict(stats)
 
@@ -3745,13 +3363,13 @@ class Collection:
         ),
         materialize_max_input_entries: int | None = None,
         materialize_max_memory_bytes: int | None = None,
-        compact_min_runs: int | None = None,
-        compact_max_runs: int | None = None,
-        compact_max_input_bytes: int = (
-            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_BYTES
+        fold_min_runs: int | None = None,
+        fold_max_runs: int | None = None,
+        fold_max_input_bytes: int = (
+            _DEFAULT_FOLD_MAX_INPUT_BYTES
         ),
-        compact_max_input_entries: int = (
-            _DEFAULT_DELTA_COMPACTION_MAX_INPUT_ENTRIES
+        fold_max_input_entries: int = (
+            _DEFAULT_FOLD_MAX_INPUT_ENTRIES
         ),
         clean_max_candidate_segments: int = (
             _DEFAULT_CLEAN_MAX_CANDIDATE_SEGMENTS
@@ -3790,88 +3408,58 @@ class Collection:
         seconds = float(max_seconds)
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("max_seconds must be finite and zero or greater")
-        validated_max_actions = _validate_delta_compaction_limit(
+        validated_max_actions = _validate_resource_limit(
             max_actions, name="max_actions", maximum=5
         )
-        validated_rotate_bytes = _validate_delta_compaction_limit(
+        validated_rotate_bytes = _validate_resource_limit(
             rotate_wal_bytes, name="rotate_wal_bytes"
         )
-        validated_materialize_wals = _validate_delta_compaction_limit(
+        validated_materialize_wals = _validate_resource_limit(
             materialize_max_wals, name="materialize_max_wals"
         )
-        validated_materialize_bytes = _validate_delta_compaction_limit(
+        validated_materialize_bytes = _validate_resource_limit(
             materialize_max_input_bytes,
             name="materialize_max_input_bytes",
         )
-        if self._format_version != 7 and (
-            materialize_max_input_entries is not None
-            or materialize_max_memory_bytes is not None
-        ):
-            raise ValueError(
-                "materialize entry and memory budgets require a format-7 "
-                "collection"
-            )
         validated_materialize_entries = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_INPUT_ENTRIES
-            if self._format_version == 7
-            and materialize_max_input_entries is None
-            else _UINT64_MAX
             if materialize_max_input_entries is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 materialize_max_input_entries,
                 name="materialize_max_input_entries",
             )
         )
         validated_materialize_memory = (
             _DEFAULT_MAINTAIN_MATERIALIZE_MAX_MEMORY_BYTES
-            if self._format_version == 7
-            and materialize_max_memory_bytes is None
-            else _UINT64_MAX
             if materialize_max_memory_bytes is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 materialize_max_memory_bytes,
                 name="materialize_max_memory_bytes",
             )
         )
-        validated_compact_min_runs = _validate_delta_compaction_limit(
-            (
-                1
-                if self._format_version == 7
-                else _DEFAULT_MAINTAIN_COMPACT_MIN_RUNS
-            )
-            if compact_min_runs is None
-            else compact_min_runs,
-            name="compact_min_runs",
-            minimum=1 if self._format_version == 7 else 2,
-            maximum=(
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _MAX_DELTA_COMPACTION_RUNS
-            ),
+        validated_fold_min_runs = _validate_resource_limit(
+            1
+            if fold_min_runs is None
+            else fold_min_runs,
+            name="fold_min_runs",
+            minimum=1,
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        validated_compact_max_runs = _validate_delta_compaction_limit(
-            (
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _DEFAULT_DELTA_COMPACTION_MAX_RUNS
-            )
-            if compact_max_runs is None
-            else compact_max_runs,
-            name="compact_max_runs",
-            minimum=2,
-            maximum=(
-                _MAX_PARTITIONED_FOLD_RUNS
-                if self._format_version == 7
-                else _MAX_DELTA_COMPACTION_RUNS
-            ),
+        validated_fold_max_runs = _validate_resource_limit(
+            _MAX_PARTITIONED_FOLD_RUNS
+            if fold_max_runs is None
+            else fold_max_runs,
+            name="fold_max_runs",
+            minimum=1,
+            maximum=_MAX_PARTITIONED_FOLD_RUNS,
         )
-        if validated_compact_max_runs < validated_compact_min_runs:
-            raise ValueError("compact_max_runs must be >= compact_min_runs")
-        validated_compact_bytes = _validate_delta_compaction_limit(
-            compact_max_input_bytes, name="compact_max_input_bytes"
+        if validated_fold_max_runs < validated_fold_min_runs:
+            raise ValueError("fold_max_runs must be >= fold_min_runs")
+        validated_fold_bytes = _validate_resource_limit(
+            fold_max_input_bytes, name="fold_max_input_bytes"
         )
-        validated_compact_entries = _validate_delta_compaction_limit(
-            compact_max_input_entries, name="compact_max_input_entries"
+        validated_fold_entries = _validate_resource_limit(
+            fold_max_input_entries, name="fold_max_input_entries"
         )
         clean_limits = {
             "clean_max_candidate_segments": clean_max_candidate_segments,
@@ -3882,15 +3470,15 @@ class Collection:
             "clean_min_garbage_rows": clean_min_garbage_rows,
         }
         validated_clean = {
-            name: _validate_delta_compaction_limit(value, name=name)
+            name: _validate_resource_limit(value, name=name)
             for name, value in clean_limits.items()
         }
-        validated_clean_reclaimable = _validate_delta_compaction_limit(
+        validated_clean_reclaimable = _validate_resource_limit(
             clean_min_reclaimable_bytes,
             name="clean_min_reclaimable_bytes",
             minimum=0,
         )
-        validated_clean_ratio = _validate_delta_compaction_limit(
+        validated_clean_ratio = _validate_resource_limit(
             clean_min_garbage_ratio_ppm,
             name="clean_min_garbage_ratio_ppm",
             minimum=0,
@@ -3899,7 +3487,7 @@ class Collection:
         validated_clean_cursor = (
             self._cleaning_cursor
             if clean_start_after_segment_id is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 clean_start_after_segment_id,
                 name="clean_start_after_segment_id",
                 minimum=0,
@@ -3922,10 +3510,10 @@ class Collection:
             "materialize_max_input_bytes": validated_materialize_bytes,
             "materialize_max_input_entries": validated_materialize_entries,
             "materialize_max_memory_bytes": validated_materialize_memory,
-            "compact_min_runs": validated_compact_min_runs,
-            "compact_max_runs": validated_compact_max_runs,
-            "compact_max_input_bytes": validated_compact_bytes,
-            "compact_max_input_entries": validated_compact_entries,
+            "fold_min_runs": validated_fold_min_runs,
+            "fold_max_runs": validated_fold_max_runs,
+            "fold_max_input_bytes": validated_fold_bytes,
+            "fold_max_input_entries": validated_fold_entries,
             **validated_clean,
             "clean_min_reclaimable_bytes": validated_clean_reclaimable,
             "clean_min_garbage_ratio_ppm": validated_clean_ratio,
@@ -4042,132 +3630,131 @@ class Collection:
                             "reason": reason, "before": action_before,
                             "after": dict(current), "result": result})
 
-        compact_planned = (
-            stat_int(current, "delta_run_count")
-            >= validated_compact_min_runs
+        fold_planned = (
+            stat_int(current, "index_run_count")
+            >= validated_fold_min_runs
         )
         if dry_run:
             record_skipped(
-                "compact_deltas", compact_planned,
-                "threshold_reached" if compact_planned else "below_threshold",
+                "fold_partitions", fold_planned,
+                "threshold_reached" if fold_planned else "below_threshold",
             )
-        elif not compact_planned:
-            record_skipped("compact_deltas", False, "below_threshold")
+        elif not fold_planned:
+            record_skipped("fold_partitions", False, "below_threshold")
         elif not may_attempt():
-            record_skipped("compact_deltas", True, "maintenance_budget_reached")
+            record_skipped("fold_partitions", True, "maintenance_budget_reached")
         else:
             actions_attempted += 1
             action_before = dict(current)
-            result = self.compact_deltas(
-                max_runs=validated_compact_max_runs,
-                max_input_bytes=validated_compact_bytes,
-                max_input_entries=validated_compact_entries,
+            result = self.fold_partitions(
+                max_runs=validated_fold_max_runs,
+                max_input_bytes=validated_fold_bytes,
+                max_input_entries=validated_fold_entries,
             )
-            performed = bool(result.get("compacted"))
+            performed = bool(result.get("folded"))
             actions_performed += int(performed)
             current = stats_snapshot()
-            actions.append({"name": "compact_deltas", "planned": True,
+            actions.append({"name": "fold_partitions", "planned": True,
                             "attempted": True, "performed": performed,
                             "reason": (
                                 "completed" if performed
                                 else (
                                     "input_exceeds_budget"
-                                    if result.get("compaction_budget_blocked")
+                                    if result.get("fold_budget_blocked")
                                     else "no_eligible_partition"
                                 )
                             ), "before": action_before,
                             "after": dict(current), "result": result})
 
-        if self._format_version == 7:
-            clean_kwargs = {
-                "max_candidate_segments": validated_clean[
-                    "clean_max_candidate_segments"
-                ],
-                "max_sidecar_scan_bytes": validated_clean[
-                    "clean_max_sidecar_scan_bytes"
-                ],
-                "max_source_bytes": validated_clean[
-                    "clean_max_source_bytes"
-                ],
-                "max_output_bytes": validated_clean[
-                    "clean_max_output_bytes"
-                ],
-                "max_memory_bytes": validated_clean[
-                    "clean_max_memory_bytes"
-                ],
-                "min_garbage_rows": validated_clean[
-                    "clean_min_garbage_rows"
-                ],
-                "min_reclaimable_bytes": validated_clean_reclaimable,
-                "min_garbage_ratio_ppm": validated_clean_ratio,
-                "start_after_segment_id": validated_clean_cursor,
-            }
-            if dry_run:
-                clean_plan = self.clean_segments(dry_run=True, **clean_kwargs)
-                clean_planned = clean_plan["candidate_found"]
-                actions.append(
-                    {
-                        "name": "clean_segments",
-                        "planned": clean_planned,
-                        "attempted": False,
-                        "performed": False,
-                        "reason": (
-                            "candidate_found"
-                            if clean_planned
-                            else (
-                                "budget_blocked"
-                                if clean_plan["budget_blocked"]
-                                else "no_candidate"
-                            )
-                        ),
-                        "before": dict(current),
-                        "after": dict(current),
-                        "result": clean_plan,
-                    }
-                )
-            elif actions_attempted >= validated_max_actions:
-                action_budget_reached = True
-                record_skipped(
-                    "clean_segments", True, "maintenance_budget_reached"
-                )
-            elif time.monotonic() - started >= seconds:
-                deadline_reached = True
-                record_skipped(
-                    "clean_segments", True, "maintenance_budget_reached"
-                )
-            else:
-                # Execute performs its own bounded selection while holding the
-                # native lifecycle locks. A separate dry-run here would scan
-                # every candidate sidecar twice and could consume twice the
-                # advertised scan budget in one maintenance pass.
-                actions_attempted += 1
-                action_before = dict(current)
-                clean_result = self.clean_segments(
-                    dry_run=False, **clean_kwargs
-                )
-                performed = clean_result["cleaned"]
-                actions_performed += int(performed)
-                current = stats_snapshot()
-                actions.append(
-                    {
-                        "name": "clean_segments",
-                        "planned": clean_result["candidate_found"],
-                        "attempted": True,
-                        "performed": performed,
-                        "reason": (
-                            "completed"
-                            if performed
-                            else (
-                                "budget_blocked"
-                                if clean_result["budget_blocked"]
-                                else "no_candidate"
-                            )
-                        ),
-                        "before": action_before,
-                        "after": dict(current),
-                        "result": clean_result,
-                    }
-                )
+        clean_kwargs = {
+            "max_candidate_segments": validated_clean[
+                "clean_max_candidate_segments"
+            ],
+            "max_sidecar_scan_bytes": validated_clean[
+                "clean_max_sidecar_scan_bytes"
+            ],
+            "max_source_bytes": validated_clean[
+                "clean_max_source_bytes"
+            ],
+            "max_output_bytes": validated_clean[
+                "clean_max_output_bytes"
+            ],
+            "max_memory_bytes": validated_clean[
+                "clean_max_memory_bytes"
+            ],
+            "min_garbage_rows": validated_clean[
+                "clean_min_garbage_rows"
+            ],
+            "min_reclaimable_bytes": validated_clean_reclaimable,
+            "min_garbage_ratio_ppm": validated_clean_ratio,
+            "start_after_segment_id": validated_clean_cursor,
+        }
+        if dry_run:
+            clean_plan = self.clean_segments(dry_run=True, **clean_kwargs)
+            clean_planned = clean_plan["candidate_found"]
+            actions.append(
+                {
+                    "name": "clean_segments",
+                    "planned": clean_planned,
+                    "attempted": False,
+                    "performed": False,
+                    "reason": (
+                        "candidate_found"
+                        if clean_planned
+                        else (
+                            "budget_blocked"
+                            if clean_plan["budget_blocked"]
+                            else "no_candidate"
+                        )
+                    ),
+                    "before": dict(current),
+                    "after": dict(current),
+                    "result": clean_plan,
+                }
+            )
+        elif actions_attempted >= validated_max_actions:
+            action_budget_reached = True
+            record_skipped(
+                "clean_segments", True, "maintenance_budget_reached"
+            )
+        elif time.monotonic() - started >= seconds:
+            deadline_reached = True
+            record_skipped(
+                "clean_segments", True, "maintenance_budget_reached"
+            )
+        else:
+            # Execute performs its own bounded selection while holding the
+            # native lifecycle locks. A separate dry-run here would scan
+            # every candidate sidecar twice and could consume twice the
+            # advertised scan budget in one maintenance pass.
+            actions_attempted += 1
+            action_before = dict(current)
+            clean_result = self.clean_segments(
+                dry_run=False, **clean_kwargs
+            )
+            performed = clean_result["cleaned"]
+            actions_performed += int(performed)
+            current = stats_snapshot()
+            actions.append(
+                {
+                    "name": "clean_segments",
+                    "planned": clean_result["candidate_found"],
+                    "attempted": True,
+                    "performed": performed,
+                    "reason": (
+                        "completed"
+                        if performed
+                        else (
+                            "budget_blocked"
+                            if clean_result["budget_blocked"]
+                            else "no_candidate"
+                        )
+                    ),
+                    "before": action_before,
+                    "after": dict(current),
+                    "result": clean_result,
+                }
+            )
 
         if dry_run:
             orphan_result = self.collect_orphans(
@@ -4204,7 +3791,7 @@ class Collection:
         finished_unix_ns = time.time_ns()
         return {
             "format": "throwdb-maintenance-report",
-            "version": 2 if self._format_version == 7 else 1,
+            "version": 2,
             "dry_run": dry_run,
             "started_unix_ns": started_unix_ns,
             "finished_unix_ns": finished_unix_ns,
@@ -4235,17 +3822,9 @@ class Collection:
         normalized lazily, so callers must not mutate its structure or values
         until the returned stream is closed. Previously yielded batches remain
         valid if a later batch contains a missing/invalid ID and fails.
-
-        The operation is available only for format 7 because older formats do
-        not expose a pinned mutable-view read primitive.
         """
 
         storage = self._ensure_reader()
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "snapshot-consistent stream_get requires a format-7 "
-                "collection; rebuild the collection in format 7"
-            )
         rows = _validate_id_scan_batch_rows(batch_rows)
         batch_bytes = _validate_stream_byte_limit(
             max_batch_bytes,
@@ -4361,11 +3940,6 @@ class Collection:
         """
 
         storage = self._ensure_reader()
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "snapshot-consistent record scanning requires a format-7 "
-                "collection; rebuild the collection in format 7"
-            )
         rows = _validate_id_scan_batch_rows(batch_rows)
         if not isinstance(with_locations, bool):
             raise TypeError("with_locations must be a bool")
@@ -4435,11 +4009,6 @@ class Collection:
         rows = _validate_id_scan_batch_rows(batch_rows)
         if not isinstance(with_locations, bool):
             raise TypeError("with_locations must be a bool")
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "physical ID scanning requires a format-7 collection; "
-                "rebuild the collection in format 7"
-            )
         snapshot_limit = (
             None
             if max_snapshot_bytes is None
@@ -4554,10 +4123,6 @@ class Collection:
 
         if not isinstance(dry_run, bool):
             raise TypeError("dry_run must be a bool")
-        if self._format_version != 7:
-            raise NotImplementedError(
-                "selective segment cleaning requires a format-7 collection"
-            )
         limits = {
             "max_candidate_segments": max_candidate_segments,
             "max_sidecar_scan_bytes": max_sidecar_scan_bytes,
@@ -4567,15 +4132,15 @@ class Collection:
             "min_garbage_rows": min_garbage_rows,
         }
         validated = {
-            name: _validate_delta_compaction_limit(value, name=name)
+            name: _validate_resource_limit(value, name=name)
             for name, value in limits.items()
         }
-        validated_reclaimable = _validate_delta_compaction_limit(
+        validated_reclaimable = _validate_resource_limit(
             min_reclaimable_bytes,
             name="min_reclaimable_bytes",
             minimum=0,
         )
-        validated_ratio = _validate_delta_compaction_limit(
+        validated_ratio = _validate_resource_limit(
             min_garbage_ratio_ppm,
             name="min_garbage_ratio_ppm",
             minimum=0,
@@ -4584,7 +4149,7 @@ class Collection:
         cursor = (
             self._cleaning_cursor
             if start_after_segment_id is None
-            else _validate_delta_compaction_limit(
+            else _validate_resource_limit(
                 start_after_segment_id,
                 name="start_after_segment_id",
                 minimum=0,

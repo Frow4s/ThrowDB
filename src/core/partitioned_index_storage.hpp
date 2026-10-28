@@ -68,6 +68,9 @@ public:
     virtual void get_into(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const = 0;
+    [[nodiscard]] virtual NativeReadStats get_into_profiled(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const = 0;
 };
 
 class PartitionedReadView {
@@ -83,6 +86,9 @@ public:
     [[nodiscard]] std::uint32_t output_dimension() const noexcept;
     [[nodiscard]] DType dtype() const noexcept;
     void get_into(
+        std::span<const std::uint64_t> ids,
+        std::span<std::byte> output) const;
+    [[nodiscard]] NativeReadStats get_into_profiled(
         std::span<const std::uint64_t> ids,
         std::span<std::byte> output) const;
 
@@ -134,8 +140,8 @@ private:
 };
 
 // Reads only the manifest discriminator, without following a substituted
-// symlink or blocking on a non-regular file. A false result means that the
-// existing format-6 path should perform its normal validation.
+// symlink or blocking on a non-regular file. A false result rejects unsupported
+// storage before any collection locks or resources are opened.
 [[nodiscard]] bool is_partitioned_index_store(
     const std::filesystem::path& store_path);
 

@@ -30,6 +30,7 @@
 #include "throwdb/native_collection.hpp"
 #include "../src/core/crc32c.hpp"
 #include "../src/core/internal.hpp"
+#include "../src/core/mutation_wal.hpp"
 #include "../src/core/native_collection_test_hooks.hpp"
 #include "../src/core/partition_snapshot_storage.hpp"
 #include "../src/core/partitioned_index_format.hpp"
@@ -282,7 +283,7 @@ void blocking_materialization_hook(
     if (context.operation
             != NativeCollectionTestOperation::MaterializeFrozenWals
         || context.point
-               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+               != NativeCollectionTestHookPoint::LifecycleOutputDurable) {
         return;
     }
     materialization_output_entered.store(true, std::memory_order_release);
@@ -299,7 +300,7 @@ void blocking_fold_hook(
     using namespace throwdb::detail;
     if (context.operation != NativeCollectionTestOperation::FoldPartitions
         || context.point
-               != NativeCollectionTestHookPoint::MutationDeltaOutputDurable) {
+               != NativeCollectionTestHookPoint::LifecycleOutputDurable) {
         return;
     }
     fold_output_entered.store(true, std::memory_order_release);
@@ -335,6 +336,10 @@ void test_float16_end_to_end_and_read_surface() {
 
     const throwdb::NativeCollectionMetadata metadata =
         throwdb::NativeCollection::inspect_metadata(temporary.path());
+    require(
+        metadata.collection_id_low != 0
+            || metadata.collection_id_high != 0,
+        "metadata collection identity is empty");
     require(metadata.format_version == 7, "metadata format is not 7");
     require(metadata.dimension == 4, "metadata dimension changed");
     require(metadata.dtype == throwdb::DType::Float16, "metadata dtype changed");
@@ -367,7 +372,7 @@ void test_float16_end_to_end_and_read_surface() {
         collection->get_into_profiled(requested, output);
     require(output == expected, "profiled format-7 lookup changed output");
     require(
-        stats.zero_delta_fast_path && stats.base_rows == requested.size()
+        stats.snapshot_only_fast_path && stats.base_rows == requested.size()
             && stats.mutation_rows == 0,
         "profiled format-7 lookup reported wrong source");
 
@@ -410,8 +415,7 @@ void test_float16_end_to_end_and_read_surface() {
     const throwdb::NativeMutationLogStats clean_stats =
         writable->rotate_wal();
     require(
-        !clean_stats.rotated && clean_stats.catalog_managed
-            && clean_stats.delta_managed && clean_stats.generation == 1,
+        !clean_stats.rotated && clean_stats.generation == 1,
         "empty format-7 WAL rotation was not a clean no-op");
     writable.reset();
     auto calibration = throwdb::NativeCollection::open(
@@ -772,6 +776,30 @@ void test_read_view_and_record_scan_prefix_budget_and_concurrency() {
     require(
         output == expected,
         "read view prefix was not bit-exact or lost order/duplicates");
+    std::fill(output.begin(), output.end(), std::byte{0});
+    const throwdb::NativeReadStats view_stats =
+        view->get_into_profiled(requested, output);
+    require(
+        output == expected,
+        "profiled read view prefix was not bit-exact");
+    require(
+        view_stats.requested_rows == requested.size()
+            && view_stats.base_rows == 1
+            && view_stats.mutation_rows == 3
+            && view_stats.planned_ranges > 0
+            && view_stats.planned_read_bytes
+                   >= 3 * prefix_size
+            && view_stats.backend_tasks > 0
+            && !view_stats.snapshot_only_fast_path
+            && view_stats.total_seconds
+                   >= view_stats.lookup_seconds,
+        "profiled read view did not expose its logical/physical plan: "
+            + std::to_string(view_stats.requested_rows) + "/"
+            + std::to_string(view_stats.base_rows) + "/"
+            + std::to_string(view_stats.mutation_rows) + " rows, "
+            + std::to_string(view_stats.planned_ranges) + " ranges, "
+            + std::to_string(view_stats.planned_read_bytes) + " bytes, "
+            + std::to_string(view_stats.backend_tasks) + " tasks");
 
     const std::array<std::uint64_t, 2> with_missing{1, 999};
     std::vector<std::byte> untouched(
@@ -1022,7 +1050,7 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
     const throwdb::NativeReadStats profile = writer->get_into_profiled(
         profiled_ids, profiled_output);
     require(
-        !profile.zero_delta_fast_path && profile.base_rows == 1
+        !profile.snapshot_only_fast_path && profile.base_rows == 1
             && profile.mutation_rows == 2,
         "format-7 mixed read source accounting changed");
 
@@ -1065,11 +1093,11 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
             && materialized.materialized_sequence == 5
             && materialized.materialized_wal_count == 1
             && materialized.frozen_wal_count == 0
-            && materialized.delta_run_count == 1
-            && materialized.delta_entry_count == 6
-            && materialized.delta_put_rows == 6
-            && materialized.total_delta_run_bytes != 0
-            && materialized.total_delta_segment_bytes != 0
+            && materialized.index_run_count == 1
+            && materialized.index_run_entry_count == 6
+            && materialized.materialized_segment_rows == 6
+            && materialized.index_run_bytes != 0
+            && materialized.materialized_segment_bytes != 0
             && !materialized.reclamation_complete,
         "format-7 materialization stats changed");
     require(
@@ -1136,7 +1164,7 @@ void test_writable_crud_reopen_rotation_and_snapshot_isolation() {
             && replayed.materialized_sequence == 5
             && replayed.frozen_wal_count == 0
             && replayed.active_wal_put_rows == 1
-            && replayed.delta_run_count == 1,
+            && replayed.index_run_count == 1,
         "format-7 reopen mutation stats changed");
 }
 
@@ -1197,7 +1225,7 @@ void test_sampler_distributes_quota_between_materialized_runs() {
     const throwdb::NativeMutationLogStats materialized =
         writer->materialize_frozen_wals();
     require(
-        materialized.materialized && materialized.delta_run_count == 2,
+        materialized.materialized && materialized.index_run_count == 2,
         "multiple-run sample fixture did not retain two runs");
 
     // The empty snapshot contributes eight raw slots. With a 100-slot limit,
@@ -1438,15 +1466,15 @@ void test_materialization_budget_and_tombstone_only_run() {
         materialized.materialized
             && !materialized.materialization_budget_blocked
             && materialized.materialized_sequence == 1
-            && materialized.delta_run_count == 1
-            && materialized.delta_entry_count == 2
-            && materialized.delta_put_rows == 0
+            && materialized.index_run_count == 1
+            && materialized.index_run_entry_count == 2
+            && materialized.materialized_segment_rows == 0
             && materialized.materialized_wal_input_entries == 2
             && materialized.materialization_estimated_peak_memory_bytes != 0
             && materialized.materialization_estimated_peak_memory_bytes
                    <= (1ULL << 30)
-            && materialized.total_delta_segment_bytes == 0
-            && materialized.total_delta_run_bytes != 0,
+            && materialized.materialized_segment_bytes == 0
+            && materialized.index_run_bytes != 0,
         "format-7 tombstone-only materialization stats changed");
     require(writer->count() == 1, "tombstone materialization changed count");
     require_throws<throwdb::MissingIdError>(
@@ -1558,7 +1586,7 @@ void test_materialization_rebases_over_newer_rotation() {
     const throwdb::NativeMutationLogStats second_stats =
         writer->materialize_frozen_wals();
     require(
-        second_stats.materialized && second_stats.delta_run_count == 2
+        second_stats.materialized && second_stats.index_run_count == 2
             && second_stats.materialized_sequence == 2
             && second_stats.frozen_wal_count == 0,
         "second format-7 materialization did not advance run precedence");
@@ -1737,7 +1765,7 @@ void test_materialization_crash_checkpoints_reopen() {
     };
     const std::array<CrashCase, 4> cases{{
         {HookPoint::MutationReservationDurable, 3, false},
-        {HookPoint::MutationDeltaOutputDurable, 3, false},
+        {HookPoint::LifecycleOutputDurable, 3, false},
         {HookPoint::MutationCatalogDurableBeforeCurrent, 4, false},
         {HookPoint::MutationCurrentDurable, 4, true},
     }};
@@ -1801,13 +1829,13 @@ void test_materialization_crash_checkpoints_reopen() {
             require(
                 stats.materialized_sequence == 1
                     && stats.frozen_wal_count == 0
-                    && stats.delta_run_count == 1,
+                    && stats.index_run_count == 1,
                 "durable final CURRENT did not expose materialized state");
         } else {
             require(
                 stats.materialized_sequence == 0
                     && stats.frozen_wal_count == 1
-                    && stats.delta_run_count == 0,
+                    && stats.index_run_count == 0,
                 "pre-CURRENT crash exposed unpublished materialization");
         }
     }
@@ -1861,7 +1889,7 @@ void test_fully_folded_materialized_snapshot_uses_fast_path() {
     const throwdb::NativeReadStats profile =
         reader->get_into_profiled(ids, output);
     require(
-        output == replacement && profile.zero_delta_fast_path
+        output == replacement && profile.snapshot_only_fast_path
             && profile.base_rows == 0 && profile.mutation_rows == 1,
         "fully folded materialized snapshot missed the direct fast path");
 }
@@ -1904,9 +1932,9 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
     auto writer = throwdb::NativeCollection::open(
         temporary.path(), {}, true);
     const throwdb::NativeMutationLogStats fresh =
-        writer->compact_delta_runs();
+        writer->fold_partitions();
     require(
-        !fresh.compacted && !fresh.compaction_budget_blocked
+        !fresh.folded && !fresh.fold_budget_blocked
             && fresh.generation == 1,
         "selective fold fresh-store no-op changed");
 
@@ -1921,10 +1949,10 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
     const throwdb::NativeMutationLogStats before =
         writer->mutation_log_stats();
     const throwdb::NativeMutationLogStats blocked =
-        writer->compact_delta_runs(
+        writer->fold_partitions(
             2, 1, std::numeric_limits<std::uint64_t>::max());
     require(
-        !blocked.compacted && blocked.compaction_budget_blocked
+        !blocked.folded && blocked.fold_budget_blocked
             && blocked.generation == before.generation,
         "selective fold did not report a budget-blocked no-op");
 
@@ -1935,7 +1963,7 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
     throwdb::NativeMutationLogStats first_fold;
     std::thread background([&] {
         try {
-            first_fold = writer->compact_delta_runs(
+            first_fold = writer->fold_partitions(
                 2, std::numeric_limits<std::uint64_t>::max(), 6);
         } catch (...) {
             background_error = std::current_exception();
@@ -1969,20 +1997,20 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
     }
 
     require(
-        first_fold.compacted && first_fold.generation == 10
+        first_fold.folded && first_fold.generation == 10
             && first_fold.committed_sequence == 3
-            && first_fold.compacted_partition_count == 2
-            && first_fold.compacted_run_section_count == 4
-            && first_fold.compacted_snapshot_input_entries == 2
-            && first_fold.compacted_delta_input_entries == 4
-            && first_fold.compacted_delta_input_bytes
+            && first_fold.folded_partition_count == 2
+            && first_fold.folded_run_section_count == 4
+            && first_fold.folded_snapshot_input_entries == 2
+            && first_fold.folded_run_input_entries == 4
+            && first_fold.folded_run_input_bytes
                    == 4 * throwdb::detail::kPartitionRunRecordSize
-            && first_fold.compacted_output_entries == 2
-            && first_fold.compacted_snapshot_input_bytes != 0
-            && first_fold.compacted_output_bytes != 0
-            && first_fold.compaction_budget_blocked
+            && first_fold.folded_output_entries == 2
+            && first_fold.folded_snapshot_input_bytes != 0
+            && first_fold.folded_output_bytes != 0
+            && first_fold.fold_budget_blocked
             && !first_fold.reclamation_complete
-            && first_fold.delta_run_count == 2
+            && first_fold.index_run_count == 2
             && first_fold.frozen_wal_count == 1,
         "bounded selective fold diagnostics changed");
     std::vector<std::byte> expected = second;
@@ -1995,15 +2023,15 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
         "selective fold changed an already-open reader view");
 
     const throwdb::NativeMutationLogStats second_fold =
-        writer->compact_delta_runs(
+        writer->fold_partitions(
             2, std::numeric_limits<std::uint64_t>::max(),
             std::numeric_limits<std::uint64_t>::max());
     require(
-        second_fold.compacted && second_fold.generation == 12
-            && second_fold.compacted_partition_count == 2
-            && second_fold.compacted_run_section_count == 4
-            && !second_fold.compaction_budget_blocked
-            && second_fold.delta_run_count == 0,
+        second_fold.folded && second_fold.generation == 12
+            && second_fold.folded_partition_count == 2
+            && second_fold.folded_run_section_count == 4
+            && !second_fold.fold_budget_blocked
+            && second_fold.index_run_count == 0,
         "second selective fold did not clear all active run sections");
     require(writer->get_bytes(ids) == expected, "second fold changed output");
     writer.reset();
@@ -2018,6 +2046,82 @@ void test_selective_fold_is_bounded_and_rebases_newer_wal() {
     require(
         old_reader->get_bytes(ids) == second,
         "old reader pins did not survive all selective folds");
+}
+
+void test_fold_one_run_budget_preserves_complete_partitions() {
+    TemporaryDirectory temporary("fold-one-run-budget");
+    const std::array<std::uint64_t, 1> ids{17};
+    const std::vector<std::byte> base(4, std::byte{1});
+    build_collection(
+        temporary.path(), ids, base, throwdb::DType::Float16,
+        2, 4, 0);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    const auto materialize_update = [&](const std::byte value) {
+        const std::vector<std::byte> replacement(4, value);
+        writer->update(ids, replacement);
+        require(writer->rotate_wal().rotated,
+                "one-run-budget fixture did not rotate");
+        require(writer->materialize_frozen_wals().materialized,
+                "one-run-budget fixture did not materialize");
+        return replacement;
+    };
+
+    const auto first = materialize_update(std::byte{2});
+    const auto before = writer->mutation_log_stats();
+    require(before.index_run_count == 1,
+            "one-run-budget fixture did not create exactly one run");
+    auto old_reader = throwdb::NativeCollection::open(temporary.path());
+    const auto folded = writer->fold_partitions(1);
+    require(
+        folded.folded && !folded.fold_budget_blocked
+            && folded.generation > before.generation
+            && folded.folded_partition_count == 1
+            && folded.folded_run_section_count == 1
+            && folded.folded_snapshot_input_entries == 1
+            && folded.folded_run_input_entries == 1
+            && folded.index_run_count == 0,
+        "one-run budget did not fold the run with its authoritative snapshot");
+    require(writer->get_bytes(ids) == first,
+            "one-run fold changed the stored value");
+
+    static_cast<void>(materialize_update(std::byte{3}));
+    const auto latest = materialize_update(std::byte{4});
+    const auto blocked_catalog = current_catalog(temporary.path());
+    const auto blocked_current = read_file(temporary.path() / "CURRENT");
+    require(blocked_catalog.runs.size() == 2,
+            "one-run-budget fixture did not retain two runs in one partition");
+    const auto blocked = writer->fold_partitions(1);
+    require(
+        !blocked.folded && blocked.fold_budget_blocked
+            && blocked.generation == blocked_catalog.generation
+            && blocked.index_run_count == 2
+            && blocked.folded_partition_count == 0
+            && blocked.folded_run_section_count == 0,
+        "one-run budget partially folded a partition with two active runs");
+    require(
+        current_catalog(temporary.path()) == blocked_catalog
+            && read_file(temporary.path() / "CURRENT") == blocked_current,
+        "blocked fold changed snapshots, run masks, or CURRENT");
+    require(writer->get_bytes(ids) == latest,
+            "blocked fold changed the newest stored value");
+
+    const auto complete = writer->fold_partitions(2);
+    require(
+        complete.folded && !complete.fold_budget_blocked
+            && complete.folded_partition_count == 1
+            && complete.folded_run_section_count == 2
+            && complete.index_run_count == 0,
+        "two-run budget did not fold the complete partition");
+    require(writer->get_bytes(ids) == latest
+                && old_reader->get_bytes(ids) == first,
+            "bounded folds changed current values or the pinned reader view");
+    writer.reset();
+    throwdb::ReaderOptions verified;
+    verified.verify_native_index = true;
+    auto reopened = throwdb::NativeCollection::open(temporary.path(), verified);
+    require(reopened->get_bytes(ids) == latest,
+            "verified reopen changed the bounded-fold result");
 }
 
 void test_format_aware_default_fold_covers_all_active_runs() {
@@ -2042,16 +2146,16 @@ void test_format_aware_default_fold_covers_all_active_runs() {
         require(writer->materialize_frozen_wals().materialized,
                 "default-fold fixture did not materialize");
     }
-    require(writer->mutation_log_stats().delta_run_count == 9,
+    require(writer->mutation_log_stats().index_run_count == 9,
             "default-fold fixture did not create nine active runs");
 
     const throwdb::NativeMutationLogStats folded =
-        writer->compact_delta_runs();
+        writer->fold_partitions();
     require(
-        folded.compacted && folded.compacted_partition_count == 1
-            && folded.compacted_run_section_count == 9
-            && folded.delta_run_count == 0
-            && !folded.compaction_budget_blocked,
+        folded.folded && folded.folded_partition_count == 1
+            && folded.folded_run_section_count == 9
+            && folded.index_run_count == 0
+            && !folded.fold_budget_blocked,
         "format-7 native default did not fold every active run section");
     require(writer->get_bytes(ids) == expected,
             "format-aware default fold changed the newest value");
@@ -2085,23 +2189,23 @@ void test_fold_budget_charges_worst_case_output_geometry() {
         + catalog.runs.front().entry_count
               * throwdb::detail::kPartitionRunRecordSize;
     const throwdb::NativeMutationLogStats blocked =
-        writer->compact_delta_runs(2, raw_input_bytes, row_count);
+        writer->fold_partitions(2, raw_input_bytes, row_count);
     require(
-        !blocked.compacted && blocked.compaction_budget_blocked
+        !blocked.folded && blocked.fold_budget_blocked
             && blocked.generation == catalog.generation,
         "fold admitted output growth that exceeded the byte budget");
 
     const throwdb::NativeMutationLogStats folded =
-        writer->compact_delta_runs(2, 100000, row_count);
+        writer->fold_partitions(2, 100000, row_count);
     require(
-        folded.compacted && !folded.compaction_budget_blocked
-            && folded.compacted_partition_count == 1
-            && folded.compacted_run_section_count == 1
-            && folded.compacted_delta_input_entries == row_count
-            && folded.compacted_snapshot_input_entries == 0
-            && folded.compacted_output_entries == row_count
-            && folded.compacted_output_bytes <= 100000
-            && folded.delta_run_count == 0,
+        folded.folded && !folded.fold_budget_blocked
+            && folded.folded_partition_count == 1
+            && folded.folded_run_section_count == 1
+            && folded.folded_run_input_entries == row_count
+            && folded.folded_snapshot_input_entries == 0
+            && folded.folded_output_entries == row_count
+            && folded.folded_output_bytes <= 100000
+            && folded.index_run_count == 0,
         "fold did not honor its bounded worst-case output geometry");
     require(
         writer->get_bytes(ids) == embeddings,
@@ -2118,7 +2222,7 @@ void test_selective_fold_crash_checkpoints_reopen() {
     };
     const std::array<CrashCase, 4> cases{{
         {HookPoint::MutationReservationDurable, 5, false},
-        {HookPoint::MutationDeltaOutputDurable, 5, false},
+        {HookPoint::LifecycleOutputDurable, 5, false},
         {HookPoint::MutationCatalogDurableBeforeCurrent, 6, false},
         {HookPoint::MutationCurrentDurable, 6, true},
     }};
@@ -2152,7 +2256,7 @@ void test_selective_fold_crash_checkpoints_reopen() {
             try {
                 auto writer = throwdb::NativeCollection::open(
                     temporary.path(), {}, true);
-                static_cast<void>(writer->compact_delta_runs(
+                static_cast<void>(writer->fold_partitions(
                     2, std::numeric_limits<std::uint64_t>::max(),
                     std::numeric_limits<std::uint64_t>::max()));
             } catch (...) {
@@ -2293,7 +2397,7 @@ void test_selective_fold_rejects_checksum_valid_snapshot_corruption() {
     require_throws<throwdb::CorruptionError>(
         [&] {
             static_cast<void>(
-                writer->compact_delta_runs(2, 1ULL << 20, 100));
+                writer->fold_partitions(2, 1ULL << 20, 100));
         },
         "selective fold normalized checksum-valid snapshot corruption");
 }
@@ -2420,7 +2524,7 @@ void test_empty_collection_surface() {
     const throwdb::NativeReadStats stats =
         collection->get_into_profiled({}, output);
     require(
-        stats.zero_delta_fast_path && stats.requested_rows == 0,
+        stats.snapshot_only_fast_path && stats.requested_rows == 0,
         "empty profiled get did not use the immutable fast path");
     const throwdb::NativeIdSample zero = collection->sample_ids(0, 1, 0);
     require(zero.complete && zero.ids.empty(), "zero-sized sample changed");
@@ -2773,6 +2877,153 @@ void test_mutable_open_limits_and_pending_fence_fail_closed() {
         temporary.path(), {}, true, false, recovery));
 }
 
+void test_live_wal_limits_preserve_state_and_recover_after_materialization() {
+    // Exercise byte and operation bounds independently, including the frozen
+    // prefix: an empty active WAL must not bypass retained-backlog limits.
+    for (const bool bound_bytes : {false, true}) {
+        TemporaryDirectory temporary(
+            bound_bytes ? "live-wal-bytes" : "live-wal-operations");
+        const std::array<std::uint64_t, 2> ids{3, 5};
+        auto embeddings = rows(ids.size(), 4);
+        build_collection(
+            temporary.path(), ids, embeddings, throwdb::DType::Float16,
+            2, 8, 1);
+        const std::array<std::uint64_t, 1> changed{ids[0]};
+        const std::array<std::uint64_t, 1> untouched{ids[1]};
+        const std::array<std::uint64_t, 1> inserted{7};
+        const std::vector<std::byte> replacement(4, std::byte{0x7f});
+        auto writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true);
+        writer->update(changed, replacement);
+        std::copy(replacement.begin(), replacement.end(), embeddings.begin());
+        const auto baseline = writer->rotate_wal();
+        require(baseline.frozen_wal_count == 1
+                    && baseline.active_wal_operation_count == 0,
+                "live-bound fixture does not retain a frozen WAL");
+        writer.reset();
+
+        throwdb::NativeOpenOptions limits;
+        if (bound_bytes) {
+            limits.max_wal_bytes = baseline.total_wal_bytes;
+        } else {
+            limits.max_wal_operations = baseline.total_wal_operation_count;
+        }
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        const auto require_unchanged = [&] {
+            const auto after = writer->mutation_log_stats();
+            require(after.generation == baseline.generation
+                        && after.committed_sequence == baseline.committed_sequence
+                        && after.total_wal_bytes == baseline.total_wal_bytes
+                        && after.total_wal_operation_count
+                               == baseline.total_wal_operation_count
+                        && after.overlay_entry_count == baseline.overlay_entry_count
+                        && writer->count() == ids.size(),
+                    "rejected mutation changed WAL or overlay state");
+            require(writer->get_bytes(ids) == embeddings,
+                    "rejected mutation changed visible rows");
+        };
+        require_throws<throwdb::StorageError>(
+            [&] { writer->insert(inserted, replacement); },
+            "live insert exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { writer->upsert(inserted, replacement); },
+            "live upsert exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { writer->update(changed, replacement); },
+            "live update exceeded the retained WAL limit");
+        require_unchanged();
+        require_throws<throwdb::StorageError>(
+            [&] { static_cast<void>(writer->erase(untouched)); },
+            "live erase exceeded the retained WAL limit");
+        require_unchanged();
+
+        // A no-op consumes no durable budget, even exactly at the limit.
+        require(writer->erase(inserted) == std::vector<std::uint8_t>{0},
+                "missing-ID erase changed state at the WAL limit");
+        require(!writer->rotate_wal().rotated,
+                "empty active WAL rotated at the WAL limit");
+        require_unchanged();
+        writer.reset();
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        require_unchanged();
+
+        const auto maintained = writer->materialize_frozen_wals();
+        require(maintained.materialized
+                    && maintained.total_wal_operation_count == 0,
+                "materialization did not release retained WAL budget");
+        writer->insert(inserted, replacement);
+        require(writer->get_bytes(inserted) == replacement,
+                "released WAL budget did not admit a new mutation");
+        writer.reset();
+        writer = throwdb::NativeCollection::open(
+            temporary.path(), {}, true, false, limits);
+        require(writer->count() == ids.size() + 1
+                    && writer->get_bytes(inserted) == replacement,
+                "bounded writer could not reopen its accepted mutation");
+    }
+}
+
+void test_live_wal_rotation_and_append_accept_exact_byte_limits() {
+    TemporaryDirectory temporary("rotation-byte-budget");
+    const std::array<std::uint64_t, 1> ids{9};
+    const auto embeddings = rows(ids.size(), 4);
+    build_collection(
+        temporary.path(), ids, embeddings, throwdb::DType::Float16,
+        2, 8, 1);
+    auto writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true);
+    writer->update(ids, embeddings);
+    const auto baseline = writer->mutation_log_stats();
+    writer.reset();
+
+    throwdb::NativeOpenOptions limits;
+    limits.max_wal_bytes =
+        baseline.total_wal_bytes + throwdb::detail::kWalFileHeaderSize - 1;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    require_throws<throwdb::StorageError>(
+        [&] { static_cast<void>(writer->rotate_wal()); },
+        "rotation failed to charge its complete retained WAL header");
+    const auto rejected = writer->mutation_log_stats();
+    require(rejected.generation == baseline.generation
+                && rejected.total_wal_bytes == baseline.total_wal_bytes
+                && rejected.frozen_wal_count == 0,
+            "rejected rotation published a catalog or successor WAL");
+    writer.reset();
+
+    ++limits.max_wal_bytes;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    const auto rotated = writer->rotate_wal();
+    require(rotated.rotated
+                && rotated.total_wal_bytes == limits.max_wal_bytes,
+            "rotation rejected an exact header-byte budget");
+    writer.reset();
+
+    limits.max_wal_bytes +=
+        baseline.total_wal_bytes - throwdb::detail::kWalFileHeaderSize;
+    limits.max_wal_operations = 2;
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    writer->update(ids, embeddings);
+    const auto appended = writer->mutation_log_stats();
+    require(appended.total_wal_bytes == limits.max_wal_bytes
+                && appended.total_wal_operation_count == limits.max_wal_operations,
+            "append rejected an exact byte/operation budget");
+    require_throws<throwdb::StorageError>(
+        [&] { writer->update(ids, embeddings); },
+        "append exceeded its exact retained WAL budget");
+    writer.reset();
+    writer = throwdb::NativeCollection::open(
+        temporary.path(), {}, true, false, limits);
+    require(writer->get_bytes(ids) == embeddings,
+            "exact-budget mutations could not reopen under the same limits");
+}
+
 struct TestCase {
     const char* name;
     std::function<void()> run;
@@ -2781,7 +3032,7 @@ struct TestCase {
 }  // namespace
 
 int main() {
-    const std::array<TestCase, 28> tests{{
+    const std::array<TestCase, 31> tests{{
         {"float16_end_to_end_and_read_surface",
          test_float16_end_to_end_and_read_surface},
         {"float32_and_reader_trial", test_float32_and_reader_trial},
@@ -2813,6 +3064,8 @@ int main() {
          test_fully_folded_materialized_snapshot_uses_fast_path},
         {"selective_fold_is_bounded_and_rebases_newer_wal",
          test_selective_fold_is_bounded_and_rebases_newer_wal},
+        {"fold_one_run_budget_preserves_complete_partitions",
+         test_fold_one_run_budget_preserves_complete_partitions},
         {"format_aware_default_fold_covers_all_active_runs",
          test_format_aware_default_fold_covers_all_active_runs},
         {"fold_budget_charges_worst_case_output_geometry",
@@ -2836,6 +3089,10 @@ int main() {
          test_checksummed_post_initial_catalog_fails_closed},
         {"mutable_open_limits_and_pending_fence_fail_closed",
          test_mutable_open_limits_and_pending_fence_fail_closed},
+        {"live_wal_limits_preserve_state_and_recover_after_materialization",
+         test_live_wal_limits_preserve_state_and_recover_after_materialization},
+        {"live_wal_rotation_and_append_accept_exact_byte_limits",
+         test_live_wal_rotation_and_append_accept_exact_byte_limits},
     }};
 
     std::size_t failures = 0;

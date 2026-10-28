@@ -8,6 +8,8 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <fstream>
+#include <limits>
 #include <iostream>
 #include <memory>
 #include <poll.h>
@@ -23,9 +25,8 @@
 
 #include "throwdb/native_collection.hpp"
 #include "../src/core/file_lock.hpp"
-#include "../src/core/mutation_catalog.hpp"
+#include "../src/core/partitioned_index_format.hpp"
 #include "../src/core/native_collection_test_hooks.hpp"
-#include "../src/core/native_format.hpp"
 
 namespace {
 
@@ -111,7 +112,8 @@ void build_store(
     const std::span<const std::byte> embeddings,
     const std::uint32_t dimension) {
     throwdb::NativeBuilderOptions options;
-    options.format_version = 6;
+    options.format_version = 7;
+    options.partition_bits = 2;
     options.dimension = dimension;
     options.dtype = throwdb::DType::Float16;
     options.segment_size_bytes = 1ULL << 20;
@@ -120,12 +122,52 @@ void build_store(
     builder->finish();
 }
 
-[[nodiscard]] throwdb::detail::MutationCatalog catalog_for(
-    const std::filesystem::path& store) {
-    const throwdb::detail::NativeManifest manifest =
-        throwdb::detail::read_native_manifest(store);
-    return throwdb::detail::read_current_mutation_catalog(store, manifest);
+[[nodiscard]] std::vector<std::byte> read_file(
+    const std::filesystem::path& path) {
+    const std::uint64_t size = std::filesystem::file_size(path);
+    if (size > std::numeric_limits<std::size_t>::max()) {
+        fail("test file does not fit memory");
+    }
+    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+    std::ifstream file(path, std::ios::binary);
+    file.read(
+        reinterpret_cast<char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    if (!file) {
+        fail("cannot read test file");
+    }
+    return bytes;
 }
+
+[[nodiscard]] std::string uuid_token(
+    const throwdb::detail::Uuid128 value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::array<char, 32> token{};
+    const auto put_word = [&token](const std::uint64_t word,
+                                   const std::size_t begin) {
+        for (std::size_t nibble = 0; nibble != 16; ++nibble) {
+            token[begin + nibble] = hex[
+                (word >> static_cast<unsigned>((15 - nibble) * 4)) & 0xfU];
+        }
+    };
+    put_word(value.high, 0);
+    put_word(value.low, 16);
+    return std::string(token.begin(), token.end());
+}
+
+[[nodiscard]] throwdb::detail::PartitionedCatalogV3 catalog_for(
+    const std::filesystem::path& root) {
+    using namespace throwdb::detail;
+    const PartitionedManifestV2 manifest = decode_partitioned_manifest_v2(
+        read_file(root / "manifest.bin"));
+    const PartitionedCurrentV1 current = decode_partitioned_current_v1(
+        read_file(root / "CURRENT"), manifest);
+    return decode_partitioned_catalog_v3(read_file(
+        root / "catalogs"
+        / ("catalog-" + uuid_token(current.catalog_id) + ".bin")));
+}
+
+
 
 [[nodiscard]] bool write_byte(const int fd, const char value) noexcept {
     while (true) {
@@ -177,8 +219,8 @@ struct ReaderOpenObservation {
     int status_fd{-1};
     const std::filesystem::path* store{nullptr};
     const std::filesystem::path* frozen_path{nullptr};
-    const throwdb::detail::MutationCatalog* before{nullptr};
-    throwdb::detail::MutationCatalog while_blocked;
+    const throwdb::detail::PartitionedCatalogV3* before{nullptr};
+    throwdb::detail::PartitionedCatalogV3 while_blocked;
     std::exception_ptr error;
     bool command_sent{false};
     bool cross_process_probe_blocked{false};
@@ -312,8 +354,12 @@ public:
                 } else {
                     const auto materialized =
                         writer->materialize_frozen_wals();
-                    if (!materialized.materialized
-                        || materialized.delta_run_count != 1
+                    // Format 7 retires pathnames through a separate bounded
+                    // orphan pass after publishing the replacement catalog.
+                    const auto reclaimed = writer->reclaim_orphans();
+                    if (!reclaimed.durability_complete
+                        || !materialized.materialized
+                        || materialized.index_run_count != 1
                         || materialized.frozen_wal_count != 0) {
                         result = 26;
                     } else if (!write_byte(status_fd, 'D')) {
@@ -334,7 +380,7 @@ public:
     ::_exit(result);
 }
 
-void test_reader_open_gate_pins_old_catalog_before_materialization_unlink() {
+void test_reader_open_gate_pins_old_catalog_before_publication_and_reclaim() {
     TempDirectory temporary;
     const auto store = temporary.path() / "store";
     constexpr std::uint32_t dimension = 8;
@@ -349,12 +395,11 @@ void test_reader_open_gate_pins_old_catalog_before_materialization_unlink() {
     const auto rotated = fixture_writer->rotate_wal();
     require(rotated.rotated, "reader-barrier fixture did not rotate its WAL");
 
-    const throwdb::detail::MutationCatalog before = catalog_for(store);
+    const throwdb::detail::PartitionedCatalogV3 before = catalog_for(store);
     require_equal(before.wal_entries.size(), std::size_t{2},
                   "reader-barrier fixture has the wrong WAL count");
     const std::filesystem::path frozen_path =
-        throwdb::detail::mutation_wal_path(
-            store, before.wal_entries.front().wal_id);
+        store / "wal" / ("wal-" + uuid_token(before.wal_entries.front().wal_id) + ".wal");
     require(std::filesystem::exists(frozen_path),
             "reader-barrier frozen WAL is missing before publication");
     fixture_writer.reset();
@@ -431,17 +476,17 @@ void test_reader_open_gate_pins_old_catalog_before_materialization_unlink() {
                   "blocked reader did not capture the old catalog");
     require_equal(old_stats.frozen_wal_count, std::uint64_t{1},
                   "blocked reader lost its frozen WAL view");
-    require_equal(old_stats.delta_run_count, std::uint64_t{0},
-                  "blocked reader captured the publisher's delta");
+    require_equal(old_stats.index_run_count, std::uint64_t{0},
+                  "blocked reader captured the publisher's materialized run");
     require_bytes_equal(
         old_reader->get_bytes(ids), updated,
         "old reader cannot read its unlinked frozen WAL resource");
 
-    const throwdb::detail::MutationCatalog after = catalog_for(store);
+    const throwdb::detail::PartitionedCatalogV3 after = catalog_for(store);
     require_equal(after.generation, before.generation + 2,
                   "publisher produced the wrong catalog generation");
-    require_equal(after.delta_entries.size(), std::size_t{1},
-                  "publisher did not create one delta run");
+    require_equal(after.runs.size(), std::size_t{1},
+                  "publisher did not create one index run");
     require_equal(after.wal_entries.size(), std::size_t{1},
                   "publisher retained its selected frozen WAL");
     require(!std::filesystem::exists(frozen_path),
@@ -451,8 +496,8 @@ void test_reader_open_gate_pins_old_catalog_before_materialization_unlink() {
     const auto later_stats = later_reader->mutation_log_stats();
     require_equal(later_stats.generation, after.generation,
                   "later reader did not select the published catalog");
-    require_equal(later_stats.delta_run_count, std::uint64_t{1},
-                  "later reader did not open the materialized delta");
+    require_equal(later_stats.index_run_count, std::uint64_t{1},
+                  "later reader did not open the materialized run");
     require_equal(later_stats.frozen_wal_count, std::uint64_t{0},
                   "later reader reopened the retired WAL view");
     require_bytes_equal(
@@ -469,8 +514,8 @@ struct TestCase {
 
 int main() {
     const std::array<TestCase, 1> tests{{
-        {"reader_open_gate_pins_old_catalog_before_materialization_unlink",
-         test_reader_open_gate_pins_old_catalog_before_materialization_unlink},
+        {"reader_open_gate_pins_old_catalog_before_publication_and_reclaim",
+         test_reader_open_gate_pins_old_catalog_before_publication_and_reclaim},
     }};
 
     std::size_t failures = 0;

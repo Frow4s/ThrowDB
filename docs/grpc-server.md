@@ -3,8 +3,8 @@
 The public gRPC contract is
 [`proto/throwdb/v1/throwdb.proto`](../proto/throwdb/v1/throwdb.proto). It is a
 first-class transport over the same transport-neutral collection engine as the
-embedded Python API. The earlier TDBP/TCP transport remains a build-tree-only
-comparison tool; it is not the public server contract and is not installed.
+embedded Python API. The earlier internal TDBP/TCP comparison transport has
+been removed; gRPC is the supported network API.
 
 ## Build contract
 
@@ -94,7 +94,7 @@ refuses a source checkout whose commit is not the pinned one.
 
 `THROWDB_BUILD_GRPC_SERVER=ON` uses `find_package(... REQUIRED)`. A missing
 compiler, plugin, header, or C++ library is therefore a configuration error;
-the build never substitutes the custom TCP server silently.
+the build fails if its required transport dependencies are missing.
 
 The release preset also enables `THROWDB_GRPC_ENABLE_REFLECTION`. This
 requires `gRPC::grpc++_reflection` and exposes the service to `grpcurl` and
@@ -106,7 +106,7 @@ Python gRPC client and the public `throwdbd` launcher. The launcher resolves a
 reader profile once and then replaces itself with the wheel's private C++
 `throwdb/libexec/_throwdbd_native` daemon. Python is never in the RPC data
 path. A missing C++ gRPC toolchain therefore fails the wheel build rather than
-silently publishing a client-only or TCP-only artifact. Core-only developers
+silently publishing an incomplete server artifact. Core-only developers
 may explicitly configure both
 `THROWDB_BUILD_SERVER=OFF` and `THROWDB_BUILD_GRPC_SERVER=OFF`; the Python CI
 matrix uses that mode once per Python version, while a dedicated job builds and
@@ -301,6 +301,160 @@ before another stream is admitted. The Python client additionally uses a
 one-hour scan deadline by default; explicitly passing `scan_timeout=None`
 disables only that client deadline, not the server bounds.
 
+## Optional bounded read-workload logging
+
+The native server can record complete logical point-read traces for the offline
+layout optimizer. This is fail-open telemetry, not authoritative collection
+state or an audit WAL. It is disabled unless `--read-log-dir` is supplied:
+
+```bash
+throwdbd \
+  --storage /nvme/collections/products \
+  --listen 127.0.0.1:50051 \
+  --read-log-dir /nvme/throwdb-workload/products
+```
+
+The log directory must be dedicated and disjoint from the collection tree. It
+may be a sibling, but it may not equal the collection, be inside it, or contain
+it. This prevents raw request IDs from entering collection backup/restore and
+prevents the logger from changing permissions on a shared collection
+ancestor. The launcher and native daemon both validate this before serving.
+The directory is permanently bound to the collection ID by its owner marker.
+After rebuilding the collection under a new ID, archive or remove the old
+dedicated log directory and start the new collection with a fresh one.
+
+Logging creates one lifecycle for each unary `Get` and one for the complete
+bidirectional `StreamGet`. After a valid ID batch is decoded, every submitted
+`uint64` ID is retained in original order, including duplicates. A request is
+ended with its actual success, cancellation, deadline, client-close, or failure
+status. Only successful, fully captured requests are eligible for layout
+training. `ScanIds` and `ScanRecords` do not contain a user-supplied ID set and
+are excluded. Embeddings and per-ID physical pointers are never logged.
+
+The logger does not infer categories or label a request as broad/full. Its only
+operation value is the real `Get` or `StreamGet` method. Larger inputs are split
+into contiguous physical ID records, not sampled or truncated.
+
+The defaults after opt-in are:
+
+| Setting | Default | Purpose |
+| --- | ---: | --- |
+| `--read-log-id-chunk-rows` | `8192` | exact ordered IDs per physical record; hard maximum is 8192 |
+| `--read-log-buffer-mib` | `256` | preallocated multi-producer queue |
+| `--read-log-segment-mib` | `256` | rotate sequential binary segments |
+| `--read-log-rotate-seconds` | `3600` | time-based rotation |
+| `--read-log-retention-mib` | `51200` | total recognized-log budget, including the active segment |
+| `--read-log-retention-seconds` | `604800` | seven-day age bound |
+| `--read-log-min-free-mib` | `10240` | pause before consuming the filesystem reserve |
+| `--read-log-max-write-mib-per-second` | `16` | token-bucket cap for all sequential logger bytes |
+| `--read-log-max-retained-files` | `4096` | total cap including the active segment; supported range is 1–65533 |
+
+The buffer must fit at least two maximum-sized records. A segment must fit its
+header, opening counter baseline, one maximum record, and terminal checkpoint.
+Retention must cover at least one segment, and the write-rate cap must permit
+that complete bounded transaction in one token-bucket window.
+Tuning flags without `--read-log-dir` are rejected instead of silently enabling
+telemetry.
+
+Retention prunes recognized finalized files and stale `.open` tails
+oldest-first until both the byte and file-count budgets hold. While the logger
+is running it reserves one configured file slot for the current writer-owned
+`.open` segment, so the total recognized file count never exceeds the
+configured ceiling. It also reserves one full configured segment from the byte
+budget; finalized/stale files plus the active segment therefore stay within the
+configured retention bytes. Age retention is enforced during traffic and by a
+periodic idle sweep at least every five minutes.
+
+Disabled mode allocates no logger or queue and adds only an atomic null-pointer
+check to point reads. Enabled reads call the explicitly profiled native path and
+enqueue fixed-capacity frames through a preallocated bounded MPSC ring. A
+producer never waits for the writer. One background thread writes private
+`0600` CRC32C-framed files in a `0700` directory. Only one process may own a
+log directory.
+
+Every trace contains:
+
+- request begin/end, exact snapshot anchor when available, prefix dimensions,
+  status, submitted/delivered rows, and response bytes;
+- exact ID chunks with logical offset and input-batch/chunk sequence, plus
+  successful streaming-delivery order in the corresponding batch record;
+- lookup, physical sort/plan/backend, construction, and transport timings;
+- range/task/file fanout, requested/useful/planned/completed bytes,
+  merge-gap amplification, 4 KiB page and 1 MiB chunk runs, and input-order
+  discontinuities;
+- the effective reader backend, merge geometry, workers, queue/task sizing,
+  and `io_uring` topology used by that server process.
+
+Explicit startup errors such as invalid geometry, an unsafe/unwritable path, or
+a conflicting writer lock fail server startup. After successful startup,
+queue pressure, the minimum-free-space guard, and log I/O failures never fail
+or delay the read RPC:
+
+- queue pressure increments full-record/ID counters and marks the request
+  incomplete;
+- low free space pauses admission and is rechecked periodically;
+- a runtime filesystem error permanently disables that logger instance until
+  server restart and leaves a recoverable `.open` tail;
+- shutdown first drains all gRPC handlers, then drains accepted telemetry;
+- an active segment becomes `.tdbrl` only after its fresh terminal checkpoint,
+  file fsync, rename, and directory fsync succeed;
+- every segment starts with the exact terminal-counter baseline carried from
+  its predecessor, so deleting an old retained prefix does not turn lifetime
+  loss counters into loss attributed to the remaining files;
+- minimum-free-space refusal or any terminal-checkpoint/finalization failure
+  leaves `.open`; a pre-bind segment that never accepted an event is removed
+  instead of becoming an empty finalized file.
+
+`RemoteCollection.describe()` exposes the effective bounded policy and
+process-local counters through `read_logging` and `read_logging_stats`, without
+disclosing the server-local path. Protocol v1.5 exposes request, record,
+ID-chunk, batch, ID, queue, and reason-specific loss counters. Deprecated v1.4
+sampling fields remain compatibility aliases; a v1.5 server reports
+`sample_ppm=1000000` and never reports truncation. Alert on
+`runtime_failed`, `writer_errors`, any incomplete request, or any dropped
+record/ID.
+
+Inspect logs offline before using them for optimization:
+
+```bash
+throwdb workload inspect \
+  --logs /nvme/throwdb-workload/products \
+  --storage /nvme/collections/products \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
+  --require-suitable \
+  --output workload-report.json
+```
+
+The inspector validates collection/schema identity, strict frame geometry,
+CRC32C, request/chunk/batch sequence and offsets, the full-sequence digest,
+configured resource bounds, cumulative counter consistency, baseline
+continuity between adjacent segments, terminal completeness, and
+reason-specific loss. It reports aggregates and never prints captured IDs.
+Requests crossing an already-pruned oldest prefix are left-censored; requests
+unfinished in the newest recoverable tail are right-censored. Both are
+excluded. An interior missing chunk, counter/segment discontinuity, corrupt
+frame, or any retained-window logger drop makes `exact_capture=false` and the
+v2 corpus unsuitable for layout optimization.
+
+Inspection itself is bounded. Defaults are 65536 files, 64 GiB total input,
+4 GiB per file, 1024 per-file JSON reports, and 4096 distinct prefix-dimension
+buckets/active request states. Override them explicitly with `--max-files`,
+`--max-total-bytes`, `--max-file-bytes`, `--max-report-entries`,
+`--max-prefix-entries`, and the active-request bound.
+The latter is exposed as `--max-active-requests`.
+`--max-files` may be lowered but cannot exceed the hard 65536-entry directory
+inventory ceiling; the inspector also counts a small bounded allowance of
+service files and rejects directories that exceed it. Byte-valued inspector
+arguments are raw bytes. Exceeding any hard input or prefix bound aborts
+inspection instead of producing a partial suitable report.
+
+Raw IDs make this directory sensitive. Keep it off collection/S3 sync and
+routine support bundles, use an encrypted volume, and restrict access to the
+server/optimizer identity. Retention unlink is not secure erasure on SSD/NVMe.
+The 50-GiB budget stores approximately 6.7 billion raw numeric ID occurrences
+before framing overhead, including the reserved active segment.
+
 ## Processes and binaries
 
 - `throwdbd` and `throwdb serve`: public one-shot tune-aware launchers; after
@@ -309,8 +463,6 @@ disables only that client deadline, not the server bounds.
 - `build/server-release/throwdbd`: raw daemon produced by a standalone source
   build; it bypasses the tuning registry unless selected through the launcher
   with `--native-binary`.
-- `throwdbd-tcp`: provisional build-tree target retained only for internal
-  comparison.
 
 The public daemon opens one format-7 collection and enforces its single-writer
 lease. gRPC v1 provides `Health`, `Describe`, `Get`, bidirectional `StreamGet`,
@@ -376,9 +528,9 @@ can replace the lease-owning instance.
 Maintenance does not hold the server mutation lane for a complete lifecycle
 build. Journal reconciliation/checkpoint and WAL rotation remain serialized
 with `PREPARE -> native commit -> COMPLETE`, because they can change the replay
-domain or freeze the WAL required for recovery. Expensive processing of an
-already selected frozen WAL, delta-run prefix, or segment runs outside that
-lane, so unrelated mutations can continue; native publication is still
+domain or freeze the WAL required for recovery. Expensive processing of a
+selected frozen-WAL prefix, set of index partitions, or segment happens outside
+that lane, so unrelated mutations can continue; native publication is still
 serialized internally. Format-7 orphan GC likewise performs its complete
 filesystem inventory, classification, and bounded selection without the
 mutation lane, then briefly reacquires the native mutation/commit/view locks to
@@ -408,15 +560,24 @@ not an acceptable deployment policy.
 Writable format-7 servers normally report `durable_idempotency = true` and a
 nonzero `idempotency_domain`: within that domain, a repeated ID with the same
 request digest replays the original result, while a different request is
-rejected. `RemoteCollection` copies the domain advertised by `Describe` into
-every mutation. If the capability is explicitly disabled, clients must not
+rejected. `RemoteCollection` pins the domain for caller-supplied UUID/string/bytes IDs when the connection
+opens; a subsequent `describe()` or `count` refresh does not silently change
+that domain. Automatically generated IDs denote new work and use the current
+advertised domain. Refresh metadata with `describe()`, then use
+`remote.mutation_token()` to capture a fresh operation ID and
+the currently advertised domain for a new logical mutation. Pass that token as
+`operation_id=` and retain it with the original request. After an ambiguous
+result, `error.retry_token` retains the exact domain and ID sent on the wire,
+including across reconnects. A retired domain fails closed; never move an
+uncertain operation into a new domain just to make the retry succeed.
+If the capability is explicitly disabled, clients must not
 automatically retry an ambiguous mutation because its WAL commit may already be
 durable.
 
 The server reserves mutation `ABORTED` for an admission failure before the
 current request enters durable `PREPARE`; the current request therefore
 definitely did not commit. The Python client maps it to `RemoteAbortedError`, a
-typed retry signal carrying `operation` and `operation_id`, with
+typed retry signal carrying `operation`, `operation_id`, and `retry_token`, with
 `definitely_not_committed = true`. This remains distinct from an unknown
 transport outcome and is safe to retry even without durable idempotency. A
 caller may apply bounded backoff, but must replay the identical request with
@@ -641,8 +802,8 @@ little-endian `uint32 row_index`. They are valid only for the accompanying
 snapshot metadata; clients should expose the two fields separately instead
 of treating them as a stable global row number.
 
-The server MVP accepts storage format 7 only. `throwdbd` fails before binding
-a port with a clear rebuild message for legacy collections, so `Describe`
+The server accepts storage format 7 only. `throwdbd` fails before binding
+a port with an unsupported-format error for older collections, so `Describe`
 never advertises physical scan locations that the opened format cannot
 provide.
 
@@ -654,7 +815,7 @@ starts the public tune-aware launcher on `127.0.0.1:0`, records its ready
 diagnostics, and stops it after the run. With `--crud-rows 0` (the default) the
 daemon is opened read-only.
 
-Report revision 2 measures controlled cache states, repeats every deterministic
+Report revision 3 measures controlled cache states, repeats every deterministic
 workload three times by default, and adds exact-corpus references for the mixed
 small/large workload. Its quality-oriented defaults use 100 sequential calls,
 20 concurrent calls per worker, and 200 small plus 100 large mixed calls per

@@ -539,8 +539,8 @@ def test_public_tune_deadline_report_forwards_resource_stability(
     with throwdb.Collection.create(
         path,
         schema=throwdb.CollectionSchema(dimension=4),
-        shard_size_bytes=1 << 20,
-        format_version=6,
+        segment_size_bytes=1 << 20,
+        format_version=7,
     ) as collection:
         collection.add(
             np.array([1], dtype=np.uint64),

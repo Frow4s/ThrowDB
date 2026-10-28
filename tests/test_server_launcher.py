@@ -315,6 +315,171 @@ def test_launcher_defaults_to_read_only_and_rejects_conflicting_modes(
         _args(store, native, "--writable", "--read-only")
 
 
+def test_launcher_forwards_explicit_bounded_read_logging(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "store"
+    logs = tmp_path / "workload-logs"
+    _build_store(store)
+    native = _fake_native(tmp_path / "bin" / "throwdbd")
+
+    plan = server_module.build_server_launch_plan(
+        _args(
+            store,
+            native,
+            "--read-log-dir",
+            str(logs),
+            "--read-log-id-chunk-rows",
+            "8192",
+            "--read-log-buffer-mib",
+            "96",
+            "--read-log-segment-mib",
+            "128",
+            "--read-log-rotate-seconds",
+            "900",
+            "--read-log-retention-mib",
+            "2048",
+            "--read-log-retention-seconds",
+            "172800",
+            "--read-log-min-free-mib",
+            "4096",
+            "--read-log-max-write-mib-per-second",
+            "32",
+            "--read-log-max-retained-files",
+            "2048",
+        )
+    )
+
+    expected = {
+        "--read-log-dir": str(logs),
+        "--read-log-id-chunk-rows": "8192",
+        "--read-log-buffer-mib": "96",
+        "--read-log-segment-mib": "128",
+        "--read-log-rotate-seconds": "900",
+        "--read-log-retention-mib": "2048",
+        "--read-log-retention-seconds": "172800",
+        "--read-log-min-free-mib": "4096",
+        "--read-log-max-write-mib-per-second": "32",
+        "--read-log-max-retained-files": "2048",
+    }
+    for option, value in expected.items():
+        assert plan.argv.count(option) == 1
+        assert plan.argv[plan.argv.index(option) + 1] == value
+
+
+def test_launcher_keeps_read_logging_disabled_without_directory(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    native = _fake_native(tmp_path / "bin" / "throwdbd")
+
+    plan = server_module.build_server_launch_plan(_args(store, native))
+
+    assert not any(argument.startswith("--read-log-") for argument in plan.argv)
+    for option, value in (
+        ("--read-log-id-chunk-rows", "8192"),
+        ("--read-log-max-write-mib-per-second", "32"),
+        ("--read-log-max-retained-files", "2048"),
+    ):
+        with pytest.raises(
+            server_module.ServerLaunchError,
+            match="require --read-log-dir",
+        ):
+            server_module.build_server_launch_plan(
+                _args(store, native, option, value)
+            )
+
+
+def test_launcher_rejects_unsafe_or_unbounded_read_log_geometry(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "store"
+    _build_store(store)
+    native = _fake_native(tmp_path / "bin" / "throwdbd")
+
+    for unsafe in (store, store / "telemetry", store.parent):
+        with pytest.raises(
+            server_module.ServerLaunchError,
+            match="dedicated directory disjoint",
+        ):
+            server_module.build_server_launch_plan(
+                _args(
+                    store,
+                    native,
+                    "--read-log-dir",
+                    str(unsafe),
+                )
+            )
+    with pytest.raises(SystemExit):
+        _args(
+            store,
+            native,
+            "--read-log-dir",
+            str(tmp_path / "logs"),
+            "--read-log-id-chunk-rows",
+            "8193",
+        )
+    with pytest.raises(
+        server_module.ServerLaunchError,
+        match="retention-mib.*segment-mib",
+    ):
+        server_module.build_server_launch_plan(
+            _args(
+                store,
+                native,
+                "--read-log-dir",
+                str(tmp_path / "logs"),
+                "--read-log-segment-mib",
+                "512",
+                "--read-log-retention-mib",
+                "256",
+            )
+        )
+    with pytest.raises(
+        server_module.ServerLaunchError,
+        match="signed 64-bit",
+    ):
+        server_module.build_server_launch_plan(
+            _args(
+                store,
+                native,
+                "--read-log-dir",
+                str(tmp_path / "logs"),
+                "--read-log-rotate-seconds",
+                str(1 << 63),
+            )
+        )
+    with pytest.raises(
+        server_module.ServerLaunchError,
+        match="uint64 MiB",
+    ):
+        server_module.build_server_launch_plan(
+            _args(
+                store,
+                native,
+                "--read-log-dir",
+                str(tmp_path / "logs"),
+                "--read-log-buffer-mib",
+                str(1 << 44),
+            )
+        )
+    with pytest.raises(
+        server_module.ServerLaunchError,
+        match="retention-seconds.*uint64",
+    ):
+        server_module.build_server_launch_plan(
+            _args(
+                store,
+                native,
+                "--read-log-dir",
+                str(tmp_path / "logs"),
+                "--read-log-retention-seconds",
+                str(1 << 64),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "extra, message",
     [

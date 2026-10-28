@@ -8,8 +8,8 @@ logical rows, ID index, mutation catalog, or durability state.
 
 `Collection.open(path, tuning="auto")` performs a bounded, metadata-only
 lookup. It does not benchmark the device and does not write to the collection.
-Payload discovery stops after examining 4096 directory entries across legacy
-base data, format-6 deltas, format-7 `segments/`, and WAL directories. Any of
+Payload discovery stops after examining 4096 directory entries across the
+format-7 `segments/` and WAL directories. Any of
 those files can serve embedding bytes. Overflow is observable as incomplete
 discovery and makes the profile ineligible instead of extending open time with
 an unbounded directory walk.
@@ -150,7 +150,7 @@ report = throwdb.Collection.tune(
 ```
 
 The calibrator acquires the collection's exclusive lifecycle lease before it
-loads the large flat index. Writers and another calibrator therefore fail fast
+loads the partitioned index. Writers and another calibrator therefore fail fast
 for the duration of the run; ordinary immutable readers remain available. One
 read-only snapshot, one loaded index, and the same open segment descriptors are
 used for the whole matrix. Every candidate owns one bounded reader trial that
@@ -165,9 +165,7 @@ ID input is not required. The native sampler returns at most 4,194,304 live IDs
 after inspecting at most 33,554,432 bounded index locations. The larger cap
 lets a 512 MiB calibration keep the default screening and verification streams
 disjoint even for 2 KiB records; the actual request still shrinks with the
-memory limit. Format 6 samples
-its loaded flat base slots and filters them through the stable mutation view.
-Format 7 samples the current WAL overlay, active run sections, and authoritative
+memory limit. The sampler inspects the current WAL overlay, active run sections, and authoritative
 partition snapshots while deduplicating IDs and rechecking the logical view.
 Its exact integer quotas are proportional to raw source capacity, with a
 one-slot mutable-layer reservation for very small samples; run quota is then

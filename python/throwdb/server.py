@@ -35,6 +35,32 @@ _DEFAULT_MAX_CONCURRENT_CALLS: Final = 32
 _DEFAULT_MAX_CONCURRENT_SCANS: Final = 2
 _DEFAULT_SHUTDOWN_GRACE_MS: Final = 30_000
 _DEFAULT_SHUTDOWN_HARD_TIMEOUT_MS: Final = 60_000
+_DEFAULT_READ_LOG_ID_CHUNK_ROWS: Final = 8_192
+_DEFAULT_READ_LOG_BUFFER_MIB: Final = 256
+_DEFAULT_READ_LOG_SEGMENT_MIB: Final = 256
+_DEFAULT_READ_LOG_RETENTION_MIB: Final = 50 * 1_024
+_DEFAULT_READ_LOG_MAX_WRITE_MIB_PER_SECOND: Final = 16
+_DEFAULT_READ_LOG_MAX_RETAINED_FILES: Final = 4_096
+_MAX_READ_LOG_ID_CHUNK_ROWS: Final = 8_192
+_MAX_READ_LOG_RETAINED_FILES: Final = 65_533
+_MAX_READ_LOG_ROTATE_SECONDS: Final = (1 << 63) - 1
+_MAX_UINT64: Final = (1 << 64) - 1
+_MAX_UINT64_MIB: Final = _MAX_UINT64 >> 20
+_READ_LOG_HEADER_BYTES: Final = 4_096
+_READ_LOG_RECORD_HEADER_BYTES: Final = 256
+_READ_LOG_BATCH_RECORD_BYTES: Final = 384
+_READ_LOG_TERMINAL_CHECKPOINT_BYTES: Final = 256
+_READ_LOG_ARGUMENTS: Final = (
+    "read_log_id_chunk_rows",
+    "read_log_buffer_mib",
+    "read_log_segment_mib",
+    "read_log_rotate_seconds",
+    "read_log_retention_mib",
+    "read_log_retention_seconds",
+    "read_log_min_free_mib",
+    "read_log_max_write_mib_per_second",
+    "read_log_max_retained_files",
+)
 _NATIVE_MAGICS: Final = frozenset(
     {
         b"\x7fELF",
@@ -128,6 +154,19 @@ _NATIVE_VALUE_ARGUMENTS: Final = (
     ("orphan_min_age_seconds", "--orphan-min-age-seconds"),
     ("orphan_max_files", "--orphan-max-files"),
     ("orphan_max_mib", "--orphan-max-mib"),
+    ("read_log_dir", "--read-log-dir"),
+    ("read_log_id_chunk_rows", "--read-log-id-chunk-rows"),
+    ("read_log_buffer_mib", "--read-log-buffer-mib"),
+    ("read_log_segment_mib", "--read-log-segment-mib"),
+    ("read_log_rotate_seconds", "--read-log-rotate-seconds"),
+    ("read_log_retention_mib", "--read-log-retention-mib"),
+    ("read_log_retention_seconds", "--read-log-retention-seconds"),
+    ("read_log_min_free_mib", "--read-log-min-free-mib"),
+    (
+        "read_log_max_write_mib_per_second",
+        "--read-log-max-write-mib-per-second",
+    ),
+    ("read_log_max_retained_files", "--read-log-max-retained-files"),
 )
 
 
@@ -183,6 +222,15 @@ def _nonnegative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be zero or greater")
+    return parsed
+
+
+def _read_log_id_chunk_rows(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > _MAX_READ_LOG_ID_CHUNK_ROWS:
+        raise argparse.ArgumentTypeError(
+            f"value must be between 1 and {_MAX_READ_LOG_ID_CHUNK_ROWS}"
+        )
     return parsed
 
 
@@ -400,6 +448,33 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--orphan-min-age-seconds", type=_nonnegative_int)
     parser.add_argument("--orphan-max-files", type=_positive_int)
     parser.add_argument("--orphan-max-mib", type=_positive_int)
+    parser.add_argument(
+        "--read-log-dir",
+        type=Path,
+        help=(
+            "enable bounded point-read workload logging in this dedicated "
+            "directory; logging is disabled when omitted"
+        ),
+    )
+    parser.add_argument(
+        "--read-log-id-chunk-rows",
+        type=_read_log_id_chunk_rows,
+        help=(
+            "maximum ordered ID rows per workload-log record; requests "
+            "larger than this are recorded as multiple contiguous chunks"
+        ),
+    )
+    parser.add_argument("--read-log-buffer-mib", type=_positive_int)
+    parser.add_argument("--read-log-segment-mib", type=_positive_int)
+    parser.add_argument("--read-log-rotate-seconds", type=_positive_int)
+    parser.add_argument("--read-log-retention-mib", type=_positive_int)
+    parser.add_argument("--read-log-retention-seconds", type=_positive_int)
+    parser.add_argument("--read-log-min-free-mib", type=_nonnegative_int)
+    parser.add_argument(
+        "--read-log-max-write-mib-per-second",
+        type=_positive_int,
+    )
+    parser.add_argument("--read-log-max-retained-files", type=_positive_int)
     parser.add_argument("--no-auto-maintenance", action="store_true")
     parser.add_argument("--no-idempotency-checkpoint", action="store_true")
     parser.add_argument("--no-auto-clean", action="store_true")
@@ -544,10 +619,148 @@ def _validate_maintenance_arguments(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_read_log_arguments(args: argparse.Namespace) -> None:
+    directory = args.read_log_dir
+    configured = [
+        name
+        for name in _READ_LOG_ARGUMENTS
+        if getattr(args, name, None) is not None
+    ]
+    if directory is None:
+        if configured:
+            options = ", ".join(
+                "--" + name.replace("_", "-") for name in configured
+            )
+            raise ServerLaunchError(
+                f"{options} require --read-log-dir; workload logging is "
+                "disabled unless its dedicated directory is explicit"
+            )
+        return
+
+    for name in (
+        "read_log_buffer_mib",
+        "read_log_segment_mib",
+        "read_log_retention_mib",
+        "read_log_min_free_mib",
+        "read_log_max_write_mib_per_second",
+    ):
+        value = getattr(args, name)
+        if value is not None and value > _MAX_UINT64_MIB:
+            raise ServerLaunchError(
+                f"--{name.replace('_', '-')} exceeds the uint64 MiB range"
+            )
+    if (
+        args.read_log_retention_seconds is not None
+        and args.read_log_retention_seconds > _MAX_UINT64
+    ):
+        raise ServerLaunchError(
+            "--read-log-retention-seconds exceeds the uint64 range"
+        )
+
+    storage = args.storage.expanduser().resolve(strict=False)
+    log_directory = directory.expanduser().resolve(strict=False)
+    if (
+        log_directory == storage
+        or storage in log_directory.parents
+        or log_directory in storage.parents
+    ):
+        raise ServerLaunchError(
+            "--read-log-dir must be a dedicated directory disjoint from the "
+            "collection directory so telemetry cannot alter collection "
+            "permissions or enter collection backup and restore"
+        )
+
+    id_chunk_rows = (
+        args.read_log_id_chunk_rows
+        if args.read_log_id_chunk_rows is not None
+        else _DEFAULT_READ_LOG_ID_CHUNK_ROWS
+    )
+    buffer_mib = (
+        args.read_log_buffer_mib
+        if args.read_log_buffer_mib is not None
+        else _DEFAULT_READ_LOG_BUFFER_MIB
+    )
+    segment_mib = (
+        args.read_log_segment_mib
+        if args.read_log_segment_mib is not None
+        else _DEFAULT_READ_LOG_SEGMENT_MIB
+    )
+    retention_mib = (
+        args.read_log_retention_mib
+        if args.read_log_retention_mib is not None
+        else _DEFAULT_READ_LOG_RETENTION_MIB
+    )
+    maximum_write_mib_per_second = (
+        args.read_log_max_write_mib_per_second
+        if args.read_log_max_write_mib_per_second is not None
+        else _DEFAULT_READ_LOG_MAX_WRITE_MIB_PER_SECOND
+    )
+    maximum_retained_files = (
+        args.read_log_max_retained_files
+        if args.read_log_max_retained_files is not None
+        else _DEFAULT_READ_LOG_MAX_RETAINED_FILES
+    )
+    rotate_seconds = (
+        args.read_log_rotate_seconds
+        if args.read_log_rotate_seconds is not None
+        else 3_600
+    )
+    # The native queue keeps at least two complete fixed-capacity records.
+    # Validate the same lower bound before exec so a dry-run is authoritative.
+    maximum_record_bytes = max(
+        _READ_LOG_BATCH_RECORD_BYTES,
+        _READ_LOG_RECORD_HEADER_BYTES + id_chunk_rows * 8,
+    )
+    minimum_buffer_bytes = 2 * maximum_record_bytes
+    if buffer_mib * (1 << 20) < minimum_buffer_bytes:
+        raise ServerLaunchError(
+            "--read-log-buffer-mib cannot hold two maximum-sized log records"
+        )
+    minimum_segment_bytes = (
+        _READ_LOG_HEADER_BYTES
+        + maximum_record_bytes
+        + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+    )
+    if segment_mib * (1 << 20) < minimum_segment_bytes:
+        raise ServerLaunchError(
+            "--read-log-segment-mib cannot hold the log header and one "
+            "opening checkpoint, maximum-sized record, and terminal "
+            "checkpoint"
+        )
+    if retention_mib < segment_mib:
+        raise ServerLaunchError(
+            "--read-log-retention-mib must be at least "
+            "--read-log-segment-mib"
+        )
+    maximum_write_transaction = (
+        _READ_LOG_HEADER_BYTES
+        + maximum_record_bytes
+        + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+    )
+    if (
+        maximum_write_mib_per_second * (1 << 20)
+        < maximum_write_transaction
+    ):
+        raise ServerLaunchError(
+            "--read-log-max-write-mib-per-second must cover at least one "
+            "maximum-sized record plus its segment header, opening "
+            "checkpoint, and terminal checkpoint per second"
+        )
+    if not 1 <= maximum_retained_files <= _MAX_READ_LOG_RETAINED_FILES:
+        raise ServerLaunchError(
+            "--read-log-max-retained-files must be in [1, 65533]"
+        )
+    if rotate_seconds > _MAX_READ_LOG_ROTATE_SECONDS:
+        raise ServerLaunchError(
+            "--read-log-rotate-seconds must fit signed 64-bit seconds"
+        )
+
+
 def build_server_launch_plan(args: argparse.Namespace) -> ServerLaunchPlan:
     _validate_transport_arguments(args)
     _validate_availability_arguments(args)
     _validate_maintenance_arguments(args)
+    _validate_read_log_arguments(args)
     executable = find_native_server(getattr(args, "native_binary", None))
     tuning = resolve_server_tuning(
         args.storage,

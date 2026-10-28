@@ -1,6 +1,6 @@
 """Python bindings for the ThrowDB storage engine."""
 
-from ._throwdb import ReaderBackendError, Storage, Writer, __version__
+from ._throwdb import ReaderBackendError, __version__
 from ._calibration import CalibrationError
 from ._tuning import TuningRegistryError
 from .collection import (
@@ -43,8 +43,11 @@ from .remote import (
     RemoteIdScan,
     RemoteInternalError,
     RemoteInvalidArgumentError,
+    RemoteMutationToken,
     RemoteNotFoundError,
     RemoteProtocolError,
+    RemoteReadLoggingConfiguration,
+    RemoteReadLoggingStatistics,
     RemoteRecordScan,
     RemoteReaderConfiguration,
     RemoteResourceExhaustedError,
@@ -60,6 +63,7 @@ from .s3_backup import (
     backup_to_s3,
     restore_from_s3,
 )
+from .workload import WorkloadLogError, inspect_workload_logs
 
 __all__ = [
     "Collection",
@@ -102,19 +106,22 @@ __all__ = [
     "RemoteIdScan",
     "RemoteInternalError",
     "RemoteInvalidArgumentError",
+    "RemoteMutationToken",
     "RemoteNotFoundError",
     "RemoteProtocolError",
+    "RemoteReadLoggingConfiguration",
+    "RemoteReadLoggingStatistics",
     "RemoteRecordScan",
     "RemoteReaderConfiguration",
     "RemoteResourceExhaustedError",
     "RemoteTuningSelection",
     "RemoteUnavailableError",
     "RemoteUnimplementedError",
-    "Storage",
     "TuningRegistryError",
-    "Writer",
+    "WorkloadLogError",
     "RecordBatch",
     "backup_to_s3",
+    "inspect_workload_logs",
     "restore_from_s3",
     "__version__",
 ]

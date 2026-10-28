@@ -509,7 +509,7 @@ mTLS and export these fields:
 - admission closed, draining, and terminal-faulted state;
 - active/frozen/total WAL bytes and operations;
 - overlay entries and estimated bytes;
-- delta runs and segment bytes;
+- index run count/bytes and materialized segment bytes;
 - idempotency journal bytes, operations, generation, and configured caps;
 - filesystem available bytes and mutation reserve;
 - maintenance active state.

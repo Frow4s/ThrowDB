@@ -1351,7 +1351,7 @@ void test_engine_maintenance_actions_are_bounded_across_passes() {
     one_action.materialize_max_wals = 1;
     one_action.materialize_max_input_bytes = 1ULL << 20;
     one_action.fold_min_runs = 1;
-    one_action.fold_max_runs = 4096;
+    one_action.fold_max_runs = 1;
     one_action.fold_max_input_bytes = 1ULL << 20;
     one_action.fold_max_input_entries = 1024;
     one_action.clean_segments = false;
@@ -1371,7 +1371,7 @@ void test_engine_maintenance_actions_are_bounded_across_passes() {
             && materialized.actions_performed == 1
             && !materialized.rotated && materialized.materialized
             && materialized.after.frozen_wal_count == 0
-            && materialized.after.delta_run_count >= 1
+            && materialized.after.index_run_count >= 1
             && materialized.action_budget_reached,
         "second bounded pass did not stop after materialization");
 
@@ -1384,6 +1384,7 @@ void test_engine_maintenance_actions_are_bounded_across_passes() {
     server::EngineMaintenanceOptions orphan_pass = one_action;
     orphan_pass.reclaim_orphans = true;
     orphan_pass.fold_min_runs = 4096;
+    orphan_pass.fold_max_runs = 4096;
     orphan_pass.orphan_min_age_ns = 0;
     const auto reclaimed = engine.maintain_once(orphan_pass);
     require(

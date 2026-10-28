@@ -8,6 +8,11 @@ scrub, native full-index verification, and atomic local publication. Tests use
 small dimensions and segment sizes, but exercise the same format, WAL framing,
 and address arithmetic as a production `float16[1024]` store.
 
+For a disposable format-7 fixture, explicit pread/thread-pool/io_uring
+comparisons, and a bounded gRPC restart run, follow
+[Linux validation](linux-validation.md). It records the effective backend and
+distinguishes an unavailable ring from a completed io_uring check.
+
 ## io_uring environment probe
 
 The optional Linux probe calls `io_uring_setup` directly through the kernel ABI;
@@ -29,7 +34,7 @@ container policy must be changed before an io_uring backend can be tested.
 | --- | --- | --- |
 | Round trip | Arbitrary `uint64` IDs and bit-exact `float16` vectors | Reopened reader returns identical bits |
 | Ordering | Query IDs in a different order, including repeated query IDs | Rows follow query order; repeated IDs repeat rows |
-| Sharding | Force several shards with a tiny configured shard size | Reads across shard boundaries are correct |
+| Segmentation | Force several segments with a tiny configured `segment_size_bytes` | Reads across segment boundaries are correct |
 | Duplicate input | Add the same ID twice, in one or separate batches | Build fails and is not published |
 | Missing input | Query at least one ID absent from the index | Entire call fails; MVP does not return a partial result |
 | Validation | Wrong ID dtype/rank, vector dtype/rank/dimension, or row count | Call fails before writing the batch |
@@ -41,17 +46,17 @@ container policy must be changed before an io_uring backend can be tested.
 | Torn active WAL | Incomplete final append | Read ignores it; next writer truncates and syncs it |
 | Writer lease | Two read-write opens | Exactly one succeeds; readers remain allowed |
 | Process boundary | Reuse a builder or handle after `fork()` | Child operation is rejected and cannot release the parent's lease |
-| Corruption | Truncated shard, index, or manifest | Open or first affected read fails loudly |
-| Format compatibility | New writer emits v1 manifest, index, and every shard at the documented offsets | Existing v1 wire representation stays unchanged |
-| Version dispatch | Manifest, segment/shard, index, or WAL advertises an unknown version | Reader rejects it before interpreting version-specific fields |
-| Internal I/O | `io_workers` 0, 1, 2, 4, and 8 with a bounded queue | Results remain bit-exact across shards |
+| Corruption | Truncated segment, index, or manifest | Open or first affected read fails loudly |
+| Storage version | Builder emits a format-7 collection with the documented manifest, catalog, index, and segment structures | Format-7 data remains reopenable; formats 1–6 and unknown versions are rejected |
+| Version dispatch | Manifest, segment, index, or WAL advertises an unknown version | Reader rejects it before interpreting version-specific fields |
+| Internal I/O | `io_workers` 0, 1, 2, 4, and 8 with a bounded queue | Results remain bit-exact across segments |
 | Chunked I/O | `io_ranges_per_task` 1, 4, 8, and 16, including batches smaller than a task | Results remain bit-exact at every partition boundary |
-| Shared reader | Simultaneous `get` calls on one `Storage` instance | Calls complete without cross-request corruption |
-| Worker error | A queued range hits a truncated shard | Exception reaches the caller; executor remains usable |
+| Shared reader | Simultaneous `get` calls on one `Collection` instance | Calls complete without cross-request corruption |
+| Worker error | A queued range hits a truncated segment | Exception reaches the caller; executor remains usable |
 | io_uring | Queue depths 1, 2, and 4 with more ranges than SQ entries | Ring wraps and every row remains bit-exact |
 | Multi-ring io_uring | One and two workers with total queue depths 2, 3, and 4 | A single request is split across rings without changing bits or row order |
 | Multi-ring concurrency | Simultaneous callers share two ring-owner workers | Calls complete without cross-request corruption or deadlock |
-| io_uring error | Truncate a shard after open, then issue a healthy request | EOF reaches the caller and the ring remains reusable |
+| io_uring error | Truncate a segment after open, then issue a healthy request | EOF reaches the caller and the ring remains reusable |
 | Mixed-size fairness | A small call arrives behind a multi-unit large call | The small call completes before the large call drains; both make progress |
 | One-range fairness | Concurrent one-range calls use an enabled parallel backend | Calls pass through the shared coordinator rather than bypassing its credits |
 | Format-7 materialization | Commits and rotation continue while a frozen prefix is built | Final catalog keeps newer WALs and reads remain bit-exact after reopen |
@@ -92,7 +97,7 @@ explicit job using the production shape and cardinality:
 
 - 500--600 million unique arbitrary `uint64` IDs;
 - dimension 1024 and dtype `float16` (2048 useful bytes per row);
-- 16 GiB data shards;
+- 16 GiB data segments;
 - cold and warm random-query phases;
 - batch sizes 1, 16, 128, 1K, 10K, and 100K;
 - concurrency tested separately after the single-reader baseline is stable.
@@ -113,30 +118,11 @@ For meaningful cold-cache numbers, use an isolated host and an agreed cache
 eviction procedure. Running immediately after database construction measures
 the page cache rather than NVMe random-read behavior.
 
-The legacy Python benchmark consumes the original `ids.npy` directly:
-
-```bash
-python benchmarks/random_read.py \
-  --storage /nvme/store \
-  --ids /datasets/ids.npy \
-  --batch-sizes 1,16,128,1024,10000,100000
-```
-
-`throwdb_bench` is the lower-overhead C++ runner built by CMake. It accepts a
-headerless, native-endian `uint64` ID population followed by optional batch size,
-call count, and seed:
-
-```bash
-python -c 'import numpy as np; np.load("ids.npy").tofile("ids.u64")'
-./build/throwdb_bench /nvme/store ids.u64 1024 100 20260711
-```
-
-Both runners above are legacy sequential `pread` baselines: they open `Storage` with
-zero internal I/O workers. They sample only known IDs before timing and reuse an
-allocated output buffer. They measure client-visible latency and useful
-throughput; neither claims to measure physical bytes read. Use
-`run_load_test.py` for executor, chunk-size, and concurrent-reader comparisons;
-it auto-detects both fresh native and legacy immutable manifests.
+Use `benchmarks/run_load_test.py` for sequential, executor, chunk-size, and
+concurrent-reader comparisons against a format-7 collection. It samples known
+IDs before timing and reuses an output buffer; useful throughput does not claim
+to measure physical bytes read. The old immutable-only and format-4 A/B runners
+have been removed.
 
 After calibrating and saving a native collection profile, exercise both profile
 lookup and the selected backend with the production-shaped reader benchmark:
@@ -182,12 +168,14 @@ concurrent, and mixed-size Get workloads, streams a bounded physical-order ID
 prefix, and replays the identical sequential query stream against an embedded
 reader using the server's effective settings.
 
-Report revision 2 adds controlled cache states, three deterministic repetitions
-by default, exact-corpus mixed-workload references, and separate client queue,
-RPC, and sojourn timings. Quality-oriented defaults use 100 sequential calls,
-20 concurrent calls per worker, and 200 small plus 100 large mixed calls in
-each repetition. Use strict persisted selection and an explicit paired
-cache run for the main local-loopback result:
+Report revision 3 retains revision 2's controlled cache states, deterministic
+repetitions, exact-corpus mixed-workload references, and separate client queue,
+RPC, and sojourn timings. It additionally records optional read-logger
+configuration/counters and performs a resource-budgeted post-shutdown quality
+inspection. Quality-oriented defaults use 100 sequential calls, 20 concurrent
+calls per worker, and 200 small plus 100 large mixed calls in each repetition.
+Use strict persisted selection and an explicit paired cache run for the main
+local-loopback result:
 
 ```bash
 STORE=/nvme/store
@@ -849,7 +837,7 @@ counters; safe workload milestones also include Health, admission,
 engine/WAL/overlay, journal, free-space, and maintenance state. Automatic
 maintenance is exercised as ambient server behavior. The `maintenance`
 section checks persistent engine invariants and reports publication evidence
-inferred from materialized-sequence, delta-run, and frozen-WAL transitions.
+inferred from materialized-sequence, index-run, and frozen-WAL transitions.
 There is still no completed-cycle counter, so a normal run does not claim that
 a particular policy action ran. Use `--require-maintenance-progress` only when
 the collection and server thresholds are intentionally configured to make such
@@ -1014,10 +1002,83 @@ query-set, cache-state, and one-client-baseline confounders. They still do not
 constitute a server fairness SLA: client FIFO effects, transport, and all
 server work remain combined in the observed durations.
 
+## Read-workload logger qualification
+
+The native logger has a dedicated deterministic suite:
+
+```bash
+cmake --preset server-release
+cmake --build --preset server-release
+ctest --test-dir build/server-release \
+  --output-on-failure \
+  -R 'throwdb_(read_workload_log|grpc_server)_tests'
+```
+
+It covers binary header/frame CRCs, exact multi-chunk request reconstruction,
+original ID order and digests, concurrent producer admission, request
+completion/failure/cancellation, queue saturation, crash-torn tails, idle
+checkpoint stability, rotation, exact terminal-to-opening baselines,
+retained-window loss accounting, private permissions, exclusive ownership,
+minimum-free-space pause, runtime fail-open behavior, terminal-checkpoint
+finalization, write-rate/file-count/retention bounds, and the actual
+unary/streaming gRPC hooks. It also verifies that an unused pre-bind segment is
+removed and that minimum-free-space or finalization failure never publishes
+`.tdbrl`.
+
+Functional tests do not establish the production overhead of shared atomic
+counters, exact ID copying, and profiled native reads. Before enabling
+telemetry on a high-QPS
+collection, run the existing gRPC benchmark twice on the same isolated host,
+reader profile, deterministic corpus, cache mode, and repetition count:
+
+1. server without `--read-log-dir`;
+2. server with `--read-log-dir` and the intended chunk/resource bounds.
+
+Use a new result directory for each run. Compare client throughput and
+P50/P95/P99 latency by identical query digest, plus server CPU, RSS, cgroup
+throttling, and disk telemetry. The enabled run must also satisfy:
+
+- no read correctness or RPC failures;
+- `runtime_failed=false` and `writer_errors=0`;
+- both completed-event and completed-row outcome drop ratios below their
+  deployment quality thresholds;
+- RSS within the configured queue plus normal measurement noise;
+- finalized/recoverable file count within its configured ceiling;
+- retained bytes within the configured retention contract, accounting only
+  for the documented active-segment allowance.
+
+Finally stop the server cleanly and run:
+
+```bash
+throwdb workload inspect \
+  --logs "$READ_LOG_DIR" \
+  --storage "$STORE" \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
+  --require-suitable \
+  --output "$RESULTS/workload-inspection.json"
+```
+
+The optimizer must consume only a suitable, exact-capture report. Interior
+request/chunk gaps, stale/missing terminal checkpoints, missing or
+discontinuous opening baselines, sequence gaps, counter regressions, any
+retained-window record/row loss, and corrupt finalized files fail the
+suitability gate. Retention-boundary left/right censoring is reported and
+excluded rather than used as a partial request. Inspector inputs are themselves
+hard-bounded; use `--max-files`,
+`--max-total-bytes`, `--max-file-bytes`, `--max-report-entries`, and
+`--max-prefix-entries` (plus the active-request bound) when a deliberate test
+corpus exceeds the defaults.
+The file inventory has a non-overridable 65536-entry ceiling; split a larger
+offline corpus rather than making one inspection walk unbounded.
+A logger overhead regression does not justify relaxing fail-open or resource
+bounds. Adjust ID chunk size, queue/write/retention capacity, or leave
+telemetry disabled while investigating.
+
 ## Internal I/O workers versus reader concurrency
 
 These are independent axes. `--io-workers` controls the C++ executor owned by a
-single `Storage`; the concurrent-reader scenarios control how many Python client
+single `Collection`; the concurrent-reader scenarios control how many Python client
 threads call `get_into` on that instance. Multi-range calls submit work to the
 shared executor. Reports record both axes as `io_workers` and
 `external_reader_workers` (the legacy `workers` field is the external count).
@@ -1140,98 +1201,3 @@ throughput, and no return of cgroup throttling. Compare p50/p99, CPU time,
 context switches, diskstats, and `/proc/self/task` count. Add an intentionally
 mixed small/large-call scenario: the small call must complete before the large
 job drains while the large job continues to make bounded progress.
-
-## Fixed v4 reader A/B profile
-
-Use `run_v4_reader_ab.py` as the regression gate before and after changing the
-mutable read path or automatic tuning. It runs one report containing the
-following fixed comparison:
-
-- synchronous `thread_pool` with zero internal workers;
-- `thread_pool` with 16 workers, queue capacity 32, and 8 ranges per task;
-- `io_uring` with 2 ring workers and aggregate QD32;
-- batches 1,024 and 10,000 with 1, 8, and 16 external readers;
-- three repetitions, each paired cold then warm.
-
-```bash
-python benchmarks/run_v4_reader_ab.py \
-  --store /tmp/throwdb-prod-test-store \
-  --ids /mnt/dataset/ids.npy \
-  --source-embeddings /mnt/dataset/embeddings.npy \
-  --source-kind npy \
-  --results benchmark-results/v4-reader-ab
-```
-
-The defaults perform 100 calls per reader for batch 1,024 and 10 calls per
-reader for batch 10,000, keeping measured embeddings per reader close to
-100,000 in both cases. Override `--calls-1024` and `--calls-10000` only when a
-shorter smoke run or a longer device qualification is intentional.
-
-The matrix is scenario-blocked and paired. Inside each repetition it selects
-one `(batch_size, external_readers)` scenario, then runs all three policies on
-the same deterministic query stream before moving to the next scenario. The
-policy order uses a three-way Latin rotation across repetitions. This keeps a
-candidate close to its synchronous control while balancing first/last policy
-position. The generated `summary` reports per-policy distributions and
-repetition-paired throughput speedups. With the default `both` cache mode there
-are 108 timed results. Standalone `--cache-mode warm` retains the explicit
-measured-query replay guarantee used by `run_load_test.py`.
-
-To keep memory bounded, each policy-scenario block opens one collection handle,
-runs its adjacent cold/warm pair, and closes it before the next policy. The
-default matrix therefore performs 54 measured-policy opens in addition to the
-three preflight opens. Open time is recorded in `storage_opens` but is outside
-read throughput and latency. This intentionally trades extra index loads for
-temporal pairing without retaining three multi-gigabyte indexes at once.
-
-Before monitors or timed work start, all three policies are opened and checked.
-Candidates must return a byte-for-byte match to the synchronous baseline even
-when `--source-embeddings` is omitted; the optional source additionally checks
-that baseline against the original NumPy data. Per-policy open metadata,
-correctness status, error details, and one profiled-read telemetry sample are
-persisted under `policy_preflight`. An unavailable `io_uring` environment or a
-backend mismatch therefore fails before the expensive matrix begins.
-
-By default the preflight also requires
-`telemetry.zero_delta_fast_path: true`. A mutation smoke leaves entries in the
-active WAL even after restoring their logical values, so use a freshly built
-collection with no committed WAL mutations for the empty mutable-read
-regression gate. On format 7, materializing every WAL and folding all active run
-sections into partition snapshots can restore an authoritative snapshot-only
-state; retired run files are reclaimed separately. To intentionally measure a
-collection with mutation overlay state, opt
-out explicitly:
-
-```bash
-python benchmarks/run_v4_reader_ab.py \
-  --store /tmp/throwdb-prod-test-store-with-mutations \
-  --ids /mnt/dataset/ids.npy \
-  --results benchmark-results/v4-reader-ab-mutations \
-  --no-require-zero-delta
-```
-
-Do not mutate or replace the collection during a run. This profile requires
-native format v4 or newer and refuses to overwrite an existing `report.json`.
-The report is updated atomically after every preflight and measured result, so
-a stopped run leaves its completed raw measurements available for diagnosis;
-start a replacement run in a new results directory.
-
-For a short installation and correctness smoke test of the same matrix, reduce
-the work without changing its policies or scenarios:
-
-```bash
-python benchmarks/run_v4_reader_ab.py \
-  --store /tmp/throwdb-prod-test-store \
-  --ids /mnt/dataset/ids.npy \
-  --source-embeddings /mnt/dataset/embeddings.npy \
-  --results benchmark-results/v4-reader-ab-smoke \
-  --repeats 1 \
-  --calls-1024 2 \
-  --calls-10000 1
-```
-
-The timed A/B path deliberately uses ordinary uninstrumented `get_into()`.
-Preflight uses `Collection.get_into_profiled()` once per policy outside the
-acceptance measurement and stores the result in the report. Its
-`physical_backend_seconds` combines admission/queue wait, I/O, and scatter;
-`planned_ranges`, `planned_read_bytes`, and `backend_tasks` describe the plan.

@@ -37,7 +37,7 @@ def _build(
     ids: object,
     embeddings: np.ndarray,
     *,
-    shard_size_bytes: int = 1 << 20,
+    segment_size_bytes: int = 1 << 20,
 ) -> None:
     schema = throwdb.CollectionSchema(
         dimension=embeddings.shape[1],
@@ -46,8 +46,8 @@ def _build(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=shard_size_bytes,
-        format_version=6,
+        segment_size_bytes=segment_size_bytes,
+        format_version=7,
     ) as builder:
         builder.add(ids, embeddings)
 
@@ -69,7 +69,7 @@ def test_crud_is_bit_exact_updates_count_and_survives_reopen(
 
     with throwdb.Collection.open(path, mode="r+") as collection:
         assert collection.mode == "read_write"
-        assert collection.format_version == 6
+        assert collection.format_version == 7
         assert collection.count == 3
 
         collection.insert(np.array([40, 50], dtype=np.int16), inserted)
@@ -138,7 +138,7 @@ def test_format7_python_read_write_crud_rotation_and_reopen(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=base[0].nbytes,
+        segment_size_bytes=base[0].nbytes,
         format_version=7,
     ) as builder:
         builder.add([0, maximum_id, 7], base)
@@ -162,25 +162,25 @@ def test_format7_python_read_write_crud_rotation_and_reopen(
         assert materialized["generation"] == 4
         assert materialized["materialized_sequence"] == 4
         assert materialized["frozen_wal_count"] == 0
-        assert materialized["delta_run_count"] == 1
-        assert materialized["delta_entry_count"] == 4
-        assert materialized["delta_put_rows"] == 4
-        assert materialized["total_delta_run_bytes"] > 0
-        assert materialized["total_delta_segment_bytes"] > 0
+        assert materialized["index_run_count"] == 1
+        assert materialized["index_run_entry_count"] == 4
+        assert materialized["materialized_segment_rows"] == 4
+        assert materialized["index_run_bytes"] > 0
+        assert materialized["materialized_segment_bytes"] > 0
         assert materialized["reclamation_complete"] is False
-        folded = writer.compact_deltas()
-        assert folded["compacted"] is True
+        folded = writer.fold_partitions(max_runs=1)
+        assert folded["folded"] is True
         assert folded["generation"] == 6
-        assert folded["compacted_partition_count"] >= 1
+        assert folded["folded_partition_count"] >= 1
         assert (
-            folded["compacted_run_section_count"]
-            == folded["compacted_partition_count"]
+            folded["folded_run_section_count"]
+            == folded["folded_partition_count"]
         )
-        assert folded["compacted_snapshot_input_entries"] == 3
-        assert folded["compacted_delta_input_entries"] == 4
-        assert folded["compacted_output_entries"] == 4
-        assert folded["delta_run_count"] == 0
-        assert folded["compaction_budget_blocked"] is False
+        assert folded["folded_snapshot_input_entries"] == 3
+        assert folded["folded_run_input_entries"] == 4
+        assert folded["folded_output_entries"] == 4
+        assert folded["index_run_count"] == 0
+        assert folded["fold_budget_blocked"] is False
         assert folded["reclamation_complete"] is False
         expected = np.stack([updated[0], updated[1], inserted[0], inserted[0]])
         _assert_same_bits(writer.get([0, maximum_id, 7, 9]), expected)
@@ -216,7 +216,7 @@ def test_format7_list_and_scan_ids_follow_snapshot_physical_order(
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=base[0].nbytes * 2,
+        segment_size_bytes=base[0].nbytes * 2,
         format_version=7,
     ) as builder:
         builder.add([30, 10, 20, 50], base)
@@ -292,7 +292,7 @@ def test_scan_ids_validates_buffers_and_empty_collection(tmp_path: Path) -> None
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
         format_version=7,
     ):
         pass
@@ -387,7 +387,7 @@ def test_delete_is_idempotent_tombstones_base_and_allows_reinsert(
     reopened.close()
 
 
-def test_profiled_read_reports_zero_delta_and_mutation_paths(
+def test_profiled_read_reports_snapshot_only_and_mutation_paths(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "store"
@@ -401,18 +401,28 @@ def test_profiled_read_reports_zero_delta_and_mutation_paths(
         output = np.empty_like(base)
         clean = collection.get_into_profiled(ids, output)
         _assert_same_bits(output, base)
-        assert clean["zero_delta_fast_path"] is True
+        assert clean["snapshot_only_fast_path"] is True
         assert clean["requested_rows"] == 2
         assert clean["base_rows"] == 2
         assert clean["mutation_rows"] == 0
+        assert clean["unique_files"] == 1
         assert clean["planned_ranges"] == 1
+        assert clean["requested_bytes"] == base.nbytes
         assert clean["planned_read_bytes"] == base.nbytes
+        assert clean["completed_read_bytes"] == base.nbytes
+        assert clean["useful_read_bytes"] == base.nbytes
+        assert clean["gap_bytes"] == 0
+        assert clean["overread_bytes"] == 0
+        assert clean["pages_touched"] >= 1
+        assert clean["page_runs"] >= 1
+        assert clean["chunks_touched"] >= 1
+        assert clean["chunk_runs"] >= 1
         assert clean["backend_tasks"] == 1
 
         collection.update([22], replacement)
         mutated = collection.get_into_profiled(ids, output)
         _assert_same_bits(output, np.stack([base[0], replacement[0]]))
-        assert mutated["zero_delta_fast_path"] is False
+        assert mutated["snapshot_only_fast_path"] is False
         assert mutated["requested_rows"] == 2
         assert mutated["base_rows"] == 1
         assert mutated["mutation_rows"] == 1
@@ -423,6 +433,7 @@ def test_profiled_read_reports_zero_delta_and_mutation_paths(
         for key in (
             "total_seconds",
             "lookup_seconds",
+            "physical_sort_seconds",
             "physical_plan_seconds",
             "physical_backend_seconds",
         ):
@@ -442,7 +453,6 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
     with throwdb.Collection.open(path, mode="r+") as collection:
         initial = collection.mutation_log_stats
         assert initial is not None
-        assert initial["catalog_managed"] is True
         assert initial["generation"] == 1
         assert initial["committed_sequence"] == 0
         assert initial["frozen_wal_count"] == 0
@@ -482,10 +492,9 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
         assert second_rotation["frozen_wal_count"] == 2
 
     with throwdb.Collection.open(path) as reopened:
-        assert reopened.format_version == 6
+        assert reopened.format_version == 7
         stats = reopened.mutation_log_stats
         assert stats is not None
-        assert stats["catalog_managed"] is True
         assert stats["generation"] == 3
         assert stats["committed_sequence"] == 4
         assert stats["frozen_wal_count"] == 2
@@ -497,7 +506,7 @@ def test_catalog_wal_rotation_stats_and_recovery(tmp_path: Path) -> None:
             reopened.rotate_wal()
 
 
-def test_frozen_wals_materialize_into_reopenable_delta_runs(
+def test_frozen_wals_materialize_into_reopenable_partition_runs(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "materialized"
@@ -512,7 +521,6 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
         initial = collection.materialize_frozen_wals()
         assert initial["materialized"] is False
         assert initial["generation"] == 1
-        assert initial["delta_managed"] is True
 
         collection.upsert([0, boundary_id], first)  # sequence 1
         collection.rotate_wal()
@@ -527,14 +535,16 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
         assert materialized["committed_sequence"] == 4
         assert materialized["materialized_sequence"] == 3
         assert materialized["frozen_wal_count"] == 0
-        assert materialized["delta_run_count"] == 1
-        assert materialized["delta_entry_count"] == 3
-        assert materialized["delta_put_rows"] == 2
-        assert materialized["reclaimed_wal_count"] == 2
-        assert materialized["reclamation_complete"] is True
+        assert materialized["index_run_count"] == 1
+        assert materialized["index_run_entry_count"] == 3
+        assert materialized["materialized_segment_rows"] == 2
+        assert materialized["reclamation_complete"] is False
+        assert len(list((path / "wal").glob("*.wal"))) == 3
+        assert len(list((path / "segments").glob("*.dat"))) == 2
+        assert len(list((path / "index" / "runs").glob("*.idx"))) == 1
+        reclaimed = collection.collect_orphans(dry_run=False, min_age_seconds=0)
+        assert reclaimed["reclamation_complete"] is True
         assert len(list((path / "wal").glob("*.wal"))) == 1
-        assert len(list((path / "deltas").glob("*.dat"))) == 1
-        assert len(list((path / "deltas").glob("*.idx"))) == 1
         _assert_same_bits(
             collection.get([maximum_id, boundary_id, 0]),
             np.stack([second[1], second[0], first[0]]),
@@ -544,7 +554,7 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
         stats = reopened.mutation_log_stats
         assert stats is not None
         assert stats["materialized_sequence"] == 3
-        assert stats["delta_run_count"] == 1
+        assert stats["index_run_count"] == 1
         assert stats["frozen_wal_count"] == 0
         _assert_same_bits(
             reopened.get([0, maximum_id, boundary_id]),
@@ -555,7 +565,7 @@ def test_frozen_wals_materialize_into_reopenable_delta_runs(
         second_materialization = reopened.materialize_frozen_wals()
         assert second_materialization["materialized"] is True
         assert second_materialization["materialized_sequence"] == 4
-        assert second_materialization["delta_run_count"] == 2
+        assert second_materialization["index_run_count"] == 2
         assert second_materialization["frozen_wal_count"] == 0
 
     with throwdb.Collection.open(path) as read_only:
@@ -606,7 +616,7 @@ def test_materialization_selects_a_bounded_oldest_prefix(
         assert bounded["materialized_wal_count"] == 1
         assert bounded["materialized_wal_input_bytes"] > 0
         assert bounded["frozen_wal_count"] == 1
-        assert bounded["delta_run_count"] == 1
+        assert bounded["index_run_count"] == 1
         _assert_same_bits(collection.get([1]), second)
 
         with pytest.raises(ValueError, match="max_wals.*between"):
@@ -615,19 +625,19 @@ def test_materialization_selects_a_bounded_oldest_prefix(
             collection.materialize_frozen_wals(max_input_bytes=1.5)
 
 
-def test_delta_compaction_public_api_is_bounded_and_reopenable(
+def test_partition_folding_public_api_is_bounded_and_reopenable(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "compacted"
+    path = tmp_path / "folded"
     base = _vectors(2, 6, "float16", salt=41)
     first = _vectors(1, 6, "float16", salt=241)
     second = _vectors(1, 6, "float16", salt=441)
     _build(path, [1, 2], base)
 
     with throwdb.Collection.open(path, mode="r+") as collection:
-        no_op = collection.compact_deltas()
-        assert no_op["compacted"] is False
-        assert no_op["delta_run_count"] == 0
+        no_op = collection.fold_partitions()
+        assert no_op["folded"] is False
+        assert no_op["index_run_count"] == 0
 
         collection.update([1], first)
         collection.rotate_wal()
@@ -635,38 +645,45 @@ def test_delta_compaction_public_api_is_bounded_and_reopenable(
         collection.update([1], second)
         collection.rotate_wal()
         collection.materialize_frozen_wals()
-        assert collection.mutation_log_stats["delta_run_count"] == 2
+        before = collection.mutation_log_stats
+        assert before["index_run_count"] == 2
+        bounded = collection.fold_partitions(max_runs=1)
+        assert bounded["folded"] is False
+        assert bounded["fold_budget_blocked"] is True
+        assert collection.mutation_log_stats == before
 
-        compacted = collection.compact_deltas(
+        folded = collection.fold_partitions(
             max_runs=np.uint8(2),
             max_input_bytes=np.uint64(1 << 20),
             max_input_entries=np.int64(16),
         )
-        assert compacted["compacted"] is True
-        assert compacted["compacted_delta_run_count"] == 2
-        assert compacted["compacted_delta_input_entries"] == 2
-        assert compacted["compacted_delta_input_bytes"] > 0
-        assert compacted["delta_run_count"] == 1
-        assert compacted["delta_entry_count"] == 1
-        assert compacted["reclaimed_delta_run_count"] == 2
-        assert compacted["reclaimed_delta_bytes"] > 0
-        assert compacted["reclamation_complete"] is True
+        assert folded["folded"] is True
+        assert folded["folded_partition_count"] == 1
+        assert folded["folded_run_section_count"] == 2
+        assert folded["folded_run_input_entries"] == 2
+        assert folded["folded_run_input_bytes"] > 0
+        assert folded["index_run_count"] == 0
+        assert folded["index_run_entry_count"] == 0
+        assert folded["reclamation_complete"] is False
+        reclaimed = collection.collect_orphans(dry_run=False, min_age_seconds=0)
+        assert reclaimed["reclamation_complete"] is True
+        assert len(list((path / "index" / "runs").glob("*.idx"))) == 0
         _assert_same_bits(
             collection.get([1, 2]),
             np.stack([second[0], base[1]]),
         )
 
         with pytest.raises(TypeError, match="max_runs.*bool"):
-            collection.compact_deltas(max_runs=True)
-        with pytest.raises(ValueError, match="max_runs.*between 2 and 64"):
-            collection.compact_deltas(max_runs=1)
+            collection.fold_partitions(max_runs=True)
+        with pytest.raises(ValueError, match="max_runs.*between 1 and 4096"):
+            collection.fold_partitions(max_runs=0)
         with pytest.raises(ValueError, match="max_input_bytes.*between"):
-            collection.compact_deltas(max_input_bytes=0)
+            collection.fold_partitions(max_input_bytes=0)
         with pytest.raises(TypeError, match="max_input_entries.*integer"):
-            collection.compact_deltas(max_input_entries=1.5)
+            collection.fold_partitions(max_input_entries=1.5)
 
     with throwdb.Collection.open(path) as reopened:
-        assert reopened.mutation_log_stats["delta_run_count"] == 1
+        assert reopened.mutation_log_stats["index_run_count"] == 0
         _assert_same_bits(
             reopened.get([1, 2]),
             np.stack([second[0], base[1]]),
@@ -675,7 +692,7 @@ def test_delta_compaction_public_api_is_bounded_and_reopenable(
             RuntimeError,
             match=r"mode='r\+'",
         ):
-            reopened.compact_deltas()
+            reopened.fold_partitions()
 
 
 def test_python_open_recovers_torn_wal_tail_and_allows_next_commit(
@@ -800,7 +817,7 @@ def test_read_only_and_builder_reject_crud_and_context_closes_handles(
     builder = throwdb.Collection.create(
         tmp_path / "builder",
         schema=throwdb.CollectionSchema(dimension=3),
-        format_version=6,
+        format_version=7,
     )
     for operation in (builder.insert, builder.update, builder.upsert):
         with pytest.raises(RuntimeError, match="opened collection"):

@@ -6,16 +6,14 @@
 namespace throwdb::detail {
 
 // Private deterministic synchronization points for native lifecycle tests.
-// Production code pays only one null atomic load at an instrumented point;
-// this header is not installed as part of the public ThrowDB API.
+// Compiled out when native tests are disabled; this header is not installed
+// as part of the public ThrowDB API.
 enum class NativeCollectionTestHookPoint : std::uint8_t {
     ReaderOpenCommitLockAcquired = 1,
     MutationCatalogDurableBeforeCurrent = 2,
     MutationCurrentDurable = 3,
     MutationReservationDurable = 4,
-    MutationDeltaOutputDurable = 5,
-    BeforeSourceUnlink = 6,
-    AfterSourceUnlink = 7,
+    LifecycleOutputDurable = 5,
     BeforeOrphanRevalidation = 8,
     AfterOrphanUnlink = 9,
     BeforeOrphanDirectorySync = 10,
@@ -29,7 +27,6 @@ enum class NativeCollectionTestHookPoint : std::uint8_t {
 enum class NativeCollectionTestOperation : std::uint8_t {
     None = 0,
     MaterializeFrozenWals = 1,
-    CompactDeltaRuns = 2,
     CollectOrphans = 3,
     FoldPartitions = 4,
     CleanSegment = 5,
@@ -37,10 +34,6 @@ enum class NativeCollectionTestOperation : std::uint8_t {
 
 enum class NativeCollectionTestResourceKind : std::uint8_t {
     None = 0,
-    MutationWal = 1,
-    MutationDeltaPair = 2,
-    MutationDeltaData = 3,
-    MutationDeltaIndex = 4,
     OrphanFile = 5,
     OrphanDirectory = 6,
     PartitionSnapshot = 7,
@@ -66,9 +59,15 @@ static_assert(std::is_trivially_copyable_v<NativeCollectionTestHookContext>);
 using NativeCollectionTestHook = void (*)(
     NativeCollectionTestHookContext context) noexcept;
 
+#ifdef THROWDB_NATIVE_TEST_HOOKS
 void set_native_collection_test_hook(
     NativeCollectionTestHook hook) noexcept;
 void invoke_native_collection_test_hook(
     NativeCollectionTestHookContext context) noexcept;
+
+#else
+inline void invoke_native_collection_test_hook(
+    NativeCollectionTestHookContext) noexcept {}
+#endif
 
 }  // namespace throwdb::detail

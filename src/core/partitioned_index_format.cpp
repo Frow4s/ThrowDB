@@ -247,8 +247,7 @@ void validate_segment_kind(const PartitionedSegmentKind kind) {
     require<Error>(
         kind == PartitionedSegmentKind::Initial
             || kind == PartitionedSegmentKind::Materialized
-            || kind == PartitionedSegmentKind::Cleaner
-            || kind == PartitionedSegmentKind::LegacyDeltaV1,
+            || kind == PartitionedSegmentKind::Cleaner,
         "partitioned segment has unknown kind");
 }
 
@@ -256,8 +255,7 @@ template <typename Error>
 void validate_run_kind(const PartitionedRunKind kind) {
     require<Error>(
         kind == PartitionedRunKind::Mutation
-            || kind == PartitionedRunKind::Cleaner
-            || kind == PartitionedRunKind::LegacyDeltaV1,
+            || kind == PartitionedRunKind::Cleaner,
         "partitioned index run has unknown kind");
 }
 
@@ -505,11 +503,6 @@ void validate_manifest(const PartitionedManifestV2& manifest) {
         (manifest.required_feature_bits & kPartitionedRequiredFeatureBits)
             == kPartitionedRequiredFeatureBits,
         "manifest lacks a required format-7 feature");
-    require<Error>(
-        (manifest.required_feature_bits & kNativeRequiredFeatureDeltaV1) == 0
-            || (manifest.required_feature_bits
-                & kNativeRequiredFeatureCatalogV1) != 0,
-        "manifest requires DeltaV1 without a catalog");
 }
 
 template <typename Error>

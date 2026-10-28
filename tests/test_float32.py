@@ -40,59 +40,6 @@ def _assert_same_float32_bits(actual: np.ndarray, expected: np.ndarray) -> None:
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
-def test_native_float32_round_trip_get_into_and_validation(tmp_path: Path) -> None:
-    dimension = 7
-    ids = np.array([91, 7, 2**63 + 9, 44, 1_000_003, 0], dtype=np.uint64)
-    vectors = _float32_vectors(ids.size, dimension)
-    path = tmp_path / "native-float32"
-
-    writer = throwdb.Writer.create(
-        path,
-        dimension,
-        2 * dimension * np.dtype(np.float32).itemsize,
-        dtype="float32",
-    )
-    assert writer.dtype == "float32"
-    assert writer.format_version == 2
-    writer.add(ids[:3], vectors[:3])
-    writer.add(ids[3:], vectors[3:])
-    writer.finish()
-
-    storage = throwdb.Storage.open(path)
-    assert storage.dtype == "float32"
-    assert storage.dimension == dimension
-    assert storage.format_version == 2
-
-    positions = np.array([5, 0, 4, 1, 5, 2], dtype=np.intp)
-    query = ids[positions].copy()
-    expected = vectors[positions]
-    _assert_same_float32_bits(storage.get(query), expected)
-
-    output = np.empty(expected.shape, dtype=np.float32)
-    assert storage.get_into(query, output) is None
-    _assert_same_float32_bits(output, expected)
-
-    empty = storage.get(np.empty(0, dtype=np.uint64))
-    assert empty.dtype == np.dtype(np.float32)
-    assert empty.shape == (0, dimension)
-
-    with pytest.raises(ValueError, match="float32.*float16"):
-        storage.get_into(query, np.empty(expected.shape, dtype=np.float16))
-
-    invalid = throwdb.Writer.create(
-        tmp_path / "invalid-payload",
-        dimension=dimension,
-        shard_size_bytes=1 << 20,
-        dtype="float32",
-    )
-    with pytest.raises(ValueError, match="float32.*float16"):
-        invalid.add(ids[:1], np.zeros((1, dimension), dtype=np.float16))
-    invalid.abort()
-
-    with pytest.raises(ValueError, match="float16.*float32"):
-        throwdb.Writer.create(tmp_path / "invalid-dtype", dtype="float64")
-
-
 def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> None:
     dimension = 9
     ids = np.array([101, 303, 707, 909], dtype=np.uint32)
@@ -108,17 +55,17 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
     with throwdb.Collection.create(
         path,
         schema=schema,
-        shard_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
-        format_version=6,
+        segment_size_bytes=2 * dimension * np.dtype(np.float32).itemsize,
+        format_version=7,
     ) as builder:
         assert builder.dtype == "float32"
-        assert builder.format_version == 6
+        assert builder.format_version == 7
         builder.add(ids, embeddings)
 
     collection = throwdb.Collection.open(path)
     assert collection.schema == schema
     assert collection.dtype == "float32"
-    assert collection.format_version == 6
+    assert collection.format_version == 7
 
     positions = np.array([2, 0, 3, 1, 2], dtype=np.intp)
     query = ids[positions].astype(np.int64)
@@ -162,7 +109,7 @@ def test_collection_float32_layout_endian_and_prefix_reads(tmp_path: Path) -> No
     with throwdb.Collection.create(
         foreign_path,
         schema=throwdb.CollectionSchema(dimension=4, dtype="float32"),
-        format_version=6,
+        format_version=7,
     ) as builder:
         builder.add([1, 2, 3], foreign)
     _assert_same_float32_bits(
@@ -198,7 +145,7 @@ def test_cli_preserves_float32_dtype_and_bits(
             "--batch-rows",
             "2",
             "--format-version",
-            "6",
+            "7",
         ]
     )
     cli_main(
@@ -222,8 +169,7 @@ def test_cli_preserves_float32_dtype_and_bits(
     cli_main(["inspect", "--storage", str(store_path)])
     metadata = json.loads(capsys.readouterr().out)
     assert metadata["dtype"] == "float32"
-    assert metadata["format_version"] == 6
-    assert metadata["mutation_log"]["catalog_managed"] is True
+    assert metadata["format_version"] == 7
     assert metadata["mutation_log"]["generation"] == 1
     assert metadata["open_stats"]["index_validation"] == "checksum"
     assert metadata["open_stats"]["index_body_checksum_verified"] is True
@@ -254,5 +200,5 @@ def test_cli_preserves_float32_dtype_and_bits(
     materialized = json.loads(capsys.readouterr().out)
     assert materialized["materialized"] is True
     assert materialized["materialized_sequence"] == 1
-    assert materialized["delta_run_count"] == 1
+    assert materialized["index_run_count"] == 1
     assert materialized["frozen_wal_count"] == 0

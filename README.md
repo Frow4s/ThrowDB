@@ -8,23 +8,19 @@ partitioned `ID -> RowRef` index, immutable mutation runs, selective partition
 folding, and selective segment cleaning without periodically copying the whole
 collection.
 
-The authoritative format-7 lifecycle is documented in
-[`docs/mutable-storage.md`](docs/mutable-storage.md); formats 3 through 6 are in
-[`docs/native-format-v3.md`](docs/native-format-v3.md). The earlier immutable
-format-v1 contract is documented in
-[`docs/storage-format.md`](docs/storage-format.md). The target local collection
-semantics and staged product plan are documented in
-[`docs/collection-contract.md`](docs/collection-contract.md) and
-[`docs/product-roadmap.md`](docs/product-roadmap.md).
-The numeric version-2 binary representation is specified in
-[`docs/storage-format-v2.md`](docs/storage-format-v2.md).
+ThrowDB supports only the current format 7. Older experimental collections
+must be rebuilt from their source data; their readers, writers, and codecs have
+been removed. The storage lifecycle and wire contracts are documented in
+[`docs/mutable-storage.md`](docs/mutable-storage.md), with the API in
+[`docs/collection-contract.md`](docs/collection-contract.md).
 
 For a complete product handoff, start with the
 [repository review](docs/repository-review.md),
 [end-user guide](docs/user-guide.md),
 [Kubernetes runbook](docs/kubernetes-deployment.md),
 [wheel/release guide](docs/release-packaging.md), or the
-[documentation index](docs/README.md).
+[documentation index](docs/README.md). The latest code audit and refactoring
+decisions are in [the refactoring review](docs/refactoring-review.md).
 
 ## Install
 
@@ -157,7 +153,7 @@ with throwdb.Collection.open("/data/example", mode="r+") as collection:
     deleted = collection.delete([200, 999])  # [True, False]
     lifecycle = collection.rotate_wal()       # no-op if the WAL is empty
     materialized = collection.materialize_frozen_wals()
-    compacted = collection.compact_deltas()   # format 7: selective partition fold
+    folded = collection.fold_partitions()     # selective index partition fold
     cleaner_plan = collection.clean_segments(dry_run=True)
     cleaned = collection.clean_segments(dry_run=False)
     orphan_plan = collection.collect_orphans(
@@ -193,6 +189,43 @@ throwdbd \
   --listen 127.0.0.1:50051 \
   --writable
 ```
+
+Point-read workload logging for future physical-layout optimization is
+optional and disabled by default. Enable it only with a dedicated directory
+that is neither inside nor above the collection:
+
+```bash
+throwdbd \
+  --storage /data/example \
+  --listen 127.0.0.1:50051 \
+  --read-log-dir /data/throwdb-workload/example
+
+throwdb workload inspect \
+  --logs /data/throwdb-workload/example \
+  --storage /data/example \
+  --max-drop-ratio 0 \
+  --max-row-drop-ratio 0 \
+  --require-suitable \
+  --output workload-report.json
+```
+
+The dedicated log directory is bound to the collection ID. If the collection
+is rebuilt under a new ID, archive or remove that directory before enabling
+logging for the rebuilt collection.
+
+The native hot path records every submitted ID from valid `Get`/`StreamGet`
+requests in original order. It does not sample, truncate, or infer request
+categories. Large logical requests are split into exact 8192-ID records and
+written through a preallocated nonblocking MPSC queue. Queue or disk pressure
+marks telemetry incomplete rather than failing reads; only a zero-loss trace is
+suitable for layout training. The default bounds are a 256-MiB queue,
+256-MiB segments, 50-GiB retention, 10-GiB free-space reserve, and 16-MiB/s
+writer ceiling. Version 2 additionally records request/batch timing and
+aggregate range/page/chunk costs from the profiled native read path. Logs
+contain raw numeric IDs, not embeddings, so they are sensitive and deliberately
+live outside collection/S3 backup. See
+[`docs/workload-aware-layout.md`](docs/workload-aware-layout.md) and the
+[server runbook](docs/grpc-server.md#optional-bounded-read-workload-logging).
 
 Both the ready record and `RemoteCollection.describe()` report the complete
 effective reader/tuning selection and separate unary/scan availability bounds.
@@ -249,12 +282,16 @@ iterator yields embedding arrays in query order, while `scan_records()` yields
 writes. See [`docs/streaming-reads.md`](docs/streaming-reads.md) for snapshot,
 memory, cancellation, and partial-progress semantics.
 
-Public mutations always carry a nonzero UUID operation ID. Supplying one
-explicitly lets a caller repeat an ambiguous request after reconnect/restart;
-the durable server journal replays the original result only when the complete
-request digest matches. `RemoteCollection` creates an ID automatically when
-none is supplied and exposes it on `AmbiguousCommitError` if the outcome is
-unknown. Ambient HTTP proxies are disabled by default for internal embedding
+Public mutations carry a nonzero UUID operation ID and the server's replay
+domain. Capture both with `remote.mutation_token()` and pass the token as
+`operation_id=` when a retry must survive reconnect/restart. The durable server
+journal replays the original result only within that domain and when the
+complete request digest matches. `RemoteCollection` also creates IDs
+automatically; if the outcome is unknown and durable idempotency was enabled,
+retry the identical request with `operation_id=error.retry_token` from
+`AmbiguousCommitError`. A refreshed
+`Describe` never silently changes the domain of caller-supplied UUIDs within
+an existing connection. See [safe mutation retry](docs/user-guide.md#safe-mutation-retry). Ambient HTTP proxies are disabled by default for internal embedding
 traffic; opt in explicitly with `use_http_proxy=True`. The MVP transport is
 plaintext only on a numeric loopback endpoint. A non-loopback bind requires
 server certificate, private key, and client CA (mTLS), unless the operator uses
@@ -271,19 +308,13 @@ authorization. `collect_orphans(dry_run=False)` on an `r+` handle performs a
 fresh locked scan, applies hard file/byte budgets, revalidates every pathname
 without following symlinks, unlinks it, and syncs each affected directory.
 Format-7 superseded catalogs and interrupted segment-pair singletons converge
-through the same age, budget, and identity checks; format 6 keeps its historical
-catalog-retention policy.
+through the same age, budget, and identity checks.
 
-`Collection.create()` builds format 7 when `format_version` is omitted. The
-public boundary accepts versions 6 and 7; `format_version=6` remains available
-for legacy compatibility. Version 6 retains a flat base index plus immutable
-DeltaV1 runs. Version 7 makes partition snapshots and their active immutable run
-sections authoritative, stores every immutable embedding segment with a
-reverse `{id, sequence}` sidecar, and supports selective segment replacement.
-The reader also opens format 5 and legacy version-3/4 collections; format 5
-remains catalog/WAL-only and rejects materialization. Version 3 uses a full
-structural index validation as its checksum-free fallback. UTF-8 IDs are
-explicitly postponed; the current product accepts numeric IDs only.
+`Collection.create()` builds format 7. The optional `format_version` argument
+accepts only `7`; readers reject every other storage format. Partition snapshots
+and their active immutable run sections are authoritative. Every immutable
+embedding segment has a reverse `{id, sequence}` sidecar and supports selective
+replacement. UTF-8 IDs are postponed; the product accepts numeric IDs only.
 Prefix reads are API-correct today but the dense-row backend still
 reads each complete row into a temporary before returning its prefix.
 `"auto"` never runs a calibration benchmark while opening. It selects the
@@ -393,31 +424,30 @@ tuning report, optional system-monitor logs, and an aggregate `report.json`.
 Each target summary includes `profile_reuse_level`, so an opaque-overlay
 compatible result is distinguishable from an exact local identity.
 
-Normal format-6 open verifies the CRC32C persisted for the complete flat-index
-body and every immutable delta index. Normal format-7 open verifies the
-catalog-selected partition snapshots and immutable run bodies, plus every
-segment header, descriptor, sidecar geometry, and payload size. Large embedding
-payloads are not rescanned solely to recompute their CRC during ordinary open.
-Use `Collection.open(path, verify_index=True)` to additionally run the much
-more expensive format-specific structural and embedding-payload audit. For
-format 6 this includes flat-index slots, `RowRef`s, uniqueness, and probe paths;
-format 7 verifies complete segment payload CRCs and authoritative snapshot
-structure. Per-phase durations and the selected validation path are available in
-`collection.open_stats` and are copied into load-test `report.json`.
-`throwdb inspect --storage /data/example` prints the same diagnostics as JSON;
-add `--verify-index` for the full format-specific audit. A standalone scrub
-command and complete format-6 DeltaV1 payload scrubbing remain separate work.
+Normal open verifies the catalog-selected partition snapshots and immutable
+run bodies, plus every segment header, descriptor, sidecar geometry, and payload
+size. Large embedding payloads are not rescanned solely to recompute their CRC
+during ordinary open. `Collection.open(path, verify_index=True)` additionally
+verifies complete segment payload CRCs and authoritative snapshot structure.
+Per-phase durations and the validation path are available in
+`collection.open_stats` and load-test `report.json`.
+`throwdb inspect --storage /data/example --verify-index` exposes this full audit.
 
 `collection.mutation_log_stats` reports the selected catalog generation,
 committed/indexed sequence, frozen-WAL count, immutable-run count, and
-active/total WAL, run, and segment bytes. Calling `rotate_wal()` seals a
-non-empty active WAL and atomically publishes its successor. On format 7,
+active/total WAL, run, and segment bytes. `index_run_count`,
+`index_run_entry_count`, and `index_run_bytes` describe the retained index runs;
+`materialized_segment_rows` and `materialized_segment_bytes` describe immutable
+mutation segments, including cleaner output and ID sidecars in the byte count.
+`mutation_resource_bytes` is the sum of run and materialized-segment bytes;
+it excludes WALs, partition snapshots, and catalogs.
+Calling `rotate_wal()` seals a non-empty active WAL and atomically publishes
+its successor. On format 7,
 `materialize_frozen_wals()` collapses a bounded frozen-WAL prefix, streams its
 winning PUT rows into immutable segments, writes one partitioned mutation run,
-and atomically advances the indexed sequence. `compact_deltas()` then folds
+and atomically advances the indexed sequence. `fold_partitions()` then folds
 complete active run sections for selected partitions into new authoritative
-partition snapshots; it does not rewrite embedding payloads. Format 6 keeps
-the older DeltaV1 materialization and oldest-prefix merge semantics.
+partition snapshots; it does not rewrite embedding payloads.
 
 `clean_segments()` is format-7-only. It scans a bounded number of immutable ID
 sidecars, chooses at most one segment whose garbage and reclaimable-byte
@@ -426,22 +456,6 @@ sequence, and publishes replacement segments plus a cleaner run. Dry-run uses
 the same deterministic candidate policy without writing. Materialization,
 folding, and cleaning deliberately leave retired pathnames for the separately
 locked orphan collector; already-open readers keep their pinned old inodes.
-
-`Writer` and `Storage` remain the legacy immutable low-level API used by the
-existing benchmark suite. They require native, aligned, C-contiguous `uint64`
-IDs and embedding arrays whose dtype exactly matches the writer (`float16` or
-`float32`). They do not open the fresh mutable format; new applications should
-use `Collection`.
-
-```python
-with throwdb.Writer.create(
-    "/data/example-low-level", dimension=1024, dtype="float32"
-) as writer:
-    writer.add(ids.astype(np.uint64, copy=False), vectors)
-
-db = throwdb.Storage.open("/data/example-low-level")
-result = db.get(np.array([42, 100], dtype=np.uint64))
-```
 
 The sequential `pread` baseline remains the conservative fallback. A saved
 profile may select another backend automatically; pass an explicit mapping to
@@ -493,9 +507,9 @@ jobs waiting inside the coordinator. One-range requests also pass through this
 coordinator and its ring lane. `io_workers` and `io_queue_capacity` must both be
 zero in io_uring mode.
 
-Large inputs should be appended in batches; `finish()` writes the immutable
-hash index and publishes `manifest.bin` only after the shards and index are
-complete. Duplicate build IDs are rejected. A missing query ID raises
+Large inputs should be appended in batches; `finish()` writes the partitioned
+index snapshots and publishes `manifest.bin` only after all referenced resources
+and `CURRENT` are durable. Duplicate build IDs are rejected. A missing query ID raises
 `KeyError` before the output buffer is modified.
 
 To avoid allocating the result in C++, use a caller-owned array:
@@ -521,7 +535,7 @@ print(
     stats["physical_backend_seconds"],
     stats["planned_ranges"],
     stats["planned_read_bytes"],
-    stats["zero_delta_fast_path"],
+    stats["snapshot_only_fast_path"],
 )
 ```
 
@@ -571,7 +585,8 @@ throwdb create \
   --storage /data/example \
   --ids ids.npy \
   --embeddings embeddings.npy \
-  --format-version 7
+  --format-version 7 \
+  --segment-size-gib 16
 
 throwdb get \
   --storage /data/example \
@@ -593,7 +608,7 @@ throwdb rotate-wal --storage /data/example
 
 throwdb materialize --storage /data/example
 
-throwdb compact-deltas \
+throwdb fold-partitions \
   --storage /data/example \
   --max-runs 8 \
   --max-input-gib 8 \
@@ -620,14 +635,16 @@ throwdb collect-orphans \
   --max-bytes 8589934592
 
 throwdb maintain --storage /data/example --dry-run
-throwdb maintain --storage /data/example --execute
+throwdb maintain --storage /data/example --execute \
+  --fold-max-runs 8 \
+  --fold-max-input-bytes 8589934592 \
+  --fold-max-input-entries 1000000
 ```
 
 `collect-orphans` requires exactly one explicit mode. `--dry-run` is advisory;
 `--execute` always rescans under the writer and commit leases before deleting.
 It considers only old temporary publications and catalog-unreferenced mutable
-resources. For format 6 these are WALs and delta pairs; superseded catalogs stay
-retained. Format 7 additionally collects superseded catalogs, complete segment
+resources: WALs, superseded catalogs, complete segment
 pairs, safe partial segment singletons left by interrupted cleanup, partition
 snapshots, and index runs. A half still named by CURRENT remains reachable and
 is never a candidate. Reachable files, symlinks, and unknown entries are never
@@ -637,8 +654,7 @@ Embedded `Collection.maintain()` and the CLI command below are explicit
 one-pass policies, not library-created background threads. Format 7
 uses the fixed order rotate WAL, materialize a bounded frozen prefix, fold
 selected partitions, clean at most one segment, then collect bounded orphans.
-Format 6 omits the cleaner and keeps its oldest-prefix DeltaV1 merge. Its
-wall-clock limit is cooperative and checked only between durable actions.
+The wall-clock limit is cooperative and checked only between durable actions.
 
 A practical local format-7 lifecycle is:
 
@@ -737,17 +753,13 @@ can interrupt cleanup.
   authorization, multi-collection routing, full payload scrubbing, and
   reduced-copy large RPCs remain later stages.
 
-See [the storage format](docs/storage-format.md),
-[the mutable-storage design](docs/mutable-storage.md), and
-[the streaming contract](docs/streaming-reads.md), plus
-[the benchmark plan](docs/testing.md) for details. The legacy
-`benchmarks/random_read.py` and `throwdb_bench` runners are sequential-baseline
-benchmarks: they open `Storage` without enabling the internal executor. For a
-complete machine, correctness, sequential-read, and concurrent-reader run, edit
-the configuration at the top of `benchmarks/run_load_test.py` and execute it
-once. The runner auto-detects fresh native and legacy immutable manifests.
-`--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` on immutable base
-segments and every retained mutation WAL for rootless eviction on Linux.
+See [the storage design](docs/mutable-storage.md),
+[streaming contract](docs/streaming-reads.md), and
+[benchmark plan](docs/testing.md). `benchmarks/run_load_test.py` uses the same
+format-7 `Collection` API for sequential and concurrent reads, explicit backend
+settings, and persisted tuning profiles.
+`--cache-mode cold` uses per-file `POSIX_FADV_DONTNEED` on immutable segment
+payloads and every retained mutation WAL for rootless eviction on Linux.
 Standalone `warm` replays the exact measured query set outside the timed
 interval before measuring it; `both` measures the same deterministic stream
 cold first and warm immediately afterwards. A result's
@@ -763,6 +775,5 @@ instead of silently falling back, and `report.json` records the complete
 effective `collection.tuning` selection. The default `--tuning explicit` keeps
 the existing `--io-*` comparison workflow.
 
-The on-disk format is versioned but still experimental. Format-v1 compatibility
-is covered by a byte-level golden test; format v2 may still evolve before its
-first stable declaration.
+The on-disk format is versioned but still experimental. Unsupported versions
+are rejected explicitly; backward compatibility is not a development constraint.

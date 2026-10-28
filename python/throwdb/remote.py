@@ -6,7 +6,6 @@ import contextlib
 import operator
 import threading
 import uuid
-from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Final, Iterator, Literal, overload
@@ -14,13 +13,17 @@ from typing import Final, Iterator, Literal, overload
 import grpc
 import numpy as np
 
+from ._array_validation import (
+    _StreamingNumericIdSource,
+    _normalize_numeric_ids,
+    _require_disjoint_numpy_arrays as _reject_array_overlap,
+    _validate_id_scan_output,
+    _validate_output,
+)
 from ._tuning import normalize_reader_options
 from .collection import (
     CollectionSchema,
     _normalize_embeddings,
-    _normalize_numeric_ids,
-    _validate_id_scan_output,
-    _validate_output,
     _validate_prefix_dimensions,
 )
 from .id_scan import (
@@ -44,6 +47,10 @@ _UINT32_MAX: Final = (1 << 32) - 1
 _UINT64_MAX: Final = (1 << 64) - 1
 _GRPC_MAX_MESSAGE_BYTES: Final = (1 << 31) - 1
 _PROTOCOL_MAJOR: Final = 1
+_READ_LOG_HEADER_BYTES: Final = 4_096
+_READ_LOG_RECORD_HEADER_BYTES: Final = 256
+_READ_LOG_BATCH_RECORD_BYTES: Final = 384
+_READ_LOG_TERMINAL_CHECKPOINT_BYTES: Final = 256
 
 _DTYPE_TO_PROTO: Final = {
     "float16": throwdb_pb2.EMBEDDING_DTYPE_FLOAT16,
@@ -146,6 +153,32 @@ _DEFINITE_MUTATION_REJECTIONS: Final = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class RemoteMutationToken:
+    """An operation ID bound to its original server replay domain.
+
+    Persist both UUIDs before submitting a mutation when recovery must survive
+    client restarts. Pass the complete token as ``operation_id`` on every retry.
+    A stale domain is rejected by the server instead of replaying the operation
+    as new work after an idempotency-journal checkpoint.
+    """
+
+    operation_id: uuid.UUID
+    idempotency_domain: uuid.UUID | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, uuid.UUID):
+            raise TypeError("operation_id must be a UUID")
+        if self.operation_id.int == 0:
+            raise ValueError("operation_id must be nonzero")
+        domain = self.idempotency_domain
+        if domain is not None:
+            if not isinstance(domain, uuid.UUID):
+                raise TypeError("idempotency_domain must be a UUID or None")
+            if domain.int == 0:
+                raise ValueError("idempotency_domain must be nonzero")
+
+
 class AmbiguousCommitError(RemoteError, ConnectionError):
     """A mutation may have committed although its response was not received."""
 
@@ -156,14 +189,18 @@ class AmbiguousCommitError(RemoteError, ConnectionError):
         *,
         code: str,
         details: str,
+        idempotency_domain: uuid.UUID | None = None,
     ) -> None:
         self.operation_id = operation_id
         self.operation = operation
+        self.idempotency_domain = idempotency_domain
+        self.retry_token = RemoteMutationToken(operation_id, idempotency_domain)
         super().__init__(
             code,
             f"remote {operation} outcome is unknown; "
             f"operation_id={operation_id}; {details or code}. Do not retry "
-            "automatically unless the server advertises durable idempotency.",
+            "automatically unless the server advertises durable idempotency. "
+            "Retain retry_token and pass it as operation_id on every retry.",
         )
 
 
@@ -190,16 +227,20 @@ class RemoteAbortedError(AmbiguousCommitError):
         operation: str,
         *,
         details: str,
+        idempotency_domain: uuid.UUID | None = None,
     ) -> None:
         self.operation_id = operation_id
         self.operation = operation
+        self.idempotency_domain = idempotency_domain
+        self.retry_token = RemoteMutationToken(operation_id, idempotency_domain)
         RemoteError.__init__(
             self,
             "ABORTED",
             f"remote {operation} was rejected before durable PREPARE; "
             f"operation_id={operation_id}; {details or 'ABORTED'}. Retry only "
             f"the identical {operation} request with the same operation_id; "
-            "never allocate a new operation_id for this logical mutation.",
+            "never allocate a new operation_id for this logical mutation. "
+            "Pass retry_token as operation_id to preserve its replay domain.",
         )
 
 
@@ -306,9 +347,9 @@ class RemoteEngineStatistics:
     total_wal_operations: int
     overlay_entries: int
     estimated_overlay_bytes: int
-    delta_run_count: int
-    total_delta_run_bytes: int
-    total_delta_segment_bytes: int
+    index_run_count: int
+    index_run_bytes: int
+    materialized_segment_bytes: int
     idempotency_journal_bytes: int
     idempotency_completed_operations: int
     idempotency_aborted_operations: int
@@ -318,6 +359,102 @@ class RemoteEngineStatistics:
     filesystem_available_bytes: int
     mutation_disk_reserve_bytes: int
     maintenance_active: bool
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteReadLoggingConfiguration:
+    enabled: bool
+    # Protocol-v1.4 compatibility aliases. A v1.5 logger always reports
+    # sample_ppm=1_000_000 and max_ids_per_event=id_chunk_rows.
+    sample_ppm: int
+    max_ids_per_event: int
+    buffer_bytes: int
+    segment_bytes: int
+    rotate_seconds: int
+    retention_bytes: int
+    retention_seconds: int
+    minimum_free_bytes: int
+    max_write_bytes_per_second: int
+    max_retained_files: int
+    id_chunk_rows: int = 0
+    format_version: int = 1
+
+    def as_dict(self) -> dict[str, int | str | bool]:
+        return {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteReadLoggingStatistics:
+    enabled: bool
+    considered_events: int
+    sampled_events: int
+    enqueued_events: int
+    written_events: int
+    truncated_events: int
+    captured_ids: int
+    dropped_queue_events: int
+    dropped_disk_pressure_events: int
+    dropped_error_events: int
+    bytes_written: int
+    segments_created: int
+    retained_bytes: int
+    retained_segments: int
+    queue_bytes: int
+    peak_queue_bytes: int
+    retention_deleted_bytes: int
+    retention_deleted_segments: int
+    writer_errors: int
+    observed_ids: int
+    unsampled_events: int
+    dropped_busy_events: int
+    dropped_full_events: int
+    rotated_segments: int
+    queued_events: int
+    buffer_capacity_bytes: int
+    last_error_number: int
+    paused_for_minimum_free_space: bool
+    runtime_failed: bool
+    shutting_down: bool
+    sampled_ids: int
+    enqueued_ids: int
+    written_ids: int
+    dropped_busy_ids: int
+    dropped_full_ids: int
+    dropped_error_ids: int
+    dropped_disk_pressure_ids: int
+    dropped_io_budget_events: int
+    dropped_io_budget_ids: int
+    # Protocol-v1.5 request-lifecycle and framed-record counters. Defaults
+    # preserve source compatibility for callers constructing the v1.4 model.
+    observed_requests: int = 0
+    begun_requests: int = 0
+    completed_requests: int = 0
+    complete_requests: int = 0
+    incomplete_requests: int = 0
+    observed_records: int = 0
+    enqueued_records: int = 0
+    written_records: int = 0
+    observed_id_chunks: int = 0
+    enqueued_id_chunks: int = 0
+    written_id_chunks: int = 0
+    observed_batches: int = 0
+    enqueued_batches: int = 0
+    written_batches: int = 0
+    dropped_full_records: int = 0
+    dropped_runtime_failure_records: int = 0
+    dropped_minimum_free_space_records: int = 0
+    dropped_io_budget_records: int = 0
+    queued_records: int = 0
+    active_requests: int = 0
 
     def as_dict(self) -> dict[str, int | bool]:
         return {
@@ -342,6 +479,10 @@ class RemoteDescription:
     # domain. Journal checkpoint rotates it before retiring old operation
     # results, so a delayed retry fails closed instead of being applied twice.
     idempotency_domain: uuid.UUID | None
+    # Added in protocol 1.4. Defaults preserve source compatibility for
+    # callers that construct the previously public dataclass themselves.
+    read_logging: RemoteReadLoggingConfiguration | None = None
+    read_logging_stats: RemoteReadLoggingStatistics | None = None
 
     @property
     def writable(self) -> bool:
@@ -436,23 +577,6 @@ def _bounded_stream_parameters(
             f"streaming limits cannot fit one {operation} row"
         )
     return int(rows), int(payload_bytes)
-
-
-def _reject_array_overlap(
-    arrays: Sequence[tuple[str, np.ndarray]],
-    *,
-    operation: str,
-) -> None:
-    for left_index, (left_name, left) in enumerate(arrays):
-        for right_name, right in arrays[left_index + 1 :]:
-            # may_share_memory is deliberately conservative and bounded. An
-            # occasional false positive is preferable to successful-looking
-            # corruption while sequential copies advance a remote cursor.
-            if np.may_share_memory(left, right):
-                raise ValueError(
-                    f"{operation} buffers {left_name} and {right_name} "
-                    "must not overlap"
-                )
 
 
 @contextlib.contextmanager
@@ -890,128 +1014,19 @@ class RemoteIdScan(Iterator[np.ndarray | LocatedIdBatch]):
             self.close()
 
 
-class _BoundedSequenceWindow(Sequence[object]):
-    """Non-owning ID window so one remote batch has one dense allocation."""
-
-    def __init__(
-        self,
-        source: Sequence[object],
-        begin: int,
-        end: int,
-    ) -> None:
-        self._source = source
-        self._begin = begin
-        self._length = end - begin
-
-    def __len__(self) -> int:
-        return self._length
-
-    def __getitem__(self, index: int | slice) -> object:
-        if isinstance(index, slice):
-            start, stop, step = index.indices(self._length)
-            return [
-                self._source[self._begin + position]
-                for position in range(start, stop, step)
-            ]
-        normalized = operator.index(index)
-        if normalized < 0:
-            normalized += self._length
-        if not 0 <= normalized < self._length:
-            raise IndexError(index)
-        return self._source[self._begin + normalized]
-
-
-class _IndexedIds:
-    """Lazily normalize an ndarray/memmap or ordered Python sequence."""
-
-    def __init__(self, ids: object) -> None:
-        if isinstance(ids, np.ma.MaskedArray):
-            raise TypeError("ids must not be a masked array")
-        self._array: np.ndarray | None = None
-        self._sequence: Sequence[object] | None = None
-        self._shape: tuple[int, ...] | None = None
-        self._dtype: np.dtype[object] | None = None
-        self._strides: tuple[int, ...] | None = None
-        self._data_pointer: int | None = None
-        if isinstance(ids, np.ndarray):
-            if ids.ndim != 1:
-                raise ValueError(f"ids must have shape (N,), got {ids.shape}")
-            if ids.dtype.kind not in {"i", "u"} or ids.dtype.itemsize not in {
-                1,
-                2,
-                4,
-                8,
-            }:
-                raise TypeError(
-                    "ids ndarray must have an 8-, 16-, 32-, or 64-bit "
-                    f"integer dtype, got {ids.dtype}"
-                )
-            self._array = ids
-            self._count = int(ids.shape[0])
-            self._shape = tuple(ids.shape)
-            self._dtype = ids.dtype
-            self._strides = tuple(ids.strides)
-            self._data_pointer = int(ids.ctypes.data)
-        else:
-            if isinstance(ids, (str, bytes, bytearray, memoryview)):
-                raise TypeError(
-                    "numeric ids must be a one-dimensional integer array "
-                    "or ordered sequence"
-                )
-            if not isinstance(ids, Sequence):
-                raise TypeError(
-                    "stream_get ids must be a one-dimensional integer array "
-                    "or ordered sequence"
-                )
-            self._sequence = ids
-            self._count = len(ids)
+class _IndexedIds(_StreamingNumericIdSource):
+    """Remote naming adapter around the shared bounded ID source."""
 
     @property
     def count(self) -> int:
-        return self._count
-
-    def _require_unchanged(self) -> None:
-        if self._array is not None:
-            array = self._array
-            if (
-                array.ndim != 1
-                or tuple(array.shape) != self._shape
-                or array.dtype != self._dtype
-                or tuple(array.strides) != self._strides
-                or int(array.ctypes.data) != self._data_pointer
-            ):
-                raise RuntimeError(
-                    "ids source structure changed while stream_get was active"
-                )
-            return
-        assert self._sequence is not None
-        if len(self._sequence) != self._count:
-            raise RuntimeError(
-                "ids source length changed while stream_get was active"
-            )
+        return len(self)
 
     def normalized_slice(self, begin: int, end: int) -> np.ndarray:
-        self._require_unchanged()
-        if not 0 <= begin <= end <= self._count:
-            raise RuntimeError("stream_get requested an invalid ID slice")
-        values: object
-        if self._array is not None:
-            values = self._array[begin:end]
-        else:
-            assert self._sequence is not None
-            values = _BoundedSequenceWindow(self._sequence, begin, end)
-        normalized = _normalize_numeric_ids(values, position_offset=begin)
-        if normalized.size != end - begin:
-            raise ValueError("ids sequence changed length during streaming")
-        self._require_unchanged()
-        return normalized
+        return self.batch(begin, end)
 
     def reject_output_overlap(self, output: np.ndarray) -> None:
-        if self._array is not None:
-            _reject_array_overlap(
-                (("ids source", self._array), ("output", output)),
-                operation="StreamGet",
-            )
+        if self.output_overlaps_unread(output, begin=0):
+            raise ValueError("StreamGet buffers ids source and output must not overlap")
 
 
 class _StreamGetRequestIterator(Iterator[throwdb_pb2.StreamGetRequest]):
@@ -1874,6 +1889,9 @@ class RemoteCollection:
                     "UNAVAILABLE", "ThrowDB server is not ready to serve"
                 )
             self._description = self._describe()
+            # Describe refreshes live diagnostics and may observe a journal
+            # rollover. Legacy UUID retries must keep their original domain.
+            self._mutation_domain = self._description.idempotency_domain
         except BaseException:
             self.close()
             raise
@@ -1925,7 +1943,7 @@ class RemoteCollection:
         request: object,
         *,
         operation: str,
-        operation_id: uuid.UUID,
+        token: RemoteMutationToken,
     ) -> object:
         try:
             return call(  # type: ignore[operator]
@@ -1937,16 +1955,18 @@ class RemoteCollection:
             code = _rpc_code_name(error)
             if code == "ABORTED":
                 raise RemoteAbortedError(
-                    operation_id,
+                    token.operation_id,
                     operation,
                     details=_rpc_details(error),
+                    idempotency_domain=token.idempotency_domain,
                 ) from error
             if code not in _DEFINITE_MUTATION_REJECTIONS:
                 raise AmbiguousCommitError(
-                    operation_id,
+                    token.operation_id,
                     operation,
                     code=code,
                     details=_rpc_details(error),
+                    idempotency_domain=token.idempotency_domain,
                 ) from error
             raise _typed_rpc_error(error) from error
 
@@ -1955,6 +1975,11 @@ class RemoteCollection:
             self._stub.Describe, throwdb_pb2.DescribeRequest()
         )
         assert isinstance(response, throwdb_pb2.DescribeResponse)
+        if response.format_version != 7:
+            raise RemoteProtocolError(
+                f"server collection format {response.format_version} is unsupported; "
+                "only format 7 is supported"
+            )
         if response.schema.id_type != throwdb_pb2.ID_TYPE_UINT64:
             raise RemoteProtocolError("server collection is not a uint64 collection")
         dtype = _PROTO_TO_DTYPE.get(response.schema.embedding_dtype)
@@ -2182,6 +2207,247 @@ class RemoteCollection:
                     for field in RemoteEngineStatistics.__dataclass_fields__
                 }
             )
+        read_logging: RemoteReadLoggingConfiguration | None = None
+        has_read_logging = response.HasField("read_logging")
+        has_read_logging_stats = response.HasField("read_logging_stats")
+        if (
+            self._protocol_minor is not None
+            and self._protocol_minor >= 4
+            and (not has_read_logging or not has_read_logging_stats)
+        ):
+            raise RemoteProtocolError(
+                "server omitted protocol-v1.4 read-logging diagnostics"
+            )
+        if has_read_logging:
+            raw_logging = response.read_logging
+            raw_format_version = int(raw_logging.format_version)
+            format_version = (
+                raw_format_version
+                if raw_format_version != 0
+                else (1 if raw_logging.enabled else 0)
+            )
+            id_chunk_rows = (
+                int(raw_logging.id_chunk_rows)
+                if format_version >= 2
+                else int(raw_logging.max_ids_per_event)
+            )
+            maximum_record_bytes = max(
+                _READ_LOG_BATCH_RECORD_BYTES,
+                _READ_LOG_RECORD_HEADER_BYTES + 8 * id_chunk_rows,
+            )
+            configured_values = (
+                raw_logging.sample_ppm,
+                raw_logging.max_ids_per_event,
+                raw_logging.buffer_bytes,
+                raw_logging.segment_bytes,
+                raw_logging.rotate_seconds,
+                raw_logging.retention_bytes,
+                raw_logging.retention_seconds,
+                raw_logging.minimum_free_bytes,
+                raw_logging.max_write_bytes_per_second,
+                raw_logging.max_retained_files,
+                raw_logging.id_chunk_rows,
+                raw_logging.format_version,
+            )
+            if (
+                raw_logging.enabled
+                and (
+                    format_version not in {1, 2}
+                    or raw_logging.sample_ppm < 1
+                    or raw_logging.sample_ppm > 1_000_000
+                    or raw_logging.max_ids_per_event < 1
+                    or raw_logging.max_ids_per_event > 65_536
+                    or id_chunk_rows < 1
+                    or id_chunk_rows > (
+                        8_192 if format_version >= 2 else 65_536
+                    )
+                    or (
+                        format_version >= 2
+                        and (
+                            raw_logging.sample_ppm != 1_000_000
+                            or raw_logging.max_ids_per_event
+                                != id_chunk_rows
+                            or raw_logging.id_chunk_rows != id_chunk_rows
+                        )
+                    )
+                    or raw_logging.buffer_bytes
+                        < 2 * maximum_record_bytes
+                    or raw_logging.segment_bytes
+                        < (
+                            _READ_LOG_HEADER_BYTES
+                            + maximum_record_bytes
+                            + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+                        )
+                    or raw_logging.rotate_seconds < 1
+                    or raw_logging.rotate_seconds > (1 << 63) - 1
+                    or raw_logging.retention_bytes
+                        < raw_logging.segment_bytes
+                    or raw_logging.retention_seconds < 1
+                    or raw_logging.max_write_bytes_per_second
+                        < (
+                            _READ_LOG_HEADER_BYTES
+                            + maximum_record_bytes
+                            + 2 * _READ_LOG_TERMINAL_CHECKPOINT_BYTES
+                        )
+                    or raw_logging.max_retained_files < 1
+                    or raw_logging.max_retained_files > 65_533
+                )
+            ) or (
+                not raw_logging.enabled and any(configured_values)
+            ):
+                raise RemoteProtocolError(
+                    "server returned invalid read-logging configuration"
+                )
+            configuration = {
+                field: getattr(raw_logging, field)
+                for field in RemoteReadLoggingConfiguration.__dataclass_fields__
+            }
+            configuration["id_chunk_rows"] = id_chunk_rows
+            configuration["format_version"] = format_version
+            read_logging = RemoteReadLoggingConfiguration(**configuration)
+        read_logging_stats: RemoteReadLoggingStatistics | None = None
+        if has_read_logging_stats:
+            raw_logging_stats = response.read_logging_stats
+            maximum_u64 = (1 << 64) - 1
+            expected_queue_drops = min(
+                maximum_u64,
+                raw_logging_stats.dropped_busy_events
+                + raw_logging_stats.dropped_full_events,
+            )
+            lifecycle_v2 = (
+                read_logging is not None
+                and read_logging.enabled
+                and read_logging.format_version >= 2
+            )
+            completed_outcomes = min(
+                maximum_u64,
+                raw_logging_stats.complete_requests
+                + raw_logging_stats.incomplete_requests,
+            )
+            v2_counters_invalid = lifecycle_v2 and (
+                raw_logging_stats.begun_requests
+                    > raw_logging_stats.observed_requests
+                or raw_logging_stats.completed_requests
+                    > raw_logging_stats.observed_requests
+                or raw_logging_stats.complete_requests
+                    > raw_logging_stats.completed_requests
+                or raw_logging_stats.completed_requests
+                    != completed_outcomes
+                or raw_logging_stats.enqueued_records
+                    > raw_logging_stats.observed_records
+                or raw_logging_stats.written_records
+                    > raw_logging_stats.enqueued_records
+                or raw_logging_stats.enqueued_id_chunks
+                    > raw_logging_stats.observed_id_chunks
+                or raw_logging_stats.written_id_chunks
+                    > raw_logging_stats.enqueued_id_chunks
+                or raw_logging_stats.enqueued_batches
+                    > raw_logging_stats.observed_batches
+                or raw_logging_stats.written_batches
+                    > raw_logging_stats.enqueued_batches
+                or raw_logging_stats.enqueued_ids
+                    > raw_logging_stats.observed_ids
+                or raw_logging_stats.written_ids
+                    > raw_logging_stats.enqueued_ids
+            )
+            numeric_stats = (
+                getattr(raw_logging_stats, field)
+                for field in
+                RemoteReadLoggingStatistics.__dataclass_fields__
+                if field not in {
+                    "enabled",
+                    "paused_for_minimum_free_space",
+                    "runtime_failed",
+                    "shutting_down",
+                }
+            )
+            if (
+                read_logging is None
+                or raw_logging_stats.enabled != read_logging.enabled
+            ) or (
+                raw_logging_stats.dropped_queue_events
+                    != expected_queue_drops
+            ) or (
+                raw_logging_stats.enabled
+                and (
+                    v2_counters_invalid
+                    or raw_logging_stats.buffer_capacity_bytes == 0
+                    or raw_logging_stats.buffer_capacity_bytes
+                        > read_logging.buffer_bytes
+                    or raw_logging_stats.queue_bytes
+                        > raw_logging_stats.buffer_capacity_bytes
+                    or raw_logging_stats.peak_queue_bytes
+                        > raw_logging_stats.buffer_capacity_bytes
+                )
+            ) or (
+                not raw_logging_stats.enabled
+                and (
+                    any(numeric_stats)
+                    or raw_logging_stats.paused_for_minimum_free_space
+                    or raw_logging_stats.runtime_failed
+                    or raw_logging_stats.shutting_down
+                )
+            ):
+                raise RemoteProtocolError(
+                    "server returned inconsistent read-logging statistics"
+                )
+            statistics = {
+                field: getattr(raw_logging_stats, field)
+                for field in RemoteReadLoggingStatistics.__dataclass_fields__
+            }
+            if (
+                read_logging is not None
+                and read_logging.enabled
+                and read_logging.format_version == 1
+            ):
+                incomplete = min(
+                    maximum_u64,
+                    raw_logging_stats.truncated_events
+                    + raw_logging_stats.dropped_queue_events
+                    + raw_logging_stats.dropped_disk_pressure_events
+                    + raw_logging_stats.dropped_error_events
+                    + raw_logging_stats.dropped_io_budget_events,
+                )
+                complete = int(raw_logging_stats.written_events)
+                statistics.update(
+                    observed_requests=int(
+                        raw_logging_stats.considered_events
+                    ),
+                    begun_requests=int(raw_logging_stats.sampled_events),
+                    completed_requests=min(
+                        maximum_u64, complete + incomplete
+                    ),
+                    complete_requests=complete,
+                    incomplete_requests=incomplete,
+                    observed_records=int(
+                        raw_logging_stats.sampled_events
+                    ),
+                    enqueued_records=int(
+                        raw_logging_stats.enqueued_events
+                    ),
+                    written_records=complete,
+                    observed_id_chunks=int(
+                        raw_logging_stats.sampled_events
+                    ),
+                    enqueued_id_chunks=int(
+                        raw_logging_stats.enqueued_events
+                    ),
+                    written_id_chunks=complete,
+                    dropped_full_records=int(
+                        raw_logging_stats.dropped_queue_events
+                    ),
+                    dropped_runtime_failure_records=int(
+                        raw_logging_stats.dropped_error_events
+                    ),
+                    dropped_minimum_free_space_records=int(
+                        raw_logging_stats.dropped_disk_pressure_events
+                    ),
+                    dropped_io_budget_records=int(
+                        raw_logging_stats.dropped_io_budget_events
+                    ),
+                    queued_records=int(raw_logging_stats.queued_events),
+                )
+            read_logging_stats = RemoteReadLoggingStatistics(**statistics)
         return RemoteDescription(
             format_version=response.format_version,
             schema=schema,
@@ -2193,6 +2459,8 @@ class RemoteCollection:
             availability=availability,
             admission_stats=admission_stats,
             engine_stats=engine_stats,
+            read_logging=read_logging,
+            read_logging_stats=read_logging_stats,
             idempotency_domain=idempotency_domain,
         )
 
@@ -2280,6 +2548,36 @@ class RemoteCollection:
     def idempotency_domain(self) -> uuid.UUID | None:
         return self._description.idempotency_domain
 
+    def mutation_token(
+        self,
+        operation_id: uuid.UUID | str | bytes | None = None,
+    ) -> RemoteMutationToken:
+        """Bind a new logical mutation to the currently described domain.
+
+        Call ``describe()`` first when intentionally starting new work after a
+        server journal checkpoint. Existing ambiguous operations must retain
+        their original token; never create a replacement token for a retry.
+        """
+        self._ensure_open()
+        return RemoteMutationToken(
+            _operation_id(operation_id), self._description.idempotency_domain
+        )
+
+    def _mutation_token(
+        self,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None,
+    ) -> RemoteMutationToken:
+        if isinstance(operation_id, RemoteMutationToken):
+            return operation_id
+        # A generated UUID always denotes new work; caller-supplied UUIDs
+        # may be retries and therefore retain the connection's original domain.
+        domain = (
+            self._description.idempotency_domain
+            if operation_id is None
+            else self._mutation_domain
+        )
+        return RemoteMutationToken(_operation_id(operation_id), domain)
+
     @property
     def reader(self) -> RemoteReaderConfiguration | None:
         return self._description.reader
@@ -2302,6 +2600,15 @@ class RemoteCollection:
     def engine_stats(self) -> RemoteEngineStatistics | None:
         # The mutation backlog and filesystem headroom are live gauges.
         return self.describe().engine_stats
+
+    @property
+    def read_logging(self) -> RemoteReadLoggingConfiguration | None:
+        return self._description.read_logging
+
+    @property
+    def read_logging_stats(self) -> RemoteReadLoggingStatistics | None:
+        # Queue pressure, retention and writer failures are live diagnostics.
+        return self.describe().read_logging_stats
 
     def get(
         self,
@@ -2419,7 +2726,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None,
     ) -> None:
         self._ensure_open()
         if not self._description.writable:
@@ -2432,7 +2739,8 @@ class RemoteCollection:
         )
         if normalized_ids.size == 0:
             return
-        identifier = _operation_id(operation_id)
+        token = self._mutation_token(operation_id)
+        identifier = token.operation_id
         wire_embeddings = _native_little_endian(
             normalized_embeddings, self.dtype
         )
@@ -2446,21 +2754,22 @@ class RemoteCollection:
                 values_le=wire_embeddings.tobytes(order="C"),
             ),
         )
-        if self._description.idempotency_domain is not None:
+        if token.idempotency_domain is not None:
             request.idempotency_domain.CopyFrom(
-                _proto_operation_id(self._description.idempotency_domain)
+                _proto_operation_id(token.idempotency_domain)
             )
         response = self._invoke_mutation(
             method,
             request,
             operation=operation_name,
-            operation_id=identifier,
+            token=token,
         )
         assert isinstance(response, throwdb_pb2.MutationResponse)
         if response.affected_count != normalized_ids.size:
             raise AmbiguousCommitError(
                 identifier,
                 operation_name,
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="mutation response count does not match request",
             )
@@ -2470,7 +2779,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Insert,
@@ -2485,7 +2794,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Update,
@@ -2500,7 +2809,7 @@ class RemoteCollection:
         ids: object,
         embeddings: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> None:
         self._put(
             self._stub.Upsert,
@@ -2514,7 +2823,7 @@ class RemoteCollection:
         self,
         ids: object,
         *,
-        operation_id: uuid.UUID | str | bytes | None = None,
+        operation_id: RemoteMutationToken | uuid.UUID | str | bytes | None = None,
     ) -> np.ndarray:
         self._ensure_open()
         if not self._description.writable:
@@ -2522,20 +2831,21 @@ class RemoteCollection:
         normalized_ids = _normalize_numeric_ids(ids)
         if normalized_ids.size == 0:
             return np.empty(0, dtype=np.bool_)
-        identifier = _operation_id(operation_id)
+        token = self._mutation_token(operation_id)
+        identifier = token.operation_id
         request = throwdb_pb2.DeleteRequest(
             operation_id=_proto_operation_id(identifier),
             ids=_proto_ids(normalized_ids),
         )
-        if self._description.idempotency_domain is not None:
+        if token.idempotency_domain is not None:
             request.idempotency_domain.CopyFrom(
-                _proto_operation_id(self._description.idempotency_domain)
+                _proto_operation_id(token.idempotency_domain)
             )
         response = self._invoke_mutation(
             self._stub.Delete,
             request,
             operation="delete",
-            operation_id=identifier,
+            token=token,
         )
         assert isinstance(response, throwdb_pb2.DeleteResponse)
         if (
@@ -2545,6 +2855,7 @@ class RemoteCollection:
             raise AmbiguousCommitError(
                 identifier,
                 "delete",
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="delete response size does not match request",
             )
@@ -2553,6 +2864,7 @@ class RemoteCollection:
             raise AmbiguousCommitError(
                 identifier,
                 "delete",
+                idempotency_domain=token.idempotency_domain,
                 code="PROTOCOL_ERROR",
                 details="delete response contains an invalid bitmap value",
             )
@@ -2775,8 +3087,11 @@ __all__ = [
     "RemoteIdScan",
     "RemoteInternalError",
     "RemoteInvalidArgumentError",
+    "RemoteMutationToken",
     "RemoteNotFoundError",
     "RemoteProtocolError",
+    "RemoteReadLoggingConfiguration",
+    "RemoteReadLoggingStatistics",
     "RemoteRecordScan",
     "RemoteReaderConfiguration",
     "RemoteResourceExhaustedError",

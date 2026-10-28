@@ -161,7 +161,7 @@ def _create_collection(
             dimension=dimension,
             dtype="float16",
         ),
-        shard_size_bytes=1 << 20,
+        segment_size_bytes=1 << 20,
     ) as collection:
         collection.add(ids, embeddings)
     return ids, embeddings

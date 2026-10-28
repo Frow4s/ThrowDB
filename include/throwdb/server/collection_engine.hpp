@@ -57,6 +57,11 @@ struct GetResult {
     std::vector<std::byte> embeddings;
 };
 
+struct ProfiledGetResult {
+    GetResult result;
+    NativeReadStats read;
+};
+
 struct MutationResult {
     std::uint64_t commit_sequence = 0;
     std::uint64_t row_count = 0;
@@ -201,7 +206,7 @@ struct EngineMaintenanceResult {
     bool materialization_memory_budget_blocked = false;
     bool materialization_disk_budget_blocked = false;
     bool folded = false;
-    bool compaction_budget_blocked = false;
+    bool fold_budget_blocked = false;
     bool fold_disk_budget_blocked = false;
     bool idempotency_checkpointed = false;
     bool cleaner_attempted = false;
@@ -219,9 +224,9 @@ struct EngineMaintenanceResult {
     bool action_budget_reached = false;
 };
 
-// The sole transport-neutral owner of remote operation semantics. TDBP and
-// gRPC adapters must share one instance so mutation ordering, preconditions,
-// durable idempotency, and returned commit sequences cannot diverge.
+// The sole transport-neutral owner of remote operation semantics. Server
+// adapters share one instance so mutation ordering, preconditions, durable
+// idempotency, and returned commit sequences cannot diverge.
 class SingleCollectionEngine {
 public:
     SingleCollectionEngine(
@@ -235,6 +240,11 @@ public:
 
     [[nodiscard]] CollectionDescription describe() const;
     [[nodiscard]] GetResult get(
+        std::span<const std::uint64_t> ids,
+        std::uint32_t prefix_dimension = 0) const;
+    // Used only by explicitly enabled telemetry/calibration paths. The
+    // ordinary Get avoids clock reads and physical-plan counters.
+    [[nodiscard]] ProfiledGetResult get_profiled(
         std::span<const std::uint64_t> ids,
         std::uint32_t prefix_dimension = 0) const;
     [[nodiscard]] MutationResult mutate(
@@ -264,6 +274,7 @@ public:
 
     [[nodiscard]] NativeCollection& collection() noexcept;
     [[nodiscard]] const NativeCollection& collection() const noexcept;
+    [[nodiscard]] const std::filesystem::path& storage_path() const noexcept;
     [[nodiscard]] bool durable_idempotency() const noexcept;
     [[nodiscard]] OperationId idempotency_domain() const;
     [[nodiscard]] IdempotencyStats idempotency_stats() const;
