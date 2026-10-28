@@ -232,8 +232,34 @@ def test_excessively_nested_registry_is_reported_as_corrupt(tmp_path: Path) -> N
     loaded = load_registry(store)
     assert loaded.status == "corrupt"
     assert loaded.registry is None
-    assert "decode" in (loaded.error or "")
-    with pytest.raises(TuningRegistryError, match="decode"):
+    # Decoder nesting limits vary by Python version. If decoding succeeds,
+    # the registry schema must still reject the top-level nested array.
+    assert loaded.error is not None
+    assert (
+        loaded.error.startswith("cannot decode tuning registry:")
+        or loaded.error == "registry envelope must be an object"
+    )
+    with pytest.raises(TuningRegistryError) as error:
+        load_registry(store, strict=True)
+    assert str(error.value) == loaded.error
+
+
+def test_decoder_recursion_failure_is_reported_as_corrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    create_registry(store)
+
+    def fail_decode(*args: object, **kwargs: object) -> object:
+        raise RecursionError("decoder nesting limit")
+
+    monkeypatch.setattr(tuning_module.json, "loads", fail_decode)
+    loaded = load_registry(store)
+    assert loaded.status == "corrupt"
+    assert loaded.registry is None
+    assert loaded.error == "cannot decode tuning registry: decoder nesting limit"
+    with pytest.raises(TuningRegistryError, match="cannot decode tuning registry"):
         load_registry(store, strict=True)
 
 
